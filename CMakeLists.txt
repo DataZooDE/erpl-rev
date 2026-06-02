@@ -7,42 +7,68 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# --- SAP NW RFC SDK (repo-local, same approach as DataZooDE/erpl) ------------
-# Resolves SAPNWRFC_HOME from nwrfcsdk/linux at the repo root (overridable with
-# -DSAPNWRFC_HOME=...). The SDK is gitignored; see README for how to provide it
-# (locally: copy it in; in CI: fetched from S3 by download_and_extract_nwrfc.sh).
-include(${CMAKE_CURRENT_SOURCE_DIR}/scripts/functions.cmake)
-set(SAPNWRFC_HOME "" CACHE PATH "Path to the SAP NW RFC SDK (defaults to nwrfcsdk/linux)")
-default_linux_libraries()
+# Platform sub-dir of the repo-local NW RFC SDK (gitignored; provided locally or
+# fetched from S3 in CI — same convention as DataZooDE/erpl).
+if(WIN32)
+  set(_sdk_sub win)
+elseif(APPLE)
+  set(_sdk_sub osx)
+else()
+  set(_sdk_sub linux)
+endif()
 
-# DuckDB engine + headers. Self-contained distribution (libduckdb.so +
-# amalgamated duckdb.hpp) supplied via -DDUCKDB_DIST=<dir> — the Makefile
-# defaults this to the official prebuilt release fetched into vendor/ by
-# `make duckdb-dist` (>=1.5.3, matching the public extension repo so the quack
-# network server's `INSTALL quack` resolves at runtime).
-set(DUCKDB_DIST "" CACHE PATH "Standalone DuckDB dist dir (libduckdb.so + duckdb.hpp)")
+# --- SAP NW RFC SDK ----------------------------------------------------------
+set(SAPNWRFC_HOME "" CACHE PATH "Path to the SAP NW RFC SDK platform dir")
+if(NOT SAPNWRFC_HOME)
+  get_filename_component(SAPNWRFC_HOME "${CMAKE_CURRENT_SOURCE_DIR}/nwrfcsdk/${_sdk_sub}" ABSOLUTE)
+endif()
+if(NOT EXISTS "${SAPNWRFC_HOME}/include/sapnwrfc.h")
+  message(FATAL_ERROR "NW RFC SDK not found at ${SAPNWRFC_HOME}; provide nwrfcsdk/${_sdk_sub} or set -DSAPNWRFC_HOME=...")
+endif()
+# Names resolve across platforms: lib{sapnwrfc,sapucum}.{so,dylib} / {sapnwrfc,libsapucum}.lib
+find_library(SAP_NWRFC_LIB sapnwrfc PATHS "${SAPNWRFC_HOME}/lib" NO_DEFAULT_PATH)
+find_library(SAP_UCUM_LIB  sapucum  PATHS "${SAPNWRFC_HOME}/lib" NO_DEFAULT_PATH)
+if(NOT SAP_NWRFC_LIB OR NOT SAP_UCUM_LIB)
+  message(FATAL_ERROR "Could not find sapnwrfc/sapucum under ${SAPNWRFC_HOME}/lib")
+endif()
+set(SAP_LIBS ${SAP_NWRFC_LIB} ${SAP_UCUM_LIB})
+
+# --- DuckDB (self-contained dist: libduckdb + amalgamated duckdb.hpp) --------
+set(DUCKDB_DIST "" CACHE PATH "Standalone DuckDB dist dir (libduckdb + duckdb.hpp)")
 if(NOT DUCKDB_DIST)
   message(FATAL_ERROR "DUCKDB_DIST not set; run `make duckdb-dist` or pass -DDUCKDB_DIST=<dir>")
 endif()
 set(DUCKDB_INCLUDE "${DUCKDB_DIST}")
-set(DUCKDB_LIBDIR  "${DUCKDB_DIST}")
-set(DUCKDB_LIB     "${DUCKDB_DIST}/libduckdb.so")
+if(WIN32)
+  set(DUCKDB_LIB "${DUCKDB_DIST}/duckdb.lib")        # import lib; duckdb.dll bundled at runtime
+elseif(APPLE)
+  set(DUCKDB_LIB "${DUCKDB_DIST}/libduckdb.dylib")
+else()
+  set(DUCKDB_LIB "${DUCKDB_DIST}/libduckdb.so")
+endif()
 
-# Catch2 comes from vcpkg (manifest mode); the toolchain file is supplied
-# externally via the Makefile (-DCMAKE_TOOLCHAIN_FILE=.../vcpkg.cmake).
+# Catch2 from vcpkg (manifest mode); toolchain supplied by the Makefile/CI.
 find_package(Catch2 3 CONFIG REQUIRED)
-
-# SAP NW RFC SDK build defines for 64-bit Unicode Linux.
-add_compile_definitions(SAPonUNIX SAPwithUNICODE SAPonLIN SAPwithTHREADS
-                        SAPonLINUX __NO_MATH_INLINES)
-
 find_package(Threads REQUIRED)
 
-# Statically link the C++ runtime; remaining dynamic deps are libduckdb.so and
-# the SAP .so trio (libsapnwrfc/libsapucum/libicu*), none of which ship static.
-add_link_options(-static-libstdc++ -static-libgcc)
+# --- SAP build definitions (64-bit Unicode, per platform) --------------------
+if(WIN32)
+  add_compile_definitions(SAPonNT WIN32 SAPwithUNICODE SAPwithTHREADS
+                          UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+elseif(APPLE)
+  add_compile_definitions(SAPonUNIX SAPonDARW SAPwithUNICODE SAPwithTHREADS)
+else()
+  add_compile_definitions(SAPonUNIX SAPonLIN SAPonLINUX SAPwithUNICODE SAPwithTHREADS
+                          __NO_MATH_INLINES)
+endif()
 
-# --- Server -----------------------------------------------------------------
+# Statically link the C++/gcc runtime on Linux so the bundle needs no toolchain
+# libs on the target. (clang/macOS uses libc++; MSVC handled below.)
+if(UNIX AND NOT APPLE)
+  add_link_options(-static-libstdc++ -static-libgcc)
+endif()
+
+# --- Server ------------------------------------------------------------------
 add_executable(erpl_rev_server
   src/sap_uc.cpp
   src/rfc_metadata.cpp
@@ -53,21 +79,27 @@ add_executable(erpl_rev_server
   src/logging.cpp
   src/main.cpp)
 target_include_directories(erpl_rev_server PRIVATE
-  ${SAPNWRFC_HOME}/include
-  ${DUCKDB_INCLUDE}
-  src)
+  "${SAPNWRFC_HOME}/include" "${DUCKDB_INCLUDE}" src)
 target_link_libraries(erpl_rev_server PRIVATE
-  ${SAPNWRFC_LIB_FILES}
-  ${DUCKDB_LIB}
-  Threads::Threads
-  ${CMAKE_DL_LIBS})
-# rpath covers the SAP libs + libduckdb.so. (LD_LIBRARY_PATH to the SAP lib dir
-# is still needed at runtime for the ICU libs that libsapnwrfc dlopens by name.)
-set_target_properties(erpl_rev_server PROPERTIES
-  BUILD_RPATH "${SAPNWRFC_HOME}/lib;${DUCKDB_LIBDIR}"
-  INSTALL_RPATH "${SAPNWRFC_HOME}/lib;${DUCKDB_LIBDIR}")
+  ${SAP_LIBS} ${DUCKDB_LIB} Threads::Threads ${CMAKE_DL_LIBS})
 
-# --- DuckDB bridge Catch2 tests ---------------------------------------------
+# So the extracted inner binary finds the bundled libs sitting next to it
+# (belt-and-suspenders with the launcher's loader-path env var).
+if(APPLE)
+  set_target_properties(erpl_rev_server PROPERTIES
+    BUILD_RPATH "@loader_path" INSTALL_RPATH "@loader_path")
+elseif(UNIX)
+  set_target_properties(erpl_rev_server PROPERTIES
+    BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
+endif()
+
+# --- Self-extracting launcher (the single-file distributable wraps this) -----
+add_executable(erpl_rev_launch launcher/erpl_rev_launch.cpp)
+if(UNIX AND NOT APPLE)
+  target_link_options(erpl_rev_launch PRIVATE -static-libstdc++ -static-libgcc)
+endif()
+
+# --- DuckDB-bridge Catch2 tests ----------------------------------------------
 if(EXISTS "${DUCKDB_LIB}")
   add_executable(erpl_rev_tests
     test/test_duckdb_bridge.cpp
@@ -76,15 +108,16 @@ if(EXISTS "${DUCKDB_LIB}")
     src/duckdb_bridge.cpp
     src/json_util.cpp
     src/sxml_binary.cpp)
-  target_include_directories(erpl_rev_tests PRIVATE
-    src ${DUCKDB_INCLUDE})
+  target_include_directories(erpl_rev_tests PRIVATE src "${DUCKDB_INCLUDE}")
   target_compile_definitions(erpl_rev_tests PRIVATE
     ERPL_REV_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
   target_link_libraries(erpl_rev_tests PRIVATE
     ${DUCKDB_LIB} Threads::Threads Catch2::Catch2WithMain)
-  set_target_properties(erpl_rev_tests PROPERTIES
-    BUILD_RPATH "${DUCKDB_LIBDIR}"
-    INSTALL_RPATH "${DUCKDB_LIBDIR}")
+  if(APPLE)
+    set_target_properties(erpl_rev_tests PROPERTIES BUILD_RPATH "${DUCKDB_DIST}")
+  elseif(UNIX)
+    set_target_properties(erpl_rev_tests PROPERTIES BUILD_RPATH "${DUCKDB_DIST}")
+  endif()
 else()
-  message(WARNING "libduckdb.so not found at ${DUCKDB_LIB}; skipping tests.")
+  message(WARNING "libduckdb not found at ${DUCKDB_LIB}; skipping tests.")
 endif()

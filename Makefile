@@ -25,7 +25,8 @@ BUILD_DIR := build
 # DUCKDB_DIST option follows suit.
 DUCKDB_VERSION ?= 1.5.3
 DUCKDB_DIST ?= $(CURDIR)/vendor/duckdb-$(DUCKDB_VERSION)
-DUCKDB_URL := https://github.com/duckdb/duckdb/releases/download/v$(DUCKDB_VERSION)/libduckdb-linux-amd64.zip
+# Override DUCKDB_URL/DUCKDB_SHA256 for non-Linux dists (osx-universal / windows-amd64).
+DUCKDB_URL ?= https://github.com/duckdb/duckdb/releases/download/v$(DUCKDB_VERSION)/libduckdb-linux-amd64.zip
 # Pinned SHA256 of libduckdb-linux-amd64.zip v1.5.3 — verified on download (supply
 # DUCKDB_SHA256= for another version).
 DUCKDB_SHA256 ?= 0a926eba5bce0abc0010f4b9109133e4440cb74e97bd10fd2d0fc2a721621b05
@@ -46,9 +47,17 @@ RUN_ENV := LD_LIBRARY_PATH=$(NWRFC_LIB):$(DUCKDB_LIB)
 # Prefer Ninja when available, else fall back to Make generator.
 GENERATOR := $(shell command -v ninja >/dev/null 2>&1 && echo Ninja || echo "Unix Makefiles")
 
-.PHONY: all build configure test run run-mem run-no-quack e2e duckdb-dist start-sap clean
+DIST ?= dist
+
+.PHONY: all build configure test run run-mem run-no-quack e2e duckdb-dist start-sap clean bundle
 
 all: build
+
+# Single-file distributable: launcher + inner server + runtime libs (see scripts/bundle.sh).
+bundle: build
+	./scripts/bundle.sh linux \
+	  $(BUILD_DIR)/erpl_rev_server $(BUILD_DIR)/erpl_rev_launch \
+	  $(NWRFC_LIB) $(DUCKDB_DIST) $(DIST)/erpl-rev
 
 # Fetch the official prebuilt DuckDB distribution (libduckdb.so + duckdb.hpp).
 duckdb-dist: $(DUCKDB_DIST)/libduckdb.so

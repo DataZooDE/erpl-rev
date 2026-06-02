@@ -12,3 +12,5 @@ dev_rfc.log
 # local parquet data artifacts (data/taxi.parquet is a small tracked fixture)
 /bseg.parquet
 /flights.parquet
+# self-extracting bundle output
+/dist/

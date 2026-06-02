@@ -90,6 +90,12 @@ native/ADBC BW path reads cross-client). Full guide: [`docs/security.md`](docs/s
 
 ## Install & setup
 
+**Prefer a prebuilt binary?** Each [release](https://github.com/DataZooDE/erpl-rev/releases)
+ships a **single self-extracting file** per OS (`erpl-rev-linux-amd64`,
+`erpl-rev-macos-arm64`, `erpl-rev-windows-amd64.exe`) that bundles the SAP NW RFC
+SDK + DuckDB — download it, run it, nothing else to install. To build that file
+from source yourself: `make bundle` → `dist/erpl-rev`. To build the plain server:
+
 ### Prerequisites
 - Linux host with **CMake ≥ 3.16**, a **C++17** compiler, **Ninja**, and **vcpkg**
   (supplies Catch2 for the tests).
