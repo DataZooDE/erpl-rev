@@ -1,0 +1,72 @@
+<!doctype html>
+<!-- Source for docs/perf-scaling.png — erpl-rev parallel-replication scaling curve.
+     Render: open in a browser (or screenshot the .card element) to regenerate the PNG.
+     Data: live run, ZWIDE_BSEG (400-col BSEG-shaped), 50-col slice, 10,000,000 rows,
+     BELNR-partitioned, SAP A4H trial over loopback. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+  body { margin: 0; background: #FFF1C9; font-family: Inter, -apple-system, "Segoe UI", sans-serif; }
+  .card {
+    width: 860px; margin: 24px; background: #FFF8E1;
+    border: 3px solid #1A1A1A; border-radius: 10px;
+    box-shadow: 8px 8px 0 #1A1A1A; padding: 26px 30px 22px;
+  }
+  .title { font-size: 26px; font-weight: 800; color: #1A1A1A; letter-spacing: -0.4px; }
+  .subtitle { font-size: 14px; font-weight: 500; color: #5A5340; margin-top: 4px; }
+  .peak { display: inline-block; margin-top: 12px; padding: 5px 12px;
+          background: #FDD835; border: 2px solid #1A1A1A; border-radius: 6px;
+          font-size: 13px; font-weight: 700; color: #1A1A1A; }
+  #chart { margin-top: 10px; }
+  figure { margin: 0; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="title">Parallel replication throughput — 10M rows</div>
+    <div class="subtitle">ZWIDE_BSEG · 50 of 400 columns · BELNR-partitioned · SAP A4H trial (loopback)</div>
+    <span class="peak">▲ peak ~167k rows/s at 5 workers — 10M rows in 60&nbsp;s</span>
+    <div id="chart"></div>
+  </div>
+  <script type="module">
+    import * as Plot from "https://cdn.jsdelivr.net/npm/@observablehq/plot@0.6/+esm";
+
+    const data = [
+      { workers: 2, series: "Aggregate",  rows_per_s: 94340,  secs: 106 },
+      { workers: 4, series: "Aggregate",  rows_per_s: 153846, secs: 65 },
+      { workers: 5, series: "Aggregate",  rows_per_s: 166667, secs: 60 },
+      { workers: 2, series: "Per worker", rows_per_s: 47170,  secs: 106 },
+      { workers: 4, series: "Per worker", rows_per_s: 38462,  secs: 65 },
+      { workers: 5, series: "Per worker", rows_per_s: 33333,  secs: 60 },
+    ];
+    const k = v => (v / 1000).toFixed(0) + "k";
+
+    const chart = Plot.plot({
+      width: 800, height: 440,
+      marginLeft: 74, marginRight: 24, marginTop: 16, marginBottom: 48,
+      style: { background: "transparent", color: "#1A1A1A",
+               fontFamily: "Inter, sans-serif", fontSize: "13px" },
+      x: { label: "parallel workers →", domain: [1.6, 5.4], ticks: [2, 4, 5],
+           tickFormat: d => d, labelAnchor: "center" },
+      y: { label: "↑ rows / second", domain: [0, 185000],
+           ticks: [0, 50000, 100000, 150000], tickFormat: k, grid: true },
+      color: { domain: ["Aggregate", "Per worker"], range: ["#1565C0", "#E8A200"],
+               legend: true },
+      marks: [
+        Plot.ruleY([0], { stroke: "#1A1A1A", strokeWidth: 1.5 }),
+        Plot.line(data, { x: "workers", y: "rows_per_s", stroke: "series",
+                          strokeWidth: 3.5, curve: "catmull-rom" }),
+        Plot.dot(data, { x: "workers", y: "rows_per_s", fill: "series",
+                         stroke: "#1A1A1A", strokeWidth: 1.5, r: 5.5 }),
+        Plot.text(data, { x: "workers", y: "rows_per_s",
+                          text: d => k(d.rows_per_s),
+                          dy: d => d.series === "Aggregate" ? -22 : 24,
+                          fontSize: 13, fontWeight: 700, fill: "#1A1A1A",
+                          stroke: "#FFF8E1", strokeWidth: 4, paintOrder: "stroke" }),
+      ],
+    });
+    document.querySelector("#chart").append(chart);
+  </script>
+</body>
+</html>

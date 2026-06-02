@@ -66,6 +66,8 @@ data world back in through ABAP.
 
 ## Performance
 
+![Parallel replication throughput: aggregate rises to ~167k rows/s at 5 workers (10M rows in 60s) while per-worker throughput tapers from 47k to 33k rows/s](docs/perf-scaling.png)
+
 Built for full loads of arbitrary size — fast, parallel, memory-bounded, and
 restartable:
 
