@@ -1,23 +1,60 @@
-# erpl-rev — an ABAP-RFC → DuckDB bridge (C++)
+# erpl-rev — push SAP data into DuckDB, parquet, and live SQL
 
-The inverse of [`erpl`](https://github.com/DataZooDE/erpl): instead of DuckDB
-calling *into* SAP, **`erpl-rev` is a standalone C++ RFC server** that registers
-a PROGRAM_ID at the SAP gateway and hosts function modules ABAP can call with
-`CALL FUNCTION '…' DESTINATION '…'` — running **DuckDB** behind them.
+**erpl-rev lets ABAP move SAP data straight into [DuckDB](https://duckdb.org).**
+It is a standalone C++ server that registers at the SAP gateway as an RFC
+destination and hosts function modules your ABAP code calls with
+`CALL FUNCTION '…' DESTINATION 'ERPL_REV'` — with DuckDB running behind them.
+There is **nothing to install inside SAP** (no DuckDB extension) and **no DDIC
+structures to define**: payloads travel as plain JSON over RFC, so any table,
+CDS view, or query result flows through the same generic interface.
 
-> Status: research prototype.
+It is the inverse of [`erpl`](https://github.com/DataZooDE/erpl) — where `erpl`
+makes DuckDB call *into* SAP, **erpl-rev has SAP call out into DuckDB.**
 
-Two capabilities, both verified end-to-end against the live A4H docker system:
+> Status: research prototype — every capability below is verified end-to-end
+> against a live SAP ABAP (A4H) system in `scripts/e2e.sh`.
 
-- **Query** — ABAP sends SQL; the server runs it on DuckDB over **NYC-taxi
-  parquet** and returns rows as JSON.
-- **Ingest** — ABAP pushes rows (here, real `T000` client rows); the server does
-  a DuckDB **INSERT/UPSERT** and writes the table to **parquet** — i.e.
-  *SAP → parquet via DuckDB*.
-- **Quack** *(optional, `--quack`)* — expose the *same in-process DuckDB* over the
-  network via DuckDB's [quack](https://duckdb.org/docs/current/quack/overview)
-  extension, so remote DuckDB clients can query exactly the data ABAP ingested —
-  no export step. See [Quack network server](#quack-network-server).
+## Use cases
+
+- **Replicate SAP into DuckDB (SLT-style).** Copy an arbitrary **table**, **CDS
+  view**, or **BW / native (ADBC)** query into a typed DuckDB table — full or
+  filtered, with a source-side `WHERE`, column selection, and idempotent
+  `UPSERT`. Designed for full loads up to **>100M rows** (bounded memory,
+  restartable, optional parallel background jobs).
+  → [Replicating SAP tables](#replicating-sap-tables-slt-style)
+- **Export SAP data to the open lakehouse.** Land a SAP slice as a **parquet**
+  file or partitioned dataset, or publish it into an **`ATTACH`**ed catalog —
+  Postgres, DuckLake, BigQuery, Iceberg, anything DuckDB can attach — through one
+  SQL path.
+- **Run SQL analytics on SAP data, from ABAP.** Send SQL from ABAP and get rows
+  back as JSON: joins, aggregates and parquet scans that would be painful in
+  OpenSQL. An in-ABAP **SQL console** (`Z_ERPL_REV_SQL`, `SE38`) gives an
+  interactive surface over the same engine.
+- **Serve ingested data live to remote DuckDB clients.** With `--quack`, the same
+  in-process DuckDB is exposed over the network, so whatever ABAP just ingested is
+  instantly queryable from any DuckDB client — **no export step**.
+  → [Quack network server](#quack-network-server)
+
+## Performance
+
+Built for full loads of arbitrary size — fast, memory-bounded, and restartable:
+
+- **≈ 5,500 rows/s on a 400-column table** (`ZWIDE_BSEG`: 100,000 rows in ~18 s),
+  via a DuckDB **`Appender`** into a staging clone followed by one vectorized
+  `INSERT … SELECT` — about **230× faster** than the naive per-row path
+  (~24 rows/s). The strategy comparison lives in `test/bench_ingest.cpp`.
+- **Memory bounded by batch, not table size.** The source streams **package-wise**
+  (keyset pagination, default 50,000 rows/batch); only one package is resident at
+  a time, so a 100M-row load uses the same RAM as a 100k-row one.
+- **Restartable & idempotent.** Full-load-replace truncates up front and keyed
+  `UPSERT` dedups on conflict, so a crashed or re-run load yields no duplicates;
+  a file-backed DuckDB keeps ingested data durable across server restarts.
+- **Parallel.** Large loads can fan out across several background worker jobs that
+  append disjoint key ranges into one target, with the primary key built once.
+- **Byte-identity verified.** A diff harness compares the DuckDB target against
+  the SAP source cell-by-cell (SFLIGHT every row × column; ZWIDE_BSEG 3000 × 390
+  via per-row md5), plus a negative control — see
+  [Very large tables](#very-large-tables-100m-rows).
 
 ## Architecture
 
@@ -267,9 +304,10 @@ atomic, and restartable**:
 
 **Data-identity check.** `zcl_erpl_rev_difftest` exhaustively compares the
 replicated DuckDB target against the SAP source — SFLIGHT every row × every
-column (direct values), ZWIDE_BSEG 3000 rows × 390 columns (per-row md5), plus a
+column (direct values), ZWIDE_BSEG 3000 rows × 390 columns (per-row md5), and
+REPOSRC 200 rows × 34 columns (large multi-chunk text + blank dates), plus a
 negative control that corrupts one value and confirms the diff is detected. Wired
-into `scripts/e2e.sh` (`DIFF RESULT pass=3 fail=0`).
+into `scripts/e2e.sh` (`DIFF RESULT pass=4 fail=0`).
 
 *Known limitation:* the BXML/asXML binary path **drops trailing zero bytes of
 fixed `RAW` columns** (a 16-byte RAW ending `0x00` arrives shorter; an all-zero
@@ -301,9 +339,12 @@ scripts/e2e.sh
 
 It builds, runs the unit tests, starts the server (with `LD_LIBRARY_PATH` to the
 SDK libs — required because `libsapnwrfc.so` `dlopen`s the ICU libs by name),
-deploys/runs the ABAP caller classes, and asserts: the taxi aggregate
-(`CARD 4/86.00`, `CASH 2/12.50`) and the SAP→parquet upsert
-(`mtext='ERPL-REV-UPSERT'`, parquet written).
+deploys/runs the ABAP caller classes, and asserts each capability end-to-end:
+the taxi aggregate query and SAP→parquet upsert; arbitrary-SQL console results;
+SLT-style replication (projection + source filter + key retention); cell-by-cell
+data identity; partitioned parallel full-load; the end-user replicate report's
+background-job branch; external-target publish (parquet / dataset / attached
+catalog); and CDS-view and BW/native (ADBC) sources.
 
 ## Gotchas worth knowing (the ones that cost time)
 
