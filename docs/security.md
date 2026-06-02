@@ -52,8 +52,11 @@ Create a dedicated **Communications**-type user (no dialog logon) for the FM cal
 and give it only the delivered role:
 - Role **`ZERPL_REV_RFC`** → `S_RFC` for **function group `ZERPL_REV` only**
   (`RFC_TYPE=FUGR`, `RFC_NAME=ZERPL_REV`, `ACTVT=16`). Nothing else.
-- The replicator/console reports run under the *end user's* own authorizations
-  (so source-table reads obey existing `S_TABU_*`/CDS DCL — no privilege bypass).
+- The replicator/console reports run under the *end user's* own authorizations,
+  gated by who may execute them (`S_PROGRAM` / transaction). **CDS views enforce
+  their DCL automatically**; a raw-table dynamic `SELECT` is **not** implicitly
+  `S_TABU`-checked, so restrict report execution accordingly. The **native (ADBC)**
+  BW calc-view path reads **cross-client** — treat it as privileged.
 - Do **not** grant `S_RFC = *`. Do **not** reuse `DDIC`/`SAP*`.
 
 Minimal `S_RFC` authorization (PFCG):

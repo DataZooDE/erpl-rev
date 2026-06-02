@@ -96,6 +96,20 @@ What SAP teams tend to ask about — and why erpl-rev fits:
   **10,000,000 rows in ~60 s** (see [Performance](#performance)) — wide, deep,
   fully typed.
 
+> **Security & authorizations.** erpl-rev ships only `Z*` objects (no core
+> modification) and is reached through a **type-T RFC destination**; in production
+> it's pinned with a gateway `reginfo` allow-list (one PROGRAM_ID, one host) and,
+> off-box, **SNC** encryption — SAP table data crosses the RFC wire. FM calls run
+> as a dedicated **communication user holding `S_RFC` for function group
+> `ZERPL_REV` only**. The replicate/console programs run under the **end user's**
+> own authorizations and are gated by who may execute them (`S_PROGRAM` /
+> transaction): **CDS views enforce their DCL automatically**, while a raw-table
+> dynamic `SELECT` is **not** implicitly `S_TABU`-checked — so restrict program
+> execution accordingly, and note that the **native (ADBC)** BW calc-view path
+> reads **cross-client**. Credentials for publish targets live in the server's
+> init-file, never on the RFC wire or in ABAP. Full Basis hardening guide:
+> [`docs/security.md`](docs/security.md).
+
 ## Performance
 
 ![Parallel replication throughput: aggregate rises to ~167k rows/s at 5 workers (10M rows in 60s) while per-worker throughput tapers from 47k to 33k rows/s](docs/perf-scaling.png)
