@@ -64,6 +64,38 @@ data world back in through ABAP.
   is instantly queryable (and `ATTACH`-able) from any DuckDB client.
   → [Quack network server](#quack-network-server)
 
+## Built for the SAP data stack
+
+What SAP teams tend to ask about — and why erpl-rev fits:
+
+- **No SLT, no SDI, no Data Services, no add-on.** It's a registered RFC server
+  plus a small function group (`ZERPL_REV`) and one report — shipped as a
+  transport, not a kernel patch, an HANA license, or a BTP subscription. Works
+  against any NetWeaver ABAP stack (ECC, S/4HANA, BW/4HANA); the only SAP-side
+  prerequisite is a type-T RFC destination and gateway registration.
+- **Reads the sources you actually model.** Transparent **tables**, **CDS views**
+  (incl. `WITH PARAMETERS`, keys auto-detected), and **BW / HANA calculation
+  views** (read natively over ADBC, e.g. `"_SYS_BIC"."pkg/CV"`) — all through one
+  path, with their semantics intact rather than as raw tables.
+- **SLT semantics you already know (LTRS).** Field selection / target
+  minimization, a **source-side `WHERE`** so non-matching rows never leave the
+  SAP system, and a key-based **`UPSERT`** that dedups on re-run — the three
+  per-table knobs of SLT, without standing up SLT.
+- **DDIC-typed and provably faithful.** NUMC / DATS / TIMS / CURR / QUAN /
+  `DECIMAL` precision+scale / RAW map to real DuckDB types, and Open SQL reads are
+  **client-aware** (MANDT-scoped). A built-in diff harness checks the target
+  against the source **cell-by-cell** (SFLIGHT, REPOSRC, and a 400-column
+  BSEG-shaped table) — fidelity you can demonstrate, not assume.
+- **DuckDB analytics on SAP data — and past it.** Send arbitrary SQL and get a
+  typed result back in ABAP, or an ALV grid via the **in-GUI SQL console**
+  (`Z_ERPL_REV_SQL`, `SE38`): joins, window functions and aggregations that are
+  painful in Open SQL. Then **federate** — join a SAP slice against an Iceberg /
+  DuckLake / parquet dataset or an attached Postgres / BigQuery table **in one
+  statement**, which the SAP stack can't do on its own.
+- **It eats the scary tables.** A 400-column **BSEG**-shaped line-item table at
+  **10,000,000 rows in ~60 s** (see [Performance](#performance)) — wide, deep,
+  fully typed.
+
 ## Performance
 
 ![Parallel replication throughput: aggregate rises to ~167k rows/s at 5 workers (10M rows in 60s) while per-worker throughput tapers from 47k to 33k rows/s](docs/perf-scaling.png)
