@@ -69,19 +69,26 @@ data world back in through ABAP.
 Built for full loads of arbitrary size — fast, parallel, memory-bounded, and
 restartable:
 
-- **≥ 10,000 rows/s per worker, ×N workers.** Each worker streams a disjoint key
-  range and ingests it with a DuckDB **`Appender`** + one vectorized
-  `INSERT … SELECT`, sustaining **≥ 10,000 rows/s** on typical tables. N workers
-  run concurrently into one target (the primary key is built once at the end), so
-  a full load scales roughly to **10,000 × N rows/s** — add workers to go faster.
-- **Measured: 10,000,000 rows in 66 s** (≈ **151,000 rows/s**, ≈ **37,900 rows/s
-  per worker**) — a 50-column slice of a 400-column BSEG-shaped table replicated
-  with 4 parallel workers, partitioned on the document-number key, on the SAP
-  A4H developer trial over loopback. The per-worker rate scales with table width:
-  the full 400-column row holds ≈5,500 rows/s per stream, and the `Appender` path
-  is ~230× the naive per-row baseline (strategy comparison in
-  `test/bench_ingest.cpp`). Treat ≥10,000 rows/s/worker as the conservative floor
-  for real networks.
+- **Parallel full loads — measured.** Each worker streams a disjoint key range
+  and ingests it with a DuckDB **`Appender`** + one vectorized `INSERT … SELECT`;
+  N workers run concurrently into one target and the primary key is built once at
+  the end. Replicating a **50-column slice of a 400-column BSEG-shaped table —
+  all 10,000,000 rows** — on the SAP A4H developer trial, partitioned on the
+  document-number key, over loopback:
+
+  | Workers | Wall time | Aggregate | Per worker |
+  |:-------:|----------:|----------:|-----------:|
+  | 2 | 106 s | ~94,000 rows/s  | ~47,000 rows/s |
+  | 4 |  65 s | ~154,000 rows/s | ~38,000 rows/s |
+  | 5 |  60 s | ~167,000 rows/s | ~33,000 rows/s |
+
+  **Peak ~167,000 rows/s at 5 workers — 10M rows in a minute.** Aggregate keeps
+  climbing as you add workers (here up to the trial's 5 batch work processes);
+  scaling is sublinear because workers contend for the SAP read side and the
+  shared server ingest, so per-worker throughput tapers (47k → 33k). Throughput
+  tracks table width — the full 400-column row sustains ≈5,500 rows/s per
+  stream — and the `Appender` path is ~230× the naive per-row baseline
+  (`test/bench_ingest.cpp`).
 - **Memory bounded by batch, not table size.** Each worker reads **package-wise**
   (keyset pagination, default 50,000 rows/batch); only one package is resident at
   a time, so a 100M-row load uses the same RAM as a 100k-row one.
