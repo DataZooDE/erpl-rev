@@ -1,6 +1,15 @@
 #include "logging.hpp"
 
-#include <unistd.h>   // isatty, fileno
+#if defined(_WIN32)
+#  include <io.h>      // _isatty, _fileno
+#  define isatty _isatty
+#  define fileno _fileno
+// POSIX *_r take (time_t*, tm*); MSVC *_s take (tm*, time_t*) — adapt by name.
+#  define gmtime_r(t, tm)    gmtime_s((tm), (t))
+#  define localtime_r(t, tm) localtime_s((tm), (t))
+#else
+#  include <unistd.h>  // isatty, fileno
+#endif
 
 #include <chrono>
 #include <cstdio>
