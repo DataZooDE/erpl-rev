@@ -16,9 +16,9 @@ $pay   = Join-Path $stage 'payload'
 New-Item -ItemType Directory -Path $pay -Force | Out-Null
 
 Copy-Item $Server (Join-Path $pay 'erpl_rev_server.exe')
-foreach ($l in 'sapnwrfc.dll','libsapucum.dll','icudt50.dll','icuin50.dll','icuuc50.dll') {
-  Copy-Item (Join-Path $SdkLib $l) (Join-Path $pay $l)
-}
+# All runtime DLLs the SDK ships (sapnwrfc.dll, libsapucum.dll, icu*.dll —
+# whatever the SDK version names them), plus DuckDB.
+Get-ChildItem (Join-Path $SdkLib '*.dll') | ForEach-Object { Copy-Item $_.FullName $pay }
 Copy-Item (Join-Path $DuckdbDir 'duckdb.dll') (Join-Path $pay 'duckdb.dll')
 
 Write-Host "Bundling:"; Get-ChildItem $pay | ForEach-Object { "  {0,12}  {1}" -f $_.Length, $_.Name }
