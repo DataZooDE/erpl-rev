@@ -101,6 +101,10 @@ Override the location with `make build NWRFC_HOME=/path/to/nwrfcsdk/linux`
 `vendor/` (`DUCKDB_DIST`, fetched by `make duckdb-dist`) so the quack extension
 is installable; point `DUCKDB_DIST` elsewhere to use a different build.
 
+CI (`.github/workflows/ci.yml`) builds the server + runs the tests on every push
+and PR; it pulls the SDK from S3 (`s3://erpl-resources/sapnwrfc/…`) via the same
+GitHub-OIDC → AWS role as `erpl` (`scripts/download_and_extract_nwrfc.sh`).
+
 Portable dependencies (currently **Catch2**, the test framework) are managed
 with **vcpkg in manifest mode** (`vcpkg.json`) and statically linked via the
 `x64-linux` triplet. Point `VCPKG_ROOT` at an external vcpkg checkout; it

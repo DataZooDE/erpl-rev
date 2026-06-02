@@ -9,7 +9,8 @@ endif()
 
 # --- SAP NW RFC SDK (repo-local, same approach as DataZooDE/erpl) ------------
 # Resolves SAPNWRFC_HOME from nwrfcsdk/linux at the repo root (overridable with
-# -DSAPNWRFC_HOME=...). The SDK is gitignored; see README for how to provide it.
+# -DSAPNWRFC_HOME=...). The SDK is gitignored; see README for how to provide it
+# (locally: copy it in; in CI: fetched from S3 by download_and_extract_nwrfc.sh).
 include(${CMAKE_CURRENT_SOURCE_DIR}/scripts/functions.cmake)
 set(SAPNWRFC_HOME "" CACHE PATH "Path to the SAP NW RFC SDK (defaults to nwrfcsdk/linux)")
 default_linux_libraries()
