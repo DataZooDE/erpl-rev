@@ -1,0 +1,14 @@
+build/
+vendor/
+# SAP NW RFC SDK — proprietary, not redistributable (provide locally; see README)
+nwrfcsdk/
+sap/
+sap/*.generated
+*.trc
+dev_rfc.log
+# default file-backed DuckDB (and its WAL) — local data, never committed
+*.duckdb
+*.duckdb.wal
+# local parquet data artifacts (data/taxi.parquet is a small tracked fixture)
+/bseg.parquet
+/flights.parquet

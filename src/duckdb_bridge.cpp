@@ -1,0 +1,600 @@
+#include "duckdb_bridge.hpp"
+#include "json_util.hpp"
+#include "sxml_binary.hpp"
+
+#include <cstdlib>
+#include <future>
+#include <mutex>
+#include <sstream>
+#include <stdexcept>
+#include <unordered_map>
+
+#include "duckdb.hpp"
+
+namespace erpl_rev {
+
+namespace {
+
+// SQL single-quote escaping for string literals.
+std::string SqlQuote(const std::string &s) {
+    std::string out = "'";
+    for (char c : s) { if (c == '\'') out += "''"; else out += c; }
+    out += "'";
+    return out;
+}
+
+// Render a parsed JSON cell as a SQL literal.
+std::string CellToSql(const json::Cell &c) {
+    if (c.is_null) return "NULL";
+    if (c.is_string) return SqlQuote(c.value);
+    return c.value;   // number/bool verbatim
+}
+
+// DuckDB folds unquoted identifiers to lower case; we lower-case BXML column
+// names (which arrive upper-case from ABAP) to match the stored/target names.
+std::string LowerName(const std::string &s) {
+    std::string l = s;
+    for (char &c : l) if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+    return l;
+}
+
+// Sanitize a DuckDB column name into a valid ABAP component name so ABAP can
+// build the result structure (cl_abap_structdescr) — else expression columns
+// like count(*) ("count_star()") raise CX_SY_STRUCT_COMP_NAME. Uppercase; map
+// any char outside [A-Z0-9_] to '_'; trim leading/trailing '_'; ensure a
+// letter/underscore start; cap at 30 chars. The SAME sanitized name is used for
+// both EV_COLUMNS and the BXML element, so they still bind. (Alias expression
+// columns for prettier headers.)
+std::string SanitizeColName(const std::string &s) {
+    std::string u;
+    for (char c : s) {
+        char up = (c >= 'a' && c <= 'z') ? char(c - 'a' + 'A') : c;
+        u += ((up >= 'A' && up <= 'Z') || (up >= '0' && up <= '9') || up == '_')
+                 ? up : '_';
+    }
+    size_t a = u.find_first_not_of('_');
+    size_t b = u.find_last_not_of('_');
+    u = (a == std::string::npos) ? std::string() : u.substr(a, b - a + 1);
+    if (u.empty()) u = "COL";
+    if (!((u[0] >= 'A' && u[0] <= 'Z') || u[0] == '_')) u = "C" + u;
+    if (u.size() > 30) u = u.substr(0, 30);
+    return u;
+}
+
+// One cell as raw text for BXML (NULL -> empty element). DuckDB Value::ToString
+// gives canonical text (ISO dates/times, plain decimals) that asXML `id`
+// deserializes back into the matching ABAP type.
+std::string CellText(duckdb::DataChunk &chunk, duckdb::idx_t col, duckdb::idx_t row) {
+    auto v = chunk.GetValue(col, row);
+    return v.IsNull() ? std::string() : v.ToString();
+}
+
+} // namespace
+
+// A streaming cursor owns its OWN DuckDB connection (DuckDB permits only one
+// active stream per connection) and the lazy result it pages through.
+//
+// Prefetch: after serving page N, a background task produces page N+1 into
+// `pending` (one page ahead, double-buffered), so DuckDB fetch + BXML encode
+// overlap the RFC round-trip and ABAP-side decode. At most two pages exist at
+// once (one buffered + one building), so memory stays bounded. Only ONE thread
+// ever touches `result` at a time: the foreground always .get()s `pending`
+// (waiting for the background task) before touching `result` again, and the
+// per-cursor `mtx` serialises concurrent FetchCursor calls.
+//
+// `pending` is declared LAST so it destructs FIRST: a std::async(launch::async)
+// future blocks in its destructor until the task completes, guaranteeing the
+// background task stops touching `result`/`con` before those are destroyed.
+struct Cursor {
+    std::unique_ptr<duckdb::Connection> con;
+    std::unique_ptr<duckdb::QueryResult> result;
+    std::vector<QueryColumn> columns;
+    std::mutex mtx;          // serialises Fetch on this cursor
+    bool done = false;
+    long long page_rows = 0; // fixed at the first FetchCursor; prefetch reuses it
+    std::future<CursorPage> pending;
+};
+
+namespace {
+
+// Pull whole DataChunks (each <= STANDARD_VECTOR_SIZE) until `page_rows` is
+// reached or the stream ends, and BXML-encode them. Touches only `cur` members
+// and must be called single-threaded w.r.t. this cursor (see Cursor docs).
+CursorPage ProducePage(Cursor &cur, long long page_rows) {
+    CursorPage page;
+    if (cur.done) { page.done = true; return page; }
+
+    const duckdb::idx_t ncol = cur.columns.size();
+    std::vector<std::string> colnames;
+    colnames.reserve(ncol);
+    for (auto &c : cur.columns) colnames.push_back(c.name);
+    // Stream straight into BXML — no intermediate row-major string matrix. The
+    // dominant case (every replicated SAP column is stored VARCHAR) reads the
+    // string_t bytes flat, with zero Value allocation; BLOB / numeric / computed
+    // columns keep the canonical Value::ToString() path so output is byte-identical.
+    sxml::StreamEncoder enc(std::move(colnames));
+
+    long long got = 0;
+    while (page_rows <= 0 || got < page_rows) {
+        auto chunk = cur.result->Fetch();
+        if (cur.result->HasError())
+            throw std::runtime_error("DuckDB query failed: " + cur.result->GetError());
+        if (!chunk || chunk->size() == 0) { cur.done = true; break; }
+        chunk->Flatten();   // guarantee FLAT vectors so string_t reads are direct
+        const duckdb::idx_t n = chunk->size();
+        for (duckdb::idx_t row = 0; row < n; row++) {
+            enc.StartRow();
+            for (duckdb::idx_t c = 0; c < ncol; c++) {
+                auto &vec = chunk->data[c];
+                if (vec.GetType().id() == duckdb::LogicalTypeId::VARCHAR) {
+                    if (!duckdb::FlatVector::Validity(vec).RowIsValid(row)) {
+                        enc.Cell(c, nullptr, 0);
+                    } else {
+                        auto &s = duckdb::FlatVector::GetData<duckdb::string_t>(vec)[row];
+                        enc.Cell(c, s.GetData(), s.GetSize());
+                    }
+                } else {
+                    std::string s = CellText(*chunk, c, row);
+                    enc.Cell(c, s.data(), s.size());
+                }
+            }
+            enc.EndRow();
+            got++;
+        }
+    }
+    page.fetched = got;
+    page.done = cur.done;
+    if (got > 0) page.bxml = enc.Finish();
+    return page;
+}
+
+} // namespace
+
+struct CursorStore {
+    std::mutex mtx;
+    std::unordered_map<std::string, std::shared_ptr<Cursor>> map;
+    long long counter = 0;
+    static constexpr size_t kMaxOpen = 64;
+};
+
+DuckDbBridge::DuckDbBridge(const std::string &path, const std::string &init_sql)
+    : db_(std::make_unique<duckdb::DuckDB>(path.empty() ? nullptr : path.c_str())),
+      cursors_(std::make_unique<CursorStore>()) {
+    // GLOBAL engine config, inherited by every per-op connection. We never rely on
+    // row insertion order (targets get a PRIMARY KEY; reads ORDER BY explicitly),
+    // so preserve_insertion_order=false lowers memory and speeds large bulk ops.
+    // Ops can tune further (memory_limit/threads/checkpoint_threshold/temp_directory)
+    // via ERPL_REV_DUCKDB_INIT, e.g. "SET GLOBAL memory_limit='32GB'".
+    duckdb::Connection con(*db_);
+    auto r = con.Query("SET GLOBAL preserve_insertion_order=false");
+    if (r->HasError())
+        throw std::runtime_error("DuckDB config failed: " + r->GetError());
+    // Boot init: explicit init_sql (CLI/--init-file) wins; else env fallback. Runs
+    // INSTALL/LOAD/CREATE SECRET/ATTACH so replication can publish to external
+    // targets (parquet object stores, postgres, ducklake, bigquery, iceberg).
+    std::string init = init_sql;
+    if (init.empty()) {
+        if (const char *extra = std::getenv("ERPL_REV_DUCKDB_INIT"))
+            init = extra;
+    }
+    if (!init.empty()) {
+        auto e = con.Query(init);
+        if (e->HasError())
+            throw std::runtime_error("DuckDB init SQL failed: " + e->GetError());
+    }
+}
+
+DuckDbBridge::~DuckDbBridge() = default;
+
+CursorOpen DuckDbBridge::OpenCursor(const std::string &sql) {
+    auto cur = std::make_shared<Cursor>();
+    cur->con = std::make_unique<duckdb::Connection>(*db_);
+    auto r = cur->con->SendQuery(sql);   // streaming; runs all statements, streams the last
+    if (r->HasError())
+        throw std::runtime_error("DuckDB query failed: " + r->GetError());
+    std::unordered_map<std::string, int> seen;
+    for (duckdb::idx_t c = 0; c < r->ColumnCount(); c++) {
+        std::string name = SanitizeColName(r->names[c]);
+        if (int &n = seen[name]) {            // collision -> suffix _2, _3, …
+            std::string suffix = "_" + std::to_string(++n);
+            if (name.size() + suffix.size() > 30) name = name.substr(0, 30 - suffix.size());
+            name += suffix;
+        } else { n = 1; }
+        cur->columns.push_back({name, r->types[c].ToString()});
+    }
+    cur->result = std::move(r);
+
+    std::lock_guard<std::mutex> lk(cursors_->mtx);
+    if (cursors_->map.size() >= CursorStore::kMaxOpen)
+        throw std::runtime_error("too many open cursors");
+    std::string handle = "cur_" + std::to_string(++cursors_->counter);
+    cursors_->map[handle] = cur;
+    return {handle, cur->columns};
+}
+
+CursorPage DuckDbBridge::FetchCursor(const std::string &handle, long long page_rows) {
+    std::shared_ptr<Cursor> cur;
+    {
+        std::lock_guard<std::mutex> lk(cursors_->mtx);
+        auto it = cursors_->map.find(handle);
+        if (it == cursors_->map.end())
+            throw std::runtime_error("unknown cursor handle: " + handle);
+        cur = it->second;
+    }
+    std::lock_guard<std::mutex> lk(cur->mtx);
+
+    // Page size is fixed at the first FetchCursor (prefetch reuses it); later
+    // page_rows changes are ignored so a buffered page stays valid.
+    if (cur->page_rows == 0) cur->page_rows = page_rows;
+    const long long pr = cur->page_rows;
+
+    // Consume the prefetched page if one is in flight (this overlapped the RFC
+    // round-trip); otherwise produce the first page synchronously.
+    CursorPage page = cur->pending.valid() ? cur->pending.get()
+                                           : ProducePage(*cur, pr);
+
+    // Kick off prefetch of the NEXT page unless the stream is exhausted.
+    if (!page.done) {
+        Cursor *raw = cur.get();
+        cur->pending = std::async(std::launch::async,
+                                  [raw, pr] { return ProducePage(*raw, pr); });
+    }
+    return page;
+}
+
+void DuckDbBridge::CloseCursor(const std::string &handle) {
+    // Take ownership of the cursor under the map lock, then RELEASE the lock before
+    // letting it destruct: ~Cursor blocks in the pending-future destructor until the
+    // background prefetch finishes touching result/con, and we must not hold the
+    // shared cursor-map mutex while waiting (it would stall every other cursor op).
+    std::shared_ptr<Cursor> cur;
+    {
+        std::lock_guard<std::mutex> lk(cursors_->mtx);
+        auto it = cursors_->map.find(handle);
+        if (it != cursors_->map.end()) { cur = std::move(it->second); cursors_->map.erase(it); }
+    }
+    // `cur` destructs here, outside the map lock.
+}
+
+// Run a statement on a given connection and throw on error. Each public bridge
+// operation uses its OWN connection (DuckDB allows many concurrent connections on
+// one database — the cursor prefetch already relies on this), so the operations
+// are thread-safe WITHOUT a global lock, enabling parallel ingest and reads.
+static void Exec(duckdb::Connection &con, const std::string &sql) {
+    auto r = con.Query(sql);
+    if (r->HasError())
+        throw std::runtime_error("DuckDB execute failed: " + r->GetError());
+}
+
+void DuckDbBridge::Execute(const std::string &sql) {
+    duckdb::Connection con(*db_);
+    Exec(con, sql);
+}
+
+std::string DuckDbBridge::StartQuack(const std::string &listen, bool allow_other_host,
+                                    const std::string &token) {
+    // The quack extension is not bundled — pull it from the configured
+    // extension repository (idempotent if already cached) and load it.
+    Execute("INSTALL quack");
+    Execute("LOAD quack");
+
+    std::string sql = "CALL quack_serve(" + SqlQuote(listen);
+    if (allow_other_host) sql += ", allow_other_hostname => true";
+    if (!token.empty()) sql += ", token => " + SqlQuote(token);
+    sql += ")";
+
+    QueryResult r = Query(sql);   // returns the listening URI / HTTP URL / token
+    std::string out = "[";
+    for (size_t i = 0; i < r.rows.size(); i++) { if (i) out += ","; out += r.rows[i]; }
+    out += "]";
+    return out;
+}
+
+void DuckDbBridge::StopQuack(const std::string &listen) {
+    Execute("CALL quack_stop(" + SqlQuote(listen) + ")");
+}
+
+QueryResult DuckDbBridge::Query(const std::string &sql, long long max_rows, bool want_total) {
+    // Stream the result: SendQuery runs any leading statements (INSTALL/LOAD/…)
+    // eagerly and returns the LAST statement's result lazily, so a capped SELECT
+    // stops after cap+1 rows instead of materializing + draining the whole result
+    // (a capped `SELECT *` over a huge table no longer scans it all). With
+    // want_total=true (or no cap), the full result is drained to report the exact
+    // total. Non-result final statements (INSERT/DDL/…) just run.
+    duckdb::Connection con(*db_);
+    auto head = con.SendQuery(sql);
+    if (head->HasError())
+        throw std::runtime_error("DuckDB query failed: " + head->GetError());
+    // Multi-statement: leading statements are materialized + chained via ->next;
+    // the LAST is the (streamed) result we return. `head` owns the chain — when it
+    // destructs on return, an early-stopped stream is cancelled.
+    duckdb::QueryResult *r = head.get();
+    while (r->next) r = r->next.get();
+    if (r->HasError())
+        throw std::runtime_error("DuckDB query failed: " + r->GetError());
+
+    QueryResult out;
+    if (r->properties.return_type != duckdb::StatementReturnType::QUERY_RESULT)
+        return out;
+
+    const idx_t ncol = r->ColumnCount();
+    for (idx_t c = 0; c < ncol; c++)
+        out.columns.push_back({r->names[c], r->types[c].ToString()});
+
+    long long total = 0;   // rows seen (== shipped unless want_total drains past cap)
+    bool more = false;     // at least one row exists beyond the cap
+    bool stop = false;
+    while (!stop) {
+        auto chunk = r->Fetch();
+        if (!chunk || chunk->size() == 0) break;
+        const idx_t nrow = chunk->size();
+        for (idx_t row = 0; row < nrow; row++) {
+            if (max_rows > 0 && (long long)out.rows.size() >= max_rows) {
+                more = true;
+                if (!want_total) { stop = true; break; }  // stop: the stream is cancelled on return
+                total++;                                  // want_total: count the rest, no JSON
+                continue;
+            }
+            total++;
+            std::string obj = "{";
+            for (idx_t c = 0; c < ncol; c++) {
+                if (c) obj += ",";
+                obj += json::QuoteString(out.columns[c].name);
+                obj += ":";
+                auto val = chunk->GetValue(c, row);
+                if (val.IsNull()) {
+                    obj += "null";
+                } else {
+                    auto id = r->types[c].id();
+                    bool numeric =
+                        id == duckdb::LogicalTypeId::TINYINT ||
+                        id == duckdb::LogicalTypeId::SMALLINT ||
+                        id == duckdb::LogicalTypeId::INTEGER ||
+                        id == duckdb::LogicalTypeId::BIGINT ||
+                        id == duckdb::LogicalTypeId::HUGEINT ||
+                        id == duckdb::LogicalTypeId::UTINYINT ||
+                        id == duckdb::LogicalTypeId::USMALLINT ||
+                        id == duckdb::LogicalTypeId::UINTEGER ||
+                        id == duckdb::LogicalTypeId::UBIGINT ||
+                        id == duckdb::LogicalTypeId::FLOAT ||
+                        id == duckdb::LogicalTypeId::DOUBLE ||
+                        id == duckdb::LogicalTypeId::DECIMAL;
+                    bool boolean = id == duckdb::LogicalTypeId::BOOLEAN;
+                    if (numeric || boolean) obj += val.ToString();
+                    else obj += json::QuoteString(val.ToString());
+                }
+            }
+            obj += "}";
+            out.rows.push_back(std::move(obj));
+        }
+    }
+    out.truncated = more;
+    // Exact total when drained (want_total or uncapped); otherwise a cap+1
+    // sentinel so the caller still detects truncation (row_count > shipped)
+    // without us scanning the whole result just to count it.
+    out.row_count = want_total ? total : (more ? max_rows + 1 : total);
+    return out;
+}
+
+namespace {
+
+// Build one INSERT (… ON CONFLICT DO UPDATE for upsert) from column names and
+// already-SQL-rendered cell literals (NULL / number / quoted string).
+std::string BuildInsert(const std::string &target,
+                        const std::vector<std::string> &cols,
+                        const std::vector<std::string> &cell_sql,
+                        IngestMode mode,
+                        const std::vector<std::string> &key_cols) {
+    std::ostringstream sql;
+    sql << "INSERT INTO " << target << " (";
+    for (size_t i = 0; i < cols.size(); i++) { if (i) sql << ","; sql << cols[i]; }
+    sql << ") VALUES (";
+    for (size_t i = 0; i < cell_sql.size(); i++) { if (i) sql << ","; sql << cell_sql[i]; }
+    sql << ")";
+    if (mode == IngestMode::Upsert && !key_cols.empty()) {
+        sql << " ON CONFLICT (";
+        for (size_t i = 0; i < key_cols.size(); i++) { if (i) sql << ","; sql << key_cols[i]; }
+        sql << ") DO UPDATE SET ";
+        bool first = true;
+        for (auto &col : cols) {
+            bool is_key = false;
+            for (auto &k : key_cols) if (k == col) { is_key = true; break; }
+            if (is_key) continue;
+            if (!first) sql << ",";
+            first = false;
+            sql << col << "=excluded." << col;
+        }
+    }
+    return sql.str();
+}
+
+} // namespace
+
+long long DuckDbBridge::Ingest(const std::string &target,
+                               const std::string &json_rows,
+                               IngestMode mode,
+                               const std::vector<std::string> &key_cols,
+                               const std::string &parquet_out,
+                               const std::string &init_sql,
+                               const std::string &ddl) {
+    duckdb::Connection con(*db_);   // own connection (thread-safe, no global lock)
+    // Optional setup, in order: user init SQL (e.g. LOAD/INSTALL), then the
+    // typed CREATE TABLE, before any rows are inserted.
+    if (!init_sql.empty()) Exec(con, init_sql);
+    if (!ddl.empty()) Exec(con, ddl);
+
+    auto rows = json::ParseRows(json_rows);
+    if (rows.empty()) {
+        if (!parquet_out.empty())
+            Exec(con, "COPY " + target + " TO " + SqlQuote(parquet_out) + " (FORMAT PARQUET)");
+        return 0;
+    }
+
+    // Column order is taken from the first row; all rows must share it.
+    std::vector<std::string> cols;
+    for (auto &cell : rows.front()) cols.push_back(cell.key);
+
+    long long n = 0;
+    for (auto &row : rows) {
+        std::vector<std::string> cell_sql;
+        cell_sql.reserve(row.size());
+        for (auto &c : row) cell_sql.push_back(CellToSql(c));
+        Exec(con, BuildInsert(target, cols, cell_sql, mode, key_cols));
+        n++;
+    }
+
+    if (!parquet_out.empty())
+        Exec(con, "COPY " + target + " TO " + SqlQuote(parquet_out) + " (FORMAT PARQUET)");
+    return n;
+}
+
+long long DuckDbBridge::IngestBxml(const std::string &target,
+                                   const std::string &bxml,
+                                   IngestMode mode,
+                                   const std::vector<std::string> &key_cols,
+                                   const std::string &parquet_out,
+                                   const std::string &init_sql,
+                                   const std::string &ddl) {
+    // Own connection: the staging TEMP table, the Appender and the INSERT…SELECT
+    // all run on it, so concurrent ingests (async pipeline / partitioned loads)
+    // don't collide (TEMP tables are connection-local) and don't serialize.
+    duckdb::Connection con(*db_);
+    if (!init_sql.empty()) Exec(con, init_sql);
+    if (!ddl.empty()) Exec(con, ddl);
+
+    sxml::Table tbl = bxml.empty() ? sxml::Table{} : sxml::Decode(bxml);
+    if (tbl.rows.empty()) {
+        if (!parquet_out.empty())
+            Exec(con, "COPY " + target + " TO " + SqlQuote(parquet_out) + " (FORMAT PARQUET)");
+        return 0;
+    }
+
+    // Bulk path (benchmarked ~250x the old per-row INSERT, see test/bench_ingest):
+    // append the package's RAW string cells into a VARCHAR/BLOB staging clone,
+    // then ONE vectorized, atomic `INSERT … SELECT <casts>` into the target.
+    // DuckDB's set-based VARCHAR->type cast gives the same result as the old
+    // literal path; binary columns stage as BLOB and pass through.
+
+    // Target column types, in the BXML column order (target names fold to lower).
+    auto desc = con.Query("SELECT * FROM " + target + " LIMIT 0");
+    if (desc->HasError())
+        throw std::runtime_error("DuckDB describe failed: " + desc->GetError());
+    std::unordered_map<std::string, duckdb::LogicalType> tcol;
+    for (duckdb::idx_t c = 0; c < desc->ColumnCount(); c++)
+        tcol.emplace(LowerName(desc->names[c]), desc->types[c]);
+
+    std::vector<duckdb::LogicalType> coltypes;
+    coltypes.reserve(tbl.columns.size());
+    for (auto &cn : tbl.columns) {
+        auto it = tcol.find(LowerName(cn));
+        coltypes.push_back(it != tcol.end() ? it->second
+                                            : duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR));
+    }
+
+    // Staging clone: BLOB for binary target columns, VARCHAR for everything else.
+    const std::string stg = target + "__erpl_stg";
+    {
+        std::string s = "CREATE OR REPLACE TEMP TABLE " + stg + " (";
+        for (size_t i = 0; i < tbl.columns.size(); i++) {
+            if (i) s += ",";
+            bool is_blob = coltypes[i].id() == duckdb::LogicalTypeId::BLOB;
+            s += tbl.columns[i] + (is_blob ? " BLOB" : " VARCHAR");
+        }
+        s += ")";
+        Exec(con, s);
+    }
+
+    // Append the package COLUMN-WISE: fill VARCHAR/BLOB DuckDB vectors and append
+    // whole DataChunks (~+20% over the per-cell Appender — far fewer Append calls,
+    // a tight per-column inner loop). Cells are raw strings/bytes; the vectorized
+    // INSERT…SELECT below casts them to the target types. (No NULLs: a decoded BXML
+    // cell is always present — empty element = "".)
+    {
+        const size_t ncols = tbl.columns.size();
+        duckdb::vector<duckdb::LogicalType> vtypes;
+        vtypes.reserve(ncols);
+        for (size_t i = 0; i < ncols; i++)
+            vtypes.push_back(coltypes[i].id() == duckdb::LogicalTypeId::BLOB
+                                 ? duckdb::LogicalType::BLOB : duckdb::LogicalType::VARCHAR);
+        const std::string empty;
+        duckdb::Appender app(con, stg);
+        duckdb::DataChunk chunk;
+        chunk.Initialize(duckdb::Allocator::DefaultAllocator(), vtypes);
+        const size_t nrows = tbl.rows.size();
+        for (size_t base = 0; base < nrows; base += STANDARD_VECTOR_SIZE) {
+            const size_t blk =
+                (nrows - base < STANDARD_VECTOR_SIZE) ? (nrows - base) : STANDARD_VECTOR_SIZE;
+            chunk.Reset();
+            for (size_t c = 0; c < ncols; c++) {
+                duckdb::Vector &v = chunk.data[c];
+                auto out = duckdb::FlatVector::GetData<duckdb::string_t>(v);
+                for (size_t k = 0; k < blk; k++) {
+                    const auto &row = tbl.rows[base + k];
+                    const std::string &cell = c < row.size() ? row[c] : empty;
+                    // AddStringOrBlob: no UTF-8 validation — fits both VARCHAR text
+                    // and raw BLOB bytes.
+                    out[k] = duckdb::StringVector::AddStringOrBlob(v, cell.data(), cell.size());
+                }
+            }
+            chunk.SetCardinality(blk);
+            app.AppendDataChunk(chunk);
+        }
+        app.Close();
+    }
+
+    // One set-based INSERT … SELECT with per-column casts (atomic: a bad cast
+    // aborts the whole package and leaves the target unchanged).
+    // Use the target's actual (lowercased) column names everywhere. An UPPERCASE
+    // target column list in `INSERT … (COLS) … ON CONFLICT` mis-maps the conflict
+    // arbiter and nulls the key — lowercase (matching the stored names) is safe.
+    std::string proj;
+    for (size_t i = 0; i < tbl.columns.size(); i++) {
+        if (i) proj += ",";
+        const std::string cn = LowerName(tbl.columns[i]);
+        switch (coltypes[i].id()) {
+            case duckdb::LogicalTypeId::BLOB:
+            case duckdb::LogicalTypeId::VARCHAR:
+                proj += cn;                                                  // passthrough
+                break;
+            case duckdb::LogicalTypeId::DATE:
+                // An initial/blank DATS has no valid date: the kernel renders it
+                // as "0000-00-00" (zero) or "    -  -  " (blank, 8 spaces). Map any
+                // date with no digits (strip '-', trim) plus the zero-date to NULL;
+                // a genuinely malformed non-blank date still errors loudly.
+                proj += "CASE WHEN " + cn + "='0000-00-00' OR trim(replace(" + cn +
+                        ",'-','')) = '' THEN NULL ELSE " + cn + "::DATE END";
+                break;
+            default:
+                proj += cn + "::" + coltypes[i].ToString();
+                break;
+        }
+    }
+    std::string ins = "INSERT INTO " + target + " (";
+    for (size_t i = 0; i < tbl.columns.size(); i++) {
+        if (i) ins += ",";
+        ins += LowerName(tbl.columns[i]);
+    }
+    ins += ") SELECT " + proj + " FROM " + stg;
+    if (mode == IngestMode::Upsert && !key_cols.empty()) {
+        ins += " ON CONFLICT (";
+        for (size_t i = 0; i < key_cols.size(); i++) { if (i) ins += ","; ins += LowerName(key_cols[i]); }
+        ins += ") DO UPDATE SET ";
+        bool first = true;
+        for (auto &cn0 : tbl.columns) {
+            const std::string cn = LowerName(cn0);
+            bool is_key = false;
+            for (auto &k : key_cols) if (LowerName(k) == cn) { is_key = true; break; }
+            if (is_key) continue;  // a key in DO UPDATE SET makes DuckDB null it
+            if (!first) ins += ",";
+            first = false;
+            ins += cn + "=excluded." + cn;
+        }
+    }
+    Exec(con, ins);
+
+    if (!parquet_out.empty())
+        Exec(con, "COPY " + target + " TO " + SqlQuote(parquet_out) + " (FORMAT PARQUET)");
+    return static_cast<long long>(tbl.rows.size());
+}
+
+} // namespace erpl_rev

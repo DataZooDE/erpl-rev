@@ -1,0 +1,38 @@
+[Unit]
+# erpl-rev: external registered RFC server (ABAP RFC -> DuckDB).
+# Runs the C++ server as a managed service. See docs/INSTALL.md + docs/security.md.
+Description=erpl-rev SAP RFC -> DuckDB bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# dedicated, non-login service account (NOT root)
+User=erpl
+Group=erpl
+
+# NW RFC SDK (libsapnwrfc/ICU) + vendored DuckDB 1.5.3 must be on the library path
+Environment=LD_LIBRARY_PATH=/opt/nwrfcsdk/lib:/opt/erpl/duckdb-1.5.3
+
+# Gateway / registration (match the reginfo allow-list)
+Environment=ERPL_REV_PROGRAM_ID=ERPL_REV
+Environment=ERPL_REV_GWHOST=sapgw.example.corp
+Environment=ERPL_REV_GWSERV=sapgw00
+Environment=ERPL_REV_DB_PATH=/var/lib/erpl/erpl-rev.duckdb
+
+# Boot SQL for external publish targets (ATTACH/CREATE SECRET); keep chmod 600.
+# Credentials live here, never on the RFC wire / in ABAP.
+ExecStart=/opt/erpl/bin/erpl_rev_server --init-file /etc/erpl/init.sql
+
+Restart=on-failure
+RestartSec=5
+# hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/erpl
+StateDirectory=erpl
+
+[Install]
+WantedBy=multi-user.target
