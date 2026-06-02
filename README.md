@@ -74,9 +74,14 @@ restartable:
   `INSERT … SELECT`, sustaining **≥ 10,000 rows/s** on typical tables. N workers
   run concurrently into one target (the primary key is built once at the end), so
   a full load scales roughly to **10,000 × N rows/s** — add workers to go faster.
-  (Even a pathological 400-column table — `ZWIDE_BSEG` — holds ≈5,500 rows/s per
-  stream; the `Appender` path is ~230× the naive per-row baseline. Strategy
-  comparison in `test/bench_ingest.cpp`.)
+- **Measured: 10,000,000 rows in 66 s** (≈ **151,000 rows/s**, ≈ **37,900 rows/s
+  per worker**) — a 50-column slice of a 400-column BSEG-shaped table replicated
+  with 4 parallel workers, partitioned on the document-number key, on the SAP
+  A4H developer trial over loopback. The per-worker rate scales with table width:
+  the full 400-column row holds ≈5,500 rows/s per stream, and the `Appender` path
+  is ~230× the naive per-row baseline (strategy comparison in
+  `test/bench_ingest.cpp`). Treat ≥10,000 rows/s/worker as the conservative floor
+  for real networks.
 - **Memory bounded by batch, not table size.** Each worker reads **package-wise**
   (keyset pagination, default 50,000 rows/batch); only one package is resident at
   a time, so a 100M-row load uses the same RAM as a 100k-row one.
