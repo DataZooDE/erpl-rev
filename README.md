@@ -11,46 +11,82 @@ CDS view, or query result flows through the same generic interface.
 It is the inverse of [`erpl`](https://github.com/DataZooDE/erpl) — where `erpl`
 makes DuckDB call *into* SAP, **erpl-rev has SAP call out into DuckDB.**
 
-> Status: research prototype — every capability below is verified end-to-end
-> against a live SAP ABAP (A4H) system in `scripts/e2e.sh`.
+> Status: research prototype. The core paths — replicating table / CDS / BW
+> sources, publishing to parquet, datasets and attached catalogs, querying and
+> live serving — are verified end-to-end against a live SAP ABAP (A4H) system in
+> `scripts/e2e.sh`. The wider lakehouse targets (Iceberg, DuckLake, cloud object
+> storage, other attached warehouses) ride the **same DuckDB SQL path**, so they
+> work wherever DuckDB's extensions do.
 
 ## Use cases
 
-- **Replicate SAP into DuckDB (SLT-style).** Copy an arbitrary **table**, **CDS
-  view**, or **BW / native (ADBC)** query into a typed DuckDB table — full or
-  filtered, with a source-side `WHERE`, column selection, and idempotent
-  `UPSERT`. Designed for full loads up to **>100M rows** (bounded memory,
-  restartable, optional parallel background jobs).
+erpl-rev turns the SAP gateway into a two-way door between ABAP and the whole
+DuckDB ecosystem — **read** SAP out into the lakehouse, and **write** the wider
+data world back in through ABAP.
+
+### Read — get SAP data out, at scale
+
+- **Replicate any SAP source into DuckDB.** Transparent **tables**, **CDS views**,
+  and **BW / HANA calculation views** (read natively over ADBC) all flow through
+  the same path into a typed DuckDB table — full or filtered, with a source-side
+  `WHERE`, column selection, and idempotent `UPSERT`. Built for full loads up to
+  **>100M rows** with parallel workers (see [Performance](#performance)).
   → [Replicating SAP tables](#replicating-sap-tables-slt-style)
-- **Export SAP data to the open lakehouse.** Land a SAP slice as a **parquet**
-  file or partitioned dataset, or publish it into an **`ATTACH`**ed catalog —
-  Postgres, DuckLake, BigQuery, Iceberg, anything DuckDB can attach — through one
-  SQL path.
-- **Run SQL analytics on SAP data, from ABAP.** Send SQL from ABAP and get rows
-  back as JSON: joins, aggregates and parquet scans that would be painful in
-  OpenSQL. An in-ABAP **SQL console** (`Z_ERPL_REV_SQL`, `SE38`) gives an
-  interactive surface over the same engine.
-- **Serve ingested data live to remote DuckDB clients.** With `--quack`, the same
-  in-process DuckDB is exposed over the network, so whatever ABAP just ingested is
-  instantly queryable from any DuckDB client — **no export step**.
+- **Build a SAP-sourced lakehouse.** Land a SAP slice straight into open table
+  formats — **parquet** files and partitioned datasets, **DuckLake**, or
+  **Iceberg** — on local disk or **cloud object storage** (S3 / GCS / Azure, via
+  DuckDB's `httpfs`). Other engines (Spark, Trino, Snowflake, …) read it from
+  there; SAP stops being a silo.
+- **Publish into an existing warehouse.** `ATTACH` a **Postgres**, **MySQL**,
+  **BigQuery**, **DuckLake**, or **Iceberg** catalog and push the SAP slice into
+  it with a single SQL statement — replication / reverse-ETL without a separate
+  tool.
+- **Feed BI & data science.** The output is plain parquet/Arrow — open it in
+  pandas, Polars, or any notebook — or query the live server (below) directly.
+
+### Write — bring the world back into SAP
+
+- **Enrich SAP data with external data.** DuckDB reads a parquet / Iceberg /
+  DuckLake dataset (or an attached Postgres / BigQuery table) **from the cloud**,
+  joins it against SAP data, and hands the joined result back to ABAP as rows —
+  cross-system joins SAP can't do on its own.
+- **Reverse-ETL reference data into SAP.** Pull a curated dataset from the
+  lakehouse through DuckDB and return it to ABAP, which persists it into your
+  SAP tables — keep SAP aligned with an external source of truth.
+- **Interactive SQL console in ABAP.** `Z_ERPL_REV_SQL` (`SE38`) runs arbitrary
+  DuckDB SQL — over SAP data, cloud files, or attached catalogs — from the SAP
+  GUI, with results in an ALV grid.
+
+### Serve — live, no export step
+
+- **Expose ingested data to remote DuckDB clients.** With `--quack`, the same
+  in-process DuckDB is reachable over the network, so whatever ABAP just ingested
+  is instantly queryable (and `ATTACH`-able) from any DuckDB client.
   → [Quack network server](#quack-network-server)
 
 ## Performance
 
-Built for full loads of arbitrary size — fast, memory-bounded, and restartable:
+Built for full loads of arbitrary size — fast, parallel, memory-bounded, and
+restartable:
 
-- **≈ 5,500 rows/s on a 400-column table** (`ZWIDE_BSEG`: 100,000 rows in ~18 s),
-  via a DuckDB **`Appender`** into a staging clone followed by one vectorized
-  `INSERT … SELECT` — about **230× faster** than the naive per-row path
-  (~24 rows/s). The strategy comparison lives in `test/bench_ingest.cpp`.
-- **Memory bounded by batch, not table size.** The source streams **package-wise**
+- **≥ 10,000 rows/s per worker, ×N workers.** Each worker streams a disjoint key
+  range and ingests it with a DuckDB **`Appender`** + one vectorized
+  `INSERT … SELECT`, sustaining **≥ 10,000 rows/s** on typical tables. N workers
+  run concurrently into one target (the primary key is built once at the end), so
+  a full load scales roughly to **10,000 × N rows/s** — add workers to go faster.
+  (Even a pathological 400-column table — `ZWIDE_BSEG` — holds ≈5,500 rows/s per
+  stream; the `Appender` path is ~230× the naive per-row baseline. Strategy
+  comparison in `test/bench_ingest.cpp`.)
+- **Memory bounded by batch, not table size.** Each worker reads **package-wise**
   (keyset pagination, default 50,000 rows/batch); only one package is resident at
   a time, so a 100M-row load uses the same RAM as a 100k-row one.
 - **Restartable & idempotent.** Full-load-replace truncates up front and keyed
   `UPSERT` dedups on conflict, so a crashed or re-run load yields no duplicates;
   a file-backed DuckDB keeps ingested data durable across server restarts.
-- **Parallel.** Large loads can fan out across several background worker jobs that
-  append disjoint key ranges into one target, with the primary key built once.
+- **Parallel via background jobs.** Workers run as SAP background jobs
+  (`Z_ERPL_REV_REPL_WORKER`), so a load isn't bound by the dialog step timeout and
+  uses spare batch work processes; the coordinator auto-picks a partition column
+  and a sensible job count.
 - **Byte-identity verified.** A diff harness compares the DuckDB target against
   the SAP source cell-by-cell (SFLIGHT every row × column; ZWIDE_BSEG 3000 × 390
   via per-row md5), plus a negative control — see
