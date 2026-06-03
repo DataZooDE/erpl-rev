@@ -72,10 +72,13 @@ jobs:
       - name: Smoke test (self-extract, no external libs)
         run: env -u LD_LIBRARY_PATH -u DYLD_LIBRARY_PATH "./dist/${{ matrix.asset }}" --help
 
+      - name: Package (tar.gz preserves the exec bit)
+        run: tar -czf "dist/${{ matrix.asset }}.tar.gz" -C dist "${{ matrix.asset }}"
+
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset }}
-          path: dist/${{ matrix.asset }}
+          name: ${{ matrix.asset }}.tar.gz
+          path: dist/${{ matrix.asset }}.tar.gz
 
   windows:
     name: bundle erpl-rev-windows-amd64
@@ -118,10 +121,13 @@ jobs:
       - name: Smoke test (self-extract)
         run: .\dist\erpl-rev-windows-amd64.exe --help
 
+      - name: Package (zip)
+        run: Compress-Archive -Force -Path dist\erpl-rev-windows-amd64.exe -DestinationPath dist\erpl-rev-windows-amd64.zip
+
       - uses: actions/upload-artifact@v4
         with:
-          name: erpl-rev-windows-amd64
-          path: dist\erpl-rev-windows-amd64.exe
+          name: erpl-rev-windows-amd64.zip
+          path: dist\erpl-rev-windows-amd64.zip
 
   release:
     name: Publish release
@@ -131,7 +137,31 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with: { path: artifacts }
+      - name: Collect assets + checksums
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} release/ \;
+          ( cd release && sha256sum * > SHA256SUMS.txt )
+          ls -la release
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/*
+          name: ${{ github.ref_name }}
+          make_latest: true
+          generate_release_notes: true
+          files: release/*
+          body: |
+            **erpl-rev — query and replicate SAP through DuckDB.**
+
+            Single self-extracting binaries — download the one for your OS, then
+            run it. They bundle the SAP NW RFC SDK + DuckDB, so there is nothing
+            else to install.
+
+            | OS | Asset |
+            |----|-------|
+            | Linux x86-64 | `erpl-rev-linux-amd64.tar.gz` |
+            | macOS arm64 | `erpl-rev-macos-arm64.tar.gz` |
+            | Windows x64 | `erpl-rev-windows-amd64.zip` |
+
+            Verify with `SHA256SUMS.txt`. See the [README](https://github.com/DataZooDE/erpl-rev#readme)
+            for setup and the [LICENSE](https://github.com/DataZooDE/erpl-rev/blob/main/LICENSE) (BSL 1.1).
