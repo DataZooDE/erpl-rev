@@ -187,7 +187,7 @@ INITIALIZATION.
   c_cparm  = 'CDS parameters'.
   c_skey   = 'Order/key cols (CDS)'.
   c_bw     = 'BW/native source (ADBC)'.
-  c_nfrom  = 'Native FROM (e.g. calc view)'.
+  c_nfrom  = 'Native FROM (calc view)'.
   c_target = 'DuckDB target table'.
   c_init   = 'Init SQL (e.g. LOAD)'.
   c_mode   = 'Write mode'.
@@ -479,7 +479,7 @@ START-OF-SELECTION.
   ENDIF.
   WRITE: / |  { 'Column types' WIDTH = 14 } : { lv_mix }|.
   IF lv_cols IS NOT INITIAL.
-    WRITE: / |  { 'Field select' WIDTH = 14 } : { lv_cols }|.
+    WRITE: / |  { 'Selected' WIDTH = 14 } : { lv_cols }|.
   ENDIF.
   WRITE: / |  { 'Filter (WHERE)' WIDTH = 14 } : { COND string( WHEN lv_where IS NOT INITIAL THEN lv_where ELSE `(all rows)` ) }|.
   IF p_init IS NOT INITIAL.

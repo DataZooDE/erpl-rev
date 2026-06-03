@@ -1,5 +1,5 @@
 @AccessControl.authorizationCheck: #NOT_REQUIRED
-@EndUserText.label: 'erpl param test CDS over SFLIGHT'
+@EndUserText.label: 'ERPL param test CDS over SFLIGHT'
 define view entity ZERPL_CP_FLIGHTS
   with parameters
     p_carrid : abap.char(3)

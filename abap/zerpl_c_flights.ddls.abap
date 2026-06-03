@@ -1,6 +1,6 @@
 @AbapCatalog.viewEnhancementCategory: [#NONE]
 @AccessControl.authorizationCheck: #NOT_REQUIRED
-@EndUserText.label: 'erpl test CDS over SFLIGHT'
+@EndUserText.label: 'ERPL test CDS over SFLIGHT'
 define view entity ZERPL_C_FLIGHTS
   as select from sflight
 {
