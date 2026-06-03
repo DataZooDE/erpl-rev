@@ -91,6 +91,6 @@ error"** on any ABAP runtime dump — not a useful message. Wrap classrun logic 
 ## A4H coordinates (recap)
 
 gateway `vhcala4hci`/`sapgw00` (host port 3300), ADT `localhost:50000`, client
-`001`, user `DEVELOPER`, pw `ABAPtr2023#00`. Readiness check:
-`curl -u DEVELOPER:ABAPtr2023#00 http://localhost:50000/sap/bc/adt/core/discovery`
+`001`, user `DEVELOPER`, password = the SAP-published A4H trial default. Readiness check:
+`curl -u DEVELOPER:"$SAP_PASSWORD" http://localhost:50000/sap/bc/adt/core/discovery`
 → 200. Boot ~5–7 min. **Restarting the container wipes `$TMP` ABAP objects.**

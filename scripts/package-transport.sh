@@ -12,7 +12,8 @@
 # dev system) to get the files.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; AB="$HERE/abap"
-export SAP_PASSWORD="${SAP_PASSWORD:-ABAPtr2023#00}"
+# Credentials from the environment — never hardcode (A4H trial = SAP-published default).
+: "${SAP_PASSWORD:?set SAP_PASSWORD in the environment before running}"
 A=(--host "${SAP_HOST:-localhost}" --port "${SAP_PORT:-50000}" --user "${SAP_USER:-DEVELOPER}" --client "${SAP_CLIENT:-001}" --password-env SAP_PASSWORD)
 adt() { uvx erpl-adt "${A[@]}" "$@"; }
 clean() { sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g' | tr -d '\r'; }
