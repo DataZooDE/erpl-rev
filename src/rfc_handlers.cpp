@@ -296,6 +296,13 @@ extern "C" RFC_RC SAP_API ZCdcPlanImpl(RFC_CONNECTION_HANDLE,
         spec.source = src;
         spec.keys = SplitCsv(ks);
         spec.mode = CdcModeOf(md);
+        // FULL_IUD logs the full row image: take the column set from the (seeded)
+        // DuckDB target and upper-case it to the SAP/HANA column names the triggers
+        // reference (replicate lower-cases on the way in).
+        if (spec.mode == CdcMode::FullIud) {
+            QueryResult tc = g_bridge->Query("SELECT * FROM " + target + " LIMIT 0");
+            for (auto &c : tc.columns) spec.columns.push_back(UpperOf(c.name));
+        }
         CdcPlan plan = MakeDialect(plat)->Plan(spec);
 
         if (action == "PROVISION")

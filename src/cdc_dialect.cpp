@@ -26,11 +26,12 @@ std::string NameToken(const std::string &s) {
 
 std::string Quote(const std::string &id) { return "\"" + id + "\""; }
 
-// Build the INSERT-into-log that a trigger body runs, capturing the row's keys
-// plus the op flag, the next sequence value and the commit timestamp.
+// Build the INSERT-into-log that a trigger body runs, capturing the logged columns
+// (keys, or the full row image for FULL_IUD) plus the op flag, the next sequence
+// value and the commit timestamp, from the OLD/NEW row image `alias`.
 std::string LogInsert(const CdcPlan &p, const std::string &alias, const char op) {
     std::string cols, vals;
-    for (const auto &k : p.key_cols) {
+    for (const auto &k : p.log_cols) {
         cols += Quote(k) + ",";
         vals += ":" + alias + "." + Quote(k) + ",";
     }
@@ -56,6 +57,9 @@ CdcPlan HanaDialect::Plan(const CdcSpec &spec) const {
     const std::string tok = NameToken(spec.source);
     CdcPlan p;
     p.key_cols = spec.keys;
+    // FULL_IUD logs the full row image (so inserts/updates can be upserted server-side);
+    // DELETE_ONLY logs only the keys (a delete needs nothing more).
+    p.log_cols = (spec.mode == CdcMode::FullIud && !spec.columns.empty()) ? spec.columns : spec.keys;
     p.log_table = spec.log_table.empty() ? "ZCDC_" + tok + "_LOG" : spec.log_table;
     p.seq_name = spec.seq_name.empty() ? "ZCDC_" + tok + "_SEQ" : spec.seq_name;
     const std::string tpfx = spec.trig_prefix.empty() ? "ZCDC_" + tok : spec.trig_prefix;
@@ -68,7 +72,7 @@ CdcPlan HanaDialect::Plan(const CdcSpec &spec) const {
     //    insert; the server casts back to the target's key types when applying)
     //    + op flag + monotonic seq + commit timestamp.
     std::string cols;
-    for (const auto &k : spec.keys)
+    for (const auto &k : p.log_cols)
         cols += Quote(k) + " NVARCHAR(" + std::to_string(spec.key_len) + "),";
     cols += Quote(p.op_col) + " NVARCHAR(1)," + Quote(p.seq_col) + " BIGINT,\"_TS\" TIMESTAMP";
     p.provision_ddl.push_back("CREATE COLUMN TABLE " + Quote(p.log_table) + " (" + cols + ")");
@@ -89,14 +93,14 @@ CdcPlan HanaDialect::Plan(const CdcSpec &spec) const {
     // read (incremental by position) + prune (watermark-driven, bounded by the
     // server-confirmed position). %POS% / %CONF% are substituted per cycle.
     std::string sel;
-    for (const auto &k : spec.keys) sel += Quote(k) + ",";
+    for (const auto &k : p.log_cols) sel += Quote(k) + ",";
     sel += Quote(p.op_col) + "," + Quote(p.seq_col);
     p.read_sql = "SELECT " + sel + " FROM " + Quote(p.log_table) +
                  " WHERE " + Quote(p.seq_col) + " > %POS% ORDER BY " + Quote(p.seq_col);
     // read_from: the keys + op + seq (cast to INTEGER), no _TS — the ABAP ADBC reader
     // binds these cleanly where it chokes on HANA TIMESTAMP / BIGINT host types.
     std::string rcols;
-    for (const auto &k : spec.keys) rcols += Quote(k) + ",";
+    for (const auto &k : p.log_cols) rcols += Quote(k) + ",";
     rcols += Quote(p.op_col) + ",CAST(" + Quote(p.seq_col) + " AS INTEGER) AS " + Quote(p.seq_col);
     p.read_from = "(SELECT " + rcols + " FROM " + Quote(p.log_table) + ") AS LOGREAD";
     p.prune_sql = "DELETE FROM " + Quote(p.log_table) +

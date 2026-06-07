@@ -87,6 +87,23 @@ TEST_CASE("CDC dialect: HANA full-IUD plan has three triggers", "[cdc][dialect]"
     REQUIRE(p.teardown_ddl.size() == 5);
 }
 
+TEST_CASE("CDC dialect: full-IUD with columns logs the full row image", "[cdc][dialect]") {
+    HanaDialect d;
+    CdcSpec spec;
+    spec.source = "ZDELTA_WM";
+    spec.keys = {"CLIENT", "ID"};
+    spec.columns = {"CLIENT", "ID", "NAME", "VAL", "CHANGED_AT"};
+    spec.mode = CdcMode::FullIud;
+    CdcPlan p = d.Plan(spec);
+    // the log table + insert trigger + read carry the data columns, not just keys.
+    REQUIRE(Contains(p.provision_ddl[1], R"("NAME" NVARCHAR)"));
+    REQUIRE(Contains(p.provision_ddl[1], R"("VAL" NVARCHAR)"));
+    const std::string ins = Find(p.provision_ddl, "AFTER INSERT");
+    REQUIRE(Contains(ins, R"(:newr."NAME")"));
+    REQUIRE(Contains(ins, R"(:newr."CHANGED_AT")"));
+    REQUIRE(Contains(p.read_from, R"("NAME","VAL","CHANGED_AT")"));
+}
+
 TEST_CASE("CDC dialect: name overrides + custom key length", "[cdc][dialect]") {
     HanaDialect d;
     CdcSpec spec;

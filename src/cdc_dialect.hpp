@@ -26,6 +26,9 @@ enum class CdcMode {
 struct CdcSpec {
     std::string source;               // SAP source table, e.g. "SFLIGHT"
     std::vector<std::string> keys;    // key columns, in order
+    // All columns to log for FULL_IUD (so inserts/updates carry the row image the
+    // server upserts). Empty / DELETE_ONLY logs keys only (deletes need just the key).
+    std::vector<std::string> columns;
     CdcMode mode = CdcMode::DeleteOnly;
     std::string log_table;            // override; default ZCDC_<source>_LOG
     std::string seq_name;             // override; default ZCDC_<source>_SEQ
@@ -49,7 +52,9 @@ struct CdcPlan {
     std::string prune_sql;
     std::string op_col = "_OP";
     std::string seq_col = "_SEQ";
-    std::vector<std::string> key_cols;        // log key column names (== spec.keys)
+    std::vector<std::string> key_cols;        // merge/match key columns (== spec.keys)
+    std::vector<std::string> log_cols;        // columns written to the log (keys, or
+                                              // all columns for FULL_IUD full-row)
 };
 
 class CdcDialect {

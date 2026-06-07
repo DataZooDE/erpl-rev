@@ -5,7 +5,9 @@ CLASS zcl_erpl_rev_cdctest DEFINITION PUBLIC FINAL CREATE PUBLIC.
     DATA: mv_pass TYPE i, mv_fail TYPE i, mo TYPE REF TO if_oo_adt_classrun_out.
     METHODS ok IMPORTING cond TYPE abap_bool what TYPE string detail TYPE string DEFAULT ''.
     METHODS cnt IMPORTING iv_sql TYPE string RETURNING VALUE(rv) TYPE i.
+    METHODS has IMPORTING iv_sql TYPE string iv_sub TYPE string RETURNING VALUE(rv) TYPE abap_bool.
     METHODS m1_delete_only.
+    METHODS m2_full_iud.
 ENDCLASS.
 
 CLASS zcl_erpl_rev_cdctest IMPLEMENTATION.
@@ -19,10 +21,16 @@ CLASS zcl_erpl_rev_cdctest IMPLEMENTATION.
     rv = zcl_erpl_rev_delta=>scalar( iv_sql ).
   ENDMETHOD.
 
+  METHOD has.
+    DATA(ls) = zcl_erpl_rev_util=>query( iv_sql ).
+    rv = xsdbool( ls-error IS INITIAL AND ls-rows CS iv_sub ).
+  ENDMETHOD.
+
   METHOD if_oo_adt_classrun~main.
     mo = out.
     TRY.
         m1_delete_only( ).
+        m2_full_iud( ).
       CATCH cx_root INTO DATA(lx).
         mv_fail = mv_fail + 1.
         out->write( |DUMP: { lx->get_text( ) }| ).
@@ -70,6 +78,45 @@ CLASS zcl_erpl_rev_cdctest IMPLEMENTATION.
     " Teardown: drop trigger + log + sequence (trigger first, so ZDELTA_WM stays usable).
     DATA(lv_te) = zcl_erpl_rev_cdc=>teardown( 'cdc_wm' ).
     ok( cond = xsdbool( lv_te IS INITIAL ) what = 'CDC teardown ok (no orphan objects)' detail = lv_te ).
+  ENDMETHOD.
+
+  METHOD m2_full_iud.
+    " FULL_IUD on ZDELTA_WM (a source without a usable change column): provision
+    " AFTER INSERT/UPDATE/DELETE triggers that log the full row image, then make all
+    " three kinds of change and prove one cycle reflects insert + update + delete in
+    " the DuckDB target — the server upserts the I/U row images and deletes by key.
+    zcl_erpl_rev_deltadrv=>seed_wm( 10 ).
+    zcl_erpl_rev_util=>replicate( iv_tab = 'ZDELTA_WM' iv_target = 'cdc_iud' ).
+    DATA(lv_pe) = zcl_erpl_rev_cdc=>provision(
+      iv_target = 'cdc_iud' iv_source = 'ZDELTA_WM' iv_keys = 'CLIENT,ID' iv_mode = 'FULL_IUD' ).
+    ok( cond = xsdbool( lv_pe IS INITIAL ) what = 'CDC(iud) provision ok' detail = lv_pe ).
+    DATA(lv_n0) = cnt( |SELECT count(*) AS c FROM cdc_iud| ).
+
+    " one insert, one update, one delete -> three trigger rows (I/U/D).
+    zcl_erpl_rev_deltadrv=>insert_wm( '0000000011' ).
+    zcl_erpl_rev_deltadrv=>touch_wm( '0000000002' ).
+    zcl_erpl_rev_deltadrv=>delete_wm( '0000000004' ).
+
+    DATA(r1) = zcl_erpl_rev_cdc=>run( 'cdc_iud' ).
+    ok( cond = xsdbool( r1-error IS INITIAL ) what = 'CDC(iud) cycle ok' detail = r1-error ).
+    ok( cond = xsdbool( r1-ins = 1 ) what = 'CDC(iud) one insert' detail = |{ r1-ins }| ).
+    ok( cond = xsdbool( r1-upd = 1 ) what = 'CDC(iud) one update' detail = |{ r1-upd }| ).
+    ok( cond = xsdbool( r1-del = 1 ) what = 'CDC(iud) one delete' detail = |{ r1-del }| ).
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM cdc_iud| ) = lv_n0 + 1 - 1 )
+        what = 'CDC(iud) net count (+1 insert, -1 delete)' ).
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM cdc_iud WHERE id='0000000011'| ) = 1 )
+        what = 'CDC(iud) inserted row 11 present' ).
+    ok( cond = has( iv_sql = |SELECT name FROM cdc_iud WHERE id='0000000002'| iv_sub = 'touched' )
+        what = 'CDC(iud) updated row 2 carries the new value' ).
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM cdc_iud WHERE id='0000000004'| ) = 0 )
+        what = 'CDC(iud) deleted row 4 absent' ).
+
+    DATA(r2) = zcl_erpl_rev_cdc=>run( 'cdc_iud' ).
+    ok( cond = xsdbool( r2-applied = abap_false ) what = 'CDC(iud) idempotent re-run is a no-op'
+        detail = |applied={ r2-applied }| ).
+
+    DATA(lv_te) = zcl_erpl_rev_cdc=>teardown( 'cdc_iud' ).
+    ok( cond = xsdbool( lv_te IS INITIAL ) what = 'CDC(iud) teardown ok' detail = lv_te ).
   ENDMETHOD.
 
 ENDCLASS.

@@ -918,10 +918,10 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
     auto in_staging = [&](const std::string &n) {
         for (auto &s : sset) if (s == n) return true; return false;
     };
-    std::vector<std::string> dcols;
+    std::vector<std::string> dcols, dtypes;
     for (duckdb::idx_t c = 0; c < tcols->ColumnCount(); c++) {
         std::string n = LowerName(tcols->names[c]);
-        if (in_staging(n)) dcols.push_back(n);
+        if (in_staging(n)) { dcols.push_back(n); dtypes.push_back(tcols->types[c].ToString()); }
     }
 
     // Counts (pre-apply, key-only anti-joins): del = net-deletes present in target;
@@ -948,26 +948,29 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
         "DELETE FROM " + target + " t WHERE EXISTS (SELECT 1 FROM " + net_del +
         " c WHERE " + key_join("t", "c") + ")";
 
-    std::string ups_sql;
+    // Upsert the net inserts/updates as DELETE-then-INSERT (not ON CONFLICT): DuckDB's
+    // ON CONFLICT NULLs the leading column of a composite key when the source is a
+    // SELECT, so the whole engine uses delete-then-insert (same as the delta MERGE).
+    std::string del_iu_sql, ins_sql;
     if (!dcols.empty()) {
-        std::string collist, setlist;
-        for (size_t i = 0; i < dcols.size(); i++) { if (i) collist += ","; collist += dcols[i]; }
-        for (auto &cn : dcols) {
-            bool is_key = false;
-            for (auto &k : kl) if (k == cn) { is_key = true; break; }
-            if (is_key) continue;
-            if (!setlist.empty()) setlist += ",";
-            setlist += cn + "=excluded." + cn;
+        std::string collist, sellist;
+        for (size_t i = 0; i < dcols.size(); i++) {
+            if (i) { collist += ","; sellist += ","; }
+            collist += dcols[i];
+            // The log delivers every value as NVARCHAR text; cast it to the target
+            // column's type for the insert (keys included, harmless for delete-only).
+            sellist += "CAST(c." + dcols[i] + " AS " + dtypes[i] + ") AS " + dcols[i];
         }
-        ups_sql = "INSERT INTO " + target + " (" + collist + ") SELECT " + collist +
-                  " FROM " + net_iu + " c ON CONFLICT (" + keycsv + ")" +
-                  (setlist.empty() ? " DO NOTHING" : (" DO UPDATE SET " + setlist));
+        del_iu_sql = "DELETE FROM " + target + " t WHERE EXISTS (SELECT 1 FROM " + net_iu +
+                     " c WHERE " + key_join("t", "c") + ")";
+        ins_sql = "INSERT INTO " + target + " (" + collist + ") SELECT " + sellist +
+                  " FROM " + net_iu + " c";
     }
 
     Exec(con, "BEGIN");
     try {
         Exec(con, del_sql);
-        if (!ups_sql.empty()) Exec(con, ups_sql);
+        if (!del_iu_sql.empty()) { Exec(con, del_iu_sql); Exec(con, ins_sql); }
         Exec(con, "UPDATE _erpl_rev_cdc SET position=" + std::to_string(max_seq) +
                   ", last_run_ts=now(), status='ACTIVE' WHERE target=" + SqlLit(target));
         Exec(con, "DROP TABLE " + staging);
