@@ -270,7 +270,9 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
     IF is_state-wm_value IS NOT INITIAL.
       " safety overlap is expressed at cadence/value level by the caller; the
       " numeric watermark compares strictly greater-than the stored high-water.
-      lv_where = |{ is_state-chg_col } > { is_state-wm_value }|.
+      " Quote the literal: a DEC(21,7) TIMESTAMPL carries a decimal point, which the
+      " ABAP SQL parser rejects as a bare numeric literal in a dynamic condition.
+      lv_where = |{ is_state-chg_col } > '{ is_state-wm_value }'|.
     ENDIF.
     DATA(r) = zcl_erpl_rev_util=>replicate(
       iv_tab      = is_state-source_from
@@ -435,7 +437,7 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
   METHOD scalar.
     DATA(ls) = zcl_erpl_rev_util=>query( iv_sql ).
     IF ls-error IS NOT INITIAL. RETURN. ENDIF.
-    FIND REGEX ':\s*(-?[0-9]+)' IN ls-rows SUBMATCHES DATA(lv).
+    FIND PCRE ':\s*(-?[0-9]+)' IN ls-rows SUBMATCHES DATA(lv).
     IF sy-subrc = 0. rv = CONV i( lv ). ENDIF.
   ENDMETHOD.
 

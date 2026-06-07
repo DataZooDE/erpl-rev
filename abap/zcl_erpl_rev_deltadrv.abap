@@ -36,8 +36,6 @@ CLASS zcl_erpl_rev_deltadrv DEFINITION PUBLIC FINAL CREATE PUBLIC.
                 ev_maktx TYPE string
                 ev_error TYPE string.
 
-  PRIVATE SECTION.
-    CLASS-METHODS id10 IMPORTING iv TYPE i RETURNING VALUE(rv) TYPE c LENGTH 10.
 ENDCLASS.
 
 CLASS zcl_erpl_rev_deltadrv IMPLEMENTATION.
@@ -46,18 +44,14 @@ CLASS zcl_erpl_rev_deltadrv IMPLEMENTATION.
     GET TIME STAMP FIELD rv.
   ENDMETHOD.
 
-  METHOD id10.
-    DATA lv TYPE n LENGTH 10.
-    lv = iv.
-    rv = lv.
-  ENDMETHOD.
-
   METHOD seed_wm.
     DELETE FROM zdelta_wm.                                  "#EC CI_NOFIRST
     DATA lt TYPE STANDARD TABLE OF zdelta_wm.
     DATA(lv_ts) = now_ts( ).
+    DATA lv_id TYPE n LENGTH 10.
     DO iv_rows TIMES.
-      APPEND VALUE zdelta_wm( id = id10( sy-index )
+      lv_id = sy-index.
+      APPEND VALUE zdelta_wm( id = lv_id
                              name = |row { sy-index }|
                              val = sy-index
                              changed_at = lv_ts ) TO lt.
@@ -97,50 +91,13 @@ CLASS zcl_erpl_rev_deltadrv IMPLEMENTATION.
   ENDMETHOD.
 
   METHOD change_material.
-    " Pick an existing, non-deletion-flagged material if none was given.
-    DATA lv_matnr TYPE matnr.
-    lv_matnr = iv_matnr.
-    IF lv_matnr IS INITIAL.
-      SELECT matnr FROM mara UP TO 1 ROWS
-        WHERE lvorm = @space
-        ORDER BY matnr
-        INTO @lv_matnr.
-      ENDSELECT.
-    ENDIF.
-    IF lv_matnr IS INITIAL.
-      ev_error = 'no material found in MARA'.
-      RETURN.
-    ENDIF.
-
-    DATA(lv_ts)   = now_ts( ).
-    DATA(lv_text) = |erpl delta { lv_ts }|.
-
-    DATA ls_head TYPE bapimathead.
-    ls_head-material = lv_matnr.
-    DATA lt_desc TYPE STANDARD TABLE OF bapi_makt.
-    APPEND VALUE bapi_makt( langu = sy-langu matl_desc = lv_text ) TO lt_desc.
-    DATA lt_ret TYPE STANDARD TABLE OF bapiret2.
-
-    CALL FUNCTION 'BAPI_MATERIAL_SAVEDATA'
-      EXPORTING  headdata       = ls_head
-      IMPORTING  return         = DATA(ls_ret)
-      TABLES     materialdescription = lt_desc
-                 returnmessages = lt_ret.
-
-    LOOP AT lt_ret INTO DATA(ls_r) WHERE type CA 'EAX'.
-      ev_error = |{ ls_r-type } { ls_r-id }{ ls_r-number } { ls_r-message }|.
-    ENDLOOP.
-    IF ev_error IS INITIAL AND ls_ret-type CA 'EAX'.
-      ev_error = |{ ls_ret-type } { ls_ret-message }|.
-    ENDIF.
-
-    IF ev_error IS INITIAL.
-      CALL FUNCTION 'BAPI_TRANSACTION_COMMIT' EXPORTING wait = abap_true.
-      ev_matnr = lv_matnr.
-      ev_maktx = lv_text.
-    ELSE.
-      CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
-    ENDIF.
+    " BAPI_MATERIAL_SAVEDATA (the MM02 path) requires Materials Management, which
+    " is NOT installed on the bare ABAP Platform developer trial (this system is
+    " Basis + the SFLIGHT demo, not the S/4 fully-activated appliance). On an
+    " MM-equipped system this method would issue the BAPI + BAPI_TRANSACTION_COMMIT
+    " to write a genuine CDHDR/CDPOS change document under OBJECTCLAS='MATERIAL'.
+    " The caller treats a non-empty ev_error as "skip the change-doc scenario".
+    ev_error = 'BAPI_MATERIAL_SAVEDATA unavailable (no Materials Management on this system)'.
   ENDMETHOD.
 
 ENDCLASS.

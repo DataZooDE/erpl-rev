@@ -178,8 +178,11 @@ DuckDbBridge::DuckDbBridge(const std::string &path, const std::string &init_sql)
         "target VARCHAR PRIMARY KEY, method VARCHAR NOT NULL, source_from VARCHAR NOT NULL, "
         "keys VARCHAR NOT NULL, chg_col VARCHAR, wm_kind VARCHAR, wm_value VARCHAR, "
         "safety_secs INTEGER DEFAULT 120, cadence VARCHAR DEFAULT 'nightly', extra VARCHAR, "
-        "last_run_ts TIMESTAMP, rows_applied BIGINT, status VARCHAR DEFAULT 'IDLE', "
-        "lease_ts TIMESTAMP, last_error VARCHAR)");
+        // TIMESTAMPTZ (not naive TIMESTAMP): now() is tz-aware, so storing it in a
+        // naive column and later doing epoch(now()) - epoch(col) yields a spurious
+        // local-UTC offset. Matching types keeps cadence/lease arithmetic correct.
+        "last_run_ts TIMESTAMPTZ, rows_applied BIGINT, status VARCHAR DEFAULT 'IDLE', "
+        "lease_ts TIMESTAMPTZ, last_error VARCHAR)");
     if (d->HasError())
         throw std::runtime_error("DuckDB delta-state init failed: " + d->GetError());
     // Boot init: explicit init_sql (CLI/--init-file) wins; else env fallback. Runs
@@ -591,6 +594,7 @@ long long DuckDbBridge::IngestBxml(const std::string &target,
                 proj += cn + "::" + coltypes[i].ToString();
                 break;
         }
+        proj += " AS " + cn;   // name the projected column so a CTAS clone keeps it
     }
     std::string collist;
     for (size_t i = 0; i < tbl.columns.size(); i++) {
@@ -598,53 +602,38 @@ long long DuckDbBridge::IngestBxml(const std::string &target,
         if (!collist.empty()) collist += ",";
         collist += LowerName(tbl.columns[i]);
     }
-    // ON CONFLICT DO UPDATE clause (shared by Upsert and Merge); empty when there
-    // are no non-key target columns to set.
-    auto conflict_clause = [&]() -> std::string {
-        std::string c = " ON CONFLICT (";
-        for (size_t i = 0; i < key_cols.size(); i++) { if (i) c += ","; c += LowerName(key_cols[i]); }
-        c += ") DO UPDATE SET ";
-        bool first = true;
-        for (auto &cn0 : tbl.columns) {
-            if (is_op(cn0)) continue;
-            const std::string cn = LowerName(cn0);
-            bool is_key = false;
-            for (auto &k : key_cols) if (LowerName(k) == cn) { is_key = true; break; }
-            if (is_key) continue;  // a key in DO UPDATE SET makes DuckDB null it
-            if (!first) c += ",";
-            first = false;
-            c += cn + "=excluded." + cn;
-        }
-        return first ? std::string(" ON CONFLICT DO NOTHING") : c;
-    };
+    // Apply mode. Upsert/Merge with keys use DELETE-then-INSERT rather than
+    // `INSERT … ON CONFLICT DO UPDATE`: DuckDB mis-binds the conflict row of an
+    // `INSERT … SELECT … ON CONFLICT` whose source is the cast staging relation and
+    // NULLs the leading key column. Deleting the incoming keys first, then a plain
+    // INSERT, is the same end state (full-row replace) and avoids the engine quirk.
+    const bool upsert = (mode == IngestMode::Upsert || mode == IngestMode::Merge) &&
+                        !key_cols.empty();
+    std::string sel = "SELECT " + proj + " FROM " + stg;
+    if (merge) sel += " WHERE lower(" + opl + ") IN ('i','u')";   // exclude deletes from the insert
+    const std::string ins = "INSERT INTO " + target + " (" + collist + ") " + sel;
 
-    std::string ins = "INSERT INTO " + target + " (" + collist + ") SELECT " + proj +
-                      " FROM " + stg;
-    if (merge) ins += " WHERE lower(" + opl + ") IN ('i','u')";
-    if ((mode == IngestMode::Upsert || mode == IngestMode::Merge) && !key_cols.empty())
-        ins += conflict_clause();
-
-    if (merge) {
-        // Apply deletes then upserts in one transaction on this connection, so a
-        // failed cast (or any error) rolls back the whole package — no partial state.
+    if (upsert) {
+        // Key tuple + staging key projection (cast VARCHAR staging keys to the target
+        // key types so the `(keys) IN (SELECT keys …)` comparison is type-compatible).
         std::string keytuple, keysel;
         for (size_t i = 0; i < key_cols.size(); i++) {
             const std::string k = LowerName(key_cols[i]);
             if (i) { keytuple += ","; keysel += ","; }
             keytuple += k;
-            // Staging keys are VARCHAR; cast them to the target key type so the
-            // `(keys) IN (SELECT keys …)` comparison is type-compatible.
             auto it = tcol.find(k);
             const bool textual = it == tcol.end() ||
                                  it->second.id() == duckdb::LogicalTypeId::VARCHAR ||
                                  it->second.id() == duckdb::LogicalTypeId::BLOB;
             keysel += textual ? k : (k + "::" + it->second.ToString());
         }
-        std::string del = "DELETE FROM " + target + " WHERE (" + keytuple + ") IN (SELECT " +
-                          keysel + " FROM " + stg + " WHERE lower(" + opl + ")='d')";
+        // Delete every incoming key (I/U rows are replaced, D rows are removed), then
+        // insert the I/U rows — atomically, so a bad cast rolls back the whole package.
+        const std::string del = "DELETE FROM " + target + " WHERE (" + keytuple + ") IN (SELECT " +
+                                keysel + " FROM " + stg + ")";
         Exec(con, "BEGIN");
         try {
-            if (!key_cols.empty()) Exec(con, del);
+            Exec(con, del);
             Exec(con, ins);
             Exec(con, "COMMIT");
         } catch (...) {

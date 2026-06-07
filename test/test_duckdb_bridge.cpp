@@ -763,3 +763,36 @@ TEST_CASE("SnapshotMerge: insert+update+delete diff in one transaction",
                        "WHERE lower(table_name)='t__snap'");
     REQUIRE(sg.rows[0] == R"({"c":0})");
 }
+
+TEST_CASE("IngestBxml UPSERT: composite key with client-first column", "[bridge][ingest][upsert][composite]") {
+    DuckDbBridge db;
+    std::string ddl = "CREATE TABLE IF NOT EXISTS mt(client VARCHAR, id VARCHAR, v VARCHAR, PRIMARY KEY(client,id));";
+    sxml::Table s; s.columns = {"CLIENT","ID","V"};
+    s.rows = {{"001","1","a"},{"001","2","b"},{"001","3","c"}};
+    auto n = db.IngestBxml("mt", sxml::Encode("DATA", s), IngestMode::Insert, {"CLIENT","ID"}, "", "SET threads TO 1;", ddl);
+    REQUIRE(n == 3);
+    REQUIRE(db.Query("SELECT count(*) AS c FROM mt").rows[0] == R"({"c":3})");
+    // re-upsert the SAME 3 rows (ddl carries CREATE IF NOT EXISTS, like a delta cycle)
+    auto n2 = db.IngestBxml("mt", sxml::Encode("DATA", s), IngestMode::Upsert, {"CLIENT","ID"}, "", "", ddl);
+    REQUIRE(n2 == 3);
+    REQUIRE(db.Query("SELECT count(*) AS c FROM mt").rows[0] == R"({"c":3})");
+    REQUIRE(db.Query("SELECT client FROM mt WHERE id='1'").rows[0] == R"({"client":"001"})");
+}
+
+TEST_CASE("IngestBxml UPSERT: exact A4H delta shape (client PK + DECIMAL ts)", "[bridge][ingest][upsert][a4h]") {
+    DuckDbBridge db;
+    std::string ddl = "CREATE TABLE IF NOT EXISTS mt2 (CLIENT VARCHAR, ID VARCHAR, NAME VARCHAR, VAL INTEGER, CHANGED_AT DECIMAL(21,7), PRIMARY KEY(CLIENT,ID));";
+    sxml::Table s; s.columns = {"CLIENT","ID","NAME","VAL","CHANGED_AT"};
+    s.rows = {{"001","0000000001","row 1","1","20260607135828.5250730"},
+              {"001","0000000002","row 2","2","20260607135828.5250730"},
+              {"001","0000000003","row 3","3","20260607135828.5250730"}};
+    // baseline: heap insert then PK already in ddl
+    auto n = db.IngestBxml("mt2", sxml::Encode("DATA", s), IngestMode::Insert, {"CLIENT","ID"}, "", "SET threads TO 1;", ddl);
+    REQUIRE(n == 3);
+    // delta upsert: same rows, ddl carries CREATE IF NOT EXISTS (as on A4H)
+    auto n2 = db.IngestBxml("mt2", sxml::Encode("DATA", s), IngestMode::Upsert, {"CLIENT","ID"}, "", "", ddl);
+    REQUIRE(n2 == 3);
+    REQUIRE(db.Query("SELECT count(*) AS c FROM mt2").rows[0] == R"({"c":3})");
+    REQUIRE(db.Query("SELECT client AS c FROM mt2 WHERE id='0000000001'").rows[0] == R"({"c":"001"})");
+    REQUIRE(db.Query("SELECT count(*) AS c FROM mt2 WHERE client IS NULL").rows[0] == R"({"c":0})");
+}
