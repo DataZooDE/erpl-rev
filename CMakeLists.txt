@@ -74,6 +74,7 @@ add_executable(erpl_rev_server
   src/rfc_metadata.cpp
   src/rfc_handlers.cpp
   src/duckdb_bridge.cpp
+  src/cdc_dialect.cpp
   src/json_util.cpp
   src/sxml_binary.cpp
   src/logging.cpp
@@ -103,9 +104,11 @@ endif()
 if(EXISTS "${DUCKDB_LIB}")
   add_executable(erpl_rev_tests
     test/test_duckdb_bridge.cpp
+    test/test_cdc_dialect.cpp
     test/test_sxml_binary.cpp
     test/bench_ingest.cpp
     src/duckdb_bridge.cpp
+    src/cdc_dialect.cpp
     src/json_util.cpp
     src/sxml_binary.cpp)
   target_include_directories(erpl_rev_tests PRIVATE src "${DUCKDB_INCLUDE}")
