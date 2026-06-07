@@ -48,18 +48,32 @@ SELECTION-SCREEN PUSHBUTTON 21(18) b_run   USER-COMMAND run.
 SELECTION-SCREEN PUSHBUTTON 40(18) b_view  USER-COMMAND view.
 SELECTION-SCREEN END OF LINE.
 SELECTION-SCREEN BEGIN OF LINE.
-SELECTION-SCREEN PUSHBUTTON  2(18) b_upd USER-COMMAND upd.
-SELECTION-SCREEN PUSHBUTTON 21(18) b_ins USER-COMMAND ins.
-SELECTION-SCREEN PUSHBUTTON 40(18) b_del USER-COMMAND del.
+SELECTION-SCREEN COMMENT  2(18) c_one.
+SELECTION-SCREEN PUSHBUTTON 21(18) b_upd USER-COMMAND upd.
+SELECTION-SCREEN PUSHBUTTON 40(18) b_ins USER-COMMAND ins.
+SELECTION-SCREEN PUSHBUTTON 59(18) b_del USER-COMMAND del.
+SELECTION-SCREEN END OF LINE.
+" Mass operations (bulk demo flights in a far-future date range).
+PARAMETERS p_mass TYPE i DEFAULT 1000.
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT  2(18) c_mass.
+SELECTION-SCREEN PUSHBUTTON 21(18) b_mupd USER-COMMAND mupd.
+SELECTION-SCREEN PUSHBUTTON 40(18) b_mins USER-COMMAND mins.
+SELECTION-SCREEN PUSHBUTTON 59(18) b_mdel USER-COMMAND mdel.
 SELECTION-SCREEN END OF LINE.
 
 INITIALIZATION.
   b_setup = 'Setup (load+register)'.
   b_run   = 'Run delta cycle'.
   b_view  = 'Refresh view'.
+  c_one   = 'Single flight:'.
   b_upd   = 'Update flight'.
   b_ins   = 'Insert flight'.
   b_del   = 'Delete flight'.
+  c_mass  = 'Mass (p_mass rows):'.
+  b_mupd  = 'Mass update'.
+  b_mins  = 'Mass insert'.
+  b_mdel  = 'Mass delete'.
   zcl_erpl_rev_deltadrv=>sflight_default(
     IMPORTING ev_carrid = p_carr ev_connid = p_conn ev_fldate = p_date ).
   APPEND |Press Setup to full-load SFLIGHT into DuckDB and register the snapshot delta.| TO gt_log.
@@ -67,7 +81,9 @@ INITIALIZATION.
 AT SELECTION-SCREEN.
   DATA lv_act TYPE syucomm.
   lv_act = sy-ucomm.
-  IF lv_act CA 'SETUP RUN UPD INS DEL VIEW' AND lv_act IS NOT INITIAL.
+  IF lv_act = 'SETUP' OR lv_act = 'RUN' OR lv_act = 'VIEW'
+     OR lv_act = 'UPD' OR lv_act = 'INS' OR lv_act = 'DEL'
+     OR lv_act = 'MUPD' OR lv_act = 'MINS' OR lv_act = 'MDEL'.
     PERFORM act USING lv_act.
     IF go_dock IS BOUND.
       go_dock->free( ).
@@ -100,6 +116,15 @@ FORM act USING iv_act TYPE syucomm.
     WHEN 'DEL'.
       lv_l = zcl_erpl_rev_deltadrv=>sflight_change(
                iv_kind = 'D' iv_carrid = p_carr iv_connid = p_conn iv_fldate = p_date ).
+    WHEN 'MINS'.
+      lv_l = zcl_erpl_rev_deltadrv=>sflight_mass(
+               iv_kind = 'I' iv_carrid = p_carr iv_connid = p_conn iv_count = p_mass ).
+    WHEN 'MUPD'.
+      lv_l = zcl_erpl_rev_deltadrv=>sflight_mass(
+               iv_kind = 'U' iv_carrid = p_carr iv_connid = p_conn iv_count = p_mass ).
+    WHEN 'MDEL'.
+      lv_l = zcl_erpl_rev_deltadrv=>sflight_mass(
+               iv_kind = 'D' iv_carrid = p_carr iv_connid = p_conn iv_count = p_mass ).
     WHEN 'RUN'.
       DATA(rs) = zcl_erpl_rev_delta=>run( c_target ).
       IF rs-target IS INITIAL OR rs-error CS 'no delta registration'.

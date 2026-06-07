@@ -214,6 +214,30 @@ CLASS zcl_erpl_rev_deltatest IMPLEMENTATION.
         what = 'M5 deleted flight absent from DuckDB' ).
     ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM sflight| ) = lv_n0 )
         what = 'M5 count restored to baseline' ).
+
+    " MASS operations (bulk demo flights, FLDATE >= 2099-01-01). N=25 for a fast test.
+    DATA(lv_m) = 25.
+    zcl_erpl_rev_deltadrv=>sflight_mass( iv_kind = 'I' iv_carrid = lv_c iv_connid = lv_n iv_count = lv_m ).
+    zcl_erpl_rev_delta=>run( 'sflight' ).
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM sflight| ) = lv_n0 + lv_m )
+        what = 'M5 mass insert reflected (+25)' ).
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM sflight WHERE fldate >= '2099-01-01'| ) = lv_m )
+        what = 'M5 25 demo flights present in DuckDB' ).
+
+    DATA(lv_s0) = cnt( |SELECT CAST(sum(price) AS INTEGER) AS c FROM sflight WHERE fldate >= '2099-01-01'| ).
+    zcl_erpl_rev_deltadrv=>sflight_mass( iv_kind = 'U' iv_carrid = lv_c iv_connid = lv_n iv_count = lv_m ).
+    zcl_erpl_rev_delta=>run( 'sflight' ).
+    ok( cond = xsdbool( cnt( |SELECT CAST(sum(price) AS INTEGER) AS c FROM sflight WHERE fldate >= '2099-01-01'| )
+                        = lv_s0 + lv_m * 100 )
+        what = 'M5 mass update reflected (+100 x 25)' detail = |{ lv_s0 }| ).
+
+    zcl_erpl_rev_deltadrv=>sflight_mass( iv_kind = 'D' iv_carrid = lv_c iv_connid = lv_n iv_count = lv_m ).
+    DATA(rmdel) = zcl_erpl_rev_delta=>run( 'sflight' ).
+    ok( cond = xsdbool( rmdel-del = lv_m ) what = 'M5 mass delete detected (del=25)' detail = |{ rmdel-del }| ).
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM sflight WHERE fldate >= '2099-01-01'| ) = 0 )
+        what = 'M5 all demo flights gone' ).
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM sflight| ) = lv_n0 )
+        what = 'M5 mass delete restored baseline' ).
   ENDMETHOD.
 
 ENDCLASS.

@@ -53,6 +53,19 @@ CLASS zcl_erpl_rev_deltadrv DEFINITION PUBLIC FINAL CREATE PUBLIC.
                 ev_connid TYPE s_conn_id
                 ev_fldate TYPE s_date.
 
+    "! MASS change to SFLIGHT for the demo: bulk insert / update / delete iv_count
+    "! "demo flights" for (carrid,connid). Demo flights live in a far-future FLDATE
+    "! range (>= 2099-01-01) so they never collide with real data and are trivially
+    "! targeted/cleaned. 'I' bulk-inserts iv_count new dates after the current max;
+    "! 'U' bumps PRICE+100 on up to iv_count of them; 'D' deletes up to iv_count.
+    "! One COMMIT per call (bulk DML). Returns a log line.
+    CLASS-METHODS sflight_mass
+      IMPORTING iv_kind   TYPE c
+                iv_carrid TYPE s_carr_id
+                iv_connid TYPE s_conn_id
+                iv_count  TYPE i
+      RETURNING VALUE(rv_msg) TYPE string.
+
 ENDCLASS.
 
 CLASS zcl_erpl_rev_deltadrv IMPLEMENTATION.
@@ -173,6 +186,68 @@ CLASS zcl_erpl_rev_deltadrv IMPLEMENTATION.
         rv_msg = |DELETE { iv_carrid } { iv_connid } { iv_fldate }|.
       WHEN OTHERS.
         rv_msg = |ERROR: unknown change kind { iv_kind }|.
+    ENDCASE.
+  ENDMETHOD.
+
+  METHOD sflight_mass.
+    CONSTANTS lc_base TYPE d VALUE '20990101'.   " demo-flight marker: FLDATE >= this
+    DATA lv_n TYPE i.
+    lv_n = COND #( WHEN iv_count > 0 THEN iv_count ELSE 1000 ).
+
+    CASE iv_kind.
+      WHEN 'I'.
+        " Template: any existing flight of this connection (else any flight at all).
+        DATA ls_t TYPE sflight.
+        SELECT SINGLE * FROM sflight
+          WHERE carrid = @iv_carrid AND connid = @iv_connid INTO @ls_t.
+        IF sy-subrc <> 0.
+          SELECT SINGLE * FROM sflight INTO @ls_t.
+          IF sy-subrc <> 0. rv_msg = 'ERROR: SFLIGHT is empty (no template)'. RETURN. ENDIF.
+        ENDIF.
+        " Start the new dates after the current max demo date (so repeated presses
+        " keep appending without key collisions).
+        SELECT MAX( fldate ) FROM sflight
+          WHERE carrid = @iv_carrid AND connid = @iv_connid AND fldate >= @lc_base
+          INTO @DATA(lv_max).
+        DATA lv_start TYPE d.
+        lv_start = COND #( WHEN lv_max IS INITIAL THEN lc_base ELSE lv_max + 1 ).
+        DATA lt_ins TYPE STANDARD TABLE OF sflight.
+        DO lv_n TIMES.
+          DATA(ls) = ls_t.
+          ls-carrid   = iv_carrid.
+          ls-connid   = iv_connid.
+          ls-fldate   = lv_start + ( sy-index - 1 ).
+          ls-price    = ls_t-price + sy-index.
+          ls-seatsocc = 0.
+          APPEND ls TO lt_ins.
+        ENDDO.
+        INSERT sflight FROM TABLE @lt_ins ACCEPTING DUPLICATE KEYS.
+        COMMIT WORK AND WAIT.
+        rv_msg = |MASS INSERT { lines( lt_ins ) } flights ({ iv_carrid } { iv_connid }, from { lv_start })|.
+      WHEN 'U'.
+        DATA lt_upd TYPE STANDARD TABLE OF sflight.
+        SELECT * FROM sflight
+          WHERE carrid = @iv_carrid AND connid = @iv_connid AND fldate >= @lc_base
+          ORDER BY fldate
+          INTO TABLE @lt_upd UP TO @lv_n ROWS.
+        LOOP AT lt_upd ASSIGNING FIELD-SYMBOL(<f>).
+          <f>-price    = <f>-price + 100.
+          <f>-seatsocc = <f>-seatsocc + 1.
+        ENDLOOP.
+        UPDATE sflight FROM TABLE @lt_upd.
+        COMMIT WORK AND WAIT.
+        rv_msg = |MASS UPDATE { lines( lt_upd ) } demo flights (price +100)|.
+      WHEN 'D'.
+        DATA lt_del TYPE STANDARD TABLE OF sflight.
+        SELECT * FROM sflight
+          WHERE carrid = @iv_carrid AND connid = @iv_connid AND fldate >= @lc_base
+          ORDER BY fldate
+          INTO TABLE @lt_del UP TO @lv_n ROWS.
+        DELETE sflight FROM TABLE @lt_del.
+        COMMIT WORK AND WAIT.
+        rv_msg = |MASS DELETE { lines( lt_del ) } demo flights|.
+      WHEN OTHERS.
+        rv_msg = |ERROR: unknown mass kind { iv_kind }|.
     ENDCASE.
   ENDMETHOD.
 
