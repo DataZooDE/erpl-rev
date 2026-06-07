@@ -39,6 +39,12 @@ CLASS zcl_erpl_rev_cdc DEFINITION PUBLIC FINAL CREATE PUBLIC.
       IMPORTING iv_target TYPE string
       RETURNING VALUE(rv_error) TYPE string.
 
+    "! Run one cycle for every provisioned (SEEDED/ACTIVE) CDC target — the heartbeat
+    "! entry point, called from a periodic job alongside the watermark/snapshot tiers.
+    "! Returns the targets it ran.
+    CLASS-METHODS run_due
+      RETURNING VALUE(rt_targets) TYPE string_table.
+
   PRIVATE SECTION.
     CONSTANTS c_dest TYPE rfcdest VALUE 'ERPL_REV'.
 
@@ -224,6 +230,19 @@ CLASS zcl_erpl_rev_cdc IMPLEMENTATION.
     LOOP AT ls-teardown_ddl INTO DATA(lv_ddl).
       DATA(lv_e) = exec_native( iv_sql = lv_ddl iv_ddl = abap_true ).
       IF lv_e IS NOT INITIAL AND rv_error IS INITIAL. rv_error = lv_e. ENDIF.
+    ENDLOOP.
+  ENDMETHOD.
+
+  METHOD run_due.
+    DATA(ls) = zcl_erpl_rev_util=>query(
+      |SELECT target FROM _erpl_rev_cdc WHERE status IN ('SEEDED','ACTIVE')| ).
+    IF ls-error IS NOT INITIAL OR ls-row_count = 0. RETURN. ENDIF.
+    TYPES: BEGIN OF ty_t, target TYPE string, END OF ty_t.
+    DATA lt TYPE STANDARD TABLE OF ty_t WITH EMPTY KEY.
+    /ui2/cl_json=>deserialize( EXPORTING json = ls-rows CHANGING data = lt ).
+    LOOP AT lt INTO DATA(ls_t).
+      run( ls_t-target ).
+      APPEND ls_t-target TO rt_targets.
     ENDLOOP.
   ENDMETHOD.
 

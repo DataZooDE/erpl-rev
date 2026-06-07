@@ -75,6 +75,11 @@ CLASS zcl_erpl_rev_cdctest IMPLEMENTATION.
         detail = |applied={ r2-applied } del={ r2-del }| ).
     ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM cdc_wm| ) = 8 ) what = 'CDC count still 8' ).
 
+    " Heartbeat: run_due runs every provisioned (SEEDED/ACTIVE) CDC target.
+    DATA(lt_due) = zcl_erpl_rev_cdc=>run_due( ).
+    ok( cond = xsdbool( line_exists( lt_due[ table_line = 'cdc_wm' ] ) )
+        what = 'CDC run_due runs the active target' ).
+
     " Teardown: drop trigger + log + sequence (trigger first, so ZDELTA_WM stays usable).
     DATA(lv_te) = zcl_erpl_rev_cdc=>teardown( 'cdc_wm' ).
     ok( cond = xsdbool( lv_te IS INITIAL ) what = 'CDC teardown ok (no orphan objects)' detail = lv_te ).
