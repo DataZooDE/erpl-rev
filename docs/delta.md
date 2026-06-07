@@ -71,9 +71,39 @@ on the first cycle, and SNAPSHOT self-seeds the target from its staging structur
   (lease → dispatch by method → commit watermark → release).
 - `zcl_erpl_rev_delta=>run_due( )` runs every **due** target (cadence elapsed since
   `last_run_ts`, lease free).
-- **`Z_ERPL_REV_DELTA`** is the orchestration report: one tick (`p_once`, the default,
-  for an external scheduler / self-rescheduling job) or a `p_loop` watch loop
-  (`p_secs` interval, `p_dur` duration) for sub-minute micro-batch during a demo.
+- **`Z_ERPL_REV_DELTA`** is the orchestration report: one tick (`p_once`, the default —
+  the job step) or a `p_loop` watch loop (`p_secs` interval, `p_dur` duration) for
+  sub-minute micro-batch during a demo.
+
+## Running it periodically (the cron)
+
+The supported way to run delta on a schedule is **one periodic SAP background job**
+running `Z_ERPL_REV_DELTA` (one tick) at the *finest* period you need. Each tick calls
+`run_due()`, which runs only the targets whose per-target `cadence` has elapsed — so a
+single 1-minute job drives mixed cadences (a `micro:120` target every ~2 min, a
+`nightly` one once a day). It's all SM37-monitorable; no third-party scheduler.
+
+Install/remove the job from the report (or `Z_ERPL_REV_REPLICATE`'s Delta tab):
+
+- `Z_ERPL_REV_DELTA` with **`p_sched`** + **`p_min`** → installs a periodic job
+  `ERPL_REV_DELTA` that starts now and repeats every `p_min` minutes (`1` = every
+  minute, `30` = every 30 min). Re-running it just re-times the job.
+- **`p_unsch`** → removes the job.
+- Programmatically: `zcl_erpl_rev_delta=>schedule( iv_minutes = 1 )` /
+  `schedule( iv_remove = abap_true )` (uses `JOB_OPEN`/`JOB_SUBMIT`/`JOB_CLOSE`).
+
+A background-job period is **≥ 1 minute**. For genuine **sub-minute** micro-batch, use
+the report's `p_loop` (a job that ticks every `p_secs` via `WAIT`, holding a work
+process) or an external trigger. For most cases a 1-minute job is plenty — the
+`safety_secs` overlap + idempotent merge absorb the lag.
+
+### One screen: load + register + schedule
+
+`Z_ERPL_REV_REPLICATE` has a **Delta & schedule** tab: tick *Register as delta target*
+(method / watermark column / kind / cadence / extra-JSON) to register the just-loaded
+DuckDB table as a delta target in one go (the full load is the seed; WATERMARK/
+INSERT_ONLY auto-seed the high-water from the current source max), and tick *Schedule
+periodic job* (+ minutes) to install the cron — so a full setup is one screen.
 
 ## Correctness contract
 

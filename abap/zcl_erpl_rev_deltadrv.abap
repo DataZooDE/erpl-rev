@@ -47,6 +47,10 @@ CLASS zcl_erpl_rev_deltadrv DEFINITION PUBLIC FINAL CREATE PUBLIC.
                 iv_fldate TYPE s_date
       RETURNING VALUE(rv_msg) TYPE string.
 
+    "! Delete ALL demo flights (FLDATE >= 2099-01-01) — full cleanup of anything the
+    "! mass/single demo ops left behind, so a run starts from a clean SFLIGHT.
+    CLASS-METHODS sflight_purge_demo.
+
     "! First SFLIGHT flight in key order — sensible defaults for the demo screen.
     CLASS-METHODS sflight_default
       EXPORTING ev_carrid TYPE s_carr_id
@@ -128,6 +132,11 @@ CLASS zcl_erpl_rev_deltadrv IMPLEMENTATION.
     " to write a genuine CDHDR/CDPOS change document under OBJECTCLAS='MATERIAL'.
     " The caller treats a non-empty ev_error as "skip the change-doc scenario".
     ev_error = 'BAPI_MATERIAL_SAVEDATA unavailable (no Materials Management on this system)'.
+  ENDMETHOD.
+
+  METHOD sflight_purge_demo.
+    DELETE FROM sflight WHERE fldate >= '20990101'.       "#EC CI_NOFIRST
+    COMMIT WORK AND WAIT.
   ENDMETHOD.
 
   METHOD sflight_default.

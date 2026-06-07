@@ -113,6 +113,19 @@ CLASS zcl_erpl_rev_delta DEFINITION PUBLIC FINAL CREATE PUBLIC.
                 ev_del     TYPE i
                 ev_error   TYPE string.
 
+    "! Install (or remove) the periodic SAP background job that drives the sync —
+    "! the supported way to run delta on a cron. It schedules report Z_ERPL_REV_DELTA
+    "! (one tick = run_due, i.e. every DUE target) to start now and repeat every
+    "! iv_minutes minutes; one tick at the finest period gates each target by its own
+    "! `cadence`. Any existing job of the same name is removed first, so calling it
+    "! again just re-times it. iv_remove=X removes it and does not reschedule.
+    "! NB: a SAP background-job period is >= 1 minute; for sub-minute cadence use the
+    "! report's loop mode (p_loop) or an external trigger. Returns a status line.
+    CLASS-METHODS schedule
+      IMPORTING iv_minutes TYPE i DEFAULT 1
+                iv_remove  TYPE abap_bool DEFAULT abap_false
+      RETURNING VALUE(rv_msg) TYPE string.
+
   PRIVATE SECTION.
     CONSTANTS c_dest TYPE rfcdest VALUE 'ERPL_REV'.
 
@@ -494,6 +507,55 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
     LOOP AT due( ) INTO DATA(lv_t).
       APPEND run( lv_t ) TO rt.
     ENDLOOP.
+  ENDMETHOD.
+
+  METHOD schedule.
+    CONSTANTS lc_job TYPE btcjob VALUE 'ERPL_REV_DELTA'.
+    " Remove any existing scheduled/released/ready periodic job of this name first
+    " (status S=scheduled, R=released/ready, Y=ready, P=planned), so a re-schedule
+    " just re-times it instead of stacking duplicates.
+    SELECT jobname, jobcount FROM tbtco
+      WHERE jobname = @lc_job AND status IN ( 'S', 'R', 'Y', 'P' )
+      INTO TABLE @DATA(lt_old).
+    LOOP AT lt_old INTO DATA(ls_old).
+      CALL FUNCTION 'BP_JOB_DELETE'
+        EXPORTING jobcount = ls_old-jobcount jobname = ls_old-jobname
+                  forcedmode = abap_true commit_flag = abap_true
+        EXCEPTIONS OTHERS = 0.
+    ENDLOOP.
+    DATA(lv_removed) = lines( lt_old ).
+
+    IF iv_remove = abap_true.
+      rv_msg = |unscheduled: removed { lv_removed } '{ lc_job }' job(s).|.
+      RETURN.
+    ENDIF.
+
+    DATA(lv_min) = COND i( WHEN iv_minutes > 0 THEN iv_minutes ELSE 1 ).
+    DATA lv_jc TYPE btcjobcnt.
+    CALL FUNCTION 'JOB_OPEN'
+      EXPORTING jobname = lc_job IMPORTING jobcount = lv_jc EXCEPTIONS OTHERS = 1.
+    IF sy-subrc <> 0. rv_msg = |ERROR: JOB_OPEN subrc { sy-subrc }|. RETURN. ENDIF.
+
+    " The job step: report Z_ERPL_REV_DELTA with its defaults (p_once -> one tick over
+    " every DUE target). JOB_SUBMIT (an FM) is used rather than `SUBMIT … VIA JOB` so
+    " it also works when scheduled from a non-dialog context.
+    CALL FUNCTION 'JOB_SUBMIT'
+      EXPORTING authcknam = sy-uname jobcount = lv_jc jobname = lc_job report = 'Z_ERPL_REV_DELTA'
+      EXCEPTIONS OTHERS = 1.
+    IF sy-subrc <> 0. rv_msg = |ERROR: JOB_SUBMIT subrc { sy-subrc }|. RETURN. ENDIF.
+
+    " Schedule it to start now and repeat every lv_min minutes (the cron). An
+    " explicit start date/time + PRDMINS is the canonical way to create a PERIODIC
+    " job (more reliable than STRTIMMED, which is geared to a one-off immediate run).
+    CALL FUNCTION 'JOB_CLOSE'
+      EXPORTING jobcount = lv_jc jobname = lc_job
+                sdlstrtdt = sy-datum sdlstrttm = sy-uzeit prdmins = lv_min
+      EXCEPTIONS OTHERS = 1.
+    IF sy-subrc <> 0. rv_msg = |ERROR: JOB_CLOSE subrc { sy-subrc }|. RETURN. ENDIF.
+
+    rv_msg = |scheduled '{ lc_job }' to run every { lv_min } min| &&
+             COND string( WHEN lv_removed > 0 THEN | (replaced { lv_removed } old)| ELSE `` ) &&
+             |; monitor/stop in SM37.|.
   ENDMETHOD.
 
 ENDCLASS.

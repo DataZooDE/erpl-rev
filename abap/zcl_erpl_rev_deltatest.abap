@@ -182,8 +182,9 @@ CLASS zcl_erpl_rev_deltatest IMPLEMENTATION.
     IF lv_c IS INITIAL. RETURN. ENDIF.
     DATA(lv_demo) = CONV s_date( '20991231' ).
 
-    " clean any leftover demo flight, then full-load + register SNAPSHOT
-    zcl_erpl_rev_deltadrv=>sflight_change( iv_kind = 'D' iv_carrid = lv_c iv_connid = lv_n iv_fldate = lv_demo ).
+    " purge any leftover demo flights (FLDATE >= 2099-01-01) for a clean baseline,
+    " then full-load + register SNAPSHOT
+    zcl_erpl_rev_deltadrv=>sflight_purge_demo( ).
     zcl_erpl_rev_util=>replicate( iv_tab = 'SFLIGHT' iv_target = 'sflight' ).
     zcl_erpl_rev_delta=>register( VALUE #(
       target = 'sflight' method = 'SNAPSHOT' source_from = 'SFLIGHT'

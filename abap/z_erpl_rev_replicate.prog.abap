@@ -28,6 +28,7 @@ SELECTION-SCREEN BEGIN OF TABBED BLOCK tabb FOR 14 LINES.
   SELECTION-SCREEN TAB (22) ts_tgt USER-COMMAND ts2 DEFAULT SCREEN 0200.
   SELECTION-SCREEN TAB (22) ts_par USER-COMMAND ts3 DEFAULT SCREEN 0300.
   SELECTION-SCREEN TAB (22) ts_ext USER-COMMAND ts4 DEFAULT SCREEN 0400.
+  SELECTION-SCREEN TAB (22) ts_dlt USER-COMMAND ts5 DEFAULT SCREEN 0500.
 SELECTION-SCREEN END OF BLOCK tabb.
 
 " MODIF ID groups drive show/hide in AT SELECTION-SCREEN OUTPUT:
@@ -173,12 +174,54 @@ SELECTION-SCREEN BEGIN OF BLOCK ext WITH FRAME TITLE t_ext.
 SELECTION-SCREEN END OF BLOCK ext.
 SELECTION-SCREEN END OF SCREEN 0400.
 
+SELECTION-SCREEN BEGIN OF SCREEN 0500 AS SUBSCREEN.
+" Delta (incremental): after this (full) load, register the DuckDB target as a delta
+" target in _erpl_rev_delta_state so future runs load only what changed, and
+" optionally install the periodic background job that drives them. Applies to a local
+" DuckDB target (External target = DuckDB table). See docs/delta.md.
+SELECTION-SCREEN BEGIN OF BLOCK dlt WITH FRAME TITLE t_dlt.
+  SELECTION-SCREEN BEGIN OF LINE.
+    SELECTION-SCREEN COMMENT 1(28) c_dlt FOR FIELD p_dlt.
+    PARAMETERS p_dlt AS CHECKBOX.
+  SELECTION-SCREEN END OF LINE.
+  SELECTION-SCREEN BEGIN OF LINE.
+    SELECTION-SCREEN COMMENT 1(28) c_dmeth FOR FIELD p_dmeth.
+    PARAMETERS p_dmeth(12) TYPE c DEFAULT 'SNAPSHOT'.    " WATERMARK|SNAPSHOT|CHANGEDOC|INSERT_ONLY
+  SELECTION-SCREEN END OF LINE.
+  SELECTION-SCREEN BEGIN OF LINE.
+    SELECTION-SCREEN COMMENT 1(28) c_dwm FOR FIELD p_dwm.
+    PARAMETERS p_dwm(30) TYPE c.                          " watermark column (WATERMARK/INSERT_ONLY)
+  SELECTION-SCREEN END OF LINE.
+  SELECTION-SCREEN BEGIN OF LINE.
+    SELECTION-SCREEN COMMENT 1(28) c_dwmk FOR FIELD p_dwmk.
+    PARAMETERS p_dwmk(10) TYPE c DEFAULT 'NUMTS'.         " wm kind: NUMTS|DATETIME|CHANGENR|INT|DATE
+  SELECTION-SCREEN END OF LINE.
+  SELECTION-SCREEN BEGIN OF LINE.
+    SELECTION-SCREEN COMMENT 1(28) c_dcad FOR FIELD p_dcad.
+    PARAMETERS p_dcad(20) TYPE c DEFAULT 'nightly'.       " micro:<sec>|hourly|nightly|manual
+  SELECTION-SCREEN END OF LINE.
+  SELECTION-SCREEN BEGIN OF LINE.
+    SELECTION-SCREEN COMMENT 1(28) c_dxtra FOR FIELD p_dxtra.
+    PARAMETERS p_dxtra(60) TYPE c LOWER CASE.             " extra JSON, e.g. {"objectclas":"MATERIAL"}
+  SELECTION-SCREEN END OF LINE.
+  SELECTION-SCREEN BEGIN OF LINE.
+    SELECTION-SCREEN COMMENT 1(28) c_dsch FOR FIELD p_dsch.
+    PARAMETERS p_dsch AS CHECKBOX.                        " install the periodic delta job
+  SELECTION-SCREEN END OF LINE.
+  SELECTION-SCREEN BEGIN OF LINE.
+    SELECTION-SCREEN COMMENT 1(28) c_dmin FOR FIELD p_dmin.
+    PARAMETERS p_dmin TYPE i DEFAULT 30.                  " ... every N minutes
+  SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN END OF BLOCK dlt.
+SELECTION-SCREEN END OF SCREEN 0500.
+
 *----------------------------------------------------------------------*
 INITIALIZATION.
   ts_src = 'Source'.
   ts_tgt = 'Target & options'.
   ts_par = 'Parallel load'.
   ts_ext = 'External target'.
+  ts_dlt = 'Delta & schedule'.
   t_src    = 'Source (what to replicate)'.
   t_tgt    = 'Target & options'.
   c_tab    = 'Source Table / CDS View'.
@@ -209,6 +252,15 @@ INITIALIZATION.
   c_kt     = 'Table in attached catalog'.
   c_dest   = 'Destination (path / ref)'.
   c_part   = 'Parquet partition by'.
+  t_dlt    = 'Delta (incremental) + periodic schedule'.
+  c_dlt    = 'Register as delta target'.
+  c_dmeth  = 'Method'.
+  c_dwm    = 'Watermark column'.
+  c_dwmk   = 'Watermark kind'.
+  c_dcad   = 'Cadence'.
+  c_dxtra  = 'Extra (JSON)'.
+  c_dsch   = 'Schedule periodic job'.
+  c_dmin   = '... every N minutes'.
 
 *----------------------------------------------------------------------*
 * F4: search DDIC tables by the pattern currently typed into P_TAB.
@@ -582,6 +634,51 @@ START-OF-SELECTION.
     ELSE.
       WRITE: / |  { 'Verify' WIDTH = 16 } : MISMATCH (SAP { lv_total }, target { ls_cnt-rows })|.
     ENDIF.
+  ENDIF.
+
+  " ---- delta: register the just-loaded target as incremental + optional cron ----
+  " The full load above is the SEED; from here future runs load only what changed.
+  IF p_dlt = abap_true.
+    ULINE.
+    IF lv_kind <> 'D'.
+      WRITE: / '  DELTA: skipped — delta tracks a local DuckDB target' &&
+               ' (set External target = DuckDB table).'.
+    ELSE.
+      DATA(lv_meth) = to_upper( condense( CONV string( p_dmeth ) ) ).
+      DATA(ls_dd)   = zcl_erpl_rev_util=>describe_table( iv_tab = p_tab iv_target = lv_local ).
+      " WATERMARK/INSERT_ONLY: seed the high-water from the current source max so the
+      " first delta cycle only picks up changes made AFTER registration.
+      DATA lv_wmv TYPE string.
+      IF ( lv_meth = 'WATERMARK' OR lv_meth = 'INSERT_ONLY' ) AND p_dwm IS NOT INITIAL.
+        DATA lv_mx TYPE p LENGTH 11 DECIMALS 7.
+        DATA lt_mx TYPE string_table.
+        APPEND |max( { p_dwm } )| TO lt_mx.
+        TRY.
+            SELECT SINGLE (lt_mx) FROM (p_tab) INTO @lv_mx.
+            lv_wmv = condense( |{ lv_mx }| ).
+          CATCH cx_root ##NO_HANDLER.
+        ENDTRY.
+      ENDIF.
+      DATA(lv_rerr) = zcl_erpl_rev_delta=>register( VALUE #(
+        target      = lv_local
+        method      = lv_meth
+        source_from = condense( CONV string( p_tab ) )
+        keys        = ls_dd-keys
+        chg_col     = condense( CONV string( p_dwm ) )
+        wm_kind     = condense( CONV string( p_dwmk ) )
+        wm_value    = lv_wmv
+        cadence     = condense( CONV string( p_dcad ) )
+        extra       = condense( CONV string( p_dxtra ) ) ) ).
+      IF lv_rerr IS INITIAL.
+        WRITE: / |  DELTA: registered '{ lv_local }' as { lv_meth }| &&
+                 | (keys { ls_dd-keys }, cadence { p_dcad }).|.
+      ELSE.
+        WRITE: / |  DELTA: register error: { lv_rerr }|.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+  IF p_dsch = abap_true.
+    WRITE: / |  DELTA: { zcl_erpl_rev_delta=>schedule( iv_minutes = p_dmin ) }|.
   ENDIF.
   ULINE.
 
