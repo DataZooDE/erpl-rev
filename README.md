@@ -42,6 +42,10 @@ makes DuckDB call *into* SAP, **erpl-rev has SAP call out into DuckDB.**
   BW / HANA calculation views** into typed DuckDB — full or filtered, with
   source-side `WHERE`, column selection and idempotent `UPSERT`. Built for
   **>100M-row** loads.
+- **Delta (incremental) too.** Keep a target in sync loading only what changed —
+  **watermark, change-document (CDHDR/CDPOS), and snapshot-diff (deletes)** methods,
+  all merging server-side, idempotent and re-runnable. Customer-owned Open SQL only
+  (no ODP / SAPI / `RFC_READ_TABLE`). See [`docs/delta.md`](docs/delta.md).
 - **Land in the open lakehouse.** parquet / partitioned datasets, **DuckLake** or
   **Iceberg**, on local disk or **cloud object storage** (S3 / GCS / Azure).
 - **Publish into a warehouse.** `ATTACH` **Postgres / MySQL / BigQuery** and push
@@ -231,6 +235,7 @@ unless you intend remote access.
 
 ## Docs
 
+- [`docs/delta.md`](docs/delta.md) — incremental extraction (watermark / change-doc / snapshot)
 - [`docs/INSTALL.md`](docs/INSTALL.md) — SAP transport import + server install + upgrade/uninstall
 - [`docs/enable-rfc-registration.md`](docs/enable-rfc-registration.md) — gateway registration / `reginfo`
 - [`docs/security.md`](docs/security.md) — Basis hardening, RFC user, SNC, ACLs
