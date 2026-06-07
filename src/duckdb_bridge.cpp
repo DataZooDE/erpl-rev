@@ -169,6 +169,19 @@ DuckDbBridge::DuckDbBridge(const std::string &path, const std::string &init_sql)
     auto r = con.Query("SET GLOBAL preserve_insertion_order=false");
     if (r->HasError())
         throw std::runtime_error("DuckDB config failed: " + r->GetError());
+    // Delta registry + runtime state — created once, always (independent of the
+    // optional boot init_sql). Both the per-target config and the watermark/lease
+    // state for incremental extraction live here; ABAP reads/writes it through
+    // Z_DUCKDB_QUERY, so there is no new SAP-side state table. (HLD §4.1.)
+    auto d = con.Query(
+        "CREATE TABLE IF NOT EXISTS _erpl_rev_delta_state ("
+        "target VARCHAR PRIMARY KEY, method VARCHAR NOT NULL, source_from VARCHAR NOT NULL, "
+        "keys VARCHAR NOT NULL, chg_col VARCHAR, wm_kind VARCHAR, wm_value VARCHAR, "
+        "safety_secs INTEGER DEFAULT 120, cadence VARCHAR DEFAULT 'nightly', extra VARCHAR, "
+        "last_run_ts TIMESTAMP, rows_applied BIGINT, status VARCHAR DEFAULT 'IDLE', "
+        "lease_ts TIMESTAMP, last_error VARCHAR)");
+    if (d->HasError())
+        throw std::runtime_error("DuckDB delta-state init failed: " + d->GetError());
     // Boot init: explicit init_sql (CLI/--init-file) wins; else env fallback. Runs
     // INSTALL/LOAD/CREATE SECRET/ATTACH so replication can publish to external
     // targets (parquet object stores, postgres, ducklake, bigquery, iceberg).
@@ -454,7 +467,8 @@ long long DuckDbBridge::IngestBxml(const std::string &target,
                                    const std::vector<std::string> &key_cols,
                                    const std::string &parquet_out,
                                    const std::string &init_sql,
-                                   const std::string &ddl) {
+                                   const std::string &ddl,
+                                   const std::string &op_col) {
     // Own connection: the staging TEMP table, the Appender and the INSERT…SELECT
     // all run on it, so concurrent ingests (async pipeline / partitioned loads)
     // don't collide (TEMP tables are connection-local) and don't serialize.
@@ -547,9 +561,18 @@ long long DuckDbBridge::IngestBxml(const std::string &target,
     // Use the target's actual (lowercased) column names everywhere. An UPPERCASE
     // target column list in `INSERT … (COLS) … ON CONFLICT` mis-maps the conflict
     // arbiter and nulls the key — lowercase (matching the stored names) is safe.
+    // Delta MERGE: the payload may carry a control op column (I/U/D). It is staged
+    // (so the DELETE can read it) but is NOT a target column — exclude it from the
+    // INSERT column list and the projection. mode==Merge with no op_col is a plain
+    // key-based upsert.
+    const std::string opl = LowerName(op_col);
+    const bool merge = (mode == IngestMode::Merge) && !opl.empty();
+    auto is_op = [&](const std::string &c) { return !opl.empty() && LowerName(c) == opl; };
+
     std::string proj;
     for (size_t i = 0; i < tbl.columns.size(); i++) {
-        if (i) proj += ",";
+        if (is_op(tbl.columns[i])) continue;
+        if (!proj.empty()) proj += ",";
         const std::string cn = LowerName(tbl.columns[i]);
         switch (coltypes[i].id()) {
             case duckdb::LogicalTypeId::BLOB:
@@ -569,32 +592,150 @@ long long DuckDbBridge::IngestBxml(const std::string &target,
                 break;
         }
     }
-    std::string ins = "INSERT INTO " + target + " (";
+    std::string collist;
     for (size_t i = 0; i < tbl.columns.size(); i++) {
-        if (i) ins += ",";
-        ins += LowerName(tbl.columns[i]);
+        if (is_op(tbl.columns[i])) continue;
+        if (!collist.empty()) collist += ",";
+        collist += LowerName(tbl.columns[i]);
     }
-    ins += ") SELECT " + proj + " FROM " + stg;
-    if (mode == IngestMode::Upsert && !key_cols.empty()) {
-        ins += " ON CONFLICT (";
-        for (size_t i = 0; i < key_cols.size(); i++) { if (i) ins += ","; ins += LowerName(key_cols[i]); }
-        ins += ") DO UPDATE SET ";
+    // ON CONFLICT DO UPDATE clause (shared by Upsert and Merge); empty when there
+    // are no non-key target columns to set.
+    auto conflict_clause = [&]() -> std::string {
+        std::string c = " ON CONFLICT (";
+        for (size_t i = 0; i < key_cols.size(); i++) { if (i) c += ","; c += LowerName(key_cols[i]); }
+        c += ") DO UPDATE SET ";
         bool first = true;
         for (auto &cn0 : tbl.columns) {
+            if (is_op(cn0)) continue;
             const std::string cn = LowerName(cn0);
             bool is_key = false;
             for (auto &k : key_cols) if (LowerName(k) == cn) { is_key = true; break; }
             if (is_key) continue;  // a key in DO UPDATE SET makes DuckDB null it
-            if (!first) ins += ",";
+            if (!first) c += ",";
             first = false;
-            ins += cn + "=excluded." + cn;
+            c += cn + "=excluded." + cn;
         }
+        return first ? std::string(" ON CONFLICT DO NOTHING") : c;
+    };
+
+    std::string ins = "INSERT INTO " + target + " (" + collist + ") SELECT " + proj +
+                      " FROM " + stg;
+    if (merge) ins += " WHERE lower(" + opl + ") IN ('i','u')";
+    if ((mode == IngestMode::Upsert || mode == IngestMode::Merge) && !key_cols.empty())
+        ins += conflict_clause();
+
+    if (merge) {
+        // Apply deletes then upserts in one transaction on this connection, so a
+        // failed cast (or any error) rolls back the whole package — no partial state.
+        std::string keytuple, keysel;
+        for (size_t i = 0; i < key_cols.size(); i++) {
+            const std::string k = LowerName(key_cols[i]);
+            if (i) { keytuple += ","; keysel += ","; }
+            keytuple += k;
+            // Staging keys are VARCHAR; cast them to the target key type so the
+            // `(keys) IN (SELECT keys …)` comparison is type-compatible.
+            auto it = tcol.find(k);
+            const bool textual = it == tcol.end() ||
+                                 it->second.id() == duckdb::LogicalTypeId::VARCHAR ||
+                                 it->second.id() == duckdb::LogicalTypeId::BLOB;
+            keysel += textual ? k : (k + "::" + it->second.ToString());
+        }
+        std::string del = "DELETE FROM " + target + " WHERE (" + keytuple + ") IN (SELECT " +
+                          keysel + " FROM " + stg + " WHERE lower(" + opl + ")='d')";
+        Exec(con, "BEGIN");
+        try {
+            if (!key_cols.empty()) Exec(con, del);
+            Exec(con, ins);
+            Exec(con, "COMMIT");
+        } catch (...) {
+            Exec(con, "ROLLBACK");
+            throw;
+        }
+    } else {
+        Exec(con, ins);
     }
-    Exec(con, ins);
 
     if (!parquet_out.empty())
         Exec(con, "COPY " + target + " TO " + SqlQuote(parquet_out) + " (FORMAT PARQUET)");
     return static_cast<long long>(tbl.rows.size());
+}
+
+SnapshotResult DuckDbBridge::SnapshotMerge(const std::string &target,
+                                           const std::string &staging,
+                                           const std::vector<std::string> &keys) {
+    duckdb::Connection con(*db_);
+
+    // Target columns (lowercased) for the DO UPDATE SET list.
+    auto desc = con.Query("SELECT * FROM " + target + " LIMIT 0");
+    if (desc->HasError())
+        throw std::runtime_error("DuckDB describe failed: " + desc->GetError());
+    std::vector<std::string> cols;
+    for (duckdb::idx_t c = 0; c < desc->ColumnCount(); c++)
+        cols.push_back(LowerName(desc->names[c]));
+
+    // Join predicate "a.k1 = b.k1 AND a.k2 = b.k2 …" for the anti-joins.
+    auto key_join = [&](const std::string &a, const std::string &b) {
+        std::string j;
+        for (size_t i = 0; i < keys.size(); i++) {
+            if (i) j += " AND ";
+            const std::string k = LowerName(keys[i]);
+            j += a + "." + k + " = " + b + "." + k;
+        }
+        return j;
+    };
+
+    // Exact ins/upd/del counts, computed from the pre-merge sets (cheap key-only
+    // anti-joins). ins = snapshot keys new to target; upd = keys in both;
+    // del = target keys absent from the snapshot.
+    SnapshotResult res;
+    {
+        const std::string ej = key_join("t", "s");
+        std::string q =
+            "SELECT "
+            "(SELECT count(*) FROM " + staging + " s WHERE NOT EXISTS "
+              "(SELECT 1 FROM " + target + " t WHERE " + ej + ")) AS ins,"
+            "(SELECT count(*) FROM " + staging + " s WHERE EXISTS "
+              "(SELECT 1 FROM " + target + " t WHERE " + ej + ")) AS upd,"
+            "(SELECT count(*) FROM " + target + " t WHERE NOT EXISTS "
+              "(SELECT 1 FROM " + staging + " s WHERE " + ej + ")) AS del";
+        auto cr = con.Query(q);
+        if (cr->HasError())
+            throw std::runtime_error("DuckDB snapshot count failed: " + cr->GetError());
+        res.ins = cr->GetValue(0, 0).GetValue<int64_t>();
+        res.upd = cr->GetValue(1, 0).GetValue<int64_t>();
+        res.del = cr->GetValue(2, 0).GetValue<int64_t>();
+    }
+
+    // Upsert all of staging + delete target keys absent from staging + drop the
+    // staging table, atomically. (HLD §4.3.)
+    std::string upsert = "INSERT INTO " + target + " SELECT * FROM " + staging + " ON CONFLICT (";
+    for (size_t i = 0; i < keys.size(); i++) { if (i) upsert += ","; upsert += LowerName(keys[i]); }
+    upsert += ")";
+    {
+        std::string set;
+        for (auto &cn : cols) {
+            bool is_key = false;
+            for (auto &k : keys) if (LowerName(k) == cn) { is_key = true; break; }
+            if (is_key) continue;
+            if (!set.empty()) set += ",";
+            set += cn + "=excluded." + cn;
+        }
+        upsert += set.empty() ? " DO NOTHING" : (" DO UPDATE SET " + set);
+    }
+    const std::string del = "DELETE FROM " + target + " t WHERE NOT EXISTS "
+                            "(SELECT 1 FROM " + staging + " s WHERE " + key_join("t", "s") + ")";
+
+    Exec(con, "BEGIN");
+    try {
+        Exec(con, upsert);
+        Exec(con, del);
+        Exec(con, "DROP TABLE " + staging);
+        Exec(con, "COMMIT");
+    } catch (...) {
+        Exec(con, "ROLLBACK");
+        throw;
+    }
+    return res;
 }
 
 } // namespace erpl_rev

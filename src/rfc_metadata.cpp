@@ -70,8 +70,26 @@ RFC_FUNCTION_DESC_HANDLE BuildIngestDesc() {
     AddParam(desc, "IV_DDL",           RFCTYPE_STRING,  RFC_IMPORT, 0, 0, true);
     AddParam(desc, "IV_DATA",          RFCTYPE_STRING,  RFC_IMPORT, 0, 0, true);
     AddParam(desc, "IV_XDATA",         RFCTYPE_XSTRING, RFC_IMPORT, 0, 0, true);
+    AddParam(desc, "IV_OP_COL",        RFCTYPE_STRING,  RFC_IMPORT, 0, 0, true);
     AddParam(desc, "EV_ROWS_AFFECTED", RFCTYPE_STRING,  RFC_EXPORT);
     AddParam(desc, "EV_ERROR",         RFCTYPE_STRING, RFC_EXPORT);
+    return desc;
+}
+
+RFC_FUNCTION_DESC_HANDLE BuildSnapshotMergeDesc() {
+    static RFC_FUNCTION_DESC_HANDLE desc = nullptr;
+    if (desc) return desc;
+    RFC_ERROR_INFO info;
+    auto uname = std2uc("Z_DUCKDB_SNAPSHOT_MERGE");
+    desc = RfcCreateFunctionDesc(uname.data(), &info);
+    if (!desc) throw_rfc("RfcCreateFunctionDesc(Z_DUCKDB_SNAPSHOT_MERGE)", info);
+    AddParam(desc, "IV_TARGET",  RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
+    AddParam(desc, "IV_STAGING", RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
+    AddParam(desc, "IV_KEYS",    RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
+    AddParam(desc, "EV_INS",     RFCTYPE_STRING, RFC_EXPORT);
+    AddParam(desc, "EV_UPD",     RFCTYPE_STRING, RFC_EXPORT);
+    AddParam(desc, "EV_DEL",     RFCTYPE_STRING, RFC_EXPORT);
+    AddParam(desc, "EV_ERROR",   RFCTYPE_STRING, RFC_EXPORT);
     return desc;
 }
 
