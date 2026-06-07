@@ -809,6 +809,80 @@ TEST_CASE("CDC state: survives a restart (file-backed)", "[bridge][cdc][state]")
     std::remove((path + ".wal").c_str());
 }
 
+TEST_CASE("CDC apply: delete-only batch removes keys + advances position", "[bridge][cdc][apply]") {
+    DuckDbBridge db;
+    db.Execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, v VARCHAR)");
+    db.Execute("INSERT INTO t1 VALUES (1,'a'),(2,'b'),(3,'c')");
+    db.CdcRegister("t1", "T1", "id", "HANA", "DELETE_ONLY", "ZCDC_T1_LOG");
+    db.CdcSetStatus("t1", "SEEDED");
+    // delete-only staging carries keys + op + seq only.
+    db.Execute("CREATE TABLE log1(id INTEGER, \"_op\" VARCHAR, \"_seq\" BIGINT)");
+    db.Execute("INSERT INTO log1 VALUES (1,'D',1),(3,'D',2)");
+
+    CdcApplyResult r = db.CdcApply("t1", "log1", {"id"});
+    REQUIRE(r.applied);
+    REQUIRE(r.del == 2);
+    REQUIRE(r.ins == 0);
+    REQUIRE(r.upd == 0);
+    REQUIRE(r.prune_bound == 2);
+    REQUIRE(db.Query("SELECT count(*) AS c FROM t1").rows[0] == R"({"c":1})");
+    REQUIRE(db.Query("SELECT v FROM t1").rows[0] == R"({"v":"b"})");
+    REQUIRE(db.CdcGet("t1").position == 2);
+    REQUIRE(db.CdcGet("t1").status == "ACTIVE");
+    REQUIRE(db.Query("SELECT count(*) AS c FROM duckdb_tables() WHERE table_name='log1'").rows[0]
+            == R"({"c":0})");   // staging dropped
+}
+
+TEST_CASE("CDC apply: coalesces interleaved I/U/D per key to the net op", "[bridge][cdc][apply]") {
+    DuckDbBridge db;
+    db.Execute("CREATE TABLE t2(id INTEGER PRIMARY KEY, v VARCHAR)");
+    db.Execute("INSERT INTO t2 VALUES (2,'b'),(3,'c')");   // id1 absent; id2,id3 present
+    db.CdcRegister("t2", "T2", "id", "HANA", "FULL_IUD", "ZCDC_T2_LOG");
+    db.CdcSetStatus("t2", "SEEDED");
+    // full-IUD staging carries the row image. id1: D then I -> net I; id2: U; id3: I then D -> net D.
+    db.Execute("CREATE TABLE log2(id INTEGER, v VARCHAR, \"_op\" VARCHAR, \"_seq\" BIGINT)");
+    db.Execute("INSERT INTO log2 VALUES "
+               "(1,NULL,'D',1),(1,'x','I',2),"
+               "(2,'B','U',3),"
+               "(3,'c','I',4),(3,NULL,'D',5)");
+
+    CdcApplyResult r = db.CdcApply("t2", "log2", {"id"});
+    REQUIRE(r.ins == 1);   // id1 new
+    REQUIRE(r.upd == 1);   // id2 existing
+    REQUIRE(r.del == 1);   // id3 net delete (was present)
+    REQUIRE(r.prune_bound == 5);
+    REQUIRE(db.Query("SELECT count(*) AS c FROM t2").rows[0] == R"({"c":2})");
+    REQUIRE(db.Query("SELECT v FROM t2 WHERE id=1").rows[0] == R"({"v":"x"})");
+    REQUIRE(db.Query("SELECT v FROM t2 WHERE id=2").rows[0] == R"({"v":"B"})");
+    REQUIRE(db.Query("SELECT count(*) AS c FROM t2 WHERE id=3").rows[0] == R"({"c":0})");
+}
+
+TEST_CASE("CDC apply: empty batch is a no-op (position unchanged)", "[bridge][cdc][apply]") {
+    DuckDbBridge db;
+    db.Execute("CREATE TABLE t3(id INTEGER PRIMARY KEY)");
+    db.CdcRegister("t3", "T3", "id", "HANA", "DELETE_ONLY", "L");
+    db.CdcAdvancePosition("t3", 7);
+    db.Execute("CREATE TABLE log3(id INTEGER, \"_op\" VARCHAR, \"_seq\" BIGINT)");   // empty
+    CdcApplyResult r = db.CdcApply("t3", "log3", {"id"});
+    REQUIRE_FALSE(r.applied);
+    REQUIRE(r.prune_bound == 7);
+    REQUIRE(db.CdcGet("t3").position == 7);
+}
+
+TEST_CASE("CDC apply: an error rolls back, position untouched", "[bridge][cdc][apply]") {
+    DuckDbBridge db;
+    db.Execute("CREATE TABLE t4(id INTEGER PRIMARY KEY, v INTEGER NOT NULL)");
+    db.Execute("INSERT INTO t4 VALUES (1,10)");
+    db.CdcRegister("t4", "T4", "id", "HANA", "FULL_IUD", "L");
+    db.CdcSetStatus("t4", "SEEDED");
+    // a net insert with NULL in a NOT NULL column -> the upsert fails mid-transaction.
+    db.Execute("CREATE TABLE log4(id INTEGER, v INTEGER, \"_op\" VARCHAR, \"_seq\" BIGINT)");
+    db.Execute("INSERT INTO log4 VALUES (2,NULL,'I',5)");
+    REQUIRE_THROWS(db.CdcApply("t4", "log4", {"id"}));
+    REQUIRE(db.CdcGet("t4").position == 0);                                   // not advanced
+    REQUIRE(db.Query("SELECT count(*) AS c FROM t4").rows[0] == R"({"c":1})"); // id2 not inserted
+}
+
 TEST_CASE("IngestBxml MERGE: op_col drives insert/update/delete", "[bridge][ingest][merge]") {
     DuckDbBridge db;
     std::string ddl = "CREATE TABLE IF NOT EXISTS m(id INTEGER PRIMARY KEY, v VARCHAR);";

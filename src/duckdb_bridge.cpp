@@ -862,4 +862,123 @@ void DuckDbBridge::CdcAdvancePosition(const std::string &target, long long posit
               " WHERE target=" + SqlLit(target));
 }
 
+CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::string &staging,
+                                      const std::vector<std::string> &keys) {
+    CdcState st = CdcGet(target);
+    if (!st.exists) throw std::runtime_error("CDC: no registration for " + target);
+    CdcApplyResult res;
+    res.prune_bound = st.position;   // nothing applied yet -> don't prune past here
+
+    duckdb::Connection con(*db_);
+
+    // Max consumed sequence in this batch (the new position / prune bound). An empty
+    // staging table is a no-op: drop it and return with the position unchanged.
+    auto mq = con.Query("SELECT max(\"_seq\") FROM " + staging);
+    if (mq->HasError())
+        throw std::runtime_error("CDC: staging read failed: " + mq->GetError());
+    if (mq->RowCount() == 0 || mq->GetValue(0, 0).IsNull()) {
+        Exec(con, "DROP TABLE IF EXISTS " + staging);
+        return res;   // applied=false
+    }
+    const long long max_seq = mq->GetValue(0, 0).GetValue<int64_t>();
+
+    // Lower-cased key list (DuckDB stores unquoted identifiers lower case).
+    std::vector<std::string> kl;
+    for (auto &k : keys) kl.push_back(LowerName(k));
+    std::string keycsv;
+    for (size_t i = 0; i < kl.size(); i++) { if (i) keycsv += ","; keycsv += kl[i]; }
+
+    // Coalesce: the latest staging row per key (highest "_seq" wins). Out-of-order
+    // or duplicate sequences resolve deterministically by the window order.
+    const std::string coalesced =
+        "(SELECT * FROM " + staging +
+        " QUALIFY row_number() OVER (PARTITION BY " + keycsv + " ORDER BY \"_seq\" DESC)=1)";
+
+    auto key_join = [&](const std::string &a, const std::string &b) {
+        std::string j;
+        for (size_t i = 0; i < kl.size(); i++) {
+            if (i) j += " AND ";
+            j += a + "." + kl[i] + " = " + b + "." + kl[i];
+        }
+        return j;
+    };
+
+    // Net-op subsets of the coalesced batch.
+    const std::string net_del = "(SELECT * FROM " + coalesced + " c WHERE lower(c.\"_op\")='d')";
+    const std::string net_iu  = "(SELECT * FROM " + coalesced + " c WHERE lower(c.\"_op\") IN ('i','u'))";
+
+    // Data columns to upsert = target columns also present in staging (so delete-only
+    // staging, which carries only keys, yields a keys-only upsert == DO NOTHING).
+    auto tcols = con.Query("SELECT * FROM " + target + " LIMIT 0");
+    if (tcols->HasError()) throw std::runtime_error("CDC: target describe failed: " + tcols->GetError());
+    auto scols = con.Query("SELECT * FROM " + staging + " LIMIT 0");
+    if (scols->HasError()) throw std::runtime_error("CDC: staging describe failed: " + scols->GetError());
+    std::vector<std::string> sset;
+    for (duckdb::idx_t c = 0; c < scols->ColumnCount(); c++) sset.push_back(LowerName(scols->names[c]));
+    auto in_staging = [&](const std::string &n) {
+        for (auto &s : sset) if (s == n) return true; return false;
+    };
+    std::vector<std::string> dcols;
+    for (duckdb::idx_t c = 0; c < tcols->ColumnCount(); c++) {
+        std::string n = LowerName(tcols->names[c]);
+        if (in_staging(n)) dcols.push_back(n);
+    }
+
+    // Counts (pre-apply, key-only anti-joins): del = net-deletes present in target;
+    // ins = net-I/U keys new to target; upd = net-I/U keys already present.
+    {
+        const std::string dj = key_join("t", "c");
+        auto cr = con.Query(
+            "SELECT "
+            "(SELECT count(*) FROM " + net_del + " c WHERE EXISTS (SELECT 1 FROM " + target +
+              " t WHERE " + dj + ")) AS del,"
+            "(SELECT count(*) FROM " + net_iu + " c WHERE NOT EXISTS (SELECT 1 FROM " + target +
+              " t WHERE " + dj + ")) AS ins,"
+            "(SELECT count(*) FROM " + net_iu + " c WHERE EXISTS (SELECT 1 FROM " + target +
+              " t WHERE " + dj + ")) AS upd");
+        if (cr->HasError()) throw std::runtime_error("CDC: count failed: " + cr->GetError());
+        res.del = cr->GetValue(0, 0).GetValue<int64_t>();
+        res.ins = cr->GetValue(1, 0).GetValue<int64_t>();
+        res.upd = cr->GetValue(2, 0).GetValue<int64_t>();
+    }
+
+    // Atomic apply: delete net-deletes, upsert net-I/U, advance position + mark ACTIVE,
+    // drop staging. Any error rolls all of it back (position stays where it was).
+    const std::string del_sql =
+        "DELETE FROM " + target + " t WHERE EXISTS (SELECT 1 FROM " + net_del +
+        " c WHERE " + key_join("t", "c") + ")";
+
+    std::string ups_sql;
+    if (!dcols.empty()) {
+        std::string collist, setlist;
+        for (size_t i = 0; i < dcols.size(); i++) { if (i) collist += ","; collist += dcols[i]; }
+        for (auto &cn : dcols) {
+            bool is_key = false;
+            for (auto &k : kl) if (k == cn) { is_key = true; break; }
+            if (is_key) continue;
+            if (!setlist.empty()) setlist += ",";
+            setlist += cn + "=excluded." + cn;
+        }
+        ups_sql = "INSERT INTO " + target + " (" + collist + ") SELECT " + collist +
+                  " FROM " + net_iu + " c ON CONFLICT (" + keycsv + ")" +
+                  (setlist.empty() ? " DO NOTHING" : (" DO UPDATE SET " + setlist));
+    }
+
+    Exec(con, "BEGIN");
+    try {
+        Exec(con, del_sql);
+        if (!ups_sql.empty()) Exec(con, ups_sql);
+        Exec(con, "UPDATE _erpl_rev_cdc SET position=" + std::to_string(max_seq) +
+                  ", last_run_ts=now(), status='ACTIVE' WHERE target=" + SqlLit(target));
+        Exec(con, "DROP TABLE " + staging);
+        Exec(con, "COMMIT");
+    } catch (...) {
+        Exec(con, "ROLLBACK");
+        throw;
+    }
+    res.prune_bound = max_seq;
+    res.applied = true;
+    return res;
+}
+
 } // namespace erpl_rev
