@@ -41,6 +41,9 @@ run() { adt object run "$1" 2>&1 | tr -cd 'A-Za-z0-9 ={}_.:()[] \n-'; }
 echo "== example data: wide BSEG-shaped table (420 cols) =="
 tabl ZWIDE_BSEG zwide_bseg.ddl "wide BSEG repro (erpl-rev)"
 cls  ZCL_WIDE_BSEG zcl_wide_bseg.abap "populate ZWIDE_BSEG"
+
+echo "== delta test table (numeric watermark column) =="
+tabl ZDELTA_WM zdelta_wm.ddl "delta watermark test table (erpl-rev)"
 # Populate only if empty/absent (100k rows ~ tens of seconds). Uncomment to seed:
 #   run ZCL_WIDE_BSEG | grep -aiE 'populated|rows'
 
@@ -50,6 +53,8 @@ intf ZIF_ERPL_REV_PROGRESS zif_erpl_rev_progress.intf.abap "replicate progress c
 echo "== classes (typemap + interface before util — util depends on them) =="
 cls ZCL_ERPL_REV_TYPEMAP  zcl_erpl_rev_typemap.abap  "DDIC<->DuckDB type map"
 cls ZCL_ERPL_REV_UTIL     zcl_erpl_rev_util.abap     "query/describe/replicate"
+cls ZCL_ERPL_REV_DELTA    zcl_erpl_rev_delta.abap    "delta engine (state + 4 readers)"
+cls ZCL_ERPL_REV_DELTADRV zcl_erpl_rev_deltadrv.abap "delta change-injection driver"
 cls ZCL_ERPL_REV_MKFM     zcl_erpl_rev_mkfm.abap     "create RFC FMs"
 cls ZCL_ERPL_REV_SETUP    zcl_erpl_rev_setup.abap    "create registered dest"
 cls ZCL_ERPL_REV_TYPETEST zcl_erpl_rev_typetest.abap "typemap tests"
@@ -63,6 +68,7 @@ cls ZCL_ERPL_REV_PARTEST  zcl_erpl_rev_partest.abap  "partitioned full-load + au
 cls ZCL_ERPL_REV_PUBTEST  zcl_erpl_rev_pubtest.abap  "external target publish (parquet/dataset/attached catalog)"
 cls ZCL_ERPL_REV_CDSTEST  zcl_erpl_rev_cdstest.abap  "CDS view source (describe/keys/params/discovery/publish)"
 cls ZCL_ERPL_REV_BWTEST   zcl_erpl_rev_bwtest.abap   "BW/native (ADBC) source vs a HANA-view stand-in"
+cls ZCL_ERPL_REV_DELTATEST zcl_erpl_rev_deltatest.abap "delta E2E (watermark/snapshot/changedoc/insert-only/orchestration)"
 # NB: the CDS source tests need the DDLS fixtures ZERPL_C_FLIGHTS + ZERPL_CP_FLIGHTS
 # (abap/zerpl_c_flights.ddls.abap, abap/zerpl_cp_flights.ddls.abap) deployed once via
 # `erpl-adt object create --type DDLS/DF` + `source write --type DDLS --activate`
@@ -72,6 +78,8 @@ echo "== reports (worker before the report — the parallel report SUBMITs it) =
 prog Z_ERPL_REV_REPL_WORKER z_erpl_rev_repl_worker.prog.abap "parallel-replication worker (one key range)"
 prog Z_ERPL_REV_REPLICATE z_erpl_rev_replicate.prog.abap "replicate SAP table -> DuckDB (serial + parallel)"
 prog Z_ERPL_REV_SQL       z_erpl_rev_sql.prog.abap       "DuckDB SQL console (docking-container UI)"
+prog Z_ERPL_REV_DELTA     z_erpl_rev_delta.prog.abap     "delta orchestration loop (cadence + lease)"
+prog Z_ERPL_REV_DELTA_SFLIGHT z_erpl_rev_delta_sflight.prog.abap "SFLIGHT delta demo (load/change/run/inspect, GUI)"
 
 echo "== report-path E2E classrun (SUBMITs the report's parallel branch) =="
 cls ZCL_ERPL_REV_REPLRUN  zcl_erpl_rev_replrun.abap  "Z_ERPL_REV_REPLICATE parallel-branch E2E"

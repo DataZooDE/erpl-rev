@@ -17,6 +17,9 @@
 *&---------------------------------------------------------------------*
 REPORT z_erpl_rev_replicate.
 
+TYPE-POOLS vrm.   " VRM_SET_VALUES (dropdown listbox values for the Delta tab)
+TYPES ty_meth TYPE c LENGTH 12.   " a LISTBOX + USER-COMMAND param can't carry an inline length
+
 " Labels live in comment variables (filled at INITIALIZATION) so the screen
 " reads in plain language without a maintained text pool. p_cols/p_where/
 " p_target/p_init are LOWER CASE so values keep their case (a filter literal
@@ -28,6 +31,7 @@ SELECTION-SCREEN BEGIN OF TABBED BLOCK tabb FOR 14 LINES.
   SELECTION-SCREEN TAB (22) ts_tgt USER-COMMAND ts2 DEFAULT SCREEN 0200.
   SELECTION-SCREEN TAB (22) ts_par USER-COMMAND ts3 DEFAULT SCREEN 0300.
   SELECTION-SCREEN TAB (22) ts_ext USER-COMMAND ts4 DEFAULT SCREEN 0400.
+  SELECTION-SCREEN TAB (22) ts_dlt USER-COMMAND ts5 DEFAULT SCREEN 0500.
 SELECTION-SCREEN END OF BLOCK tabb.
 
 " MODIF ID groups drive show/hide in AT SELECTION-SCREEN OUTPUT:
@@ -173,12 +177,54 @@ SELECTION-SCREEN BEGIN OF BLOCK ext WITH FRAME TITLE t_ext.
 SELECTION-SCREEN END OF BLOCK ext.
 SELECTION-SCREEN END OF SCREEN 0400.
 
+SELECTION-SCREEN BEGIN OF SCREEN 0500 AS SUBSCREEN.
+" Delta (incremental): after this (full) load — the SEED — register the DuckDB target
+" in _erpl_rev_delta_state so future runs load only what changed, and optionally
+" install the heartbeat background job that drives it. Applies to a local DuckDB
+" target (External target = DuckDB table). Press F1 on any field for an explanation.
+SELECTION-SCREEN BEGIN OF BLOCK dlt WITH FRAME TITLE t_dlt.
+  SELECTION-SCREEN BEGIN OF LINE.
+    SELECTION-SCREEN COMMENT 1(28) c_dlt FOR FIELD p_dlt.
+    PARAMETERS p_dlt AS CHECKBOX.
+  SELECTION-SCREEN END OF LINE.
+  SELECTION-SCREEN BEGIN OF LINE.
+    SELECTION-SCREEN COMMENT 1(28) c_dmeth FOR FIELD p_dmeth.
+    PARAMETERS p_dmeth TYPE ty_meth AS LISTBOX VISIBLE LENGTH 48 USER-COMMAND dm DEFAULT 'SNAPSHOT'.
+  SELECTION-SCREEN END OF LINE.
+  SELECTION-SCREEN BEGIN OF LINE.
+    SELECTION-SCREEN COMMENT 1(28) c_dwm FOR FIELD p_dwm MODIF ID dwm.
+    PARAMETERS p_dwm(30) TYPE c MODIF ID dwm.
+  SELECTION-SCREEN END OF LINE.
+  SELECTION-SCREEN BEGIN OF LINE.
+    SELECTION-SCREEN COMMENT 1(28) c_dwmk FOR FIELD p_dwmk MODIF ID dwm.
+    PARAMETERS p_dwmk(10) TYPE c AS LISTBOX VISIBLE LENGTH 48 DEFAULT 'NUMTS' MODIF ID dwm.
+  SELECTION-SCREEN END OF LINE.
+  SELECTION-SCREEN BEGIN OF LINE.
+    SELECTION-SCREEN COMMENT 1(28) c_dxtra FOR FIELD p_dxtra MODIF ID dxt.
+    PARAMETERS p_dxtra(60) TYPE c LOWER CASE MODIF ID dxt.
+  SELECTION-SCREEN END OF LINE.
+  SELECTION-SCREEN BEGIN OF LINE.
+    SELECTION-SCREEN COMMENT 1(28) c_djob FOR FIELD p_djobs MODIF ID dsn.
+    PARAMETERS p_djobs TYPE i DEFAULT 1 MODIF ID dsn.    " parallel workers for the SNAPSHOT reload
+  SELECTION-SCREEN END OF LINE.
+  SELECTION-SCREEN BEGIN OF LINE.
+    SELECTION-SCREEN COMMENT 1(28) c_dcad FOR FIELD p_dcad.
+    PARAMETERS p_dcad(20) TYPE c AS LISTBOX VISIBLE LENGTH 48 DEFAULT 'nightly'.
+  SELECTION-SCREEN END OF LINE.
+  SELECTION-SCREEN BEGIN OF LINE.
+    SELECTION-SCREEN COMMENT 1(28) c_dsch FOR FIELD p_dsch.
+    PARAMETERS p_dsch AS CHECKBOX.
+  SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN END OF BLOCK dlt.
+SELECTION-SCREEN END OF SCREEN 0500.
+
 *----------------------------------------------------------------------*
 INITIALIZATION.
   ts_src = 'Source'.
   ts_tgt = 'Target & options'.
   ts_par = 'Parallel load'.
   ts_ext = 'External target'.
+  ts_dlt = 'Delta & schedule'.
   t_src    = 'Source (what to replicate)'.
   t_tgt    = 'Target & options'.
   c_tab    = 'Source Table / CDS View'.
@@ -209,6 +255,15 @@ INITIALIZATION.
   c_kt     = 'Table in attached catalog'.
   c_dest   = 'Destination (path / ref)'.
   c_part   = 'Parquet partition by'.
+  t_dlt    = 'Delta (incremental) + periodic schedule'.
+  c_dlt    = 'Register as delta target'.
+  c_dmeth  = 'Method (F1 = explain)'.
+  c_dwm    = 'Watermark column (F4)'.
+  c_dwmk   = 'Watermark kind'.
+  c_dxtra  = 'Change-doc object (JSON)'.
+  c_djob   = 'Parallel jobs (reload)'.
+  c_dcad   = 'Refresh interval'.
+  c_dsch   = 'Run it automatically (job)'.
 
 *----------------------------------------------------------------------*
 * F4: search DDIC tables by the pattern currently typed into P_TAB.
@@ -217,13 +272,59 @@ AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_tab.
 
 * F4: multi-pick the columns of the table currently in P_TAB (into P_COLS / P_SKEY).
 AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_cols.
-  PERFORM f4_columns USING 'P_COLS'.
+  PERFORM f4_columns USING 'P_COLS' abap_true.
 AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_skey.
-  PERFORM f4_columns USING 'P_SKEY'.
+  PERFORM f4_columns USING 'P_SKEY' abap_true.
+* F4: single-pick the watermark column from the source table's columns (Delta tab).
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_dwm.
+  PERFORM f4_columns USING 'P_DWM' abap_false.
 
 * F4: browse HANA catalog objects (views / functions, incl. _SYS_BIC calc views).
 AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_nfrom.
   PERFORM f4_nfrom.
+
+* F1: plain-language help for the Delta tab fields (press F1 on the field). The text
+* is passed in pieces (one short source line each) and joined in FORM help.
+AT SELECTION-SCREEN ON HELP-REQUEST FOR p_dlt.
+  PERFORM help USING 'Register as delta target'
+    'After this full load (the SEED), register the DuckDB target so future runs load only'
+    ' what CHANGED instead of reloading everything. Leave off for a plain one-off load.'
+    ''.
+AT SELECTION-SCREEN ON HELP-REQUEST FOR p_dmeth.
+  PERFORM help USING 'Delta method'
+    'How changes are detected. SNAPSHOT: reload + compare - the only method that catches physical DELETES (good default for small/medium tables).'
+    ' WATERMARK: read rows where a change column exceeds the last high-water (needs a timestamp/sequence column).'
+    ' CHANGEDOC / INSERT_ONLY: driven by SAP change documents (CDHDR/CDPOS).'.
+AT SELECTION-SCREEN ON HELP-REQUEST FOR p_dwm.
+  PERFORM help USING 'Watermark column'
+    'For WATERMARK: the source column whose values only ever grow (a UTC timestamp or a sequence).'
+    ' Each cycle reads the rows where this column is greater than the last value seen.'
+    ''.
+AT SELECTION-SCREEN ON HELP-REQUEST FOR p_dwmk.
+  PERFORM help USING 'Watermark kind'
+    'The type of the watermark column, so the high-water compares correctly.'
+    ' NUMTS = numeric timestamp, DATETIME = date+time pair, CHANGENR = change number,'
+    ' INT = integer, DATE = date only (coarse - nightly only).'.
+AT SELECTION-SCREEN ON HELP-REQUEST FOR p_dxtra.
+  PERFORM help USING 'Change-document object'
+    'For CHANGEDOC / INSERT_ONLY: which change-document object class to read, as JSON,'
+    ' e.g. {"objectclas":"MATERIAL"}.'
+    ''.
+AT SELECTION-SCREEN ON HELP-REQUEST FOR p_djobs.
+  PERFORM help USING 'Parallel jobs (SNAPSHOT reload)'
+    'SNAPSHOT reloads the whole table each cycle. With > 1, that reload runs across this many'
+    ' background workers (same engine as the parallel full load), partitioned on a numeric key'
+    ' column - useful for large tables. 1 = serial. Needs free batch work processes.'.
+AT SELECTION-SCREEN ON HELP-REQUEST FOR p_dcad.
+  PERFORM help USING 'Refresh interval'
+    'How fresh this target is kept - a delta cycle for it runs about this often.'
+    ' It is ALSO the period for the background job below when you tick "Run it automatically".'
+    ' Pick "manual" to never auto-run it.'.
+AT SELECTION-SCREEN ON HELP-REQUEST FOR p_dsch.
+  PERFORM help USING 'Run it automatically (background job)'
+    'Install (or re-time) ONE SAP background job that wakes every "Refresh interval" and runs all DUE delta targets.'
+    ' It is the supported way to run delta on a schedule - monitor/stop it in SM37 (job ERPL_REV_DELTA).'
+    ' Off = run delta by hand (report Z_ERPL_REV_DELTA).'.
 
 *----------------------------------------------------------------------*
 * Validate on Execute (sy-ucomm='ONLI') only — not on the USER-COMMAND toggles
@@ -254,6 +355,32 @@ AT SELECTION-SCREEN OUTPUT.
   " CDS-only fields appear only when the entered source is actually a CDS view.
   DATA(lv_src_cds) = COND abap_bool(
     WHEN p_bw = abap_false THEN zcl_erpl_rev_util=>is_cds( p_tab ) ELSE abap_false ).
+
+  " Delta tab dropdowns (method / watermark-kind / refresh interval). The option
+  " texts are the explanation; the stored key is the value used at registration.
+  DATA lt_vrm TYPE vrm_values.
+  lt_vrm = VALUE #(
+    ( key = 'SNAPSHOT'    text = 'SNAPSHOT - reload + compare; catches deletes' )
+    ( key = 'WATERMARK'   text = 'WATERMARK - rows where a change column > last seen' )
+    ( key = 'CHANGEDOC'   text = 'CHANGEDOC - via CDHDR change docs, re-read by key' )
+    ( key = 'INSERT_ONLY' text = 'INSERT_ONLY - append-only via CDHDR change numbers' ) ).
+  CALL FUNCTION 'VRM_SET_VALUES' EXPORTING id = 'P_DMETH' values = lt_vrm.
+  lt_vrm = VALUE #(
+    ( key = 'NUMTS'    text = 'NUMTS - numeric UTC timestamp' )
+    ( key = 'DATETIME' text = 'DATETIME - date + time pair' )
+    ( key = 'CHANGENR' text = 'CHANGENR - change-document number' )
+    ( key = 'INT'      text = 'INT - monotonic integer sequence' )
+    ( key = 'DATE'     text = 'DATE - date only (nightly only)' ) ).
+  CALL FUNCTION 'VRM_SET_VALUES' EXPORTING id = 'P_DWMK' values = lt_vrm.
+  lt_vrm = VALUE #(
+    ( key = 'micro:60'   text = 'every minute' )
+    ( key = 'micro:300'  text = 'every 5 minutes' )
+    ( key = 'micro:1800' text = 'every 30 minutes' )
+    ( key = 'hourly'     text = 'hourly' )
+    ( key = 'nightly'    text = 'nightly (once a day)' )
+    ( key = 'manual'     text = 'manual (only when you run it)' ) ).
+  CALL FUNCTION 'VRM_SET_VALUES' EXPORTING id = 'P_DCAD' values = lt_vrm.
+
   LOOP AT SCREEN.
     " BW/native vs Open-SQL source: show one path, hide the other.
     IF screen-group1 = 'BWN'.
@@ -271,6 +398,15 @@ AT SELECTION-SCREEN OUTPUT.
     " External target: destination unless DuckDB; partition-by only for parquet.
     IF screen-name = 'P_DEST'. screen-input = COND i( WHEN r_kd = abap_true THEN 0 ELSE 1 ). ENDIF.
     IF screen-name = 'P_PART'. screen-input = COND i( WHEN r_kp = abap_true THEN 1 ELSE 0 ). ENDIF.
+    " Delta tab: show only the fields the chosen method needs (watermark column/kind
+    " for WATERMARK; change-document object for CHANGEDOC / INSERT_ONLY).
+    IF screen-group1 = 'DWM'.
+      screen-active = COND i( WHEN p_dmeth = 'WATERMARK' THEN 1 ELSE 0 ).
+    ELSEIF screen-group1 = 'DXT'.
+      screen-active = COND i( WHEN p_dmeth = 'CHANGEDOC' OR p_dmeth = 'INSERT_ONLY' THEN 1 ELSE 0 ).
+    ELSEIF screen-group1 = 'DSN'.
+      screen-active = COND i( WHEN p_dmeth = 'SNAPSHOT' THEN 1 ELSE 0 ).
+    ENDIF.
     MODIFY SCREEN.
   ENDLOOP.
 
@@ -583,7 +719,77 @@ START-OF-SELECTION.
       WRITE: / |  { 'Verify' WIDTH = 16 } : MISMATCH (SAP { lv_total }, target { ls_cnt-rows })|.
     ENDIF.
   ENDIF.
+
+  " ---- delta: register the just-loaded target as incremental + optional cron ----
+  " The full load above is the SEED; from here future runs load only what changed.
+  IF p_dlt = abap_true.
+    ULINE.
+    IF lv_kind <> 'D'.
+      WRITE: / '  DELTA: skipped — delta tracks a local DuckDB target' &&
+               ' (set External target = DuckDB table).'.
+    ELSE.
+      DATA(lv_meth) = to_upper( condense( CONV string( p_dmeth ) ) ).
+      DATA(ls_dd)   = zcl_erpl_rev_util=>describe_table( iv_tab = p_tab iv_target = lv_local ).
+      " WATERMARK/INSERT_ONLY: seed the high-water from the current source max so the
+      " first delta cycle only picks up changes made AFTER registration.
+      DATA lv_wmv TYPE string.
+      IF ( lv_meth = 'WATERMARK' OR lv_meth = 'INSERT_ONLY' ) AND p_dwm IS NOT INITIAL.
+        DATA lv_mx TYPE p LENGTH 11 DECIMALS 7.
+        DATA lt_mx TYPE string_table.
+        APPEND |max( { p_dwm } )| TO lt_mx.
+        TRY.
+            SELECT SINGLE (lt_mx) FROM (p_tab) INTO @lv_mx.
+            lv_wmv = condense( |{ lv_mx }| ).
+          CATCH cx_root ##NO_HANDLER.
+        ENDTRY.
+      ENDIF.
+      " extra JSON is method-specific: change-doc object for CHANGEDOC/INSERT_ONLY;
+      " a parallel-reload hint {"jobs":N} for a SNAPSHOT with > 1 worker.
+      DATA(lv_extra) = condense( CONV string( p_dxtra ) ).
+      IF lv_meth = 'SNAPSHOT' AND p_djobs > 1.
+        lv_extra = |\{ "jobs": { p_djobs } \}|.
+      ENDIF.
+      DATA(lv_rerr) = zcl_erpl_rev_delta=>register( VALUE #(
+        target      = lv_local
+        method      = lv_meth
+        source_from = condense( CONV string( p_tab ) )
+        keys        = ls_dd-keys
+        chg_col     = condense( CONV string( p_dwm ) )
+        wm_kind     = condense( CONV string( p_dwmk ) )
+        wm_value    = lv_wmv
+        cadence     = condense( CONV string( p_dcad ) )
+        extra       = lv_extra ) ).
+      IF lv_rerr IS INITIAL.
+        WRITE: / |  DELTA: registered '{ lv_local }' as { lv_meth }| &&
+                 | (keys { ls_dd-keys }, cadence { p_dcad }).|.
+      ELSE.
+        WRITE: / |  DELTA: register error: { lv_rerr }|.
+      ENDIF.
+    ENDIF.
+  ENDIF.
+  IF p_dsch = abap_true.
+    " One setting drives both: the background-job period = the chosen refresh interval.
+    DATA(lv_jobmin) = zcl_erpl_rev_delta=>cadence_minutes( CONV string( p_dcad ) ).
+    IF lv_jobmin > 0.
+      WRITE: / |  DELTA: { zcl_erpl_rev_delta=>schedule( iv_minutes = lv_jobmin ) }|.
+    ELSE.
+      WRITE: / |  DELTA: refresh interval is 'manual' — no background job scheduled.|.
+    ENDIF.
+  ENDIF.
   ULINE.
+
+*&---------------------------------------------------------------------*
+*&      Form  help — F1 explanation popup for a Delta-tab field
+*&---------------------------------------------------------------------*
+FORM help USING iv_title TYPE clike iv_t1 TYPE clike iv_t2 TYPE clike iv_t3 TYPE clike.
+  DATA lv_answer TYPE c LENGTH 1.
+  CALL FUNCTION 'POPUP_TO_CONFIRM'
+    EXPORTING titlebar              = CONV string( iv_title )
+              text_question         = |{ iv_t1 }{ iv_t2 }{ iv_t3 }|
+              display_cancel_button = abap_false
+    IMPORTING answer                = lv_answer
+    EXCEPTIONS OTHERS               = 0.
+ENDFORM.
 
 *&---------------------------------------------------------------------*
 *&      Form  f4_table — value help for the source table
@@ -621,9 +827,16 @@ ENDFORM.
 *&---------------------------------------------------------------------*
 *&      Form  f4_columns — multi-pick the columns of the chosen table
 *&---------------------------------------------------------------------*
-FORM f4_columns USING iv_target TYPE csequence ##CALLED.
+FORM f4_columns USING iv_target TYPE csequence
+                      iv_multi  TYPE abap_bool ##CALLED.
   DATA lv_tab TYPE string.
   PERFORM read_screen_field USING 'P_TAB' CHANGING lv_tab.
+  " When invoked from another subscreen (e.g. the Delta tab's watermark column),
+  " P_TAB isn't on the current dynpro, so DYNP_VALUES_READ returns nothing — fall
+  " back to the global parameter, already transported when the tab was switched.
+  IF lv_tab IS INITIAL.
+    lv_tab = condense( CONV string( p_tab ) ).
+  ENDIF.
   IF lv_tab IS INITIAL.
     MESSAGE 'Enter (or F4-pick) the source table first' TYPE 'S'.
     RETURN.
@@ -640,7 +853,8 @@ FORM f4_columns USING iv_target TYPE csequence ##CALLED.
   ENDLOOP.
 
   " multiple_choice='X': the user ticks several rows; we join the picks into a
-  " comma list and push it into P_COLS.
+  " comma list and push it back. A single-pick caller (e.g. the watermark column)
+  " passes iv_multi=space and gets exactly one value written.
   DATA lt_ret TYPE STANDARD TABLE OF ddshretval.
   CALL FUNCTION 'F4IF_INT_TABLE_VALUE_REQUEST'
     EXPORTING  retfield        = 'FIELDNAME'
@@ -648,7 +862,7 @@ FORM f4_columns USING iv_target TYPE csequence ##CALLED.
                dynpnr          = sy-dynnr
                dynprofield     = iv_target
                value_org       = 'C'
-               multiple_choice = 'X'
+               multiple_choice = iv_multi
     TABLES     value_tab       = lt_names
                return_tab      = lt_ret
     EXCEPTIONS parameter_error = 1

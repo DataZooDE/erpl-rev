@@ -665,3 +665,176 @@ TEST_CASE("Cursor: realistic expression column names all sanitize valid", "[curs
     REQUIRE(p.fetched == 1);
     db.CloseCursor(open.handle);
 }
+
+// ---------------------------------------------------------------------------
+// Delta (incremental) extraction — server merge engine + state table.
+// The ABAP delta readers stream a change package whose payload carries an op
+// column (I/U/D) and call IngestBxml in MERGE mode; deletes-without-a-change-
+// column use SnapshotMerge. Delta config + runtime state live in the DuckDB
+// table _erpl_rev_delta_state, created once at boot. (See docs/delta.md.)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("Delta: _erpl_rev_delta_state registry exists at boot", "[bridge][delta][state]") {
+    DuckDbBridge db;
+    // Present, empty, queryable through the same path ABAP uses (Z_DUCKDB_QUERY).
+    auto q = db.Query("SELECT count(*) AS c FROM _erpl_rev_delta_state");
+    REQUIRE(q.rows[0] == R"({"c":0})");
+    // The column set + defaults match the HLD schema: seed a target like ABAP would.
+    db.Execute("INSERT INTO _erpl_rev_delta_state(target,method,source_from,keys) "
+               "VALUES ('delta_wm','WATERMARK','ZDELTA_WM','id')");
+    auto r = db.Query("SELECT method, safety_secs, cadence, status "
+                      "FROM _erpl_rev_delta_state WHERE target='delta_wm'");
+    REQUIRE(r.rows[0] ==
+            R"({"method":"WATERMARK","safety_secs":120,"cadence":"nightly","status":"IDLE"})");
+}
+
+// ---------------------------------------------------------------------------
+// Replication run statistics: _erpl_rev_run_stats (+ erpl_rev_run_stats view),
+// created at boot, one row per full/incremental run. (See docs/stats.md.)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("Stats: _erpl_rev_run_stats table + view exist at boot", "[bridge][stats]") {
+    DuckDbBridge db;
+    // Present + empty, queryable through the same path ABAP uses (Z_DUCKDB_QUERY).
+    REQUIRE(db.Query("SELECT count(*) AS c FROM _erpl_rev_run_stats").rows[0] == R"({"c":0})");
+    REQUIRE(db.Query("SELECT count(*) AS c FROM erpl_rev_run_stats").rows[0] == R"({"c":0})");
+}
+
+TEST_CASE("Stats: recorded run surfaces derived columns in the view", "[bridge][stats][view]") {
+    DuckDbBridge db;
+    // A full-load run as ABAP's record_run would write it (run_id + ts default).
+    db.Execute("INSERT INTO _erpl_rev_run_stats"
+               "(target,source,run_type,method,status,duration_ms,rows_read,rows_ins,rows_upd,rows_del,jobs) "
+               "VALUES ('mara','MARA','FULL','FULL','SUCCESS',2000,1000,1000,0,0,1)");
+    // A delta SNAPSHOT cycle with a physical delete.
+    db.Execute("INSERT INTO _erpl_rev_run_stats"
+               "(target,source,run_type,method,status,duration_ms,rows_read,rows_ins,rows_upd,rows_del,jobs) "
+               "VALUES ('mara','MARA','DELTA','SNAPSHOT','SUCCESS',500,3,1,1,1,1)");
+    // The view derives rows_applied, rows_per_sec, is_success — dashboard-ready.
+    auto r = db.Query("SELECT run_type, rows_applied, CAST(rows_per_sec AS BIGINT) AS rps, is_success "
+                      "FROM erpl_rev_run_stats ORDER BY run_id");
+    REQUIRE(r.rows[0] == R"({"run_type":"FULL","rows_applied":1000,"rps":500,"is_success":true})");
+    REQUIRE(r.rows[1] == R"({"run_type":"DELTA","rows_applied":3,"rps":6,"is_success":true})");
+    // run_id is sequence-assigned and monotonic; started_at = finished_at - duration.
+    auto m = db.Query("SELECT count(*) AS c FROM erpl_rev_run_stats "
+                      "WHERE started_at <= finished_at AND run_id >= 1");
+    REQUIRE(m.rows[0] == R"({"c":2})");
+}
+
+TEST_CASE("Stats: an ERROR run is recorded as not-successful", "[bridge][stats][error]") {
+    DuckDbBridge db;
+    db.Execute("INSERT INTO _erpl_rev_run_stats"
+               "(target,source,run_type,method,status,duration_ms,error_text) "
+               "VALUES ('mara','MARA','DELTA','WATERMARK','ERROR',10,'cast failed')");
+    auto r = db.Query("SELECT status, is_success, error_text FROM erpl_rev_run_stats");
+    REQUIRE(r.rows[0] == R"({"status":"ERROR","is_success":false,"error_text":"cast failed"})");
+}
+
+TEST_CASE("IngestBxml MERGE: op_col drives insert/update/delete", "[bridge][ingest][merge]") {
+    DuckDbBridge db;
+    std::string ddl = "CREATE TABLE IF NOT EXISTS m(id INTEGER PRIMARY KEY, v VARCHAR);";
+    sxml::Table s; s.columns = {"ID", "V"};
+    s.rows = {{"1", "a"}, {"2", "b"}, {"3", "c"}};
+    db.IngestBxml("m", sxml::Encode("DATA", s), IngestMode::Upsert, {"id"}, "",
+                  "SET threads TO 1;", ddl);
+
+    // A change package: update id=1, insert id=4, delete id=2 (id=3 untouched).
+    sxml::Table d; d.columns = {"ID", "V", "OP"};
+    d.rows = {{"1", "a2", "U"}, {"4", "d", "I"}, {"2", "", "D"}};
+    auto n = db.IngestBxml("m", sxml::Encode("DATA", d), IngestMode::Merge, {"id"},
+                           "", "", "", "OP");
+    REQUIRE(n == 3);
+    REQUIRE(db.Query("SELECT v FROM m WHERE id=1").rows[0] == R"({"v":"a2"})");      // updated
+    REQUIRE(db.Query("SELECT v FROM m WHERE id=4").rows[0] == R"({"v":"d"})");       // inserted
+    REQUIRE(db.Query("SELECT count(*) AS c FROM m WHERE id=2").rows[0] == R"({"c":0})"); // deleted
+    REQUIRE(db.Query("SELECT count(*) AS c FROM m").rows[0] == R"({"c":3})");        // 1,3,4
+    // op_col is control data, never a target column.
+    auto cols = db.Query("SELECT count(*) AS c FROM information_schema.columns "
+                         "WHERE lower(table_name)='m' AND lower(column_name)='op'");
+    REQUIRE(cols.rows[0] == R"({"c":0})");
+}
+
+TEST_CASE("IngestBxml MERGE: empty op_col behaves like UPSERT", "[bridge][ingest][merge]") {
+    DuckDbBridge db;
+    std::string ddl = "CREATE TABLE IF NOT EXISTS m2(id INTEGER PRIMARY KEY, v VARCHAR);";
+    sxml::Table s; s.columns = {"ID", "V"}; s.rows = {{"1", "a"}, {"2", "b"}};
+    db.IngestBxml("m2", sxml::Encode("DATA", s), IngestMode::Merge, {"id"}, "",
+                  "SET threads TO 1;", ddl, "");          // empty op_col
+    sxml::Table u; u.columns = {"ID", "V"}; u.rows = {{"2", "B"}, {"3", "c"}};
+    db.IngestBxml("m2", sxml::Encode("DATA", u), IngestMode::Merge, {"id"}, "", "", "", "");
+    REQUIRE(db.Query("SELECT count(*) AS c FROM m2").rows[0] == R"({"c":3})");   // upsert, no delete
+    REQUIRE(db.Query("SELECT v FROM m2 WHERE id=2").rows[0] == R"({"v":"B"})");
+}
+
+TEST_CASE("IngestBxml MERGE: bad cast aborts the whole package atomically",
+          "[bridge][ingest][merge][atomic]") {
+    DuckDbBridge db;
+    std::string ddl = "CREATE TABLE IF NOT EXISTS m3(id INTEGER PRIMARY KEY, n INTEGER);";
+    sxml::Table s; s.columns = {"ID", "N"}; s.rows = {{"1", "10"}, {"2", "20"}};
+    db.IngestBxml("m3", sxml::Encode("DATA", s), IngestMode::Upsert, {"id"}, "",
+                  "SET threads TO 1;", ddl);
+    // A package that DELETEs id=2 and then fails to cast id=3's N: the whole
+    // transaction (delete + insert) must roll back, leaving the target intact.
+    sxml::Table d; d.columns = {"ID", "N", "OP"};
+    d.rows = {{"2", "0", "D"}, {"3", "notanumber", "I"}};
+    REQUIRE_THROWS(db.IngestBxml("m3", sxml::Encode("DATA", d), IngestMode::Merge,
+                                 {"id"}, "", "", "", "OP"));
+    REQUIRE(db.Query("SELECT count(*) AS c FROM m3").rows[0] == R"({"c":2})");        // delete rolled back
+    REQUIRE(db.Query("SELECT count(*) AS c FROM m3 WHERE id=2").rows[0] == R"({"c":1})");
+    REQUIRE(db.Query("SELECT n FROM m3 WHERE id=1").rows[0] == R"({"n":10})");        // unchanged
+}
+
+TEST_CASE("SnapshotMerge: insert+update+delete diff in one transaction",
+          "[bridge][snapshot]") {
+    DuckDbBridge db;
+    db.Execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v VARCHAR)");
+    db.Execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')");
+    // A fresh full snapshot: id=1 unchanged, id=2 changed, id=4 new, id=3 gone.
+    db.Execute("CREATE TABLE t__snap(id INTEGER PRIMARY KEY, v VARCHAR)");
+    db.Execute("INSERT INTO t__snap VALUES (1,'a'),(2,'B'),(4,'d')");
+    auto res = db.SnapshotMerge("t", "t__snap", {"id"});
+    REQUIRE(res.ins == 1);   // id=4
+    REQUIRE(res.upd == 2);   // id=1,2 present in both (upserted)
+    REQUIRE(res.del == 1);   // id=3 absent from snapshot
+    REQUIRE(db.Query("SELECT count(*) AS c FROM t").rows[0] == R"({"c":3})");
+    REQUIRE(db.Query("SELECT v FROM t WHERE id=2").rows[0] == R"({"v":"B"})");
+    REQUIRE(db.Query("SELECT count(*) AS c FROM t WHERE id=3").rows[0] == R"({"c":0})");
+    REQUIRE(db.Query("SELECT v FROM t WHERE id=4").rows[0] == R"({"v":"d"})");
+    // staging table consumed (dropped) by the merge.
+    auto sg = db.Query("SELECT count(*) AS c FROM information_schema.tables "
+                       "WHERE lower(table_name)='t__snap'");
+    REQUIRE(sg.rows[0] == R"({"c":0})");
+}
+
+TEST_CASE("IngestBxml UPSERT: composite key with client-first column", "[bridge][ingest][upsert][composite]") {
+    DuckDbBridge db;
+    std::string ddl = "CREATE TABLE IF NOT EXISTS mt(client VARCHAR, id VARCHAR, v VARCHAR, PRIMARY KEY(client,id));";
+    sxml::Table s; s.columns = {"CLIENT","ID","V"};
+    s.rows = {{"001","1","a"},{"001","2","b"},{"001","3","c"}};
+    auto n = db.IngestBxml("mt", sxml::Encode("DATA", s), IngestMode::Insert, {"CLIENT","ID"}, "", "SET threads TO 1;", ddl);
+    REQUIRE(n == 3);
+    REQUIRE(db.Query("SELECT count(*) AS c FROM mt").rows[0] == R"({"c":3})");
+    // re-upsert the SAME 3 rows (ddl carries CREATE IF NOT EXISTS, like a delta cycle)
+    auto n2 = db.IngestBxml("mt", sxml::Encode("DATA", s), IngestMode::Upsert, {"CLIENT","ID"}, "", "", ddl);
+    REQUIRE(n2 == 3);
+    REQUIRE(db.Query("SELECT count(*) AS c FROM mt").rows[0] == R"({"c":3})");
+    REQUIRE(db.Query("SELECT client FROM mt WHERE id='1'").rows[0] == R"({"client":"001"})");
+}
+
+TEST_CASE("IngestBxml UPSERT: exact A4H delta shape (client PK + DECIMAL ts)", "[bridge][ingest][upsert][a4h]") {
+    DuckDbBridge db;
+    std::string ddl = "CREATE TABLE IF NOT EXISTS mt2 (CLIENT VARCHAR, ID VARCHAR, NAME VARCHAR, VAL INTEGER, CHANGED_AT DECIMAL(21,7), PRIMARY KEY(CLIENT,ID));";
+    sxml::Table s; s.columns = {"CLIENT","ID","NAME","VAL","CHANGED_AT"};
+    s.rows = {{"001","0000000001","row 1","1","20260607135828.5250730"},
+              {"001","0000000002","row 2","2","20260607135828.5250730"},
+              {"001","0000000003","row 3","3","20260607135828.5250730"}};
+    // baseline: heap insert then PK already in ddl
+    auto n = db.IngestBxml("mt2", sxml::Encode("DATA", s), IngestMode::Insert, {"CLIENT","ID"}, "", "SET threads TO 1;", ddl);
+    REQUIRE(n == 3);
+    // delta upsert: same rows, ddl carries CREATE IF NOT EXISTS (as on A4H)
+    auto n2 = db.IngestBxml("mt2", sxml::Encode("DATA", s), IngestMode::Upsert, {"CLIENT","ID"}, "", "", ddl);
+    REQUIRE(n2 == 3);
+    REQUIRE(db.Query("SELECT count(*) AS c FROM mt2").rows[0] == R"({"c":3})");
+    REQUIRE(db.Query("SELECT client AS c FROM mt2 WHERE id='0000000001'").rows[0] == R"({"c":"001"})");
+    REQUIRE(db.Query("SELECT count(*) AS c FROM mt2 WHERE client IS NULL").rows[0] == R"({"c":0})");
+}

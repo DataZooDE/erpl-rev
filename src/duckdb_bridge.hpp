@@ -27,7 +27,16 @@ struct QueryResult {
     bool truncated = false;          // true if row_count > rows.size()
 };
 
-enum class IngestMode { Insert, Upsert };
+enum class IngestMode { Insert, Upsert, Merge };
+
+// Result of a SnapshotMerge: how many rows the set-based diff inserted, updated
+// (counted together as "upserted from staging"), and deleted (present in the
+// target but absent from the fresh snapshot).
+struct SnapshotResult {
+    long long ins = 0;
+    long long upd = 0;
+    long long del = 0;
+};
 
 // Opened streaming cursor: a handle + the column metadata (so the caller can
 // build its target structure once before fetching pages).
@@ -105,13 +114,30 @@ public:
     // CALL TRANSFORMATION id produce). Column names are the BXML element names;
     // every cell is inserted as a string literal and cast to the target column
     // type via the typed `ddl`. Returns the number of rows ingested.
+    //
+    // Delta (MERGE): when mode == Merge and op_col is non-empty, the staged
+    // payload carries that control column with values I/U/D. The apply runs, in
+    // one transaction, a DELETE of the 'D' keys followed by an UPSERT of the
+    // 'I'/'U' rows; op_col is stripped from the target column list (it is control
+    // data, not a target column). mode == Merge with an empty op_col degrades to
+    // a plain key-based UPSERT.
     long long IngestBxml(const std::string &target,
                          const std::string &bxml,
                          IngestMode mode,
                          const std::vector<std::string> &key_cols,
                          const std::string &parquet_out,
                          const std::string &init_sql = "",
-                         const std::string &ddl = "");
+                         const std::string &ddl = "",
+                         const std::string &op_col = "");
+
+    // Snapshot diff/merge (physical-delete reconciliation): given a freshly
+    // landed full snapshot in `staging`, upsert every snapshot row onto `target`
+    // and DELETE the target keys absent from the snapshot, in one transaction,
+    // then DROP the staging table. Used by the SNAPSHOT delta method to catch
+    // hard deletes no change column can report. Returns the diff counts.
+    SnapshotResult SnapshotMerge(const std::string &target,
+                                 const std::string &staging,
+                                 const std::vector<std::string> &keys);
 
     // --- Streaming cursors (fixed-memory paging for large results) ----------
     // OpenCursor starts a streaming query on its OWN DuckDB connection (DuckDB

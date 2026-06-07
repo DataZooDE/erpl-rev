@@ -80,6 +80,8 @@ void InstallHandlers(const std::string &db_path, const std::string &init_sql) {
         throw_rfc("RfcInstallServerFunction(Z_DUCKDB_QUERY)", info);
     if (RfcInstallServerFunction(nullptr, BuildIngestDesc(), ZIngestImpl, &info) != RFC_OK)
         throw_rfc("RfcInstallServerFunction(Z_DUCKDB_INGEST)", info);
+    if (RfcInstallServerFunction(nullptr, BuildSnapshotMergeDesc(), ZSnapshotMergeImpl, &info) != RFC_OK)
+        throw_rfc("RfcInstallServerFunction(Z_DUCKDB_SNAPSHOT_MERGE)", info);
     if (RfcInstallServerFunction(nullptr, BuildOpenDesc(), ZOpenImpl, &info) != RFC_OK)
         throw_rfc("RfcInstallServerFunction(Z_DUCKDB_OPEN)", info);
     if (RfcInstallServerFunction(nullptr, BuildFetchDesc(), ZFetchImpl, &info) != RFC_OK)
@@ -89,6 +91,7 @@ void InstallHandlers(const std::string &db_path, const std::string &init_sql) {
 
     log::get().Debug("rfc", "handlers installed",
                      {{"functions", "STFC_CONNECTION,Z_DUCKDB_QUERY,Z_DUCKDB_INGEST,"
+                                    "Z_DUCKDB_SNAPSHOT_MERGE,"
                                     "Z_DUCKDB_OPEN,Z_DUCKDB_FETCH,Z_DUCKDB_CLOSE", true},
                       {"db", db_path.empty() ? ":memory:" : db_path}});
 }
@@ -170,27 +173,60 @@ extern "C" RFC_RC SAP_API ZIngestImpl(RFC_CONNECTION_HANDLE,
         std::string ddl     = GetString(funcHandle, "IV_DDL");
         std::string data    = GetString(funcHandle, "IV_DATA");
         std::string xdata   = GetXString(funcHandle, "IV_XDATA");  // binary sXML rows
+        std::string opcol   = GetString(funcHandle, "IV_OP_COL");  // I/U/D col for MERGE
         log::get().Info("rfc", "Z_DUCKDB_INGEST",
                         {{"target", target}, {"mode", mode}, {"keys", keys},
+                         {"op_col", opcol},
                          {"init_len", (long long)initsql.size()},
                          {"ddl_len", (long long)ddl.size()},
                          {"xdata_len", (long long)xdata.size()}});
 
-        IngestMode m = (mode == "UPSERT" || mode == "upsert")
-                           ? IngestMode::Upsert : IngestMode::Insert;
+        auto upper = mode;
+        for (char &c : upper) if (c >= 'a' && c <= 'z') c = char(c - 'a' + 'A');
+        IngestMode m = (upper == "MERGE")  ? IngestMode::Merge
+                     : (upper == "UPSERT") ? IngestMode::Upsert
+                                           : IngestMode::Insert;
         // No global lock: each ingest opens its own DuckDB connection (its TEMP
         // staging is connection-local), so concurrent packages (async pipeline /
         // partitioned loads) ingest in parallel. Full-load is pure INSERT (never
-        // conflicts); UPSERT packages are disjoint key ranges.
+        // conflicts); UPSERT packages are disjoint key ranges. MERGE applies an
+        // I/U/D delta package (IV_OP_COL) on one connection-local transaction.
         // Prefer the binary-sXML payload (replicate path); else JSON.
         long long n = xdata.empty()
                 ? g_bridge->Ingest(target, data, m, SplitCsv(keys), pqout, initsql, ddl)
-                : g_bridge->IngestBxml(target, xdata, m, SplitCsv(keys), pqout, initsql, ddl);
+                : g_bridge->IngestBxml(target, xdata, m, SplitCsv(keys), pqout, initsql, ddl, opcol);
         SetString(funcHandle, "EV_ROWS_AFFECTED", std::to_string(n));
         SetString(funcHandle, "EV_ERROR", "");
         log::get().Debug("rfc", "Z_DUCKDB_INGEST ok", {{"rows_affected", n}});
     } catch (const std::exception &e) {
         log::get().Error("rfc", "Z_DUCKDB_INGEST failed", {{"error", e.what()}});
+        SetString(funcHandle, "EV_ERROR", e.what());
+    }
+    return RFC_OK;
+}
+
+// Snapshot diff/merge: upsert a freshly landed full snapshot onto the target and
+// delete the target keys absent from it (physical-delete reconciliation for the
+// SNAPSHOT delta method), in one server transaction. Counts come back as strings.
+extern "C" RFC_RC SAP_API ZSnapshotMergeImpl(RFC_CONNECTION_HANDLE,
+                                             RFC_FUNCTION_HANDLE funcHandle,
+                                             RFC_ERROR_INFO *) {
+    try {
+        std::string target  = GetString(funcHandle, "IV_TARGET");
+        std::string staging = GetString(funcHandle, "IV_STAGING");
+        std::string keys    = GetString(funcHandle, "IV_KEYS");
+        log::get().Info("rfc", "Z_DUCKDB_SNAPSHOT_MERGE",
+                        {{"target", target}, {"staging", staging}, {"keys", keys}});
+
+        SnapshotResult r = g_bridge->SnapshotMerge(target, staging, SplitCsv(keys));
+        SetString(funcHandle, "EV_INS",   std::to_string(r.ins));
+        SetString(funcHandle, "EV_UPD",   std::to_string(r.upd));
+        SetString(funcHandle, "EV_DEL",   std::to_string(r.del));
+        SetString(funcHandle, "EV_ERROR", "");
+        log::get().Debug("rfc", "Z_DUCKDB_SNAPSHOT_MERGE ok",
+                         {{"ins", r.ins}, {"upd", r.upd}, {"del", r.del}});
+    } catch (const std::exception &e) {
+        log::get().Error("rfc", "Z_DUCKDB_SNAPSHOT_MERGE failed", {{"error", e.what()}});
         SetString(funcHandle, "EV_ERROR", e.what());
     }
     return RFC_OK;

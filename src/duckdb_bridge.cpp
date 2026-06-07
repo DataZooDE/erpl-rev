@@ -169,6 +169,54 @@ DuckDbBridge::DuckDbBridge(const std::string &path, const std::string &init_sql)
     auto r = con.Query("SET GLOBAL preserve_insertion_order=false");
     if (r->HasError())
         throw std::runtime_error("DuckDB config failed: " + r->GetError());
+    // Delta registry + runtime state — created once, always (independent of the
+    // optional boot init_sql). Both the per-target config and the watermark/lease
+    // state for incremental extraction live here; ABAP reads/writes it through
+    // Z_DUCKDB_QUERY, so there is no new SAP-side state table. (HLD §4.1.)
+    auto d = con.Query(
+        "CREATE TABLE IF NOT EXISTS _erpl_rev_delta_state ("
+        "target VARCHAR PRIMARY KEY, method VARCHAR NOT NULL, source_from VARCHAR NOT NULL, "
+        "keys VARCHAR NOT NULL, chg_col VARCHAR, wm_kind VARCHAR, wm_value VARCHAR, "
+        "safety_secs INTEGER DEFAULT 120, cadence VARCHAR DEFAULT 'nightly', extra VARCHAR, "
+        // TIMESTAMPTZ (not naive TIMESTAMP): now() is tz-aware, so storing it in a
+        // naive column and later doing epoch(now()) - epoch(col) yields a spurious
+        // local-UTC offset. Matching types keeps cadence/lease arithmetic correct.
+        "last_run_ts TIMESTAMPTZ, rows_applied BIGINT, status VARCHAR DEFAULT 'IDLE', "
+        "lease_ts TIMESTAMPTZ, last_error VARCHAR)");
+    if (d->HasError())
+        throw std::runtime_error("DuckDB delta-state init failed: " + d->GetError());
+    // Replication run statistics — one durable row per full or incremental run,
+    // written by the ABAP apply path (zcl_erpl_rev_util=>record_run via Z_DUCKDB_QUERY),
+    // with enough dimensions/measures to build a replication dashboard straight from
+    // DuckDB (see docs/stats.md). run_id from a sequence; ts defaults to the server
+    // clock (now()) so it agrees with the delta-state clock. The erpl_rev_run_stats
+    // view adds derived rows_applied / rows_per_sec / started_at / is_success.
+    auto seq = con.Query("CREATE SEQUENCE IF NOT EXISTS _erpl_rev_run_seq START 1");
+    if (seq->HasError())
+        throw std::runtime_error("DuckDB run-seq init failed: " + seq->GetError());
+    auto rstat = con.Query(
+        "CREATE TABLE IF NOT EXISTS _erpl_rev_run_stats ("
+        "run_id BIGINT PRIMARY KEY DEFAULT nextval('_erpl_rev_run_seq'), "
+        "ts TIMESTAMPTZ DEFAULT now(), "
+        "target VARCHAR, source VARCHAR, run_type VARCHAR, method VARCHAR, status VARCHAR, "
+        "duration_ms BIGINT, rows_read BIGINT, rows_ins BIGINT, rows_upd BIGINT, rows_del BIGINT, "
+        "wm_from VARCHAR, wm_to VARCHAR, jobs INTEGER, error_text VARCHAR)");
+    if (rstat->HasError())
+        throw std::runtime_error("DuckDB run-stats init failed: " + rstat->GetError());
+    auto rview = con.Query(
+        "CREATE OR REPLACE VIEW erpl_rev_run_stats AS SELECT "
+        "run_id, ts AS finished_at, "
+        "ts - (COALESCE(duration_ms,0) * INTERVAL '1 millisecond') AS started_at, "
+        "target, source, run_type, method, status, duration_ms, "
+        "rows_read, rows_ins, rows_upd, rows_del, "
+        "(COALESCE(rows_ins,0)+COALESCE(rows_upd,0)+COALESCE(rows_del,0)) AS rows_applied, "
+        "CASE WHEN duration_ms > 0 THEN "
+        "(COALESCE(rows_ins,0)+COALESCE(rows_upd,0)+COALESCE(rows_del,0))*1000.0/duration_ms "
+        "ELSE NULL END AS rows_per_sec, "
+        "wm_from, wm_to, jobs, (status='SUCCESS') AS is_success, error_text "
+        "FROM _erpl_rev_run_stats");
+    if (rview->HasError())
+        throw std::runtime_error("DuckDB run-stats view init failed: " + rview->GetError());
     // Boot init: explicit init_sql (CLI/--init-file) wins; else env fallback. Runs
     // INSTALL/LOAD/CREATE SECRET/ATTACH so replication can publish to external
     // targets (parquet object stores, postgres, ducklake, bigquery, iceberg).
@@ -454,7 +502,8 @@ long long DuckDbBridge::IngestBxml(const std::string &target,
                                    const std::vector<std::string> &key_cols,
                                    const std::string &parquet_out,
                                    const std::string &init_sql,
-                                   const std::string &ddl) {
+                                   const std::string &ddl,
+                                   const std::string &op_col) {
     // Own connection: the staging TEMP table, the Appender and the INSERT…SELECT
     // all run on it, so concurrent ingests (async pipeline / partitioned loads)
     // don't collide (TEMP tables are connection-local) and don't serialize.
@@ -547,9 +596,18 @@ long long DuckDbBridge::IngestBxml(const std::string &target,
     // Use the target's actual (lowercased) column names everywhere. An UPPERCASE
     // target column list in `INSERT … (COLS) … ON CONFLICT` mis-maps the conflict
     // arbiter and nulls the key — lowercase (matching the stored names) is safe.
+    // Delta MERGE: the payload may carry a control op column (I/U/D). It is staged
+    // (so the DELETE can read it) but is NOT a target column — exclude it from the
+    // INSERT column list and the projection. mode==Merge with no op_col is a plain
+    // key-based upsert.
+    const std::string opl = LowerName(op_col);
+    const bool merge = (mode == IngestMode::Merge) && !opl.empty();
+    auto is_op = [&](const std::string &c) { return !opl.empty() && LowerName(c) == opl; };
+
     std::string proj;
     for (size_t i = 0; i < tbl.columns.size(); i++) {
-        if (i) proj += ",";
+        if (is_op(tbl.columns[i])) continue;
+        if (!proj.empty()) proj += ",";
         const std::string cn = LowerName(tbl.columns[i]);
         switch (coltypes[i].id()) {
             case duckdb::LogicalTypeId::BLOB:
@@ -568,33 +626,144 @@ long long DuckDbBridge::IngestBxml(const std::string &target,
                 proj += cn + "::" + coltypes[i].ToString();
                 break;
         }
+        proj += " AS " + cn;   // name the projected column so a CTAS clone keeps it
     }
-    std::string ins = "INSERT INTO " + target + " (";
+    std::string collist;
     for (size_t i = 0; i < tbl.columns.size(); i++) {
-        if (i) ins += ",";
-        ins += LowerName(tbl.columns[i]);
+        if (is_op(tbl.columns[i])) continue;
+        if (!collist.empty()) collist += ",";
+        collist += LowerName(tbl.columns[i]);
     }
-    ins += ") SELECT " + proj + " FROM " + stg;
-    if (mode == IngestMode::Upsert && !key_cols.empty()) {
-        ins += " ON CONFLICT (";
-        for (size_t i = 0; i < key_cols.size(); i++) { if (i) ins += ","; ins += LowerName(key_cols[i]); }
-        ins += ") DO UPDATE SET ";
-        bool first = true;
-        for (auto &cn0 : tbl.columns) {
-            const std::string cn = LowerName(cn0);
-            bool is_key = false;
-            for (auto &k : key_cols) if (LowerName(k) == cn) { is_key = true; break; }
-            if (is_key) continue;  // a key in DO UPDATE SET makes DuckDB null it
-            if (!first) ins += ",";
-            first = false;
-            ins += cn + "=excluded." + cn;
+    // Apply mode. Upsert/Merge with keys apply as DELETE-then-INSERT, NOT
+    // `INSERT … ON CONFLICT DO UPDATE`. With DuckDB 1.5.3 a conflict-resolving
+    // INSERT (`ON CONFLICT` and `INSERT OR REPLACE` alike) whose source is the
+    // Appender-populated staging in the SAME connection NULLs the leading key
+    // column of the proposed row → "NOT NULL constraint failed". This was isolated
+    // to the in-connection Appender source (a plain INSERT from the same staging is
+    // fine; ON CONFLICT against a separate, committed table read on another
+    // connection — as SnapshotMerge does — is also fine; materialising the staging
+    // first does NOT help). DELETE the incoming keys then a plain INSERT is the same
+    // full-row-replace end state and dodges the engine bug; in DuckDB an UPDATE is
+    // itself a delete+insert (MVCC), and a delta package only carries CHANGED rows,
+    // so there is no extra write cost. (See test/test_duckdb_bridge.cpp merge cases.)
+    const bool upsert = (mode == IngestMode::Upsert || mode == IngestMode::Merge) &&
+                        !key_cols.empty();
+    std::string sel = "SELECT " + proj + " FROM " + stg;
+    if (merge) sel += " WHERE lower(" + opl + ") IN ('i','u')";   // exclude deletes from the insert
+    const std::string ins = "INSERT INTO " + target + " (" + collist + ") " + sel;
+
+    if (upsert) {
+        // Key tuple + staging key projection (cast VARCHAR staging keys to the target
+        // key types so the `(keys) IN (SELECT keys …)` comparison is type-compatible).
+        std::string keytuple, keysel;
+        for (size_t i = 0; i < key_cols.size(); i++) {
+            const std::string k = LowerName(key_cols[i]);
+            if (i) { keytuple += ","; keysel += ","; }
+            keytuple += k;
+            auto it = tcol.find(k);
+            const bool textual = it == tcol.end() ||
+                                 it->second.id() == duckdb::LogicalTypeId::VARCHAR ||
+                                 it->second.id() == duckdb::LogicalTypeId::BLOB;
+            keysel += textual ? k : (k + "::" + it->second.ToString());
         }
+        // Delete every incoming key (I/U rows are replaced, D rows are removed), then
+        // insert the I/U rows — atomically, so a bad cast rolls back the whole package.
+        const std::string del = "DELETE FROM " + target + " WHERE (" + keytuple + ") IN (SELECT " +
+                                keysel + " FROM " + stg + ")";
+        Exec(con, "BEGIN");
+        try {
+            Exec(con, del);
+            Exec(con, ins);
+            Exec(con, "COMMIT");
+        } catch (...) {
+            Exec(con, "ROLLBACK");
+            throw;
+        }
+    } else {
+        Exec(con, ins);
     }
-    Exec(con, ins);
 
     if (!parquet_out.empty())
         Exec(con, "COPY " + target + " TO " + SqlQuote(parquet_out) + " (FORMAT PARQUET)");
     return static_cast<long long>(tbl.rows.size());
+}
+
+SnapshotResult DuckDbBridge::SnapshotMerge(const std::string &target,
+                                           const std::string &staging,
+                                           const std::vector<std::string> &keys) {
+    duckdb::Connection con(*db_);
+
+    // Target columns (lowercased) for the DO UPDATE SET list.
+    auto desc = con.Query("SELECT * FROM " + target + " LIMIT 0");
+    if (desc->HasError())
+        throw std::runtime_error("DuckDB describe failed: " + desc->GetError());
+    std::vector<std::string> cols;
+    for (duckdb::idx_t c = 0; c < desc->ColumnCount(); c++)
+        cols.push_back(LowerName(desc->names[c]));
+
+    // Join predicate "a.k1 = b.k1 AND a.k2 = b.k2 …" for the anti-joins.
+    auto key_join = [&](const std::string &a, const std::string &b) {
+        std::string j;
+        for (size_t i = 0; i < keys.size(); i++) {
+            if (i) j += " AND ";
+            const std::string k = LowerName(keys[i]);
+            j += a + "." + k + " = " + b + "." + k;
+        }
+        return j;
+    };
+
+    // Exact ins/upd/del counts, computed from the pre-merge sets (cheap key-only
+    // anti-joins). ins = snapshot keys new to target; upd = keys in both;
+    // del = target keys absent from the snapshot.
+    SnapshotResult res;
+    {
+        const std::string ej = key_join("t", "s");
+        std::string q =
+            "SELECT "
+            "(SELECT count(*) FROM " + staging + " s WHERE NOT EXISTS "
+              "(SELECT 1 FROM " + target + " t WHERE " + ej + ")) AS ins,"
+            "(SELECT count(*) FROM " + staging + " s WHERE EXISTS "
+              "(SELECT 1 FROM " + target + " t WHERE " + ej + ")) AS upd,"
+            "(SELECT count(*) FROM " + target + " t WHERE NOT EXISTS "
+              "(SELECT 1 FROM " + staging + " s WHERE " + ej + ")) AS del";
+        auto cr = con.Query(q);
+        if (cr->HasError())
+            throw std::runtime_error("DuckDB snapshot count failed: " + cr->GetError());
+        res.ins = cr->GetValue(0, 0).GetValue<int64_t>();
+        res.upd = cr->GetValue(1, 0).GetValue<int64_t>();
+        res.del = cr->GetValue(2, 0).GetValue<int64_t>();
+    }
+
+    // Upsert all of staging + delete target keys absent from staging + drop the
+    // staging table, atomically. (HLD §4.3.)
+    std::string upsert = "INSERT INTO " + target + " SELECT * FROM " + staging + " ON CONFLICT (";
+    for (size_t i = 0; i < keys.size(); i++) { if (i) upsert += ","; upsert += LowerName(keys[i]); }
+    upsert += ")";
+    {
+        std::string set;
+        for (auto &cn : cols) {
+            bool is_key = false;
+            for (auto &k : keys) if (LowerName(k) == cn) { is_key = true; break; }
+            if (is_key) continue;
+            if (!set.empty()) set += ",";
+            set += cn + "=excluded." + cn;
+        }
+        upsert += set.empty() ? " DO NOTHING" : (" DO UPDATE SET " + set);
+    }
+    const std::string del = "DELETE FROM " + target + " t WHERE NOT EXISTS "
+                            "(SELECT 1 FROM " + staging + " s WHERE " + key_join("t", "s") + ")";
+
+    Exec(con, "BEGIN");
+    try {
+        Exec(con, upsert);
+        Exec(con, del);
+        Exec(con, "DROP TABLE " + staging);
+        Exec(con, "COMMIT");
+    } catch (...) {
+        Exec(con, "ROLLBACK");
+        throw;
+    }
+    return res;
 }
 
 } // namespace erpl_rev
