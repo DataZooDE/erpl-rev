@@ -316,6 +316,7 @@ extern "C" RFC_RC SAP_API ZCdcPlanImpl(RFC_CONNECTION_HANDLE,
         js += ",\"provision_ddl\":"  + JsonStrArray(plan.provision_ddl);
         js += ",\"teardown_ddl\":"   + JsonStrArray(plan.teardown_ddl);
         js += ",\"read_sql\":"       + json::QuoteString(read);
+        js += ",\"read_from\":"      + json::QuoteString(plan.read_from);
         js += ",\"prune_sql\":"      + json::QuoteString(plan.prune_sql);
         js += "}";
         SetString(funcHandle, "EV_PLAN", js);

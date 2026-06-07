@@ -42,6 +42,10 @@ struct CdcPlan {
     std::vector<std::string> provision_ddl;  // sequence, log table, trigger(s) — in order
     std::vector<std::string> teardown_ddl;    // drop trigger(s), table, sequence
     std::string read_sql;
+    // A derived-table FROM expression the ABAP ADBC reader stages with SELECT * (it
+    // appends "WHERE <seq_col> > <pos>"). Excludes _TS and casts _SEQ to INTEGER so
+    // every column binds in the ABAP ADBC layer (which rejects HANA TIMESTAMP/BIGINT).
+    std::string read_from;
     std::string prune_sql;
     std::string op_col = "_OP";
     std::string seq_col = "_SEQ";

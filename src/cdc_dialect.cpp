@@ -93,6 +93,12 @@ CdcPlan HanaDialect::Plan(const CdcSpec &spec) const {
     sel += Quote(p.op_col) + "," + Quote(p.seq_col);
     p.read_sql = "SELECT " + sel + " FROM " + Quote(p.log_table) +
                  " WHERE " + Quote(p.seq_col) + " > %POS% ORDER BY " + Quote(p.seq_col);
+    // read_from: the keys + op + seq (cast to INTEGER), no _TS — the ABAP ADBC reader
+    // binds these cleanly where it chokes on HANA TIMESTAMP / BIGINT host types.
+    std::string rcols;
+    for (const auto &k : spec.keys) rcols += Quote(k) + ",";
+    rcols += Quote(p.op_col) + ",CAST(" + Quote(p.seq_col) + " AS INTEGER) AS " + Quote(p.seq_col);
+    p.read_from = "(SELECT " + rcols + " FROM " + Quote(p.log_table) + ") AS LOGREAD";
     p.prune_sql = "DELETE FROM " + Quote(p.log_table) +
                   " WHERE " + Quote(p.seq_col) + " <= %CONF%";
 

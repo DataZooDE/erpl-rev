@@ -55,6 +55,7 @@ cls ZCL_ERPL_REV_TYPEMAP  zcl_erpl_rev_typemap.abap  "DDIC<->DuckDB type map"
 cls ZCL_ERPL_REV_UTIL     zcl_erpl_rev_util.abap     "query/describe/replicate"
 cls ZCL_ERPL_REV_DELTA    zcl_erpl_rev_delta.abap    "delta engine (state + 4 readers)"
 cls ZCL_ERPL_REV_DELTADRV zcl_erpl_rev_deltadrv.abap "delta change-injection driver"
+cls ZCL_ERPL_REV_CDC      zcl_erpl_rev_cdc.abap      "trigger-CDC thin executor (provision/run/teardown)"
 cls ZCL_ERPL_REV_MKFM     zcl_erpl_rev_mkfm.abap     "create RFC FMs"
 cls ZCL_ERPL_REV_SETUP    zcl_erpl_rev_setup.abap    "create registered dest"
 cls ZCL_ERPL_REV_TYPETEST zcl_erpl_rev_typetest.abap "typemap tests"
@@ -69,6 +70,7 @@ cls ZCL_ERPL_REV_PUBTEST  zcl_erpl_rev_pubtest.abap  "external target publish (p
 cls ZCL_ERPL_REV_CDSTEST  zcl_erpl_rev_cdstest.abap  "CDS view source (describe/keys/params/discovery/publish)"
 cls ZCL_ERPL_REV_BWTEST   zcl_erpl_rev_bwtest.abap   "BW/native (ADBC) source vs a HANA-view stand-in"
 cls ZCL_ERPL_REV_DELTATEST zcl_erpl_rev_deltatest.abap "delta E2E (watermark/snapshot/changedoc/insert-only/orchestration)"
+cls ZCL_ERPL_REV_CDCTEST  zcl_erpl_rev_cdctest.abap  "trigger-CDC E2E (real HANA triggers, physical deletes)"
 # NB: the CDS source tests need the DDLS fixtures ZERPL_C_FLIGHTS + ZERPL_CP_FLIGHTS
 # (abap/zerpl_c_flights.ddls.abap, abap/zerpl_cp_flights.ddls.abap) deployed once via
 # `erpl-adt object create --type DDLS/DF` + `source write --type DDLS --activate`

@@ -53,6 +53,10 @@ TEST_CASE("CDC dialect: HANA delete-only plan", "[cdc][dialect]") {
                 R"(SELECT "MANDT","CARRID","CONNID","FLDATE","_OP","_SEQ" )"
                 R"(FROM "ZCDC_SFLIGHT_LOG" WHERE "_SEQ" > %POS% ORDER BY "_SEQ")");
         REQUIRE(p.prune_sql == R"(DELETE FROM "ZCDC_SFLIGHT_LOG" WHERE "_SEQ" <= %CONF%)");
+        // read_from excludes _TS and casts _SEQ to INTEGER for the ABAP ADBC reader.
+        REQUIRE(p.read_from ==
+                R"((SELECT "MANDT","CARRID","CONNID","FLDATE","_OP",)"
+                R"(CAST("_SEQ" AS INTEGER) AS "_SEQ" FROM "ZCDC_SFLIGHT_LOG") AS LOGREAD)");
     }
     SECTION("teardown drops exactly what provision created") {
         REQUIRE(p.teardown_ddl.size() == 3);
