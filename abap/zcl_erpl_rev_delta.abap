@@ -429,10 +429,40 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
     IF ld-error IS NOT INITIAL. rs-error = ld-error. RETURN. ENDIF.
     DATA(lc) = zcl_erpl_rev_util=>query( ld-ddl ).   " ensure target exists (+PK)
     IF lc-error IS NOT INITIAL. rs-error = lc-error. RETURN. ENDIF.
-    DATA(r) = zcl_erpl_rev_util=>replicate(
-      iv_tab      = is_state-source_from
-      iv_target   = lv_stg
-      iv_truncate = abap_true ).
+
+    " Optional parallel reload: extra may carry {"jobs":N,"part_col":"X"} (e.g. set by
+    " Z_ERPL_REV_REPLICATE when the seed used the Parallel tab). With jobs>1 and a
+    " numeric partition column, the per-cycle full reload runs across N background
+    " workers via the proven parallel full-load engine; otherwise it's a serial read.
+    TYPES: BEGIN OF ty_par, jobs TYPE i, part_col TYPE string, END OF ty_par.
+    DATA ls_par TYPE ty_par.
+    IF is_state-extra IS NOT INITIAL.
+      TRY.
+          /ui2/cl_json=>deserialize( EXPORTING json = is_state-extra CHANGING data = ls_par ).
+        CATCH cx_root ##NO_HANDLER.
+      ENDTRY.
+    ENDIF.
+
+    DATA r TYPE zcl_erpl_rev_util=>ty_repl.
+    DATA(lv_pcol) = ls_par-part_col.
+    IF ls_par-jobs > 1 AND lv_pcol IS INITIAL.
+      lv_pcol = zcl_erpl_rev_util=>pick_partition_col( ld-fields ).
+    ENDIF.
+    IF ls_par-jobs > 1 AND lv_pcol IS NOT INITIAL.
+      r = zcl_erpl_rev_util=>replicate_parallel(
+            iv_tab      = is_state-source_from
+            iv_target   = lv_stg
+            iv_part_col = lv_pcol
+            iv_jobs     = ls_par-jobs ).
+    ENDIF.
+    " Serial reload when not parallel, or as a safe fallback if the parallel reload
+    " could not run (e.g. no suitable numeric partition column / no free batch WPs).
+    IF NOT ( ls_par-jobs > 1 AND lv_pcol IS NOT INITIAL ) OR r-error IS NOT INITIAL.
+      r = zcl_erpl_rev_util=>replicate(
+            iv_tab      = is_state-source_from
+            iv_target   = lv_stg
+            iv_truncate = abap_true ).
+    ENDIF.
     IF r-error IS NOT INITIAL. rs-error = r-error. RETURN. ENDIF.
     snapshot_merge( EXPORTING iv_target = is_state-target iv_staging = lv_stg iv_keys = is_state-keys
                     IMPORTING ev_ins = rs-ins ev_upd = rs-upd ev_del = rs-del ev_error = rs-error ).

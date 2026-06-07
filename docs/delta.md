@@ -65,6 +65,22 @@ Seed the target with an initial full load first (`zcl_erpl_rev_util=>replicate`)
 then register; a WATERMARK/CHANGEDOC/INSERT_ONLY target is self-creating with its PK
 on the first cycle, and SNAPSHOT self-seeds the target from its staging structure.
 
+### Parallel SNAPSHOT reload
+
+A SNAPSHOT cycle re-reads the whole source, so for large tables it can fan the read
+out across several background jobs — the same coordinator/worker engine the full load
+uses (`replicate_parallel`: split a numeric key into *N* ranges, one worker each).
+Register with `extra='{"jobs":4}'` (and optionally `"part_col":"BELNR"` to pin the
+partition column; otherwise the widest numeric key is auto-picked). On
+`Z_ERPL_REV_REPLICATE`'s Delta tab the **Parallel jobs** field (shown only for
+SNAPSHOT) does the same.
+
+It is a pure throughput optimisation: the merge/anti-join still runs once in the server
+after staging is loaded, so results are identical to a serial reload. If no suitable
+numeric partition column is available (or no free batch work processes), the cycle
+**falls back to a serial reload** — never an error. WATERMARK/CHANGEDOC/INSERT_ONLY
+read only the changed slice and don't use this.
+
 ## Running cycles
 
 - `zcl_erpl_rev_delta=>run( iv_target )` runs one cycle for one target

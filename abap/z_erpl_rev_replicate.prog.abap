@@ -204,6 +204,10 @@ SELECTION-SCREEN BEGIN OF BLOCK dlt WITH FRAME TITLE t_dlt.
     PARAMETERS p_dxtra(60) TYPE c LOWER CASE MODIF ID dxt.
   SELECTION-SCREEN END OF LINE.
   SELECTION-SCREEN BEGIN OF LINE.
+    SELECTION-SCREEN COMMENT 1(28) c_djob FOR FIELD p_djobs MODIF ID dsn.
+    PARAMETERS p_djobs TYPE i DEFAULT 1 MODIF ID dsn.    " parallel workers for the SNAPSHOT reload
+  SELECTION-SCREEN END OF LINE.
+  SELECTION-SCREEN BEGIN OF LINE.
     SELECTION-SCREEN COMMENT 1(28) c_dcad FOR FIELD p_dcad.
     PARAMETERS p_dcad(20) TYPE c AS LISTBOX VISIBLE LENGTH 48 DEFAULT 'nightly'.
   SELECTION-SCREEN END OF LINE.
@@ -257,6 +261,7 @@ INITIALIZATION.
   c_dwm    = 'Watermark column'.
   c_dwmk   = 'Watermark kind'.
   c_dxtra  = 'Change-doc object (JSON)'.
+  c_djob   = 'Parallel jobs (reload)'.
   c_dcad   = 'Refresh interval'.
   c_dsch   = 'Run it automatically (job)'.
 
@@ -302,6 +307,11 @@ AT SELECTION-SCREEN ON HELP-REQUEST FOR p_dxtra.
     'For CHANGEDOC / INSERT_ONLY: which change-document object class to read, as JSON,'
     ' e.g. {"objectclas":"MATERIAL"}.'
     ''.
+AT SELECTION-SCREEN ON HELP-REQUEST FOR p_djobs.
+  PERFORM help USING 'Parallel jobs (SNAPSHOT reload)'
+    'SNAPSHOT reloads the whole table each cycle. With > 1, that reload runs across this many'
+    ' background workers (same engine as the parallel full load), partitioned on a numeric key'
+    ' column - useful for large tables. 1 = serial. Needs free batch work processes.'.
 AT SELECTION-SCREEN ON HELP-REQUEST FOR p_dcad.
   PERFORM help USING 'Refresh interval'
     'How fresh this target is kept - a delta cycle for it runs about this often.'
@@ -391,6 +401,8 @@ AT SELECTION-SCREEN OUTPUT.
       screen-active = COND i( WHEN p_dmeth = 'WATERMARK' THEN 1 ELSE 0 ).
     ELSEIF screen-group1 = 'DXT'.
       screen-active = COND i( WHEN p_dmeth = 'CHANGEDOC' OR p_dmeth = 'INSERT_ONLY' THEN 1 ELSE 0 ).
+    ELSEIF screen-group1 = 'DSN'.
+      screen-active = COND i( WHEN p_dmeth = 'SNAPSHOT' THEN 1 ELSE 0 ).
     ENDIF.
     MODIFY SCREEN.
   ENDLOOP.
@@ -728,6 +740,12 @@ START-OF-SELECTION.
           CATCH cx_root ##NO_HANDLER.
         ENDTRY.
       ENDIF.
+      " extra JSON is method-specific: change-doc object for CHANGEDOC/INSERT_ONLY;
+      " a parallel-reload hint {"jobs":N} for a SNAPSHOT with > 1 worker.
+      DATA(lv_extra) = condense( CONV string( p_dxtra ) ).
+      IF lv_meth = 'SNAPSHOT' AND p_djobs > 1.
+        lv_extra = |\{ "jobs": { p_djobs } \}|.
+      ENDIF.
       DATA(lv_rerr) = zcl_erpl_rev_delta=>register( VALUE #(
         target      = lv_local
         method      = lv_meth
@@ -737,7 +755,7 @@ START-OF-SELECTION.
         wm_kind     = condense( CONV string( p_dwmk ) )
         wm_value    = lv_wmv
         cadence     = condense( CONV string( p_dcad ) )
-        extra       = condense( CONV string( p_dxtra ) ) ) ).
+        extra       = lv_extra ) ).
       IF lv_rerr IS INITIAL.
         WRITE: / |  DELTA: registered '{ lv_local }' as { lv_meth }| &&
                  | (keys { ls_dd-keys }, cadence { p_dcad }).|.
