@@ -258,7 +258,7 @@ INITIALIZATION.
   t_dlt    = 'Delta (incremental) + periodic schedule'.
   c_dlt    = 'Register as delta target'.
   c_dmeth  = 'Method (F1 = explain)'.
-  c_dwm    = 'Watermark column'.
+  c_dwm    = 'Watermark column (F4)'.
   c_dwmk   = 'Watermark kind'.
   c_dxtra  = 'Change-doc object (JSON)'.
   c_djob   = 'Parallel jobs (reload)'.
@@ -272,9 +272,12 @@ AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_tab.
 
 * F4: multi-pick the columns of the table currently in P_TAB (into P_COLS / P_SKEY).
 AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_cols.
-  PERFORM f4_columns USING 'P_COLS'.
+  PERFORM f4_columns USING 'P_COLS' abap_true.
 AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_skey.
-  PERFORM f4_columns USING 'P_SKEY'.
+  PERFORM f4_columns USING 'P_SKEY' abap_true.
+* F4: single-pick the watermark column from the source table's columns (Delta tab).
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_dwm.
+  PERFORM f4_columns USING 'P_DWM' abap_false.
 
 * F4: browse HANA catalog objects (views / functions, incl. _SYS_BIC calc views).
 AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_nfrom.
@@ -824,9 +827,16 @@ ENDFORM.
 *&---------------------------------------------------------------------*
 *&      Form  f4_columns — multi-pick the columns of the chosen table
 *&---------------------------------------------------------------------*
-FORM f4_columns USING iv_target TYPE csequence ##CALLED.
+FORM f4_columns USING iv_target TYPE csequence
+                      iv_multi  TYPE abap_bool ##CALLED.
   DATA lv_tab TYPE string.
   PERFORM read_screen_field USING 'P_TAB' CHANGING lv_tab.
+  " When invoked from another subscreen (e.g. the Delta tab's watermark column),
+  " P_TAB isn't on the current dynpro, so DYNP_VALUES_READ returns nothing — fall
+  " back to the global parameter, already transported when the tab was switched.
+  IF lv_tab IS INITIAL.
+    lv_tab = condense( CONV string( p_tab ) ).
+  ENDIF.
   IF lv_tab IS INITIAL.
     MESSAGE 'Enter (or F4-pick) the source table first' TYPE 'S'.
     RETURN.
@@ -843,7 +853,8 @@ FORM f4_columns USING iv_target TYPE csequence ##CALLED.
   ENDLOOP.
 
   " multiple_choice='X': the user ticks several rows; we join the picks into a
-  " comma list and push it into P_COLS.
+  " comma list and push it back. A single-pick caller (e.g. the watermark column)
+  " passes iv_multi=space and gets exactly one value written.
   DATA lt_ret TYPE STANDARD TABLE OF ddshretval.
   CALL FUNCTION 'F4IF_INT_TABLE_VALUE_REQUEST'
     EXPORTING  retfield        = 'FIELDNAME'
@@ -851,7 +862,7 @@ FORM f4_columns USING iv_target TYPE csequence ##CALLED.
                dynpnr          = sy-dynnr
                dynprofield     = iv_target
                value_org       = 'C'
-               multiple_choice = 'X'
+               multiple_choice = iv_multi
     TABLES     value_tab       = lt_names
                return_tab      = lt_ret
     EXCEPTIONS parameter_error = 1
