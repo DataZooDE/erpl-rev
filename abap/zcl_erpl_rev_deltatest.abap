@@ -102,36 +102,60 @@ CLASS zcl_erpl_rev_deltatest IMPLEMENTATION.
   ENDMETHOD.
 
   METHOD m3_changedoc.
-    " CHANGEDOC / INSERT_ONLY are exercised against a REAL change document written
-    " by BAPI_MATERIAL_SAVEDATA (the MM02 path -> CDHDR OBJECTCLAS='MATERIAL' +
-    " CDPOS): CHANGEDOC re-reads MAKT by MATNR; INSERT_ONLY appends the new CDPOS
-    " items (the CDHDR->CHANGENR->CDPOS 2-step). This requires Materials Management,
-    " which is absent on the bare ABAP Platform developer trial. When unavailable we
-    " SKIP (a note, not a fail) so the harness still proves M1/M2/M4 on real
-    " transactions; the CHANGEDOC/INSERT_ONLY engine itself is exercised by the
-    " server merge unit tests and runs on any MM-equipped (S/4) system unchanged.
-    DATA lv_matnr TYPE matnr.
-    DATA lv_maktx TYPE string.
-    DATA lv_merr  TYPE string.
-    zcl_erpl_rev_deltadrv=>change_material(
-      IMPORTING ev_matnr = lv_matnr ev_maktx = lv_maktx ev_error = lv_merr ).
-    IF lv_merr IS NOT INITIAL.
-      mo->write( |M3 SKIP (change-doc): { lv_merr }| ).
-      RETURN.
-    ENDIF.
+    " CHANGEDOC + INSERT_ONLY proven against REAL CDHDR/CDPOS change documents.
+    " A4H is a bare ABAP Platform with no Materials Management, so instead of
+    " BAPI_MATERIAL_SAVEDATA (the MM02 path) we write genuine CDHDR/CDPOS rows under
+    " customer-owned object classes and let the readers consume them through the
+    " exact CDHDR-feed -> business-key/CHANGENR -> re-read -> MERGE path. Same engine
+    " an MM-equipped (S/4) system would drive via material change documents.
+    zcl_erpl_rev_deltadrv=>synth_cd_purge( 'ZERPLCD' ).
+    zcl_erpl_rev_deltadrv=>synth_cd_purge( 'ZERPLIO' ).
 
-    zcl_erpl_rev_util=>replicate( iv_tab = 'MAKT' iv_target = 'makt_cd' iv_maxrows = 500 ).
-    DATA(lv_hw) = zcl_erpl_rev_delta=>cdhdr_highwater( 'MATERIAL' ).
+    " ---- CHANGEDOC: CDHDR(ZERPLCD).OBJECTID -> re-read ZDELTA_WM by ID -> MERGE ----
+    zcl_erpl_rev_util=>replicate( iv_tab = 'ZDELTA_WM' iv_target = 'cd_wm' ).   " baseline (+PK)
+    DATA(lv_hw_cd) = zcl_erpl_rev_delta=>cdhdr_highwater( 'ZERPLCD' ).          " '' after purge
+    zcl_erpl_rev_deltadrv=>touch_wm( '0000000007' ).                            " real source change
+    zcl_erpl_rev_deltadrv=>synth_cd(
+      iv_objectclas = 'ZERPLCD' iv_objectid = '0000000007'
+      iv_tabname = 'ZDELTA_WM' iv_fname = 'NAME' ).
     zcl_erpl_rev_delta=>register( VALUE #(
-      target = 'makt_cd' method = 'CHANGEDOC' source_from = 'MAKT'
-      keys = 'MANDT,MATNR,SPRAS' wm_kind = 'DATETIME' wm_value = lv_hw
-      extra = '{"objectclas":"MATERIAL"}' cadence = 'manual' ) ).
-    DATA(rc) = zcl_erpl_rev_delta=>run( 'makt_cd' ).
+      target = 'cd_wm' method = 'CHANGEDOC' source_from = 'ZDELTA_WM'
+      keys = 'CLIENT,ID' wm_kind = 'DATETIME' wm_value = lv_hw_cd
+      extra = '{"objectclas":"ZERPLCD"}' cadence = 'manual' ) ).
+    DATA(rc) = zcl_erpl_rev_delta=>run( 'cd_wm' ).
     ok( cond = xsdbool( rc-error IS INITIAL ) what = 'M3 changedoc cycle ok' detail = rc-error ).
     ok( cond = xsdbool( rc-rows >= 1 ) what = 'M3 changedoc applied >=1' detail = |{ rc-rows }| ).
-    ok( cond = has( iv_sql = |SELECT maktx FROM makt_cd WHERE maktx LIKE 'erpl delta%'|
-                    iv_sub = lv_maktx )
-        what = 'M3 changed material description landed in MAKT target' detail = lv_maktx ).
+    ok( cond = has( iv_sql = |SELECT name FROM cd_wm WHERE id='0000000007'| iv_sub = 'touched' )
+        what = 'M3 changedoc re-read landed the updated row in the target' ).
+    DATA(rc2) = zcl_erpl_rev_delta=>run( 'cd_wm' ).
+    ok( cond = xsdbool( rc2-rows = 0 ) what = 'M3 changedoc idempotent re-run applies 0'
+        detail = |{ rc2-rows }| ).
+
+    " ---- INSERT_ONLY: CDHDR(ZERPLIO) -> CHANGENR list -> re-read CDPOS -> append ----
+    zcl_erpl_rev_util=>query( |DROP TABLE IF EXISTS cd_pos| ).   " deterministic across runs
+    DATA(ld_pos) = zcl_erpl_rev_util=>describe_table( iv_tab = 'CDPOS' iv_target = 'cd_pos' ).
+    ok( cond = xsdbool( ld_pos-error IS INITIAL ) what = 'M3 cd_pos describe ok' detail = ld_pos-error ).
+    zcl_erpl_rev_util=>query( ld_pos-ddl ).                      " create cd_pos (+PK) empty
+    DATA(lv_hw_io) = zcl_erpl_rev_delta=>cdhdr_highwater( 'ZERPLIO' ).
+    zcl_erpl_rev_deltadrv=>synth_cd( iv_objectclas = 'ZERPLIO' iv_objectid = 'OBJ1'
+      iv_tabname = 'ZDELTA_WM' iv_tabkey = 'K1' iv_fname = 'VAL' iv_value = '111' ).
+    zcl_erpl_rev_deltadrv=>synth_cd( iv_objectclas = 'ZERPLIO' iv_objectid = 'OBJ2'
+      iv_tabname = 'ZDELTA_WM' iv_tabkey = 'K2' iv_fname = 'VAL' iv_value = '222' ).
+    zcl_erpl_rev_delta=>register( VALUE #(
+      target = 'cd_pos' method = 'INSERT_ONLY' source_from = 'CDPOS'
+      keys = 'MANDANT,OBJECTCLAS,OBJECTID,CHANGENR,TABNAME,TABKEY,FNAME,CHNGIND'
+      wm_kind = 'DATETIME' wm_value = lv_hw_io
+      extra = '{"objectclas":"ZERPLIO"}' cadence = 'manual' ) ).
+    DATA(rio) = zcl_erpl_rev_delta=>run( 'cd_pos' ).
+    ok( cond = xsdbool( rio-error IS INITIAL ) what = 'M3 insert_only cycle ok' detail = rio-error ).
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM cd_pos| ) = 2 )
+        what = 'M3 insert_only appended 2 CDPOS rows' detail = |{ rio-rows }| ).
+    DATA(rio2) = zcl_erpl_rev_delta=>run( 'cd_pos' ).
+    ok( cond = xsdbool( rio2-rows = 0 ) what = 'M3 insert_only idempotent re-run applies 0'
+        detail = |{ rio2-rows }| ).
+
+    zcl_erpl_rev_deltadrv=>synth_cd_purge( 'ZERPLCD' ).
+    zcl_erpl_rev_deltadrv=>synth_cd_purge( 'ZERPLIO' ).
   ENDMETHOD.
 
   METHOD m4_orchestration.

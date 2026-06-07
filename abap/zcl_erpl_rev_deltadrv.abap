@@ -4,9 +4,11 @@ CLASS zcl_erpl_rev_deltadrv DEFINITION PUBLIC FINAL CREATE PUBLIC.
     " REAL, committed SAP changes so a delta cycle has something to pick up:
     "   * ZDELTA_WM  - direct Open SQL insert/update/delete on a test table whose
     "                  CHANGED_AT is a numeric (DEC15 YYYYMMDDHHMMSS) watermark.
-    "   * material   - BAPI_MATERIAL_SAVEDATA (the MM02 path) writes a genuine
-    "                  change document (CDHDR OBJECTCLAS='MATERIAL' + CDPOS), which
-    "                  the CHANGEDOC / INSERT_ONLY readers consume.
+    "   * CDHDR/CDPOS - synth_cd writes a genuine change document (header + item)
+    "                  under a customer object class, which the CHANGEDOC /
+    "                  INSERT_ONLY readers consume (A4H has no MM, so this stands in
+    "                  for the BAPI_MATERIAL_SAVEDATA / MM02 change-document path).
+    "   * SFLIGHT    - sflight_change / sflight_mass for the SNAPSHOT demo.
     " Shared by zcl_erpl_rev_deltatest (automated proof) and the GUI demo report
     " Z_ERPL_REV_DELTA_SFLIGHT (run it by hand in SAP GUI to demo to others).
 
@@ -26,15 +28,6 @@ CLASS zcl_erpl_rev_deltadrv DEFINITION PUBLIC FINAL CREATE PUBLIC.
     CLASS-METHODS insert_wm IMPORTING iv_id TYPE csequence.
     "! Physically delete one ZDELTA_WM row.
     CLASS-METHODS delete_wm IMPORTING iv_id TYPE csequence.
-
-    "! Change a material description via BAPI_MATERIAL_SAVEDATA + COMMIT (real MM02,
-    "! writes a CDHDR/CDPOS change document under OBJECTCLAS='MATERIAL'). Picks an
-    "! existing material when iv_matnr is blank. Returns the material + new text.
-    CLASS-METHODS change_material
-      IMPORTING iv_matnr TYPE matnr OPTIONAL
-      EXPORTING ev_matnr TYPE matnr
-                ev_maktx TYPE string
-                ev_error TYPE string.
 
     "! Make a REAL, committed change to the SFLIGHT demo table (the SNAPSHOT delta
     "! demo). iv_kind: 'U' bumps PRICE+100 / SEATSOCC+1 of one flight; 'I' clones a
@@ -69,6 +62,26 @@ CLASS zcl_erpl_rev_deltadrv DEFINITION PUBLIC FINAL CREATE PUBLIC.
                 iv_connid TYPE s_conn_id
                 iv_count  TYPE i
       RETURNING VALUE(rv_msg) TYPE string.
+
+    "! Write a REAL change document (one CDHDR header + one CDPOS item) for a
+    "! customer-owned object class, committed. A4H has no Materials Management, so
+    "! this stands in for BAPI_MATERIAL_SAVEDATA: it produces genuine CDHDR/CDPOS
+    "! rows that the CHANGEDOC / INSERT_ONLY readers consume unchanged. CHANGENR is
+    "! a fresh GLOBAL high-water+1 so it can never collide with an existing change
+    "! number (run_insert_only re-reads CDPOS by CHANGENR alone). OBJECTID is the
+    "! business key the CHANGEDOC re-read matches against the source's first key.
+    CLASS-METHODS synth_cd
+      IMPORTING iv_objectclas TYPE cdhdr-objectclas
+                iv_objectid   TYPE cdhdr-objectid
+                iv_tabname    TYPE cdpos-tabname    DEFAULT space
+                iv_tabkey     TYPE cdpos-tabkey     DEFAULT space
+                iv_fname      TYPE cdpos-fname       DEFAULT space
+                iv_value      TYPE cdpos-value_new   DEFAULT space
+      RETURNING VALUE(rv_changenr) TYPE cdhdr-changenr.
+
+    "! Delete all synthetic change documents (CDHDR + CDPOS) for an object class —
+    "! a clean baseline before/after the change-doc scenario.
+    CLASS-METHODS synth_cd_purge IMPORTING iv_objectclas TYPE cdhdr-objectclas.
 
 ENDCLASS.
 
@@ -122,16 +135,6 @@ CLASS zcl_erpl_rev_deltadrv IMPLEMENTATION.
     lv_id = iv_id.
     DELETE FROM zdelta_wm WHERE id = @lv_id.
     COMMIT WORK AND WAIT.
-  ENDMETHOD.
-
-  METHOD change_material.
-    " BAPI_MATERIAL_SAVEDATA (the MM02 path) requires Materials Management, which
-    " is NOT installed on the bare ABAP Platform developer trial (this system is
-    " Basis + the SFLIGHT demo, not the S/4 fully-activated appliance). On an
-    " MM-equipped system this method would issue the BAPI + BAPI_TRANSACTION_COMMIT
-    " to write a genuine CDHDR/CDPOS change document under OBJECTCLAS='MATERIAL'.
-    " The caller treats a non-empty ev_error as "skip the change-doc scenario".
-    ev_error = 'BAPI_MATERIAL_SAVEDATA unavailable (no Materials Management on this system)'.
   ENDMETHOD.
 
   METHOD sflight_purge_demo.
@@ -258,6 +261,47 @@ CLASS zcl_erpl_rev_deltadrv IMPLEMENTATION.
       WHEN OTHERS.
         rv_msg = |ERROR: unknown mass kind { iv_kind }|.
     ENDCASE.
+  ENDMETHOD.
+
+  METHOD synth_cd.
+    " Fresh GLOBAL change number (CDCHANGENR is one number range; a value above the
+    " current max can't collide with any existing CDPOS row).
+    SELECT MAX( changenr ) FROM cdhdr INTO @DATA(lv_maxc).
+    DATA lv_num TYPE n LENGTH 10.
+    lv_num = lv_maxc.
+    lv_num = lv_num + 1.
+    rv_changenr = lv_num.
+
+    DATA ls_h TYPE cdhdr.
+    ls_h-mandant    = sy-mandt.
+    ls_h-objectclas = iv_objectclas.
+    ls_h-objectid   = iv_objectid.
+    ls_h-changenr   = rv_changenr.
+    ls_h-username   = sy-uname.
+    ls_h-udate      = sy-datum.
+    ls_h-utime      = sy-uzeit.
+    ls_h-change_ind = 'U'.
+    INSERT cdhdr FROM @ls_h.
+
+    DATA ls_p TYPE cdpos.
+    ls_p-mandant    = sy-mandt.
+    ls_p-objectclas = iv_objectclas.
+    ls_p-objectid   = iv_objectid.
+    ls_p-changenr   = rv_changenr.
+    ls_p-tabname    = iv_tabname.
+    ls_p-tabkey     = iv_tabkey.
+    ls_p-fname      = iv_fname.
+    ls_p-chngind    = 'U'.
+    ls_p-value_new  = iv_value.
+    INSERT cdpos FROM @ls_p.
+
+    COMMIT WORK AND WAIT.
+  ENDMETHOD.
+
+  METHOD synth_cd_purge.
+    DELETE FROM cdhdr WHERE objectclas = @iv_objectclas.   "#EC CI_NOFIRST
+    DELETE FROM cdpos WHERE objectclas = @iv_objectclas.   "#EC CI_NOFIRST
+    COMMIT WORK AND WAIT.
   ENDMETHOD.
 
 ENDCLASS.

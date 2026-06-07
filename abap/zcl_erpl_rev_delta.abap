@@ -368,9 +368,17 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       rs-wm = is_state-wm_value.
       RETURN.
     ENDIF.
-    " Business key field = the first key column of the target source.
+    " Business key field = the first NON-client key column (CDHDR.OBJECTID is the
+    " business key without the client, e.g. MATNR for MANDT,MATNR,SPRAS).
     SPLIT is_state-keys AT ',' INTO TABLE DATA(lt_keys).
-    DATA(lv_keyf) = VALUE string( lt_keys[ 1 ] OPTIONAL ).
+    DATA lv_keyf TYPE string.
+    LOOP AT lt_keys INTO DATA(lv_k).
+      DATA(lv_ku) = to_upper( condense( lv_k ) ).
+      IF lv_ku = 'MANDT' OR lv_ku = 'CLIENT' OR lv_ku = 'MANDANT'. CONTINUE. ENDIF.
+      lv_keyf = lv_ku.
+      EXIT.
+    ENDLOOP.
+    IF lv_keyf IS INITIAL. lv_keyf = to_upper( VALUE string( lt_keys[ 1 ] OPTIONAL ) ). ENDIF.
     DATA lt_in TYPE string_table.
     LOOP AT lt_oid INTO DATA(lv_oid).
       APPEND |'{ q( lv_oid ) }'| TO lt_in.
