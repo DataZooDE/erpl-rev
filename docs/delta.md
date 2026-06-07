@@ -174,4 +174,7 @@ debug exactly what was loaded. (This is the scenario the M5 E2E section verifies
   `BAPI_MATERIAL_SAVEDATA` change document on an MM-equipped system; on a bare ABAP
   Platform trial without Materials Management that section skips.)
 
+Every cycle (and every full load) is recorded in `_erpl_rev_run_stats` for a
+replication dashboard — see [`stats.md`](stats.md).
+
 See the design study (HLD + ADRs) for the rationale behind each decision.

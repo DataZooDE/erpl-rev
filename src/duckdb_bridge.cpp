@@ -185,6 +185,38 @@ DuckDbBridge::DuckDbBridge(const std::string &path, const std::string &init_sql)
         "lease_ts TIMESTAMPTZ, last_error VARCHAR)");
     if (d->HasError())
         throw std::runtime_error("DuckDB delta-state init failed: " + d->GetError());
+    // Replication run statistics — one durable row per full or incremental run,
+    // written by the ABAP apply path (zcl_erpl_rev_util=>record_run via Z_DUCKDB_QUERY),
+    // with enough dimensions/measures to build a replication dashboard straight from
+    // DuckDB (see docs/stats.md). run_id from a sequence; ts defaults to the server
+    // clock (now()) so it agrees with the delta-state clock. The erpl_rev_run_stats
+    // view adds derived rows_applied / rows_per_sec / started_at / is_success.
+    auto seq = con.Query("CREATE SEQUENCE IF NOT EXISTS _erpl_rev_run_seq START 1");
+    if (seq->HasError())
+        throw std::runtime_error("DuckDB run-seq init failed: " + seq->GetError());
+    auto rstat = con.Query(
+        "CREATE TABLE IF NOT EXISTS _erpl_rev_run_stats ("
+        "run_id BIGINT PRIMARY KEY DEFAULT nextval('_erpl_rev_run_seq'), "
+        "ts TIMESTAMPTZ DEFAULT now(), "
+        "target VARCHAR, source VARCHAR, run_type VARCHAR, method VARCHAR, status VARCHAR, "
+        "duration_ms BIGINT, rows_read BIGINT, rows_ins BIGINT, rows_upd BIGINT, rows_del BIGINT, "
+        "wm_from VARCHAR, wm_to VARCHAR, jobs INTEGER, error_text VARCHAR)");
+    if (rstat->HasError())
+        throw std::runtime_error("DuckDB run-stats init failed: " + rstat->GetError());
+    auto rview = con.Query(
+        "CREATE OR REPLACE VIEW erpl_rev_run_stats AS SELECT "
+        "run_id, ts AS finished_at, "
+        "ts - (COALESCE(duration_ms,0) * INTERVAL '1 millisecond') AS started_at, "
+        "target, source, run_type, method, status, duration_ms, "
+        "rows_read, rows_ins, rows_upd, rows_del, "
+        "(COALESCE(rows_ins,0)+COALESCE(rows_upd,0)+COALESCE(rows_del,0)) AS rows_applied, "
+        "CASE WHEN duration_ms > 0 THEN "
+        "(COALESCE(rows_ins,0)+COALESCE(rows_upd,0)+COALESCE(rows_del,0))*1000.0/duration_ms "
+        "ELSE NULL END AS rows_per_sec, "
+        "wm_from, wm_to, jobs, (status='SUCCESS') AS is_success, error_text "
+        "FROM _erpl_rev_run_stats");
+    if (rview->HasError())
+        throw std::runtime_error("DuckDB run-stats view init failed: " + rview->GetError());
     // Boot init: explicit init_sql (CLI/--init-file) wins; else env fallback. Runs
     // INSTALL/LOAD/CREATE SECRET/ATTACH so replication can publish to external
     // targets (parquet object stores, postgres, ducklake, bigquery, iceberg).

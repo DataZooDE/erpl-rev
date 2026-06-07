@@ -254,6 +254,7 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       rs-skipped = abap_true.
       RETURN.
     ENDIF.
+    GET TIME STAMP FIELD DATA(lv_t0).
     CASE ls_state-method.
       WHEN 'WATERMARK'.   rs = run_watermark( ls_state ).
       WHEN 'INSERT_ONLY'. rs = run_insert_only( ls_state ).
@@ -263,12 +264,30 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
     ENDCASE.
     rs-target = iv_target.
     rs-method = ls_state-method.
+    GET TIME STAMP FIELD DATA(lv_t1).
     IF rs-error IS INITIAL.
       commit( iv_target = iv_target iv_wm = rs-wm iv_rows = rs-rows ).
       release( iv_target = iv_target iv_status = 'IDLE' ).
     ELSE.
       release( iv_target = iv_target iv_status = 'ERROR' iv_error = rs-error ).
     ENDIF.
+    " Dashboard stats: one DELTA run row per cycle (every method). WATERMARK/CHANGEDOC/
+    " INSERT_ONLY report a row count but not an I/U/D split, so attribute it to ins so
+    " rows_applied is meaningful; SNAPSHOT carries the real ins/upd/del.
+    zcl_erpl_rev_util=>record_run(
+      iv_target   = iv_target
+      iv_source   = ls_state-source_from
+      iv_run_type = 'DELTA'
+      iv_method   = ls_state-method
+      iv_status   = COND #( WHEN rs-error IS INITIAL THEN 'SUCCESS' ELSE 'ERROR' )
+      iv_ms       = CONV i( cl_abap_tstmp=>subtract( tstmp1 = lv_t1 tstmp2 = lv_t0 ) * 1000 )
+      iv_read     = rs-rows
+      iv_ins      = COND i( WHEN rs-ins + rs-upd + rs-del = 0 THEN rs-rows ELSE rs-ins )
+      iv_upd      = rs-upd
+      iv_del      = rs-del
+      iv_wm_from  = ls_state-wm_value
+      iv_wm_to    = rs-wm
+      iv_error    = rs-error ).
   ENDMETHOD.
 
   METHOD source_max.
@@ -299,7 +318,8 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       iv_target   = is_state-target
       iv_mode     = 'MERGE'
       iv_truncate = abap_false
-      iv_where    = lv_where ).
+      iv_where    = lv_where
+      iv_record   = abap_false ).   " the cycle is recorded by run() as one DELTA row
     rs-rows  = r-rows_affected.
     rs-error = r-error.
     IF r-error IS INITIAL.
@@ -389,7 +409,8 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       iv_target   = is_state-target
       iv_mode     = 'MERGE'
       iv_truncate = abap_false
-      iv_where    = lv_where ).
+      iv_where    = lv_where
+      iv_record   = abap_false ).   " the cycle is recorded by run() as one DELTA row
     rs-rows  = r-rows_affected.
     rs-error = r-error.
     IF r-error IS NOT INITIAL. rs-wm = is_state-wm_value. ENDIF.
@@ -420,7 +441,8 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       iv_target   = is_state-target
       iv_mode     = 'MERGE'
       iv_truncate = abap_false
-      iv_where    = lv_where ).
+      iv_where    = lv_where
+      iv_record   = abap_false ).   " the cycle is recorded by run() as one DELTA row
     rs-rows  = r-rows_affected.
     rs-error = r-error.
     IF r-error IS NOT INITIAL. rs-wm = is_state-wm_value. ENDIF.
@@ -461,7 +483,8 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
             iv_tab      = is_state-source_from
             iv_target   = lv_stg
             iv_part_col = lv_pcol
-            iv_jobs     = ls_par-jobs ).
+            iv_jobs     = ls_par-jobs
+            iv_record   = abap_false ).   " staging reload; the cycle is one DELTA row
     ENDIF.
     " Serial reload when not parallel, or as a safe fallback if the parallel reload
     " could not run (e.g. no suitable numeric partition column / no free batch WPs).
@@ -469,7 +492,8 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       r = zcl_erpl_rev_util=>replicate(
             iv_tab      = is_state-source_from
             iv_target   = lv_stg
-            iv_truncate = abap_true ).
+            iv_truncate = abap_true
+            iv_record   = abap_false ).
     ENDIF.
     IF r-error IS NOT INITIAL. rs-error = r-error. RETURN. ENDIF.
     snapshot_merge( EXPORTING iv_target = is_state-target iv_staging = lv_stg iv_keys = is_state-keys

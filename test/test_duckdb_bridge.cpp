@@ -688,6 +688,48 @@ TEST_CASE("Delta: _erpl_rev_delta_state registry exists at boot", "[bridge][delt
             R"({"method":"WATERMARK","safety_secs":120,"cadence":"nightly","status":"IDLE"})");
 }
 
+// ---------------------------------------------------------------------------
+// Replication run statistics: _erpl_rev_run_stats (+ erpl_rev_run_stats view),
+// created at boot, one row per full/incremental run. (See docs/stats.md.)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("Stats: _erpl_rev_run_stats table + view exist at boot", "[bridge][stats]") {
+    DuckDbBridge db;
+    // Present + empty, queryable through the same path ABAP uses (Z_DUCKDB_QUERY).
+    REQUIRE(db.Query("SELECT count(*) AS c FROM _erpl_rev_run_stats").rows[0] == R"({"c":0})");
+    REQUIRE(db.Query("SELECT count(*) AS c FROM erpl_rev_run_stats").rows[0] == R"({"c":0})");
+}
+
+TEST_CASE("Stats: recorded run surfaces derived columns in the view", "[bridge][stats][view]") {
+    DuckDbBridge db;
+    // A full-load run as ABAP's record_run would write it (run_id + ts default).
+    db.Execute("INSERT INTO _erpl_rev_run_stats"
+               "(target,source,run_type,method,status,duration_ms,rows_read,rows_ins,rows_upd,rows_del,jobs) "
+               "VALUES ('mara','MARA','FULL','FULL','SUCCESS',2000,1000,1000,0,0,1)");
+    // A delta SNAPSHOT cycle with a physical delete.
+    db.Execute("INSERT INTO _erpl_rev_run_stats"
+               "(target,source,run_type,method,status,duration_ms,rows_read,rows_ins,rows_upd,rows_del,jobs) "
+               "VALUES ('mara','MARA','DELTA','SNAPSHOT','SUCCESS',500,3,1,1,1,1)");
+    // The view derives rows_applied, rows_per_sec, is_success — dashboard-ready.
+    auto r = db.Query("SELECT run_type, rows_applied, CAST(rows_per_sec AS BIGINT) AS rps, is_success "
+                      "FROM erpl_rev_run_stats ORDER BY run_id");
+    REQUIRE(r.rows[0] == R"({"run_type":"FULL","rows_applied":1000,"rps":500,"is_success":true})");
+    REQUIRE(r.rows[1] == R"({"run_type":"DELTA","rows_applied":3,"rps":6,"is_success":true})");
+    // run_id is sequence-assigned and monotonic; started_at = finished_at - duration.
+    auto m = db.Query("SELECT count(*) AS c FROM erpl_rev_run_stats "
+                      "WHERE started_at <= finished_at AND run_id >= 1");
+    REQUIRE(m.rows[0] == R"({"c":2})");
+}
+
+TEST_CASE("Stats: an ERROR run is recorded as not-successful", "[bridge][stats][error]") {
+    DuckDbBridge db;
+    db.Execute("INSERT INTO _erpl_rev_run_stats"
+               "(target,source,run_type,method,status,duration_ms,error_text) "
+               "VALUES ('mara','MARA','DELTA','WATERMARK','ERROR',10,'cast failed')");
+    auto r = db.Query("SELECT status, is_success, error_text FROM erpl_rev_run_stats");
+    REQUIRE(r.rows[0] == R"({"status":"ERROR","is_success":false,"error_text":"cast failed"})");
+}
+
 TEST_CASE("IngestBxml MERGE: op_col drives insert/update/delete", "[bridge][ingest][merge]") {
     DuckDbBridge db;
     std::string ddl = "CREATE TABLE IF NOT EXISTS m(id INTEGER PRIMARY KEY, v VARCHAR);";

@@ -53,6 +53,7 @@ START-OF-SELECTION.
     iv_truncate = abap_true        " INSERT mode + heap semantics, but...
     iv_create   = abap_false       " ...coordinator already created the heap, and
     iv_build_pk = abap_false       " ...coordinator builds the PK once at the end.
+    iv_record   = abap_false       " ...coordinator records ONE FULL stats row.
     ii_progress = lo_log ).
   IF r-error IS NOT INITIAL.
     MESSAGE |worker error: { r-error }| TYPE 'E'.

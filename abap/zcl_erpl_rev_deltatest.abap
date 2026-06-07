@@ -13,6 +13,7 @@ CLASS zcl_erpl_rev_deltatest DEFINITION PUBLIC FINAL CREATE PUBLIC.
     METHODS m3_changedoc.
     METHODS m4_orchestration.
     METHODS m5_sflight.
+    METHODS m6_stats.
 ENDCLASS.
 
 CLASS zcl_erpl_rev_deltatest IMPLEMENTATION.
@@ -39,6 +40,7 @@ CLASS zcl_erpl_rev_deltatest IMPLEMENTATION.
         m3_changedoc( ).
         m4_orchestration( ).
         m5_sflight( ).
+        m6_stats( ).
       CATCH cx_root INTO DATA(lx).
         mv_fail = mv_fail + 1.
         out->write( |DUMP: { lx->get_text( ) }| ).
@@ -263,6 +265,27 @@ CLASS zcl_erpl_rev_deltatest IMPLEMENTATION.
         what = 'M5 all demo flights gone' ).
     ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM sflight| ) = lv_n0 )
         what = 'M5 mass delete restored baseline' ).
+  ENDMETHOD.
+
+  METHOD m6_stats.
+    " C15: every full + incremental run is recorded in _erpl_rev_run_stats so a
+    " replication dashboard can be built straight from DuckDB. The baselines above
+    " wrote FULL rows; each delta cycle wrote a DELTA row; the SFLIGHT/snapshot
+    " cycles recorded physical deletes. The erpl_rev_run_stats view derives the
+    " dashboard columns (rows_applied / rows_per_sec / is_success / started_at).
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM _erpl_rev_run_stats WHERE run_type='FULL'| ) >= 1 )
+        what = 'C15 FULL runs recorded' ).
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM _erpl_rev_run_stats WHERE run_type='DELTA'| ) >= 1 )
+        what = 'C15 DELTA runs recorded' ).
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM _erpl_rev_run_stats | &&
+                             |WHERE method='SNAPSHOT' AND rows_del >= 1| ) >= 1 )
+        what = 'C15 a snapshot cycle recorded a physical delete' ).
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM _erpl_rev_run_stats | &&
+                             |WHERE method IN ('WATERMARK','CHANGEDOC','INSERT_ONLY')| ) >= 1 )
+        what = 'C15 watermark/changedoc/insert_only cycles recorded' ).
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM erpl_rev_run_stats | &&
+                             |WHERE is_success AND rows_applied > 0| ) >= 1 )
+        what = 'C15 dashboard view derives rows_applied / is_success' ).
   ENDMETHOD.
 
 ENDCLASS.

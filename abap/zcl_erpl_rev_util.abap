@@ -113,6 +113,7 @@ CLASS zcl_erpl_rev_util DEFINITION PUBLIC FINAL CREATE PUBLIC.
                 iv_params     TYPE string DEFAULT ''
                 iv_key_cols   TYPE string DEFAULT ''
                 ii_progress   TYPE REF TO zif_erpl_rev_progress OPTIONAL
+                iv_record     TYPE abap_bool DEFAULT abap_true
       RETURNING VALUE(rs)     TYPE ty_repl.
 
     "! Partitioned PARALLEL full-load. The coordinator (re)creates the heap target,
@@ -134,7 +135,28 @@ CLASS zcl_erpl_rev_util DEFINITION PUBLIC FINAL CREATE PUBLIC.
                 iv_batch    TYPE i DEFAULT 50000
                 iv_params   TYPE string DEFAULT ''
                 ii_progress TYPE REF TO zif_erpl_rev_progress OPTIONAL
+                iv_record   TYPE abap_bool DEFAULT abap_true
       RETURNING VALUE(rs)   TYPE ty_repl.
+
+    "! Record ONE replication-run statistics row into the DuckDB control table
+    "! _erpl_rev_run_stats (created at server boot) — full or incremental. This is
+    "! the dashboard feed (view erpl_rev_run_stats); see docs/stats.md. run_id + ts
+    "! default in the server, so callers pass only the run summary they already hold.
+    CLASS-METHODS record_run
+      IMPORTING iv_target   TYPE csequence
+                iv_source   TYPE csequence DEFAULT ''
+                iv_run_type TYPE csequence            " FULL | DELTA
+                iv_method   TYPE csequence            " FULL | WATERMARK | SNAPSHOT | CHANGEDOC | INSERT_ONLY
+                iv_status   TYPE csequence            " SUCCESS | ERROR
+                iv_ms       TYPE i DEFAULT 0
+                iv_read     TYPE i DEFAULT 0
+                iv_ins      TYPE i DEFAULT 0
+                iv_upd      TYPE i DEFAULT 0
+                iv_del      TYPE i DEFAULT 0
+                iv_wm_from  TYPE csequence DEFAULT ''
+                iv_wm_to    TYPE csequence DEFAULT ''
+                iv_jobs     TYPE i DEFAULT 0
+                iv_error    TYPE csequence DEFAULT ''.
 
     "! Build the dynamic FROM source token: the entity name, or — for a CDS view
     "! WITH PARAMETERS — `NAME( p1 = 'v', … )`. iv_params is the raw parameter-list
@@ -582,6 +604,25 @@ CLASS zcl_erpl_rev_util IMPLEMENTATION.
     ENDIF.
   ENDMETHOD.
 
+  METHOD record_run.
+    " Compose one INSERT into the server-owned stats table (run_id + ts default in
+    " the server). Controlled enums (run_type/method/status) are not escaped; the
+    " free-text identifiers/error are single-quote-escaped.
+    DATA(lv_tgt) = replace( val = CONV string( iv_target )  sub = `'` with = `''` occ = 0 ).
+    DATA(lv_src) = replace( val = CONV string( iv_source )  sub = `'` with = `''` occ = 0 ).
+    DATA(lv_wf)  = replace( val = CONV string( iv_wm_from ) sub = `'` with = `''` occ = 0 ).
+    DATA(lv_wt)  = replace( val = CONV string( iv_wm_to )   sub = `'` with = `''` occ = 0 ).
+    DATA(lv_err) = COND string( WHEN iv_error IS INITIAL THEN `NULL`
+      ELSE |'{ replace( val = CONV string( iv_error ) sub = `'` with = `''` occ = 0 ) }'| ).
+    query(
+      |INSERT INTO _erpl_rev_run_stats | &&
+      |(target,source,run_type,method,status,duration_ms,| &&
+      |rows_read,rows_ins,rows_upd,rows_del,wm_from,wm_to,jobs,error_text) | &&
+      |VALUES ('{ lv_tgt }','{ lv_src }','{ iv_run_type }','{ iv_method }','{ iv_status }',| &&
+      |{ iv_ms },{ iv_read },{ iv_ins },{ iv_upd },{ iv_del },| &&
+      |'{ lv_wf }','{ lv_wt }',{ iv_jobs },{ lv_err })| ).
+  ENDMETHOD.
+
   METHOD replicate.
     DATA(ls_desc) = describe_table( iv_tab = iv_tab iv_target = iv_target
                                     iv_columns = iv_columns ).
@@ -820,6 +861,18 @@ CLASS zcl_erpl_rev_util IMPLEMENTATION.
     GET TIME STAMP FIELD DATA(lv_t1).
     rs-seconds = cl_abap_tstmp=>subtract( tstmp1 = lv_t1 tstmp2 = lv_t0 ).
 
+    " Dashboard stats: one FULL run row (suppressed by iv_record=false for delta
+    " sub-step reloads — watermark/changedoc/insert_only merges and the snapshot
+    " staging reload — and for parallel workers; those are recorded by their owner).
+    IF iv_record = abap_true.
+      record_run( iv_target = iv_target iv_source = iv_tab
+        iv_run_type = 'FULL' iv_method = 'FULL'
+        iv_status = COND #( WHEN rs-error IS INITIAL THEN 'SUCCESS' ELSE 'ERROR' )
+        iv_ms = CONV i( rs-seconds * 1000 )
+        iv_read = rs-rows_affected iv_ins = rs-rows_affected
+        iv_error = rs-error ).
+    ENDIF.
+
     " Empty source with NO up-front truncate: still create the target (run DDL via
     " an empty ingest) so a 0-row delta load leaves an empty typed table.
     IF lv_first = abap_true AND iv_truncate = abap_false.
@@ -964,6 +1017,17 @@ CLASS zcl_erpl_rev_util IMPLEMENTATION.
     DATA(qc) = query( |SELECT count(*) AS c FROM { iv_target }| ).
     FIND PCRE '"c":(\d+)' IN qc-rows SUBMATCHES DATA(lv_cs).
     IF sy-subrc = 0. rs-rows_affected = CONV i( lv_cs ). ENDIF.
+
+    " Dashboard stats: one FULL run row for the whole parallel load (jobs = N). The
+    " workers pass iv_record=false, so this is the single row for the run.
+    IF iv_record = abap_true.
+      record_run( iv_target = iv_target iv_source = iv_tab
+        iv_run_type = 'FULL' iv_method = 'FULL'
+        iv_status = COND #( WHEN rs-error IS INITIAL THEN 'SUCCESS' ELSE 'ERROR' )
+        iv_ms = CONV i( rs-seconds * 1000 )
+        iv_read = rs-rows_affected iv_ins = rs-rows_affected
+        iv_jobs = iv_jobs iv_error = rs-error ).
+    ENDIF.
   ENDMETHOD.
 
   METHOD pick_partition_col.
