@@ -88,12 +88,27 @@ reclaimed). There is no cross-system 2-phase commit.
 `CHANGENR` is buffered and **not strictly monotonic** in commit order, so CDHDR-driven
 methods watermark on `UDATE`+`UTIME` with a safety lag — never a bare `CHANGENR > wm`.
 
-## Simulator (manual demo)
+## Demo & inspection (SAP GUI)
 
-`Z_ERPL_REV_DELTA_SIM` is a GUI-runnable report: pick a scenario (seed / update /
-insert / delete a `ZDELTA_WM` row, or change a material), and it injects a real,
-committed SAP change, runs one delta cycle, and shows the applied counts plus the
-target row count before/after — so you can watch a change flow into DuckDB by hand.
+**`Z_ERPL_REV_DELTA_SFLIGHT`** — the recommended hands-on demo, on the familiar
+flight-booking model. Run it in SAP GUI (SA38 → F8) and use the buttons:
+
+- **Setup** — full-load `SFLIGHT` into the DuckDB table `sflight` and register it as
+  a **SNAPSHOT** delta target (SFLIGHT has no change column; the snapshot anti-join
+  reflects inserts, updates **and physical deletes**).
+- **Update / Insert / Delete flight** — make a real, committed change to `SFLIGHT`
+  (the key is the screen's carrid/connid/fldate).
+- **Run delta cycle** — one cycle; the change is merged into `sflight`.
+- **Refresh** — re-read the target.
+
+The **log pane** (top) records every action plus each cycle's `ins/upd/del` counts
+and a SAP-source-vs-DuckDB row-count check; the **ALV pane** (bottom) shows the live
+DuckDB `sflight` contents — so you can watch a real SAP change flow into DuckDB and
+debug exactly what was loaded. (This is the scenario the M5 E2E section verifies.)
+
+`Z_ERPL_REV_DELTA_SIM` is the lower-level simulator: pick a scenario (seed / update /
+insert / delete a `ZDELTA_WM` row, or change a material), inject a committed change,
+run one cycle, and see the applied counts plus the target row count before/after.
 
 ## Testing
 
@@ -102,7 +117,8 @@ target row count before/after — so you can watch a change flow into DuckDB by 
   rollback, and the composite-key + cast-column upsert.
 - **E2E on A4H** — `ZCL_ERPL_REV_DELTATEST` (run by `make e2e`) proves, against real
   SAP transactions: WATERMARK merge + idempotent re-run, SNAPSHOT physical-delete
-  reconciliation, and the orchestration lease / granularity-gate / catch-up. It prints
+  reconciliation, the orchestration lease / granularity-gate / catch-up, and the
+  **SFLIGHT** insert/update/delete demo scenario end-to-end. It prints
   `DELTA RESULT pass=N fail=0`. (CHANGEDOC/INSERT_ONLY are exercised against a real
   `BAPI_MATERIAL_SAVEDATA` change document on an MM-equipped system; on a bare ABAP
   Platform trial without Materials Management that section skips.)

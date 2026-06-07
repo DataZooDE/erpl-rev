@@ -80,6 +80,7 @@ prog Z_ERPL_REV_REPLICATE z_erpl_rev_replicate.prog.abap "replicate SAP table ->
 prog Z_ERPL_REV_SQL       z_erpl_rev_sql.prog.abap       "DuckDB SQL console (docking-container UI)"
 prog Z_ERPL_REV_DELTA     z_erpl_rev_delta.prog.abap     "delta orchestration loop (cadence + lease)"
 prog Z_ERPL_REV_DELTA_SIM z_erpl_rev_delta_sim.prog.abap "delta simulator (inject change + run one cycle)"
+prog Z_ERPL_REV_DELTA_SFLIGHT z_erpl_rev_delta_sflight.prog.abap "SFLIGHT delta demo (load/change/run/inspect, GUI)"
 
 echo "== report-path E2E classrun (SUBMITs the report's parallel branch) =="
 cls ZCL_ERPL_REV_REPLRUN  zcl_erpl_rev_replrun.abap  "Z_ERPL_REV_REPLICATE parallel-branch E2E"

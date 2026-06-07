@@ -12,6 +12,7 @@ CLASS zcl_erpl_rev_deltatest DEFINITION PUBLIC FINAL CREATE PUBLIC.
     METHODS m2_snapshot.
     METHODS m3_changedoc.
     METHODS m4_orchestration.
+    METHODS m5_sflight.
 ENDCLASS.
 
 CLASS zcl_erpl_rev_deltatest IMPLEMENTATION.
@@ -37,6 +38,7 @@ CLASS zcl_erpl_rev_deltatest IMPLEMENTATION.
         m2_snapshot( ).
         m3_changedoc( ).
         m4_orchestration( ).
+        m5_sflight( ).
       CATCH cx_root INTO DATA(lx).
         mv_fail = mv_fail + 1.
         out->write( |DUMP: { lx->get_text( ) }| ).
@@ -165,6 +167,53 @@ CLASS zcl_erpl_rev_deltatest IMPLEMENTATION.
       IF ls-error IS INITIAL AND ls-rows >= 1. lv_hit = abap_true. ENDIF.
     ENDLOOP.
     ok( cond = lv_hit what = 'M4 run_due executes the due catch-up cycle' ).
+  ENDMETHOD.
+
+  METHOD m5_sflight.
+    " The SFLIGHT demo scenario behind Z_ERPL_REV_DELTA_SFLIGHT: SNAPSHOT delta on
+    " the flight-booking demo table — insert + update + physical delete, each
+    " reflected after one cycle, on a recognizable standard SAP table. Uses a fixed
+    " far-future flight date (2099-12-31) so the asserts are deterministic and the
+    " demo flight is added then removed (SFLIGHT is left as it was).
+    DATA: lv_c TYPE s_carr_id, lv_n TYPE s_conn_id, lv_d TYPE s_date.
+    zcl_erpl_rev_deltadrv=>sflight_default(
+      IMPORTING ev_carrid = lv_c ev_connid = lv_n ev_fldate = lv_d ).
+    ok( cond = xsdbool( lv_c IS NOT INITIAL ) what = 'M5 SFLIGHT demo data present' ).
+    IF lv_c IS INITIAL. RETURN. ENDIF.
+    DATA(lv_demo) = CONV s_date( '20991231' ).
+
+    " clean any leftover demo flight, then full-load + register SNAPSHOT
+    zcl_erpl_rev_deltadrv=>sflight_change( iv_kind = 'D' iv_carrid = lv_c iv_connid = lv_n iv_fldate = lv_demo ).
+    zcl_erpl_rev_util=>replicate( iv_tab = 'SFLIGHT' iv_target = 'sflight' ).
+    zcl_erpl_rev_delta=>register( VALUE #(
+      target = 'sflight' method = 'SNAPSHOT' source_from = 'SFLIGHT'
+      keys = 'MANDT,CARRID,CONNID,FLDATE' cadence = 'manual' ) ).
+    DATA(lv_n0) = cnt( |SELECT count(*) AS c FROM sflight| ).
+
+    " INSERT a demo flight -> one cycle -> present in DuckDB
+    zcl_erpl_rev_deltadrv=>sflight_change( iv_kind = 'I' iv_carrid = lv_c iv_connid = lv_n iv_fldate = lv_demo ).
+    DATA(ri) = zcl_erpl_rev_delta=>run( 'sflight' ).
+    ok( cond = xsdbool( ri-error IS INITIAL ) what = 'M5 insert cycle ok' detail = ri-error ).
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM sflight| ) = lv_n0 + 1 )
+        what = 'M5 inserted flight reflected (count +1)' ).
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM sflight WHERE fldate='2099-12-31'| ) = 1 )
+        what = 'M5 inserted flight present in DuckDB' ).
+
+    " UPDATE the demo flight's price (+100) -> one cycle -> new price in DuckDB
+    DATA(lv_p0) = cnt( |SELECT CAST(price AS INTEGER) AS c FROM sflight WHERE fldate='2099-12-31'| ).
+    zcl_erpl_rev_deltadrv=>sflight_change( iv_kind = 'U' iv_carrid = lv_c iv_connid = lv_n iv_fldate = lv_demo ).
+    zcl_erpl_rev_delta=>run( 'sflight' ).
+    ok( cond = xsdbool( cnt( |SELECT CAST(price AS INTEGER) AS c FROM sflight WHERE fldate='2099-12-31'| ) = lv_p0 + 100 )
+        what = 'M5 updated price reflected (+100)' detail = |{ lv_p0 }| ).
+
+    " DELETE the demo flight -> one cycle -> gone from DuckDB (snapshot anti-join)
+    zcl_erpl_rev_deltadrv=>sflight_change( iv_kind = 'D' iv_carrid = lv_c iv_connid = lv_n iv_fldate = lv_demo ).
+    DATA(rd) = zcl_erpl_rev_delta=>run( 'sflight' ).
+    ok( cond = xsdbool( rd-del = 1 ) what = 'M5 delete detected (del=1)' detail = |{ rd-del }| ).
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM sflight WHERE fldate='2099-12-31'| ) = 0 )
+        what = 'M5 deleted flight absent from DuckDB' ).
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM sflight| ) = lv_n0 )
+        what = 'M5 count restored to baseline' ).
   ENDMETHOD.
 
 ENDCLASS.

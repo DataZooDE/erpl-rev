@@ -36,6 +36,23 @@ CLASS zcl_erpl_rev_deltadrv DEFINITION PUBLIC FINAL CREATE PUBLIC.
                 ev_maktx TYPE string
                 ev_error TYPE string.
 
+    "! Make a REAL, committed change to the SFLIGHT demo table (the SNAPSHOT delta
+    "! demo). iv_kind: 'U' bumps PRICE+100 / SEATSOCC+1 of one flight; 'I' clones a
+    "! flight of (carrid,connid) at iv_fldate; 'D' deletes one flight. Returns a
+    "! human-readable line for the demo log (prefixed 'ERROR:' on failure).
+    CLASS-METHODS sflight_change
+      IMPORTING iv_kind   TYPE c
+                iv_carrid TYPE s_carr_id
+                iv_connid TYPE s_conn_id
+                iv_fldate TYPE s_date
+      RETURNING VALUE(rv_msg) TYPE string.
+
+    "! First SFLIGHT flight in key order — sensible defaults for the demo screen.
+    CLASS-METHODS sflight_default
+      EXPORTING ev_carrid TYPE s_carr_id
+                ev_connid TYPE s_conn_id
+                ev_fldate TYPE s_date.
+
 ENDCLASS.
 
 CLASS zcl_erpl_rev_deltadrv IMPLEMENTATION.
@@ -98,6 +115,65 @@ CLASS zcl_erpl_rev_deltadrv IMPLEMENTATION.
     " to write a genuine CDHDR/CDPOS change document under OBJECTCLAS='MATERIAL'.
     " The caller treats a non-empty ev_error as "skip the change-doc scenario".
     ev_error = 'BAPI_MATERIAL_SAVEDATA unavailable (no Materials Management on this system)'.
+  ENDMETHOD.
+
+  METHOD sflight_default.
+    SELECT carrid, connid, fldate FROM sflight
+      ORDER BY carrid, connid, fldate
+      INTO @DATA(ls) UP TO 1 ROWS.
+    ENDSELECT.
+    ev_carrid = ls-carrid.
+    ev_connid = ls-connid.
+    ev_fldate = ls-fldate.
+  ENDMETHOD.
+
+  METHOD sflight_change.
+    DATA ls TYPE sflight.
+    CASE iv_kind.
+      WHEN 'U'.
+        SELECT SINGLE * FROM sflight
+          WHERE carrid = @iv_carrid AND connid = @iv_connid AND fldate = @iv_fldate
+          INTO @ls.
+        IF sy-subrc <> 0.
+          rv_msg = |ERROR: flight { iv_carrid } { iv_connid } { iv_fldate } not found|.
+          RETURN.
+        ENDIF.
+        DATA(lv_old) = ls-price.
+        ls-price    = ls-price + 100.
+        ls-seatsocc = ls-seatsocc + 1.
+        UPDATE sflight FROM @ls.
+        COMMIT WORK AND WAIT.
+        rv_msg = |UPDATE { iv_carrid } { iv_connid } { iv_fldate }: price { lv_old } -> { ls-price }|.
+      WHEN 'I'.
+        SELECT SINGLE * FROM sflight
+          WHERE carrid = @iv_carrid AND connid = @iv_connid
+          INTO @ls.
+        IF sy-subrc <> 0.
+          rv_msg = |ERROR: no template flight for { iv_carrid } { iv_connid }|.
+          RETURN.
+        ENDIF.
+        ls-fldate   = iv_fldate.
+        ls-price    = ls-price + 100.
+        ls-seatsocc = 0.
+        INSERT sflight FROM @ls.
+        IF sy-subrc <> 0.
+          rv_msg = |ERROR: insert { iv_carrid } { iv_connid } { iv_fldate } failed (already exists?)|.
+          RETURN.
+        ENDIF.
+        COMMIT WORK AND WAIT.
+        rv_msg = |INSERT { iv_carrid } { iv_connid } { iv_fldate } (price { ls-price })|.
+      WHEN 'D'.
+        DELETE FROM sflight
+          WHERE carrid = @iv_carrid AND connid = @iv_connid AND fldate = @iv_fldate.
+        IF sy-subrc <> 0.
+          rv_msg = |ERROR: delete { iv_carrid } { iv_connid } { iv_fldate } matched nothing|.
+          RETURN.
+        ENDIF.
+        COMMIT WORK AND WAIT.
+        rv_msg = |DELETE { iv_carrid } { iv_connid } { iv_fldate }|.
+      WHEN OTHERS.
+        rv_msg = |ERROR: unknown change kind { iv_kind }|.
+    ENDCASE.
   ENDMETHOD.
 
 ENDCLASS.
