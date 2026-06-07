@@ -7,8 +7,8 @@ CLASS zcl_erpl_rev_deltadrv DEFINITION PUBLIC FINAL CREATE PUBLIC.
     "   * material   - BAPI_MATERIAL_SAVEDATA (the MM02 path) writes a genuine
     "                  change document (CDHDR OBJECTCLAS='MATERIAL' + CDPOS), which
     "                  the CHANGEDOC / INSERT_ONLY readers consume.
-    " Shared by zcl_erpl_rev_deltatest (automated proof) and Z_ERPL_REV_DELTA_SIM
-    " (run it by hand in SAP GUI to demo to others).
+    " Shared by zcl_erpl_rev_deltatest (automated proof) and the GUI demo report
+    " Z_ERPL_REV_DELTA_SFLIGHT (run it by hand in SAP GUI to demo to others).
 
     "! Current UTC time as a high-resolution TIMESTAMPL (DEC21,7) watermark value —
     "! sub-second so a seed and a same-second change still compare strictly greater.

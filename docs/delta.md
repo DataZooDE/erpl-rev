@@ -101,14 +101,14 @@ flight-booking model. Run it in SAP GUI (SA38 → F8) and use the buttons:
 - **Run delta cycle** — one cycle; the change is merged into `sflight`.
 - **Refresh** — re-read the target.
 
+For larger change sets it also has a **Mass insert / update / delete** trio (batch
+size `p_mass`, default 1000) operating on far-future "demo flights" so they never
+collide with real data and are trivially cleaned up.
+
 The **log pane** (top) records every action plus each cycle's `ins/upd/del` counts
 and a SAP-source-vs-DuckDB row-count check; the **ALV pane** (bottom) shows the live
 DuckDB `sflight` contents — so you can watch a real SAP change flow into DuckDB and
 debug exactly what was loaded. (This is the scenario the M5 E2E section verifies.)
-
-`Z_ERPL_REV_DELTA_SIM` is the lower-level simulator: pick a scenario (seed / update /
-insert / delete a `ZDELTA_WM` row, or change a material), inject a committed change,
-run one cycle, and see the applied counts plus the target row count before/after.
 
 ## Testing
 
