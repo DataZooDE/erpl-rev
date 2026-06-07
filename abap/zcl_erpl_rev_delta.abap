@@ -126,6 +126,13 @@ CLASS zcl_erpl_rev_delta DEFINITION PUBLIC FINAL CREATE PUBLIC.
                 iv_remove  TYPE abap_bool DEFAULT abap_false
       RETURNING VALUE(rv_msg) TYPE string.
 
+    "! Period in MINUTES implied by a cadence string (micro:<sec>->sec/60, hourly->60,
+    "! nightly->1440, manual/unknown->0). Used to derive the heartbeat-job period from
+    "! a target's chosen refresh interval, so one setting drives both.
+    CLASS-METHODS cadence_minutes
+      IMPORTING iv_cadence TYPE csequence
+      RETURNING VALUE(rv)  TYPE i.
+
   PRIVATE SECTION.
     CONSTANTS c_dest TYPE rfcdest VALUE 'ERPL_REV'.
 
@@ -556,6 +563,19 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
     rv_msg = |scheduled '{ lc_job }' to run every { lv_min } min| &&
              COND string( WHEN lv_removed > 0 THEN | (replaced { lv_removed } old)| ELSE `` ) &&
              |; monitor/stop in SM37.|.
+  ENDMETHOD.
+
+  METHOD cadence_minutes.
+    IF iv_cadence CP 'micro:*'.
+      DATA(lv_sec) = CONV i( condense( substring_after( val = iv_cadence sub = ':' ) ) ).
+      rv = COND #( WHEN lv_sec >= 60 THEN lv_sec / 60 ELSE 1 ).
+    ELSEIF iv_cadence = 'hourly'.
+      rv = 60.
+    ELSEIF iv_cadence = 'nightly'.
+      rv = 1440.
+    ELSE.
+      rv = 0.   " manual / unknown -> not scheduled
+    ENDIF.
   ENDMETHOD.
 
 ENDCLASS.

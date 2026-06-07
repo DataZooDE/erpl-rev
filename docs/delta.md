@@ -99,11 +99,16 @@ process) or an external trigger. For most cases a 1-minute job is plenty — the
 
 ### One screen: load + register + schedule
 
-`Z_ERPL_REV_REPLICATE` has a **Delta & schedule** tab: tick *Register as delta target*
-(method / watermark column / kind / cadence / extra-JSON) to register the just-loaded
-DuckDB table as a delta target in one go (the full load is the seed; WATERMARK/
-INSERT_ONLY auto-seed the high-water from the current source max), and tick *Schedule
-periodic job* (+ minutes) to install the cron — so a full setup is one screen.
+`Z_ERPL_REV_REPLICATE` has a **Delta & schedule** tab. Tick *Register as delta target*,
+pick a **Method** from the dropdown (only the fields that method needs are shown), pick
+a **Refresh interval**, and tick *Run it automatically* — that's a full incremental,
+scheduled load in one screen. The full load is the seed; WATERMARK/INSERT_ONLY auto-seed
+the high-water from the current source max. Press **F1 on any field** for a plain-language
+explanation.
+
+The **Refresh interval** is one setting that means two things: how fresh this target is
+kept (its `cadence`), and — when *Run it automatically* is ticked — the period of the
+background job that drives it. So "every 30 minutes" sets both; no separate numbers.
 
 ## Correctness contract
 
