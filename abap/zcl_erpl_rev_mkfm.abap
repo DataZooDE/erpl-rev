@@ -98,9 +98,16 @@ CLASS zcl_erpl_rev_mkfm IMPLEMENTATION.
               name = 'Z_DUCKDB_INGEST'
               imps = VALUE #( ( `IV_TARGET` ) ( `IV_MODE` ) ( `IV_KEYS` )
                               ( `IV_PARQUET_OUT` ) ( `IV_INIT_SQL` ) ( `IV_DDL` )
-                              ( `IV_DATA` ) ( `IV_XDATA:XSTRING` ) )
+                              ( `IV_DATA` ) ( `IV_XDATA:XSTRING` ) ( `IV_OP_COL` ) )
               exps = VALUE #( ( `EV_ROWS_AFFECTED` ) ( `EV_ERROR` ) )
               txt  = 'erpl-rev: ingest rows into DuckDB' ).
+
+        " Delta snapshot diff/merge (physical-delete reconciliation).
+        make( out  = out
+              name = 'Z_DUCKDB_SNAPSHOT_MERGE'
+              imps = VALUE #( ( `IV_TARGET` ) ( `IV_STAGING` ) ( `IV_KEYS` ) )
+              exps = VALUE #( ( `EV_INS` ) ( `EV_UPD` ) ( `EV_DEL` ) ( `EV_ERROR` ) )
+              txt  = 'erpl-rev: snapshot diff merge' ).
 
         " Streaming cursor FMs. EV_XDATA carries the binary sXML page (XSTRING).
         make( out  = out

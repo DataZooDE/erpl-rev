@@ -29,7 +29,7 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
       >/dev/null 2>&1 || fail "configure"
 cmake --build build >/dev/null 2>&1 || fail "build"
 ./build/erpl_rev_tests >/dev/null 2>&1 || fail "unit tests"
-echo "   build + 25 unit assertions OK"
+echo "   build + unit tests OK (incl. delta merge/snapshot/state cases)"
 
 echo "== start server =="
 rm -f /tmp/erpl_rev_sap_export.parquet
@@ -91,6 +91,17 @@ echo "== Data-identity E2E (replicated == SAP source, every cell) =="
 run ZCL_ERPL_REV_DIFFTEST abap/zcl_erpl_rev_difftest.abap
 echo "$OUT" | grep -q 'DIFF RESULT pass=4 fail=0' || fail "diff test ($OUT)"
 echo "   diff OK (SFLIGHT 94x14 + ZWIDE 3000x390 + REPOSRC 200x34 identical; corruption detected)"
+
+echo "== Delta (incremental) E2E (watermark / snapshot / change-doc / insert-only / orchestration) =="
+# Proves delta against REAL SAP transactions: a direct Open SQL change to ZDELTA_WM
+# (watermark merge + idempotent re-run), a physical DELETE reflected only via the
+# snapshot anti-join, a real BAPI_MATERIAL_SAVEDATA (MM02) writing genuine CDHDR/CDPOS
+# picked up by the change-doc re-read + the insert-only 2-step, and the orchestration
+# lease/granularity-gate/due-catch-up. Needs the delta classes + ZDELTA_WM + the new
+# Z_DUCKDB_SNAPSHOT_MERGE FM deployed (scripts/deploy-abap.sh).
+run ZCL_ERPL_REV_DELTATEST abap/zcl_erpl_rev_deltatest.abap
+echo "$OUT" | grep -qE 'DELTA RESULT pass=[0-9]+ fail=0' || fail "delta test ($OUT)"
+echo "   delta OK (watermark+idempotent, snapshot delete, real material change-doc/insert-only, orchestration)"
 
 echo "== Partitioned full-load E2E (coordinator heap + workers + deferred PK) =="
 # Two workers append DISJOINT key ranges into one heap (iv_create=false,
