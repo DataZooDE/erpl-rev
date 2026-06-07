@@ -120,6 +120,21 @@ TEST_CASE("CDC dialect: name overrides + custom key length", "[cdc][dialect]") {
     REQUIRE(p.trigger_names[0] == "ZCDC__BIC_AZZ_D");
 }
 
+TEST_CASE("CDC dialect: all generated objects are in the customer namespace", "[cdc][dialect]") {
+    HanaDialect d;
+    CdcSpec spec;
+    spec.source = "SFLIGHT";
+    spec.keys = {"MANDT", "CARRID"};
+    spec.mode = CdcMode::FullIud;
+    spec.columns = {"MANDT", "CARRID", "CONNID"};
+    CdcPlan p = d.Plan(spec);
+    // The log table, sequence and every trigger live in the customer Z-namespace, so
+    // provisioning can never create or drop a SAP-owned object (ADR-0004 compliance).
+    REQUIRE(p.log_table.rfind("ZCDC_", 0) == 0);
+    REQUIRE(p.seq_name.rfind("ZCDC_", 0) == 0);
+    for (const auto &t : p.trigger_names) REQUIRE(t.rfind("ZCDC_", 0) == 0);
+}
+
 TEST_CASE("CDC dialect: AnyDB refuses in v1; bad spec throws", "[cdc][dialect]") {
     AnyDbDialect any;
     CdcSpec spec;

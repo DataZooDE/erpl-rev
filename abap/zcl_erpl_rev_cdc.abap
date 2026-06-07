@@ -155,6 +155,19 @@ CLASS zcl_erpl_rev_cdc IMPLEMENTATION.
   ENDMETHOD.
 
   METHOD provision.
+    " Safety gate (ADR-0004): triggers can only go on a TRANSPARENT table. Pool/cluster
+    " tables, views and activation-request (ADSO) objects are not trigger-trackable —
+    " refuse with guidance to use SNAPSHOT instead, rather than failing obscurely.
+    DATA lv_src TYPE tabname.
+    lv_src = to_upper( iv_source ).
+    SELECT SINGLE tabclass FROM dd02l INTO @DATA(lv_class) WHERE tabname = @lv_src.
+    IF sy-subrc = 0 AND lv_class <> 'TRANSP'.
+      rv_error = |CDC: source { iv_source } is { lv_class }; trigger-CDC needs a | &&
+                 |transparent table (pool/cluster/view/ADSO are not trigger-trackable — | &&
+                 |use the SNAPSHOT delta method instead)|.
+      RETURN.
+    ENDIF.
+
     DATA ls TYPE ty_plan.
     plan( EXPORTING iv_target = iv_target iv_action = 'PROVISION'
                     iv_source = iv_source iv_keys = iv_keys iv_mode = iv_mode
