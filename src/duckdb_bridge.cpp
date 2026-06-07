@@ -69,6 +69,22 @@ std::string CellText(duckdb::DataChunk &chunk, duckdb::idx_t col, duckdb::idx_t 
     return v.IsNull() ? std::string() : v.ToString();
 }
 
+// A single-quoted SQL string literal with embedded quotes doubled.
+std::string SqlLit(const std::string &s) {
+    std::string r = "'";
+    for (char c : s) { if (c == '\'') r += "''"; r += c; }
+    return r + "'";
+}
+
+// The trigger-CDC state-machine transition guard.
+bool AllowedCdcTransition(const std::string &from, const std::string &to) {
+    if (from == "PROVISIONED") return to == "SEEDED" || to == "DISABLED";
+    if (from == "SEEDED")      return to == "ACTIVE" || to == "DISABLED";
+    if (from == "ACTIVE")      return to == "ACTIVE" || to == "DISABLED";
+    if (from == "DISABLED")    return to == "PROVISIONED";
+    return false;
+}
+
 } // namespace
 
 // A streaming cursor owns its OWN DuckDB connection (DuckDB permits only one
@@ -217,6 +233,18 @@ DuckDbBridge::DuckDbBridge(const std::string &path, const std::string &init_sql)
         "FROM _erpl_rev_run_stats");
     if (rview->HasError())
         throw std::runtime_error("DuckDB run-stats view init failed: " + rview->GetError());
+    // Trigger-CDC state machine (opt-in physical-delete tier, ADR-0004 / epic #17).
+    // One row per CDC target: config + provisioning status + log position. Guarded
+    // transitions live in the CDC* methods; the table itself is plain DuckDB so the
+    // state survives a server restart.
+    auto cdc = con.Query(
+        "CREATE TABLE IF NOT EXISTS _erpl_rev_cdc ("
+        "target VARCHAR PRIMARY KEY, source VARCHAR NOT NULL, keys VARCHAR NOT NULL, "
+        "platform VARCHAR DEFAULT 'HANA', mode VARCHAR DEFAULT 'DELETE_ONLY', "
+        "status VARCHAR DEFAULT 'PROVISIONED', log_table VARCHAR, position BIGINT DEFAULT 0, "
+        "provisioned_ts TIMESTAMPTZ, seeded_ts TIMESTAMPTZ, last_run_ts TIMESTAMPTZ, error VARCHAR)");
+    if (cdc->HasError())
+        throw std::runtime_error("DuckDB cdc-state init failed: " + cdc->GetError());
     // Boot init: explicit init_sql (CLI/--init-file) wins; else env fallback. Runs
     // INSTALL/LOAD/CREATE SECRET/ATTACH so replication can publish to external
     // targets (parquet object stores, postgres, ducklake, bigquery, iceberg).
@@ -764,6 +792,74 @@ SnapshotResult DuckDbBridge::SnapshotMerge(const std::string &target,
         throw;
     }
     return res;
+}
+
+// --- Trigger-CDC state machine ---------------------------------------------
+
+CdcState DuckDbBridge::CdcGet(const std::string &target) {
+    duckdb::Connection con(*db_);
+    auto r = con.Query(
+        "SELECT target, source, keys, platform, mode, log_table, status, position "
+        "FROM _erpl_rev_cdc WHERE target = " + SqlLit(target));
+    if (r->HasError())
+        throw std::runtime_error("DuckDB cdc get failed: " + r->GetError());
+    CdcState s;
+    if (r->RowCount() == 0) return s;
+    s.exists = true;
+    s.target = r->GetValue(0, 0).ToString();
+    s.source = r->GetValue(1, 0).ToString();
+    s.keys = r->GetValue(2, 0).ToString();
+    s.platform = r->GetValue(3, 0).ToString();
+    s.mode = r->GetValue(4, 0).ToString();
+    auto lt = r->GetValue(5, 0);
+    s.log_table = lt.IsNull() ? std::string() : lt.ToString();
+    s.status = r->GetValue(6, 0).ToString();
+    s.position = r->GetValue(7, 0).GetValue<int64_t>();
+    return s;
+}
+
+void DuckDbBridge::CdcRegister(const std::string &target, const std::string &source,
+                               const std::string &keys, const std::string &platform,
+                               const std::string &mode, const std::string &log_table) {
+    duckdb::Connection con(*db_);
+    // (Re)create the config in PROVISIONED with position reset — idempotent, and
+    // the legal way back from DISABLED.
+    Exec(con,
+        "INSERT INTO _erpl_rev_cdc "
+        "(target, source, keys, platform, mode, log_table, status, position, provisioned_ts) "
+        "VALUES (" + SqlLit(target) + "," + SqlLit(source) + "," + SqlLit(keys) + "," +
+        SqlLit(platform.empty() ? "HANA" : platform) + "," +
+        SqlLit(mode.empty() ? "DELETE_ONLY" : mode) + "," + SqlLit(log_table) +
+        ",'PROVISIONED',0,now()) "
+        "ON CONFLICT (target) DO UPDATE SET source=excluded.source, keys=excluded.keys, "
+        "platform=excluded.platform, mode=excluded.mode, log_table=excluded.log_table, "
+        "status='PROVISIONED', position=0, provisioned_ts=now(), error=NULL");
+}
+
+void DuckDbBridge::CdcSetStatus(const std::string &target, const std::string &status) {
+    CdcState s = CdcGet(target);
+    if (!s.exists) throw std::runtime_error("CDC: no registration for " + target);
+    if (s.status == status && status != "ACTIVE") return;   // no-op (ACTIVE re-stamps)
+    if (!AllowedCdcTransition(s.status, status))
+        throw std::runtime_error("CDC: illegal transition " + s.status + " -> " + status +
+                                 " for " + target);
+    duckdb::Connection con(*db_);
+    std::string stamp;
+    if (status == "SEEDED") stamp = ", seeded_ts=now()";
+    else if (status == "ACTIVE") stamp = ", last_run_ts=now()";
+    Exec(con, "UPDATE _erpl_rev_cdc SET status=" + SqlLit(status) + stamp +
+              " WHERE target=" + SqlLit(target));
+}
+
+void DuckDbBridge::CdcAdvancePosition(const std::string &target, long long position) {
+    CdcState s = CdcGet(target);
+    if (!s.exists) throw std::runtime_error("CDC: no registration for " + target);
+    if (position < s.position)
+        throw std::runtime_error("CDC: position regression for " + target + " (" +
+                                 std::to_string(position) + " < " + std::to_string(s.position) + ")");
+    duckdb::Connection con(*db_);
+    Exec(con, "UPDATE _erpl_rev_cdc SET position=" + std::to_string(position) +
+              " WHERE target=" + SqlLit(target));
 }
 
 } // namespace erpl_rev

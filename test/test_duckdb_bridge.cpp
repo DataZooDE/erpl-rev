@@ -730,6 +730,85 @@ TEST_CASE("Stats: an ERROR run is recorded as not-successful", "[bridge][stats][
     REQUIRE(r.rows[0] == R"({"status":"ERROR","is_success":false,"error_text":"cast failed"})");
 }
 
+// ---------------------------------------------------------------------------
+// Trigger-CDC state machine: _erpl_rev_cdc + guarded transitions. (Epic #17.)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("CDC state: table at boot, register, get", "[bridge][cdc][state]") {
+    DuckDbBridge db;
+    REQUIRE(db.Query("SELECT count(*) AS c FROM _erpl_rev_cdc").rows[0] == R"({"c":0})");
+    REQUIRE_FALSE(db.CdcGet("sflight").exists);
+
+    db.CdcRegister("sflight", "SFLIGHT", "MANDT,CARRID,CONNID,FLDATE", "HANA",
+                   "DELETE_ONLY", "ZCDC_SFLIGHT_LOG");
+    CdcState s = db.CdcGet("sflight");
+    REQUIRE(s.exists);
+    REQUIRE(s.source == "SFLIGHT");
+    REQUIRE(s.keys == "MANDT,CARRID,CONNID,FLDATE");
+    REQUIRE(s.platform == "HANA");
+    REQUIRE(s.mode == "DELETE_ONLY");
+    REQUIRE(s.log_table == "ZCDC_SFLIGHT_LOG");
+    REQUIRE(s.status == "PROVISIONED");
+    REQUIRE(s.position == 0);
+}
+
+TEST_CASE("CDC state: legal transitions + re-enable", "[bridge][cdc][state]") {
+    DuckDbBridge db;
+    db.CdcRegister("t", "T", "K", "HANA", "DELETE_ONLY", "ZCDC_T_LOG");
+    db.CdcSetStatus("t", "SEEDED");
+    REQUIRE(db.CdcGet("t").status == "SEEDED");
+    db.CdcSetStatus("t", "ACTIVE");
+    db.CdcSetStatus("t", "ACTIVE");   // re-run, idempotent-ish
+    REQUIRE(db.CdcGet("t").status == "ACTIVE");
+    db.CdcSetStatus("t", "DISABLED");
+    REQUIRE(db.CdcGet("t").status == "DISABLED");
+    // re-enable goes back through register -> PROVISIONED.
+    db.CdcRegister("t", "T", "K", "HANA", "DELETE_ONLY", "ZCDC_T_LOG");
+    REQUIRE(db.CdcGet("t").status == "PROVISIONED");
+}
+
+TEST_CASE("CDC state: illegal transitions are rejected", "[bridge][cdc][state]") {
+    DuckDbBridge db;
+    db.CdcRegister("t", "T", "K", "HANA", "DELETE_ONLY", "ZCDC_T_LOG");
+    REQUIRE_THROWS(db.CdcSetStatus("t", "ACTIVE"));      // must SEED first
+    db.CdcSetStatus("t", "SEEDED");
+    REQUIRE_THROWS(db.CdcSetStatus("t", "PROVISIONED")); // only DISABLED->PROVISIONED
+    REQUIRE_THROWS(db.CdcSetStatus("nope", "SEEDED"));   // unknown target
+}
+
+TEST_CASE("CDC state: position is monotonic", "[bridge][cdc][state]") {
+    DuckDbBridge db;
+    db.CdcRegister("t", "T", "K", "HANA", "DELETE_ONLY", "ZCDC_T_LOG");
+    db.CdcAdvancePosition("t", 5);
+    db.CdcAdvancePosition("t", 10);
+    db.CdcAdvancePosition("t", 10);   // equal is fine (idempotent re-apply)
+    REQUIRE(db.CdcGet("t").position == 10);
+    REQUIRE_THROWS(db.CdcAdvancePosition("t", 3));   // regression rejected
+    REQUIRE(db.CdcGet("t").position == 10);
+}
+
+TEST_CASE("CDC state: survives a restart (file-backed)", "[bridge][cdc][state]") {
+    const std::string path = "/tmp/erpl_cdc_state_test.duckdb";
+    std::remove(path.c_str());
+    std::remove((path + ".wal").c_str());
+    {
+        DuckDbBridge db(path);
+        db.CdcRegister("t", "T", "K", "HANA", "FULL_IUD", "ZCDC_T_LOG");
+        db.CdcSetStatus("t", "SEEDED");
+        db.CdcAdvancePosition("t", 42);
+    }
+    {
+        DuckDbBridge db(path);   // reopen the same store
+        CdcState s = db.CdcGet("t");
+        REQUIRE(s.exists);
+        REQUIRE(s.status == "SEEDED");
+        REQUIRE(s.position == 42);
+        REQUIRE(s.mode == "FULL_IUD");
+    }
+    std::remove(path.c_str());
+    std::remove((path + ".wal").c_str());
+}
+
 TEST_CASE("IngestBxml MERGE: op_col drives insert/update/delete", "[bridge][ingest][merge]") {
     DuckDbBridge db;
     std::string ddl = "CREATE TABLE IF NOT EXISTS m(id INTEGER PRIMARY KEY, v VARCHAR);";
