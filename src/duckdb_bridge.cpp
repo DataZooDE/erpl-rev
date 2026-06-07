@@ -602,11 +602,18 @@ long long DuckDbBridge::IngestBxml(const std::string &target,
         if (!collist.empty()) collist += ",";
         collist += LowerName(tbl.columns[i]);
     }
-    // Apply mode. Upsert/Merge with keys use DELETE-then-INSERT rather than
-    // `INSERT … ON CONFLICT DO UPDATE`: DuckDB mis-binds the conflict row of an
-    // `INSERT … SELECT … ON CONFLICT` whose source is the cast staging relation and
-    // NULLs the leading key column. Deleting the incoming keys first, then a plain
-    // INSERT, is the same end state (full-row replace) and avoids the engine quirk.
+    // Apply mode. Upsert/Merge with keys apply as DELETE-then-INSERT, NOT
+    // `INSERT … ON CONFLICT DO UPDATE`. With DuckDB 1.5.3 a conflict-resolving
+    // INSERT (`ON CONFLICT` and `INSERT OR REPLACE` alike) whose source is the
+    // Appender-populated staging in the SAME connection NULLs the leading key
+    // column of the proposed row → "NOT NULL constraint failed". This was isolated
+    // to the in-connection Appender source (a plain INSERT from the same staging is
+    // fine; ON CONFLICT against a separate, committed table read on another
+    // connection — as SnapshotMerge does — is also fine; materialising the staging
+    // first does NOT help). DELETE the incoming keys then a plain INSERT is the same
+    // full-row-replace end state and dodges the engine bug; in DuckDB an UPDATE is
+    // itself a delete+insert (MVCC), and a delta package only carries CHANGED rows,
+    // so there is no extra write cost. (See test/test_duckdb_bridge.cpp merge cases.)
     const bool upsert = (mode == IngestMode::Upsert || mode == IngestMode::Merge) &&
                         !key_cols.empty();
     std::string sel = "SELECT " + proj + " FROM " + stg;
