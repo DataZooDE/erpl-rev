@@ -35,4 +35,15 @@ RFC_FUNCTION_DESC_HANDLE BuildOpenDesc();
 RFC_FUNCTION_DESC_HANDLE BuildFetchDesc();
 RFC_FUNCTION_DESC_HANDLE BuildCloseDesc();
 
+// Trigger-CDC FMs (opt-in physical-delete tier, ADR-0004 / epic #17):
+//  Z_DUCKDB_CDC_PLAN : IMPORTING IV_TARGET, IV_SOURCE, IV_KEYS, IV_MODE,
+//      IV_PLATFORM, IV_ACTION (PROVISION|CYCLE|SEED|DISABLE) → EXPORTING EV_PLAN
+//      (JSON: provision/teardown DDL, read/prune SQL, log_table, key/op/seq cols,
+//      current position), EV_ERROR. The server registers the target + generates
+//      all platform SQL; ABAP only executes the opaque strings.
+//  Z_DUCKDB_CDC_APPLY: IMPORTING IV_TARGET, IV_STAGING, IV_KEYS → EXPORTING
+//      EV_INS, EV_UPD, EV_DEL, EV_PRUNE (confirmed position), EV_APPLIED, EV_ERROR.
+RFC_FUNCTION_DESC_HANDLE BuildCdcPlanDesc();
+RFC_FUNCTION_DESC_HANDLE BuildCdcApplyDesc();
+
 } // namespace erpl_rev
