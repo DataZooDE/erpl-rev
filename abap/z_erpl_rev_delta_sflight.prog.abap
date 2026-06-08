@@ -37,46 +37,87 @@ DATA: go_dock   TYPE REF TO cl_gui_docking_container,
       gt_log    TYPE gtt_txt,            " demo log lines (newest at the bottom)
       gv_err    TYPE string.
 
-" Change target (also the input-enabled fields that keep the selection screen alive
-" so the docking container renders).
-PARAMETERS: p_carr TYPE s_carr_id,
-            p_conn TYPE s_conn_id,
-            p_date TYPE s_date.
-SELECTION-SCREEN BEGIN OF LINE.
-SELECTION-SCREEN PUSHBUTTON  2(18) b_setup USER-COMMAND setup.
-SELECTION-SCREEN PUSHBUTTON 21(18) b_run   USER-COMMAND run.
-SELECTION-SCREEN PUSHBUTTON 40(18) b_view  USER-COMMAND view.
-SELECTION-SCREEN END OF LINE.
-SELECTION-SCREEN BEGIN OF LINE.
-SELECTION-SCREEN COMMENT  2(18) c_one.
-SELECTION-SCREEN PUSHBUTTON 21(18) b_upd USER-COMMAND upd.
-SELECTION-SCREEN PUSHBUTTON 40(18) b_ins USER-COMMAND ins.
-SELECTION-SCREEN PUSHBUTTON 59(18) b_del USER-COMMAND del.
-SELECTION-SCREEN END OF LINE.
-" Mass operations (bulk demo flights in a far-future date range).
-PARAMETERS p_mass TYPE i DEFAULT 1000.
-SELECTION-SCREEN BEGIN OF LINE.
-SELECTION-SCREEN COMMENT  2(18) c_mass.
-SELECTION-SCREEN PUSHBUTTON 21(18) b_mupd USER-COMMAND mupd.
-SELECTION-SCREEN PUSHBUTTON 40(18) b_mins USER-COMMAND mins.
-SELECTION-SCREEN PUSHBUTTON 59(18) b_mdel USER-COMMAND mdel.
-SELECTION-SCREEN END OF LINE.
+" The screen is grouped into four framed blocks, each with a one-line description:
+"   Flight key  -> which flight the change buttons act on (also keeps the screen
+"                  alive so the docking container below renders)
+"   Lifecycle   -> load+register / run a cycle / refresh
+"   One flight  -> insert/update/delete the single keyed flight
+"   Many flights-> bulk demo-flight insert/update/delete
+
+" ── Flight key ───────────────────────────────────────────────────────────────
+SELECTION-SCREEN BEGIN OF BLOCK key WITH FRAME TITLE t_key.
+  SELECTION-SCREEN BEGIN OF LINE.
+  SELECTION-SCREEN COMMENT 1(28) c_carr FOR FIELD p_carr.
+  PARAMETERS p_carr TYPE s_carr_id.
+  SELECTION-SCREEN END OF LINE.
+  SELECTION-SCREEN BEGIN OF LINE.
+  SELECTION-SCREEN COMMENT 1(28) c_conn FOR FIELD p_conn.
+  PARAMETERS p_conn TYPE s_conn_id.
+  SELECTION-SCREEN END OF LINE.
+  SELECTION-SCREEN BEGIN OF LINE.
+  SELECTION-SCREEN COMMENT 1(28) c_date FOR FIELD p_date.
+  PARAMETERS p_date TYPE s_date.
+  SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN END OF BLOCK key.
+
+" ── Delta lifecycle ──────────────────────────────────────────────────────────
+SELECTION-SCREEN BEGIN OF BLOCK life WITH FRAME TITLE t_life.
+  SELECTION-SCREEN COMMENT /1(78) c_life1.
+  SELECTION-SCREEN BEGIN OF LINE.
+  SELECTION-SCREEN PUSHBUTTON  1(22) b_setup USER-COMMAND setup.
+  SELECTION-SCREEN PUSHBUTTON 25(22) b_run   USER-COMMAND run.
+  SELECTION-SCREEN PUSHBUTTON 49(22) b_view  USER-COMMAND view.
+  SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN END OF BLOCK life.
+
+" ── Change ONE flight (the key above) ────────────────────────────────────────
+SELECTION-SCREEN BEGIN OF BLOCK one WITH FRAME TITLE t_one.
+  SELECTION-SCREEN COMMENT /1(78) c_one1.
+  SELECTION-SCREEN BEGIN OF LINE.
+  SELECTION-SCREEN PUSHBUTTON  1(22) b_ins USER-COMMAND ins.
+  SELECTION-SCREEN PUSHBUTTON 25(22) b_upd USER-COMMAND upd.
+  SELECTION-SCREEN PUSHBUTTON 49(22) b_del USER-COMMAND del.
+  SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN END OF BLOCK one.
+
+" ── Change MANY flights (bulk demo flights) ──────────────────────────────────
+SELECTION-SCREEN BEGIN OF BLOCK many WITH FRAME TITLE t_many.
+  SELECTION-SCREEN COMMENT /1(78) c_many1.
+  SELECTION-SCREEN BEGIN OF LINE.
+  SELECTION-SCREEN COMMENT 1(28) c_mass FOR FIELD p_mass.
+  PARAMETERS p_mass TYPE i DEFAULT 1000.
+  SELECTION-SCREEN END OF LINE.
+  SELECTION-SCREEN BEGIN OF LINE.
+  SELECTION-SCREEN PUSHBUTTON  1(22) b_mins USER-COMMAND mins.
+  SELECTION-SCREEN PUSHBUTTON 25(22) b_mupd USER-COMMAND mupd.
+  SELECTION-SCREEN PUSHBUTTON 49(22) b_mdel USER-COMMAND mdel.
+  SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN END OF BLOCK many.
 
 INITIALIZATION.
-  b_setup = 'Setup (load+register)'.
+  t_key   = 'Flight key — which flight the change buttons act on'.
+  c_carr  = 'Airline / carrier'.
+  c_conn  = 'Connection number'.
+  c_date  = 'Flight date'.
+  t_life  = 'Delta lifecycle'.
+  c_life1 = 'Load SFLIGHT into DuckDB and register the snapshot delta; run a cycle; refresh.'.
+  b_setup = 'Setup (load + register)'.
   b_run   = 'Run delta cycle'.
   b_view  = 'Refresh view'.
-  c_one   = 'Single flight:'.
-  b_upd   = 'Update flight'.
+  t_one   = 'Change ONE flight (the key above)'.
+  c_one1  = 'Make a real, committed SAP change, then "Run delta cycle" to watch it land in DuckDB.'.
   b_ins   = 'Insert flight'.
+  b_upd   = 'Update price + seats'.
   b_del   = 'Delete flight'.
-  c_mass  = 'Mass (p_mass rows):'.
-  b_mupd  = 'Mass update'.
+  t_many  = 'Change MANY flights at once'.
+  c_many1 = 'Bulk demo flights (date >= 2099) so real SFLIGHT data is never touched.'.
+  c_mass  = 'How many flights'.
   b_mins  = 'Mass insert'.
+  b_mupd  = 'Mass update'.
   b_mdel  = 'Mass delete'.
   zcl_erpl_rev_deltadrv=>sflight_default(
     IMPORTING ev_carrid = p_carr ev_connid = p_conn ev_fldate = p_date ).
-  APPEND |Press Setup to full-load SFLIGHT into DuckDB and register the snapshot delta.| TO gt_log.
+  APPEND |Press "Setup (load + register)" to full-load SFLIGHT into DuckDB and register the snapshot delta.| TO gt_log.
 
 AT SELECTION-SCREEN.
   DATA lv_act TYPE syucomm.
@@ -90,6 +131,16 @@ AT SELECTION-SCREEN.
       CLEAR: go_dock, go_split, go_top, go_bottom, go_logbox, go_salv, go_msg.
     ENDIF.
   ENDIF.
+
+" F1 on the key fields explains what they identify.
+AT SELECTION-SCREEN ON HELP-REQUEST FOR p_carr.
+  MESSAGE 'Airline carrier ID, e.g. AA or LH. With the connection and date it pinpoints one flight.' TYPE 'I'.
+AT SELECTION-SCREEN ON HELP-REQUEST FOR p_conn.
+  MESSAGE 'Flight connection number for that carrier, e.g. 0017.' TYPE 'I'.
+AT SELECTION-SCREEN ON HELP-REQUEST FOR p_date.
+  MESSAGE 'Flight date. The single-flight buttons act on this exact flight; Insert clones one to this date.' TYPE 'I'.
+AT SELECTION-SCREEN ON HELP-REQUEST FOR p_mass.
+  MESSAGE 'How many far-future demo flights the Mass buttons create or change (default 1000).' TYPE 'I'.
 
 *&---------------------------------------------------------------------*
 FORM act USING iv_act TYPE syucomm.
