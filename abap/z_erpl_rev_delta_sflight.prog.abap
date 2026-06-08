@@ -14,7 +14,7 @@
 *&   [Run delta] run ONE delta cycle — the change is merged into `sflight`.
 *&   [Refresh]  just re-read the DuckDB target.
 *&
-*& The log pane (top) records every action + the cycle's ins/upd/del counts and a
+*& The log pane (left) records every action + the cycle's ins/upd/del counts and a
 *& SAP-source-vs-DuckDB row count; the ALV pane (bottom) shows the current DuckDB
 *& `sflight` contents — so you can watch a real SAP change flow into DuckDB and
 *& debug exactly what was loaded. No dynpro: a docking container built in PBO,
@@ -28,8 +28,8 @@ TYPES: gtt_txt TYPE STANDARD TABLE OF char255 WITH EMPTY KEY.
 
 DATA: go_dock   TYPE REF TO cl_gui_docking_container,
       go_split  TYPE REF TO cl_gui_splitter_container,
-      go_top    TYPE REF TO cl_gui_container,
-      go_bottom TYPE REF TO cl_gui_container,
+      go_left    TYPE REF TO cl_gui_container,
+      go_right TYPE REF TO cl_gui_container,
       go_logbox TYPE REF TO cl_gui_textedit,
       go_salv   TYPE REF TO cl_salv_table,
       go_msg    TYPE REF TO cl_gui_textedit,
@@ -128,7 +128,7 @@ AT SELECTION-SCREEN.
     PERFORM act USING lv_act.
     IF go_dock IS BOUND.
       go_dock->free( ).
-      CLEAR: go_dock, go_split, go_top, go_bottom, go_logbox, go_salv, go_msg.
+      CLEAR: go_dock, go_split, go_left, go_right, go_logbox, go_salv, go_msg.
     ENDIF.
   ENDIF.
 
@@ -198,7 +198,7 @@ FORM act USING iv_act TYPE syucomm.
 ENDFORM.
 
 *&---------------------------------------------------------------------*
-*&  PBO: docking container — log (top) + DuckDB `sflight` ALV (bottom).
+*&  PBO: docking container — log (left) + DuckDB `sflight` ALV (right).
 *&---------------------------------------------------------------------*
 AT SELECTION-SCREEN OUTPUT.
   IF go_dock IS INITIAL.
@@ -216,23 +216,24 @@ AT SELECTION-SCREEN OUTPUT.
 
     go_dock  = NEW #( repid = sy-repid dynnr = sy-dynnr
                       side  = cl_gui_docking_container=>dock_at_bottom ratio = 85 ).
-    go_split = NEW #( parent = go_dock rows = 2 columns = 1 ).
-    go_split->set_row_height( id = 1 height = 30 ).
-    go_top    = go_split->get_container( row = 1 column = 1 ).
-    go_bottom = go_split->get_container( row = 2 column = 1 ).
+    " Side-by-side split: demo log on the LEFT (~40%), DuckDB `sflight` ALV on the RIGHT.
+    go_split = NEW #( parent = go_dock rows = 1 columns = 2 ).
+    go_split->set_column_width( id = 1 width = 40 ).
+    go_left  = go_split->get_container( row = 1 column = 1 ).
+    go_right = go_split->get_container( row = 1 column = 2 ).
 
-    " Top pane: the demo log (read-only).
-    go_logbox = NEW #( parent = go_top wordwrap_mode = cl_gui_textedit=>wordwrap_off ).
+    " Left pane: the demo log (read-only).
+    go_logbox = NEW #( parent = go_left wordwrap_mode = cl_gui_textedit=>wordwrap_off ).
     go_logbox->set_readonly_mode( 1 ).
     go_logbox->set_text_as_r3table(
       EXPORTING table = CORRESPONDING gtt_txt( gt_log ) EXCEPTIONS OTHERS = 0 ).
 
-    " Bottom pane: the DuckDB `sflight` target, or a hint if it isn't loaded yet.
+    " Right pane: the DuckDB `sflight` target, or a hint if it isn't loaded yet.
     IF gr_result IS BOUND.
       FIELD-SYMBOLS <t> TYPE STANDARD TABLE.
       ASSIGN gr_result->* TO <t>.
       TRY.
-          cl_salv_table=>factory( EXPORTING r_container  = go_bottom
+          cl_salv_table=>factory( EXPORTING r_container  = go_right
                                   IMPORTING r_salv_table = go_salv
                                   CHANGING  t_table      = <t> ).
           DATA(lo_cols) = go_salv->get_columns( ).
@@ -253,7 +254,7 @@ AT SELECTION-SCREEN OUTPUT.
     ENDIF.
 
     IF gr_result IS NOT BOUND.
-      go_msg = NEW #( parent = go_bottom ).
+      go_msg = NEW #( parent = go_right ).
       go_msg->set_readonly_mode( 1 ).
       go_msg->set_text_as_r3table(
         EXPORTING table = VALUE gtt_txt(
