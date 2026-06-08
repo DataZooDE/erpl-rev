@@ -72,8 +72,20 @@ AT SELECTION-SCREEN.
     CLEAR: gr_result, gv_err, gv_info, gv_total, gt_gen.
 
     IF sy-ucomm = 'GEN'.
-      " Generate a ready-to-paste ABAP snippet that runs THIS query.
-      PERFORM gen_abap.
+      " Generate a ready-to-paste ABAP snippet that runs THIS query. To make the
+      " loop concrete (a named field-symbol per column), introspect the result
+      " columns — but ONLY for a read-only statement, so Generate never executes DML.
+      DATA(lv_gsql) = concat_lines_of( table = gt_sql sep = | | ).
+      DATA(lv_head) = to_upper( lv_gsql ).
+      SHIFT lv_head LEFT DELETING LEADING ` `.
+      DATA lv_cols TYPE string.
+      IF lv_head CP 'SELECT*' OR lv_head CP 'WITH*'   OR lv_head CP 'FROM*'
+        OR lv_head CP 'DESCRIBE*' OR lv_head CP 'SHOW*' OR lv_head CP 'PRAGMA*'
+        OR lv_head CP 'VALUES*'   OR lv_head CP 'TABLE*'.
+        DATA(ls_probe) = zcl_erpl_rev_util=>query_stream( iv_sql = lv_gsql iv_maxrows = 1 ).
+        IF ls_probe-error IS INITIAL. lv_cols = ls_probe-columns. ENDIF.
+      ENDIF.
+      PERFORM gen_abap USING lv_cols.
     ELSE.
       DATA(lv_sql) = concat_lines_of( table = gt_sql sep = | | ).
       " Stream the result via the cursor FMs (fixed memory, binary sXML pages).
@@ -180,7 +192,7 @@ AT SELECTION-SCREEN OUTPUT.
 *&  Build a ready-to-paste ABAP snippet that runs the CURRENT SQL via
 *&  erpl-rev and reads the typed result table. Lines go into gt_gen.
 *&---------------------------------------------------------------------*
-FORM gen_abap.
+FORM gen_abap USING iv_cols TYPE string.
   " Keep only the non-empty SQL lines so the literal isn't padded with blanks.
   DATA lt_lines TYPE gtt_txt.
   LOOP AT gt_sql INTO DATA(lv_ln).
@@ -214,12 +226,53 @@ FORM gen_abap.
 
   APPEND |  DATA(ls_res) = zcl_erpl_rev_util=>query_stream( iv_sql = lv_sql ).| TO gt_gen.
   APPEND |  IF ls_res-error IS NOT INITIAL.| TO gt_gen.
-  APPEND |    MESSAGE ls_res-error TYPE 'I'.                 " the query failed| TO gt_gen.
+  APPEND |    MESSAGE ls_res-error TYPE 'I'.   " the query failed| TO gt_gen.
   APPEND |  ELSEIF ls_res-data IS BOUND.| TO gt_gen.
   APPEND |    FIELD-SYMBOLS <tab> TYPE STANDARD TABLE.| TO gt_gen.
-  APPEND |    ASSIGN ls_res-data->* TO <tab>.               " typed from the result columns| TO gt_gen.
+  APPEND |    ASSIGN ls_res-data->* TO <tab>.   " a STANDARD TABLE typed from the result columns| TO gt_gen.
   APPEND |    LOOP AT <tab> ASSIGNING FIELD-SYMBOL(<row>).| TO gt_gen.
-  APPEND |      " <row>: one component per SELECT column (DuckDB column names)| TO gt_gen.
+
+  " Concrete loop body: one named field-symbol per result column (introspected via a
+  " 1-row probe). Falls back to a generic comment when the columns aren't known
+  " (e.g. a non-SELECT statement, where we deliberately did NOT run the SQL).
+  TYPES: BEGIN OF ty_col, name TYPE string, type TYPE string, END OF ty_col.
+  DATA lt_cols TYPE STANDARD TABLE OF ty_col WITH EMPTY KEY.
+  IF iv_cols IS NOT INITIAL.
+    TRY.
+        /ui2/cl_json=>deserialize( EXPORTING json = iv_cols CHANGING data = lt_cols ).
+      CATCH cx_root ##NO_HANDLER.
+    ENDTRY.
+  ENDIF.
+
+  IF lt_cols IS NOT INITIAL.
+    " widest column name, so the ').' and the type comment line up.
+    DATA lv_w TYPE i.
+    LOOP AT lt_cols INTO DATA(ls_c).
+      IF strlen( ls_c-name ) > lv_w. lv_w = strlen( ls_c-name ). ENDIF.
+    ENDLOOP.
+    DATA lt_fs TYPE string_table.
+    LOOP AT lt_cols INTO ls_c.
+      DATA(lv_fs)  = to_lower( ls_c-name ).
+      " padding OUTSIDE the quotes/FS so the component name itself stays exact.
+      DATA(lv_pad) = repeat( val = ` ` occ = lv_w - strlen( ls_c-name ) ).
+      APPEND |      ASSIGN COMPONENT '{ ls_c-name }'{ lv_pad } OF STRUCTURE <row> | &&
+             |TO FIELD-SYMBOL(<{ lv_fs }>){ lv_pad }.   " { ls_c-type }| TO gt_gen.
+      APPEND |<{ lv_fs }>| TO lt_fs.
+    ENDLOOP.
+    " a ready example using the first few field-symbols.
+    DATA lv_eg TYPE string.
+    DATA lv_i  TYPE i.
+    LOOP AT lt_fs INTO DATA(lv_one).
+      lv_i = lv_i + 1.
+      IF lv_i > 4. EXIT. ENDIF.
+      lv_eg = COND #( WHEN lv_eg IS INITIAL THEN lv_one ELSE |{ lv_eg }, { lv_one }| ).
+    ENDLOOP.
+    APPEND |      " e.g.  WRITE: / { lv_eg }.| TO gt_gen.
+  ELSE.
+    APPEND |      " <row> has one component per SELECT column (= the DuckDB column names);| TO gt_gen.
+    APPEND |      " read them with  ASSIGN COMPONENT 'COLNAME' OF STRUCTURE <row> TO FIELD-SYMBOL(<c>).| TO gt_gen.
+  ENDIF.
+
   APPEND |    ENDLOOP.| TO gt_gen.
   APPEND |  ENDIF.| TO gt_gen.
 ENDFORM.
