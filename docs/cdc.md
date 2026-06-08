@@ -88,9 +88,11 @@ the idempotent merge absorbs. The state machine guards transitions
 - **DB triggers carry real cost** (write-path overhead, transport/Basis sign-off,
   DB-platform-specific DDL). This is exactly why the tier is **opt-in, per table**, not
   a default — the watermark + snapshot tiers remain the default.
-- **Key types:** keys are logged as text and the server casts them to the target's
-  column types when applying. String/char keys (e.g. `CLIENT,ID`) need no casting;
-  date/numeric keys are handled per target-column type.
+- **Key types:** keys are logged as SAP-raw text and the server casts each to the
+  target column's type when matching — `CHAR`/string keys directly, `NUMC` via numeric
+  cast (`'0017'` → `17`), `DATS`/`TIMS` via `strptime` (`'20991231'` → a `DATE`). So
+  composite keys like SFLIGHT's `MANDT,CARRID,CONNID,FLDATE` (a NUMC + a date) work
+  unchanged — the flight-booking demo is wired to CDC and proven E2E.
 
 ## Testing
 
@@ -100,9 +102,10 @@ the idempotent merge absorbs. The state machine guards transitions
   monotonic position, restart-safe), log coalescing, and the apply (delete reflected,
   full-IUD I/U/D, idempotent, rollback-on-error).
 - **E2E on A4H (real HANA triggers)** — `ZCL_ERPL_REV_CDCTEST` (run by `make e2e`):
-  provisions real HANA triggers on `ZDELTA_WM`, physically changes rows, and proves one
-  CDC cycle reflects them in the DuckDB target; idempotent re-run; teardown leaves no
-  orphan objects. Prints `CDC RESULT pass=N fail=0`.
+  provisions real HANA triggers on `ZDELTA_WM` (delete-only + full-IUD) **and on
+  SFLIGHT** (the flight-booking demo — composite DATE+NUMC keys), physically changes
+  rows, and proves one CDC cycle reflects them in the DuckDB target; idempotent re-run;
+  `run_due` heartbeat; teardown leaves no orphan objects. Prints `CDC RESULT pass=N fail=0`.
 
 See ADR-0004 in the design study for the rationale and the industry corroboration
 (Theobald Table CDC, Fivetran delete-only triggers, SLT/CDS-CDC key-only logging).

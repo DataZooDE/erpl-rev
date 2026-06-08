@@ -857,6 +857,25 @@ TEST_CASE("CDC apply: coalesces interleaved I/U/D per key to the net op", "[brid
     REQUIRE(db.Query("SELECT count(*) AS c FROM t2 WHERE id=3").rows[0] == R"({"c":0})");
 }
 
+TEST_CASE("CDC apply: SAP-typed keys (NUMC + DATE) match via cast", "[bridge][cdc][apply]") {
+    DuckDbBridge db;
+    // SFLIGHT-shaped target: CONNID numeric, FLDATE a real DATE.
+    db.Execute("CREATE TABLE sf(mandt VARCHAR, carrid VARCHAR, connid INTEGER, fldate DATE, "
+               "price INTEGER, PRIMARY KEY(mandt,carrid,connid,fldate))");
+    db.Execute("INSERT INTO sf VALUES "
+               "('001','AA',17,DATE '2099-12-31',100),('001','LH',400,DATE '2099-12-30',200)");
+    db.CdcRegister("sf", "SFLIGHT", "mandt,carrid,connid,fldate", "HANA", "DELETE_ONLY", "L");
+    db.CdcSetStatus("sf", "SEEDED");
+    // the log delivers SAP-raw key text: NUMC '0017', DATS '20991231'.
+    db.Execute("CREATE TABLE sflog(mandt VARCHAR, carrid VARCHAR, connid VARCHAR, fldate VARCHAR, "
+               "\"_op\" VARCHAR, \"_seq\" BIGINT)");
+    db.Execute("INSERT INTO sflog VALUES ('001','AA','0017','20991231','D',1)");
+    CdcApplyResult r = db.CdcApply("sf", "sflog", {"mandt", "carrid", "connid", "fldate"});
+    REQUIRE(r.del == 1);
+    REQUIRE(db.Query("SELECT count(*) AS c FROM sf WHERE carrid='AA'").rows[0] == R"({"c":0})");
+    REQUIRE(db.Query("SELECT count(*) AS c FROM sf").rows[0] == R"({"c":1})");   // LH untouched
+}
+
 TEST_CASE("CDC apply: empty batch is a no-op (position unchanged)", "[bridge][cdc][apply]") {
     DuckDbBridge db;
     db.Execute("CREATE TABLE t3(id INTEGER PRIMARY KEY)");

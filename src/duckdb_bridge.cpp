@@ -882,6 +882,36 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
     }
     const long long max_seq = mq->GetValue(0, 0).GetValue<int64_t>();
 
+    // Target + staging column metadata up front: the key match AND the upsert both
+    // cast the log's SAP-raw NVARCHAR text to the target column TYPES.
+    auto tcols = con.Query("SELECT * FROM " + target + " LIMIT 0");
+    if (tcols->HasError()) throw std::runtime_error("CDC: target describe failed: " + tcols->GetError());
+    auto scols = con.Query("SELECT * FROM " + staging + " LIMIT 0");
+    if (scols->HasError()) throw std::runtime_error("CDC: staging describe failed: " + scols->GetError());
+    std::vector<std::string> sset;
+    for (duckdb::idx_t c = 0; c < scols->ColumnCount(); c++) sset.push_back(LowerName(scols->names[c]));
+    auto in_staging = [&](const std::string &n) {
+        for (auto &s : sset) if (s == n) return true; return false;
+    };
+    auto type_of = [&](const std::string &n) -> std::string {
+        for (duckdb::idx_t c = 0; c < tcols->ColumnCount(); c++)
+            if (LowerName(tcols->names[c]) == n) return tcols->types[c].ToString();
+        return "VARCHAR";
+    };
+
+    // Cast a log text value to a target column type. SAP dates/times are YYYYMMDD /
+    // HHMMSS (not ISO), so parse them with strptime; everything else casts directly
+    // (a NUMC key '0017' -> INTEGER 17, a CHAR key as-is, a decimal string -> DECIMAL).
+    auto cast_to = [](const std::string &expr, const std::string &type) -> std::string {
+        std::string T = type;
+        for (char &ch : T) if (ch >= 'a' && ch <= 'z') ch = char(ch - 'a' + 'A');
+        if (T == "DATE") return "try_strptime(" + expr + ", '%Y%m%d')::DATE";
+        if (T == "TIME") return "try_strptime(" + expr + ", '%H%M%S')::TIME";
+        if (T.rfind("TIMESTAMP", 0) == 0)
+            return "try_strptime(" + expr + ", '%Y%m%d%H%M%S')::" + type;
+        return "CAST(" + expr + " AS " + type + ")";
+    };
+
     // Lower-cased key list (DuckDB stores unquoted identifiers lower case).
     std::vector<std::string> kl;
     for (auto &k : keys) kl.push_back(LowerName(k));
@@ -894,11 +924,13 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
         "(SELECT * FROM " + staging +
         " QUALIFY row_number() OVER (PARTITION BY " + keycsv + " ORDER BY \"_seq\" DESC)=1)";
 
+    // Key match: target value = the log text cast to the target's key type. `a` is the
+    // target side, `b` the (coalesced) staging side.
     auto key_join = [&](const std::string &a, const std::string &b) {
         std::string j;
         for (size_t i = 0; i < kl.size(); i++) {
             if (i) j += " AND ";
-            j += a + "." + kl[i] + " = " + b + "." + kl[i];
+            j += a + "." + kl[i] + " = " + cast_to(b + "." + kl[i], type_of(kl[i]));
         }
         return j;
     };
@@ -909,15 +941,6 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
 
     // Data columns to upsert = target columns also present in staging (so delete-only
     // staging, which carries only keys, yields a keys-only upsert == DO NOTHING).
-    auto tcols = con.Query("SELECT * FROM " + target + " LIMIT 0");
-    if (tcols->HasError()) throw std::runtime_error("CDC: target describe failed: " + tcols->GetError());
-    auto scols = con.Query("SELECT * FROM " + staging + " LIMIT 0");
-    if (scols->HasError()) throw std::runtime_error("CDC: staging describe failed: " + scols->GetError());
-    std::vector<std::string> sset;
-    for (duckdb::idx_t c = 0; c < scols->ColumnCount(); c++) sset.push_back(LowerName(scols->names[c]));
-    auto in_staging = [&](const std::string &n) {
-        for (auto &s : sset) if (s == n) return true; return false;
-    };
     std::vector<std::string> dcols, dtypes;
     for (duckdb::idx_t c = 0; c < tcols->ColumnCount(); c++) {
         std::string n = LowerName(tcols->names[c]);
@@ -957,9 +980,9 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
         for (size_t i = 0; i < dcols.size(); i++) {
             if (i) { collist += ","; sellist += ","; }
             collist += dcols[i];
-            // The log delivers every value as NVARCHAR text; cast it to the target
-            // column's type for the insert (keys included, harmless for delete-only).
-            sellist += "CAST(c." + dcols[i] + " AS " + dtypes[i] + ") AS " + dcols[i];
+            // The log delivers every value as SAP-raw text; cast it to the target
+            // column type for the insert (keys included, harmless for delete-only).
+            sellist += cast_to("c." + dcols[i], dtypes[i]) + " AS " + dcols[i];
         }
         del_iu_sql = "DELETE FROM " + target + " t WHERE EXISTS (SELECT 1 FROM " + net_iu +
                      " c WHERE " + key_join("t", "c") + ")";

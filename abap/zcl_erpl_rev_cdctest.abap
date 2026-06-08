@@ -8,6 +8,7 @@ CLASS zcl_erpl_rev_cdctest DEFINITION PUBLIC FINAL CREATE PUBLIC.
     METHODS has IMPORTING iv_sql TYPE string iv_sub TYPE string RETURNING VALUE(rv) TYPE abap_bool.
     METHODS m1_delete_only.
     METHODS m2_full_iud.
+    METHODS m3_sflight.
 ENDCLASS.
 
 CLASS zcl_erpl_rev_cdctest IMPLEMENTATION.
@@ -31,6 +32,7 @@ CLASS zcl_erpl_rev_cdctest IMPLEMENTATION.
     TRY.
         m1_delete_only( ).
         m2_full_iud( ).
+        m3_sflight( ).
       CATCH cx_root INTO DATA(lx).
         mv_fail = mv_fail + 1.
         out->write( |DUMP: { lx->get_text( ) }| ).
@@ -122,6 +124,50 @@ CLASS zcl_erpl_rev_cdctest IMPLEMENTATION.
 
     DATA(lv_te) = zcl_erpl_rev_cdc=>teardown( 'cdc_iud' ).
     ok( cond = xsdbool( lv_te IS INITIAL ) what = 'CDC(iud) teardown ok' detail = lv_te ).
+  ENDMETHOD.
+
+  METHOD m3_sflight.
+    " The flight-booking demo wired to trigger-CDC: provision delete-only triggers on
+    " SFLIGHT (which has a DATE key FLDATE and a NUMC key CONNID) and prove a PHYSICAL
+    " flight delete is captured into the DuckDB target — using a far-future demo flight
+    " so real data is never touched. Exercises the type-aware key casting end to end.
+    DATA: lv_c TYPE s_carr_id, lv_n TYPE s_conn_id, lv_d TYPE s_date.
+    zcl_erpl_rev_deltadrv=>sflight_default(
+      IMPORTING ev_carrid = lv_c ev_connid = lv_n ev_fldate = lv_d ).
+    ok( cond = xsdbool( lv_c IS NOT INITIAL ) what = 'CDC(sflight) demo data present' ).
+    IF lv_c IS INITIAL. RETURN. ENDIF.
+    DATA(lv_demo) = CONV s_date( '20991231' ).
+
+    " seed the target WITH a demo flight present, then provision the triggers.
+    zcl_erpl_rev_deltadrv=>sflight_purge_demo( ).
+    zcl_erpl_rev_deltadrv=>sflight_change( iv_kind = 'I' iv_carrid = lv_c iv_connid = lv_n iv_fldate = lv_demo ).
+    zcl_erpl_rev_util=>replicate( iv_tab = 'SFLIGHT' iv_target = 'sflight_cdc' ).
+    DATA(lv_n0) = cnt( |SELECT count(*) AS c FROM sflight_cdc| ).
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM sflight_cdc WHERE fldate='2099-12-31'| ) = 1 )
+        what = 'CDC(sflight) demo flight seeded' ).
+
+    DATA(lv_pe) = zcl_erpl_rev_cdc=>provision(
+      iv_target = 'sflight_cdc' iv_source = 'SFLIGHT'
+      iv_keys = 'MANDT,CARRID,CONNID,FLDATE' iv_mode = 'DELETE_ONLY' ).
+    ok( cond = xsdbool( lv_pe IS INITIAL ) what = 'CDC(sflight) provision ok' detail = lv_pe ).
+
+    " physically delete the demo flight -> the AFTER DELETE trigger logs it.
+    zcl_erpl_rev_deltadrv=>sflight_change( iv_kind = 'D' iv_carrid = lv_c iv_connid = lv_n iv_fldate = lv_demo ).
+    DATA(r1) = zcl_erpl_rev_cdc=>run( 'sflight_cdc' ).
+    ok( cond = xsdbool( r1-error IS INITIAL ) what = 'CDC(sflight) cycle ok' detail = r1-error ).
+    ok( cond = xsdbool( r1-del = 1 ) what = 'CDC(sflight) physical delete captured (DATE+NUMC keys)'
+        detail = |{ r1-del }| ).
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM sflight_cdc WHERE fldate='2099-12-31'| ) = 0 )
+        what = 'CDC(sflight) deleted flight absent from target' ).
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM sflight_cdc| ) = lv_n0 - 1 )
+        what = 'CDC(sflight) count -1' ).
+
+    DATA(r2) = zcl_erpl_rev_cdc=>run( 'sflight_cdc' ).
+    ok( cond = xsdbool( r2-applied = abap_false ) what = 'CDC(sflight) idempotent re-run no-op' ).
+
+    DATA(lv_te) = zcl_erpl_rev_cdc=>teardown( 'sflight_cdc' ).
+    ok( cond = xsdbool( lv_te IS INITIAL ) what = 'CDC(sflight) teardown ok' detail = lv_te ).
+    zcl_erpl_rev_deltadrv=>sflight_purge_demo( ).
   ENDMETHOD.
 
 ENDCLASS.
