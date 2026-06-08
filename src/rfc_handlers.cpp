@@ -2,6 +2,7 @@
 #include "rfc_metadata.hpp"
 #include "sap_uc.hpp"
 #include "duckdb_bridge.hpp"
+#include "cdc_dialect.hpp"
 #include "json_util.hpp"
 #include "logging.hpp"
 
@@ -56,6 +57,27 @@ std::string RowsToJsonArray(const std::vector<std::string> &rows) {
     return out;
 }
 
+// Replace every occurrence of `from` in `s` with `to`.
+std::string ReplaceAll(std::string s, const std::string &from, const std::string &to) {
+    if (from.empty()) return s;
+    size_t p = 0;
+    while ((p = s.find(from, p)) != std::string::npos) { s.replace(p, from.size(), to); p += to.size(); }
+    return s;
+}
+std::string UpperOf(std::string s) {
+    for (char &c : s) if (c >= 'a' && c <= 'z') c = char(c - 'a' + 'A');
+    return s;
+}
+CdcMode CdcModeOf(const std::string &m) {
+    return UpperOf(m) == "FULL_IUD" ? CdcMode::FullIud : CdcMode::DeleteOnly;
+}
+// A JSON array of plain (escaped, quoted) strings.
+std::string JsonStrArray(const std::vector<std::string> &v) {
+    std::string out = "[";
+    for (size_t i = 0; i < v.size(); i++) { if (i) out += ","; out += json::QuoteString(v[i]); }
+    return out + "]";
+}
+
 // Build a JSON array of {"name":..,"type":..} from the columns.
 std::string ColumnsToJson(const std::vector<QueryColumn> &cols) {
     std::string out = "[";
@@ -88,10 +110,14 @@ void InstallHandlers(const std::string &db_path, const std::string &init_sql) {
         throw_rfc("RfcInstallServerFunction(Z_DUCKDB_FETCH)", info);
     if (RfcInstallServerFunction(nullptr, BuildCloseDesc(), ZCloseImpl, &info) != RFC_OK)
         throw_rfc("RfcInstallServerFunction(Z_DUCKDB_CLOSE)", info);
+    if (RfcInstallServerFunction(nullptr, BuildCdcPlanDesc(), ZCdcPlanImpl, &info) != RFC_OK)
+        throw_rfc("RfcInstallServerFunction(Z_DUCKDB_CDC_PLAN)", info);
+    if (RfcInstallServerFunction(nullptr, BuildCdcApplyDesc(), ZCdcApplyImpl, &info) != RFC_OK)
+        throw_rfc("RfcInstallServerFunction(Z_DUCKDB_CDC_APPLY)", info);
 
     log::get().Debug("rfc", "handlers installed",
                      {{"functions", "STFC_CONNECTION,Z_DUCKDB_QUERY,Z_DUCKDB_INGEST,"
-                                    "Z_DUCKDB_SNAPSHOT_MERGE,"
+                                    "Z_DUCKDB_SNAPSHOT_MERGE,Z_DUCKDB_CDC_PLAN,Z_DUCKDB_CDC_APPLY,"
                                     "Z_DUCKDB_OPEN,Z_DUCKDB_FETCH,Z_DUCKDB_CLOSE", true},
                       {"db", db_path.empty() ? ":memory:" : db_path}});
 }
@@ -227,6 +253,112 @@ extern "C" RFC_RC SAP_API ZSnapshotMergeImpl(RFC_CONNECTION_HANDLE,
                          {{"ins", r.ins}, {"upd", r.upd}, {"del", r.del}});
     } catch (const std::exception &e) {
         log::get().Error("rfc", "Z_DUCKDB_SNAPSHOT_MERGE failed", {{"error", e.what()}});
+        SetString(funcHandle, "EV_ERROR", e.what());
+    }
+    return RFC_OK;
+}
+
+// --- Trigger-CDC FMs --------------------------------------------------------
+// PLAN registers the target + generates ALL the platform SQL (provision/teardown
+// DDL, read/prune SQL) as one opaque JSON plan; ABAP just executes the strings.
+// IV_ACTION: PROVISION (register, return provision DDL), CYCLE (return read SQL
+// with the current position, no re-register), SEED / DISABLE (state transitions).
+extern "C" RFC_RC SAP_API ZCdcPlanImpl(RFC_CONNECTION_HANDLE,
+                                       RFC_FUNCTION_HANDLE funcHandle,
+                                       RFC_ERROR_INFO *) {
+    try {
+        std::string target   = GetString(funcHandle, "IV_TARGET");
+        std::string source   = GetString(funcHandle, "IV_SOURCE");
+        std::string keys     = GetString(funcHandle, "IV_KEYS");
+        std::string mode     = GetString(funcHandle, "IV_MODE");
+        std::string platform = GetString(funcHandle, "IV_PLATFORM");
+        std::string action   = UpperOf(GetString(funcHandle, "IV_ACTION"));
+        if (action.empty()) action = "PROVISION";
+        log::get().Info("rfc", "Z_DUCKDB_CDC_PLAN", {{"target", target}, {"action", action}});
+
+        if (action == "SEED") {
+            g_bridge->CdcSetStatus(target, "SEEDED");
+            SetString(funcHandle, "EV_PLAN", "");
+            SetString(funcHandle, "EV_ERROR", "");
+            return RFC_OK;
+        }
+
+        // Spec comes from the params (PROVISION) or the existing state (CYCLE/DISABLE).
+        CdcState st = g_bridge->CdcGet(target);
+        std::string src  = source.empty()   ? st.source   : source;
+        std::string ks   = keys.empty()     ? st.keys     : keys;
+        std::string md   = mode.empty()     ? (st.mode.empty() ? "DELETE_ONLY" : st.mode) : mode;
+        std::string plat = platform.empty() ? (st.platform.empty() ? "HANA" : st.platform) : platform;
+        if (src.empty() || ks.empty())
+            throw std::runtime_error("CDC: source and keys required to plan " + target);
+
+        CdcSpec spec;
+        spec.source = src;
+        spec.keys = SplitCsv(ks);
+        spec.mode = CdcModeOf(md);
+        // FULL_IUD logs the full row image: take the column set from the (seeded)
+        // DuckDB target and upper-case it to the SAP/HANA column names the triggers
+        // reference (replicate lower-cases on the way in).
+        if (spec.mode == CdcMode::FullIud) {
+            QueryResult tc = g_bridge->Query("SELECT * FROM " + target + " LIMIT 0");
+            for (auto &c : tc.columns) spec.columns.push_back(UpperOf(c.name));
+        }
+        CdcPlan plan = MakeDialect(plat)->Plan(spec);
+
+        if (action == "PROVISION")
+            g_bridge->CdcRegister(target, src, ks, plat, md, plan.log_table);
+        else if (action == "DISABLE")
+            g_bridge->CdcSetStatus(target, "DISABLED");
+
+        const long long pos = g_bridge->CdcGet(target).position;
+        const std::string read = ReplaceAll(plan.read_sql, "%POS%", std::to_string(pos));
+
+        std::string js = "{";
+        js += "\"log_table\":"       + json::QuoteString(plan.log_table);
+        js += ",\"seq_name\":"       + json::QuoteString(plan.seq_name);
+        js += ",\"op_col\":"         + json::QuoteString(plan.op_col);
+        js += ",\"seq_col\":"        + json::QuoteString(plan.seq_col);
+        js += ",\"position\":"       + std::to_string(pos);
+        js += ",\"key_cols\":"       + JsonStrArray(plan.key_cols);
+        js += ",\"provision_ddl\":"  + JsonStrArray(plan.provision_ddl);
+        js += ",\"teardown_ddl\":"   + JsonStrArray(plan.teardown_ddl);
+        js += ",\"read_sql\":"       + json::QuoteString(read);
+        js += ",\"read_from\":"      + json::QuoteString(plan.read_from);
+        js += ",\"prune_sql\":"      + json::QuoteString(plan.prune_sql);
+        js += "}";
+        SetString(funcHandle, "EV_PLAN", js);
+        SetString(funcHandle, "EV_ERROR", "");
+    } catch (const std::exception &e) {
+        log::get().Error("rfc", "Z_DUCKDB_CDC_PLAN failed", {{"error", e.what()}});
+        SetString(funcHandle, "EV_PLAN", "");
+        SetString(funcHandle, "EV_ERROR", e.what());
+    }
+    return RFC_OK;
+}
+
+// APPLY consumes one staged log batch: coalesce -> MERGE I/U/D -> advance position
+// -> drop staging, atomically. Returns counts + the prune bound ABAP deletes up to.
+extern "C" RFC_RC SAP_API ZCdcApplyImpl(RFC_CONNECTION_HANDLE,
+                                        RFC_FUNCTION_HANDLE funcHandle,
+                                        RFC_ERROR_INFO *) {
+    try {
+        std::string target  = GetString(funcHandle, "IV_TARGET");
+        std::string staging = GetString(funcHandle, "IV_STAGING");
+        std::string keys    = GetString(funcHandle, "IV_KEYS");
+        log::get().Info("rfc", "Z_DUCKDB_CDC_APPLY",
+                        {{"target", target}, {"staging", staging}, {"keys", keys}});
+        CdcApplyResult r = g_bridge->CdcApply(target, staging, SplitCsv(keys));
+        SetString(funcHandle, "EV_INS",     std::to_string(r.ins));
+        SetString(funcHandle, "EV_UPD",     std::to_string(r.upd));
+        SetString(funcHandle, "EV_DEL",     std::to_string(r.del));
+        SetString(funcHandle, "EV_PRUNE",   std::to_string(r.prune_bound));
+        SetString(funcHandle, "EV_APPLIED", r.applied ? "X" : "");
+        SetString(funcHandle, "EV_ERROR",   "");
+        log::get().Debug("rfc", "Z_DUCKDB_CDC_APPLY ok",
+                         {{"ins", r.ins}, {"upd", r.upd}, {"del", r.del},
+                          {"prune", r.prune_bound}});
+    } catch (const std::exception &e) {
+        log::get().Error("rfc", "Z_DUCKDB_CDC_APPLY failed", {{"error", e.what()}});
         SetString(funcHandle, "EV_ERROR", e.what());
     }
     return RFC_OK;

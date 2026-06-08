@@ -93,6 +93,43 @@ RFC_FUNCTION_DESC_HANDLE BuildSnapshotMergeDesc() {
     return desc;
 }
 
+RFC_FUNCTION_DESC_HANDLE BuildCdcPlanDesc() {
+    static RFC_FUNCTION_DESC_HANDLE desc = nullptr;
+    if (desc) return desc;
+    RFC_ERROR_INFO info;
+    auto uname = std2uc("Z_DUCKDB_CDC_PLAN");
+    desc = RfcCreateFunctionDesc(uname.data(), &info);
+    if (!desc) throw_rfc("RfcCreateFunctionDesc(Z_DUCKDB_CDC_PLAN)", info);
+    AddParam(desc, "IV_TARGET",   RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
+    AddParam(desc, "IV_SOURCE",   RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
+    AddParam(desc, "IV_KEYS",     RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
+    AddParam(desc, "IV_MODE",     RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
+    AddParam(desc, "IV_PLATFORM", RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
+    AddParam(desc, "IV_ACTION",   RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
+    AddParam(desc, "EV_PLAN",     RFCTYPE_STRING, RFC_EXPORT);
+    AddParam(desc, "EV_ERROR",    RFCTYPE_STRING, RFC_EXPORT);
+    return desc;
+}
+
+RFC_FUNCTION_DESC_HANDLE BuildCdcApplyDesc() {
+    static RFC_FUNCTION_DESC_HANDLE desc = nullptr;
+    if (desc) return desc;
+    RFC_ERROR_INFO info;
+    auto uname = std2uc("Z_DUCKDB_CDC_APPLY");
+    desc = RfcCreateFunctionDesc(uname.data(), &info);
+    if (!desc) throw_rfc("RfcCreateFunctionDesc(Z_DUCKDB_CDC_APPLY)", info);
+    AddParam(desc, "IV_TARGET",  RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
+    AddParam(desc, "IV_STAGING", RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
+    AddParam(desc, "IV_KEYS",    RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
+    AddParam(desc, "EV_INS",     RFCTYPE_STRING, RFC_EXPORT);
+    AddParam(desc, "EV_UPD",     RFCTYPE_STRING, RFC_EXPORT);
+    AddParam(desc, "EV_DEL",     RFCTYPE_STRING, RFC_EXPORT);
+    AddParam(desc, "EV_PRUNE",   RFCTYPE_STRING, RFC_EXPORT);
+    AddParam(desc, "EV_APPLIED", RFCTYPE_STRING, RFC_EXPORT);
+    AddParam(desc, "EV_ERROR",   RFCTYPE_STRING, RFC_EXPORT);
+    return desc;
+}
+
 RFC_FUNCTION_DESC_HANDLE BuildOpenDesc() {
     static RFC_FUNCTION_DESC_HANDLE desc = nullptr;
     if (desc) return desc;

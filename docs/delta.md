@@ -37,7 +37,8 @@ is **no new `Z` table in SAP**.
 Rule of thumb: **timestamp present → WATERMARK; append-only huge → INSERT_ONLY;
 no/weak change column → CHANGEDOC for I/U + nightly SNAPSHOT for deletes; bounded &
 column-less → just SNAPSHOT.** Physical deletes are reflected **only** by SNAPSHOT
-(no change column can report a row that no longer exists).
+(no change column can report a row that no longer exists) — or, for a table too large
+to snapshot, by the opt-in **trigger-CDC** tier (see [`cdc.md`](cdc.md)).
 
 ## Registering a target
 

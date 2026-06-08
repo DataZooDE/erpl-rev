@@ -69,6 +69,22 @@ std::string CellText(duckdb::DataChunk &chunk, duckdb::idx_t col, duckdb::idx_t 
     return v.IsNull() ? std::string() : v.ToString();
 }
 
+// A single-quoted SQL string literal with embedded quotes doubled.
+std::string SqlLit(const std::string &s) {
+    std::string r = "'";
+    for (char c : s) { if (c == '\'') r += "''"; r += c; }
+    return r + "'";
+}
+
+// The trigger-CDC state-machine transition guard.
+bool AllowedCdcTransition(const std::string &from, const std::string &to) {
+    if (from == "PROVISIONED") return to == "SEEDED" || to == "DISABLED";
+    if (from == "SEEDED")      return to == "ACTIVE" || to == "DISABLED";
+    if (from == "ACTIVE")      return to == "ACTIVE" || to == "DISABLED";
+    if (from == "DISABLED")    return to == "PROVISIONED";
+    return false;
+}
+
 } // namespace
 
 // A streaming cursor owns its OWN DuckDB connection (DuckDB permits only one
@@ -217,6 +233,18 @@ DuckDbBridge::DuckDbBridge(const std::string &path, const std::string &init_sql)
         "FROM _erpl_rev_run_stats");
     if (rview->HasError())
         throw std::runtime_error("DuckDB run-stats view init failed: " + rview->GetError());
+    // Trigger-CDC state machine (opt-in physical-delete tier, ADR-0004 / epic #17).
+    // One row per CDC target: config + provisioning status + log position. Guarded
+    // transitions live in the CDC* methods; the table itself is plain DuckDB so the
+    // state survives a server restart.
+    auto cdc = con.Query(
+        "CREATE TABLE IF NOT EXISTS _erpl_rev_cdc ("
+        "target VARCHAR PRIMARY KEY, source VARCHAR NOT NULL, keys VARCHAR NOT NULL, "
+        "platform VARCHAR DEFAULT 'HANA', mode VARCHAR DEFAULT 'DELETE_ONLY', "
+        "status VARCHAR DEFAULT 'PROVISIONED', log_table VARCHAR, position BIGINT DEFAULT 0, "
+        "provisioned_ts TIMESTAMPTZ, seeded_ts TIMESTAMPTZ, last_run_ts TIMESTAMPTZ, error VARCHAR)");
+    if (cdc->HasError())
+        throw std::runtime_error("DuckDB cdc-state init failed: " + cdc->GetError());
     // Boot init: explicit init_sql (CLI/--init-file) wins; else env fallback. Runs
     // INSTALL/LOAD/CREATE SECRET/ATTACH so replication can publish to external
     // targets (parquet object stores, postgres, ducklake, bigquery, iceberg).
@@ -763,6 +791,219 @@ SnapshotResult DuckDbBridge::SnapshotMerge(const std::string &target,
         Exec(con, "ROLLBACK");
         throw;
     }
+    return res;
+}
+
+// --- Trigger-CDC state machine ---------------------------------------------
+
+CdcState DuckDbBridge::CdcGet(const std::string &target) {
+    duckdb::Connection con(*db_);
+    auto r = con.Query(
+        "SELECT target, source, keys, platform, mode, log_table, status, position "
+        "FROM _erpl_rev_cdc WHERE target = " + SqlLit(target));
+    if (r->HasError())
+        throw std::runtime_error("DuckDB cdc get failed: " + r->GetError());
+    CdcState s;
+    if (r->RowCount() == 0) return s;
+    s.exists = true;
+    s.target = r->GetValue(0, 0).ToString();
+    s.source = r->GetValue(1, 0).ToString();
+    s.keys = r->GetValue(2, 0).ToString();
+    s.platform = r->GetValue(3, 0).ToString();
+    s.mode = r->GetValue(4, 0).ToString();
+    auto lt = r->GetValue(5, 0);
+    s.log_table = lt.IsNull() ? std::string() : lt.ToString();
+    s.status = r->GetValue(6, 0).ToString();
+    s.position = r->GetValue(7, 0).GetValue<int64_t>();
+    return s;
+}
+
+void DuckDbBridge::CdcRegister(const std::string &target, const std::string &source,
+                               const std::string &keys, const std::string &platform,
+                               const std::string &mode, const std::string &log_table) {
+    duckdb::Connection con(*db_);
+    // (Re)create the config in PROVISIONED with position reset — idempotent, and
+    // the legal way back from DISABLED.
+    Exec(con,
+        "INSERT INTO _erpl_rev_cdc "
+        "(target, source, keys, platform, mode, log_table, status, position, provisioned_ts) "
+        "VALUES (" + SqlLit(target) + "," + SqlLit(source) + "," + SqlLit(keys) + "," +
+        SqlLit(platform.empty() ? "HANA" : platform) + "," +
+        SqlLit(mode.empty() ? "DELETE_ONLY" : mode) + "," + SqlLit(log_table) +
+        ",'PROVISIONED',0,now()) "
+        "ON CONFLICT (target) DO UPDATE SET source=excluded.source, keys=excluded.keys, "
+        "platform=excluded.platform, mode=excluded.mode, log_table=excluded.log_table, "
+        "status='PROVISIONED', position=0, provisioned_ts=now(), error=NULL");
+}
+
+void DuckDbBridge::CdcSetStatus(const std::string &target, const std::string &status) {
+    CdcState s = CdcGet(target);
+    if (!s.exists) throw std::runtime_error("CDC: no registration for " + target);
+    if (s.status == status && status != "ACTIVE") return;   // no-op (ACTIVE re-stamps)
+    if (!AllowedCdcTransition(s.status, status))
+        throw std::runtime_error("CDC: illegal transition " + s.status + " -> " + status +
+                                 " for " + target);
+    duckdb::Connection con(*db_);
+    std::string stamp;
+    if (status == "SEEDED") stamp = ", seeded_ts=now()";
+    else if (status == "ACTIVE") stamp = ", last_run_ts=now()";
+    Exec(con, "UPDATE _erpl_rev_cdc SET status=" + SqlLit(status) + stamp +
+              " WHERE target=" + SqlLit(target));
+}
+
+void DuckDbBridge::CdcAdvancePosition(const std::string &target, long long position) {
+    CdcState s = CdcGet(target);
+    if (!s.exists) throw std::runtime_error("CDC: no registration for " + target);
+    if (position < s.position)
+        throw std::runtime_error("CDC: position regression for " + target + " (" +
+                                 std::to_string(position) + " < " + std::to_string(s.position) + ")");
+    duckdb::Connection con(*db_);
+    Exec(con, "UPDATE _erpl_rev_cdc SET position=" + std::to_string(position) +
+              " WHERE target=" + SqlLit(target));
+}
+
+CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::string &staging,
+                                      const std::vector<std::string> &keys) {
+    CdcState st = CdcGet(target);
+    if (!st.exists) throw std::runtime_error("CDC: no registration for " + target);
+    CdcApplyResult res;
+    res.prune_bound = st.position;   // nothing applied yet -> don't prune past here
+
+    duckdb::Connection con(*db_);
+
+    // Max consumed sequence in this batch (the new position / prune bound). An empty
+    // staging table is a no-op: drop it and return with the position unchanged.
+    auto mq = con.Query("SELECT max(\"_seq\") FROM " + staging);
+    if (mq->HasError())
+        throw std::runtime_error("CDC: staging read failed: " + mq->GetError());
+    if (mq->RowCount() == 0 || mq->GetValue(0, 0).IsNull()) {
+        Exec(con, "DROP TABLE IF EXISTS " + staging);
+        return res;   // applied=false
+    }
+    const long long max_seq = mq->GetValue(0, 0).GetValue<int64_t>();
+
+    // Target + staging column metadata up front: the key match AND the upsert both
+    // cast the log's SAP-raw NVARCHAR text to the target column TYPES.
+    auto tcols = con.Query("SELECT * FROM " + target + " LIMIT 0");
+    if (tcols->HasError()) throw std::runtime_error("CDC: target describe failed: " + tcols->GetError());
+    auto scols = con.Query("SELECT * FROM " + staging + " LIMIT 0");
+    if (scols->HasError()) throw std::runtime_error("CDC: staging describe failed: " + scols->GetError());
+    std::vector<std::string> sset;
+    for (duckdb::idx_t c = 0; c < scols->ColumnCount(); c++) sset.push_back(LowerName(scols->names[c]));
+    auto in_staging = [&](const std::string &n) {
+        for (auto &s : sset) if (s == n) return true; return false;
+    };
+    auto type_of = [&](const std::string &n) -> std::string {
+        for (duckdb::idx_t c = 0; c < tcols->ColumnCount(); c++)
+            if (LowerName(tcols->names[c]) == n) return tcols->types[c].ToString();
+        return "VARCHAR";
+    };
+
+    // Cast a log text value to a target column type. SAP dates/times are YYYYMMDD /
+    // HHMMSS (not ISO), so parse them with strptime; everything else casts directly
+    // (a NUMC key '0017' -> INTEGER 17, a CHAR key as-is, a decimal string -> DECIMAL).
+    auto cast_to = [](const std::string &expr, const std::string &type) -> std::string {
+        std::string T = type;
+        for (char &ch : T) if (ch >= 'a' && ch <= 'z') ch = char(ch - 'a' + 'A');
+        if (T == "DATE") return "try_strptime(" + expr + ", '%Y%m%d')::DATE";
+        if (T == "TIME") return "try_strptime(" + expr + ", '%H%M%S')::TIME";
+        if (T.rfind("TIMESTAMP", 0) == 0)
+            return "try_strptime(" + expr + ", '%Y%m%d%H%M%S')::" + type;
+        return "CAST(" + expr + " AS " + type + ")";
+    };
+
+    // Lower-cased key list (DuckDB stores unquoted identifiers lower case).
+    std::vector<std::string> kl;
+    for (auto &k : keys) kl.push_back(LowerName(k));
+    std::string keycsv;
+    for (size_t i = 0; i < kl.size(); i++) { if (i) keycsv += ","; keycsv += kl[i]; }
+
+    // Coalesce: the latest staging row per key (highest "_seq" wins). Out-of-order
+    // or duplicate sequences resolve deterministically by the window order.
+    const std::string coalesced =
+        "(SELECT * FROM " + staging +
+        " QUALIFY row_number() OVER (PARTITION BY " + keycsv + " ORDER BY \"_seq\" DESC)=1)";
+
+    // Key match: target value = the log text cast to the target's key type. `a` is the
+    // target side, `b` the (coalesced) staging side.
+    auto key_join = [&](const std::string &a, const std::string &b) {
+        std::string j;
+        for (size_t i = 0; i < kl.size(); i++) {
+            if (i) j += " AND ";
+            j += a + "." + kl[i] + " = " + cast_to(b + "." + kl[i], type_of(kl[i]));
+        }
+        return j;
+    };
+
+    // Net-op subsets of the coalesced batch.
+    const std::string net_del = "(SELECT * FROM " + coalesced + " c WHERE lower(c.\"_op\")='d')";
+    const std::string net_iu  = "(SELECT * FROM " + coalesced + " c WHERE lower(c.\"_op\") IN ('i','u'))";
+
+    // Data columns to upsert = target columns also present in staging (so delete-only
+    // staging, which carries only keys, yields a keys-only upsert == DO NOTHING).
+    std::vector<std::string> dcols, dtypes;
+    for (duckdb::idx_t c = 0; c < tcols->ColumnCount(); c++) {
+        std::string n = LowerName(tcols->names[c]);
+        if (in_staging(n)) { dcols.push_back(n); dtypes.push_back(tcols->types[c].ToString()); }
+    }
+
+    // Counts (pre-apply, key-only anti-joins): del = net-deletes present in target;
+    // ins = net-I/U keys new to target; upd = net-I/U keys already present.
+    {
+        const std::string dj = key_join("t", "c");
+        auto cr = con.Query(
+            "SELECT "
+            "(SELECT count(*) FROM " + net_del + " c WHERE EXISTS (SELECT 1 FROM " + target +
+              " t WHERE " + dj + ")) AS del,"
+            "(SELECT count(*) FROM " + net_iu + " c WHERE NOT EXISTS (SELECT 1 FROM " + target +
+              " t WHERE " + dj + ")) AS ins,"
+            "(SELECT count(*) FROM " + net_iu + " c WHERE EXISTS (SELECT 1 FROM " + target +
+              " t WHERE " + dj + ")) AS upd");
+        if (cr->HasError()) throw std::runtime_error("CDC: count failed: " + cr->GetError());
+        res.del = cr->GetValue(0, 0).GetValue<int64_t>();
+        res.ins = cr->GetValue(1, 0).GetValue<int64_t>();
+        res.upd = cr->GetValue(2, 0).GetValue<int64_t>();
+    }
+
+    // Atomic apply: delete net-deletes, upsert net-I/U, advance position + mark ACTIVE,
+    // drop staging. Any error rolls all of it back (position stays where it was).
+    const std::string del_sql =
+        "DELETE FROM " + target + " t WHERE EXISTS (SELECT 1 FROM " + net_del +
+        " c WHERE " + key_join("t", "c") + ")";
+
+    // Upsert the net inserts/updates as DELETE-then-INSERT (not ON CONFLICT): DuckDB's
+    // ON CONFLICT NULLs the leading column of a composite key when the source is a
+    // SELECT, so the whole engine uses delete-then-insert (same as the delta MERGE).
+    std::string del_iu_sql, ins_sql;
+    if (!dcols.empty()) {
+        std::string collist, sellist;
+        for (size_t i = 0; i < dcols.size(); i++) {
+            if (i) { collist += ","; sellist += ","; }
+            collist += dcols[i];
+            // The log delivers every value as SAP-raw text; cast it to the target
+            // column type for the insert (keys included, harmless for delete-only).
+            sellist += cast_to("c." + dcols[i], dtypes[i]) + " AS " + dcols[i];
+        }
+        del_iu_sql = "DELETE FROM " + target + " t WHERE EXISTS (SELECT 1 FROM " + net_iu +
+                     " c WHERE " + key_join("t", "c") + ")";
+        ins_sql = "INSERT INTO " + target + " (" + collist + ") SELECT " + sellist +
+                  " FROM " + net_iu + " c";
+    }
+
+    Exec(con, "BEGIN");
+    try {
+        Exec(con, del_sql);
+        if (!del_iu_sql.empty()) { Exec(con, del_iu_sql); Exec(con, ins_sql); }
+        Exec(con, "UPDATE _erpl_rev_cdc SET position=" + std::to_string(max_seq) +
+                  ", last_run_ts=now(), status='ACTIVE' WHERE target=" + SqlLit(target));
+        Exec(con, "DROP TABLE " + staging);
+        Exec(con, "COMMIT");
+    } catch (...) {
+        Exec(con, "ROLLBACK");
+        throw;
+    }
+    res.prune_bound = max_seq;
+    res.applied = true;
     return res;
 }
 

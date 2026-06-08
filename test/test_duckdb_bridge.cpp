@@ -730,6 +730,178 @@ TEST_CASE("Stats: an ERROR run is recorded as not-successful", "[bridge][stats][
     REQUIRE(r.rows[0] == R"({"status":"ERROR","is_success":false,"error_text":"cast failed"})");
 }
 
+// ---------------------------------------------------------------------------
+// Trigger-CDC state machine: _erpl_rev_cdc + guarded transitions. (Epic #17.)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("CDC state: table at boot, register, get", "[bridge][cdc][state]") {
+    DuckDbBridge db;
+    REQUIRE(db.Query("SELECT count(*) AS c FROM _erpl_rev_cdc").rows[0] == R"({"c":0})");
+    REQUIRE_FALSE(db.CdcGet("sflight").exists);
+
+    db.CdcRegister("sflight", "SFLIGHT", "MANDT,CARRID,CONNID,FLDATE", "HANA",
+                   "DELETE_ONLY", "ZCDC_SFLIGHT_LOG");
+    CdcState s = db.CdcGet("sflight");
+    REQUIRE(s.exists);
+    REQUIRE(s.source == "SFLIGHT");
+    REQUIRE(s.keys == "MANDT,CARRID,CONNID,FLDATE");
+    REQUIRE(s.platform == "HANA");
+    REQUIRE(s.mode == "DELETE_ONLY");
+    REQUIRE(s.log_table == "ZCDC_SFLIGHT_LOG");
+    REQUIRE(s.status == "PROVISIONED");
+    REQUIRE(s.position == 0);
+}
+
+TEST_CASE("CDC state: legal transitions + re-enable", "[bridge][cdc][state]") {
+    DuckDbBridge db;
+    db.CdcRegister("t", "T", "K", "HANA", "DELETE_ONLY", "ZCDC_T_LOG");
+    db.CdcSetStatus("t", "SEEDED");
+    REQUIRE(db.CdcGet("t").status == "SEEDED");
+    db.CdcSetStatus("t", "ACTIVE");
+    db.CdcSetStatus("t", "ACTIVE");   // re-run, idempotent-ish
+    REQUIRE(db.CdcGet("t").status == "ACTIVE");
+    db.CdcSetStatus("t", "DISABLED");
+    REQUIRE(db.CdcGet("t").status == "DISABLED");
+    // re-enable goes back through register -> PROVISIONED.
+    db.CdcRegister("t", "T", "K", "HANA", "DELETE_ONLY", "ZCDC_T_LOG");
+    REQUIRE(db.CdcGet("t").status == "PROVISIONED");
+}
+
+TEST_CASE("CDC state: illegal transitions are rejected", "[bridge][cdc][state]") {
+    DuckDbBridge db;
+    db.CdcRegister("t", "T", "K", "HANA", "DELETE_ONLY", "ZCDC_T_LOG");
+    REQUIRE_THROWS(db.CdcSetStatus("t", "ACTIVE"));      // must SEED first
+    db.CdcSetStatus("t", "SEEDED");
+    REQUIRE_THROWS(db.CdcSetStatus("t", "PROVISIONED")); // only DISABLED->PROVISIONED
+    REQUIRE_THROWS(db.CdcSetStatus("nope", "SEEDED"));   // unknown target
+}
+
+TEST_CASE("CDC state: position is monotonic", "[bridge][cdc][state]") {
+    DuckDbBridge db;
+    db.CdcRegister("t", "T", "K", "HANA", "DELETE_ONLY", "ZCDC_T_LOG");
+    db.CdcAdvancePosition("t", 5);
+    db.CdcAdvancePosition("t", 10);
+    db.CdcAdvancePosition("t", 10);   // equal is fine (idempotent re-apply)
+    REQUIRE(db.CdcGet("t").position == 10);
+    REQUIRE_THROWS(db.CdcAdvancePosition("t", 3));   // regression rejected
+    REQUIRE(db.CdcGet("t").position == 10);
+}
+
+TEST_CASE("CDC state: survives a restart (file-backed)", "[bridge][cdc][state]") {
+    const std::string path = "/tmp/erpl_cdc_state_test.duckdb";
+    std::remove(path.c_str());
+    std::remove((path + ".wal").c_str());
+    {
+        DuckDbBridge db(path);
+        db.CdcRegister("t", "T", "K", "HANA", "FULL_IUD", "ZCDC_T_LOG");
+        db.CdcSetStatus("t", "SEEDED");
+        db.CdcAdvancePosition("t", 42);
+    }
+    {
+        DuckDbBridge db(path);   // reopen the same store
+        CdcState s = db.CdcGet("t");
+        REQUIRE(s.exists);
+        REQUIRE(s.status == "SEEDED");
+        REQUIRE(s.position == 42);
+        REQUIRE(s.mode == "FULL_IUD");
+    }
+    std::remove(path.c_str());
+    std::remove((path + ".wal").c_str());
+}
+
+TEST_CASE("CDC apply: delete-only batch removes keys + advances position", "[bridge][cdc][apply]") {
+    DuckDbBridge db;
+    db.Execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, v VARCHAR)");
+    db.Execute("INSERT INTO t1 VALUES (1,'a'),(2,'b'),(3,'c')");
+    db.CdcRegister("t1", "T1", "id", "HANA", "DELETE_ONLY", "ZCDC_T1_LOG");
+    db.CdcSetStatus("t1", "SEEDED");
+    // delete-only staging carries keys + op + seq only.
+    db.Execute("CREATE TABLE log1(id INTEGER, \"_op\" VARCHAR, \"_seq\" BIGINT)");
+    db.Execute("INSERT INTO log1 VALUES (1,'D',1),(3,'D',2)");
+
+    CdcApplyResult r = db.CdcApply("t1", "log1", {"id"});
+    REQUIRE(r.applied);
+    REQUIRE(r.del == 2);
+    REQUIRE(r.ins == 0);
+    REQUIRE(r.upd == 0);
+    REQUIRE(r.prune_bound == 2);
+    REQUIRE(db.Query("SELECT count(*) AS c FROM t1").rows[0] == R"({"c":1})");
+    REQUIRE(db.Query("SELECT v FROM t1").rows[0] == R"({"v":"b"})");
+    REQUIRE(db.CdcGet("t1").position == 2);
+    REQUIRE(db.CdcGet("t1").status == "ACTIVE");
+    REQUIRE(db.Query("SELECT count(*) AS c FROM duckdb_tables() WHERE table_name='log1'").rows[0]
+            == R"({"c":0})");   // staging dropped
+}
+
+TEST_CASE("CDC apply: coalesces interleaved I/U/D per key to the net op", "[bridge][cdc][apply]") {
+    DuckDbBridge db;
+    db.Execute("CREATE TABLE t2(id INTEGER PRIMARY KEY, v VARCHAR)");
+    db.Execute("INSERT INTO t2 VALUES (2,'b'),(3,'c')");   // id1 absent; id2,id3 present
+    db.CdcRegister("t2", "T2", "id", "HANA", "FULL_IUD", "ZCDC_T2_LOG");
+    db.CdcSetStatus("t2", "SEEDED");
+    // full-IUD staging carries the row image. id1: D then I -> net I; id2: U; id3: I then D -> net D.
+    db.Execute("CREATE TABLE log2(id INTEGER, v VARCHAR, \"_op\" VARCHAR, \"_seq\" BIGINT)");
+    db.Execute("INSERT INTO log2 VALUES "
+               "(1,NULL,'D',1),(1,'x','I',2),"
+               "(2,'B','U',3),"
+               "(3,'c','I',4),(3,NULL,'D',5)");
+
+    CdcApplyResult r = db.CdcApply("t2", "log2", {"id"});
+    REQUIRE(r.ins == 1);   // id1 new
+    REQUIRE(r.upd == 1);   // id2 existing
+    REQUIRE(r.del == 1);   // id3 net delete (was present)
+    REQUIRE(r.prune_bound == 5);
+    REQUIRE(db.Query("SELECT count(*) AS c FROM t2").rows[0] == R"({"c":2})");
+    REQUIRE(db.Query("SELECT v FROM t2 WHERE id=1").rows[0] == R"({"v":"x"})");
+    REQUIRE(db.Query("SELECT v FROM t2 WHERE id=2").rows[0] == R"({"v":"B"})");
+    REQUIRE(db.Query("SELECT count(*) AS c FROM t2 WHERE id=3").rows[0] == R"({"c":0})");
+}
+
+TEST_CASE("CDC apply: SAP-typed keys (NUMC + DATE) match via cast", "[bridge][cdc][apply]") {
+    DuckDbBridge db;
+    // SFLIGHT-shaped target: CONNID numeric, FLDATE a real DATE.
+    db.Execute("CREATE TABLE sf(mandt VARCHAR, carrid VARCHAR, connid INTEGER, fldate DATE, "
+               "price INTEGER, PRIMARY KEY(mandt,carrid,connid,fldate))");
+    db.Execute("INSERT INTO sf VALUES "
+               "('001','AA',17,DATE '2099-12-31',100),('001','LH',400,DATE '2099-12-30',200)");
+    db.CdcRegister("sf", "SFLIGHT", "mandt,carrid,connid,fldate", "HANA", "DELETE_ONLY", "L");
+    db.CdcSetStatus("sf", "SEEDED");
+    // the log delivers SAP-raw key text: NUMC '0017', DATS '20991231'.
+    db.Execute("CREATE TABLE sflog(mandt VARCHAR, carrid VARCHAR, connid VARCHAR, fldate VARCHAR, "
+               "\"_op\" VARCHAR, \"_seq\" BIGINT)");
+    db.Execute("INSERT INTO sflog VALUES ('001','AA','0017','20991231','D',1)");
+    CdcApplyResult r = db.CdcApply("sf", "sflog", {"mandt", "carrid", "connid", "fldate"});
+    REQUIRE(r.del == 1);
+    REQUIRE(db.Query("SELECT count(*) AS c FROM sf WHERE carrid='AA'").rows[0] == R"({"c":0})");
+    REQUIRE(db.Query("SELECT count(*) AS c FROM sf").rows[0] == R"({"c":1})");   // LH untouched
+}
+
+TEST_CASE("CDC apply: empty batch is a no-op (position unchanged)", "[bridge][cdc][apply]") {
+    DuckDbBridge db;
+    db.Execute("CREATE TABLE t3(id INTEGER PRIMARY KEY)");
+    db.CdcRegister("t3", "T3", "id", "HANA", "DELETE_ONLY", "L");
+    db.CdcAdvancePosition("t3", 7);
+    db.Execute("CREATE TABLE log3(id INTEGER, \"_op\" VARCHAR, \"_seq\" BIGINT)");   // empty
+    CdcApplyResult r = db.CdcApply("t3", "log3", {"id"});
+    REQUIRE_FALSE(r.applied);
+    REQUIRE(r.prune_bound == 7);
+    REQUIRE(db.CdcGet("t3").position == 7);
+}
+
+TEST_CASE("CDC apply: an error rolls back, position untouched", "[bridge][cdc][apply]") {
+    DuckDbBridge db;
+    db.Execute("CREATE TABLE t4(id INTEGER PRIMARY KEY, v INTEGER NOT NULL)");
+    db.Execute("INSERT INTO t4 VALUES (1,10)");
+    db.CdcRegister("t4", "T4", "id", "HANA", "FULL_IUD", "L");
+    db.CdcSetStatus("t4", "SEEDED");
+    // a net insert with NULL in a NOT NULL column -> the upsert fails mid-transaction.
+    db.Execute("CREATE TABLE log4(id INTEGER, v INTEGER, \"_op\" VARCHAR, \"_seq\" BIGINT)");
+    db.Execute("INSERT INTO log4 VALUES (2,NULL,'I',5)");
+    REQUIRE_THROWS(db.CdcApply("t4", "log4", {"id"}));
+    REQUIRE(db.CdcGet("t4").position == 0);                                   // not advanced
+    REQUIRE(db.Query("SELECT count(*) AS c FROM t4").rows[0] == R"({"c":1})"); // id2 not inserted
+}
+
 TEST_CASE("IngestBxml MERGE: op_col drives insert/update/delete", "[bridge][ingest][merge]") {
     DuckDbBridge db;
     std::string ddl = "CREATE TABLE IF NOT EXISTS m(id INTEGER PRIMARY KEY, v VARCHAR);";

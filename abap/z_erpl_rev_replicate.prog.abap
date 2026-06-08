@@ -215,6 +215,10 @@ SELECTION-SCREEN BEGIN OF BLOCK dlt WITH FRAME TITLE t_dlt.
     SELECTION-SCREEN COMMENT 1(28) c_dsch FOR FIELD p_dsch.
     PARAMETERS p_dsch AS CHECKBOX.
   SELECTION-SCREEN END OF LINE.
+  SELECTION-SCREEN BEGIN OF LINE.
+    SELECTION-SCREEN COMMENT 1(28) c_cdc FOR FIELD p_cdc.
+    PARAMETERS p_cdc AS CHECKBOX.
+  SELECTION-SCREEN END OF LINE.
 SELECTION-SCREEN END OF BLOCK dlt.
 SELECTION-SCREEN END OF SCREEN 0500.
 
@@ -264,6 +268,7 @@ INITIALIZATION.
   c_djob   = 'Parallel jobs (reload)'.
   c_dcad   = 'Refresh interval'.
   c_dsch   = 'Run it automatically (job)'.
+  c_cdc    = 'Also capture physical deletes (trigger CDC)'.
 
 *----------------------------------------------------------------------*
 * F4: search DDIC tables by the pattern currently typed into P_TAB.
@@ -325,6 +330,11 @@ AT SELECTION-SCREEN ON HELP-REQUEST FOR p_dsch.
     'Install (or re-time) ONE SAP background job that wakes every "Refresh interval" and runs all DUE delta targets.'
     ' It is the supported way to run delta on a schedule - monitor/stop it in SM37 (job ERPL_REV_DELTA).'
     ' Off = run delta by hand (report Z_ERPL_REV_DELTA).'.
+AT SELECTION-SCREEN ON HELP-REQUEST FOR p_cdc.
+  PERFORM help USING 'Capture physical deletes (trigger CDC)'
+    'Opt-in extra tier: also create DB triggers (delete-only) on the source so PHYSICAL deletes are captured.'
+    ' The watermark/change-doc methods cannot see a row that was hard-deleted; this closes that gap without a full snapshot.'
+    ' Customer-owned, in-namespace (ZCDC_*) triggers; transparent tables only. See docs/cdc.md.'.
 
 *----------------------------------------------------------------------*
 * Validate on Execute (sy-ucomm='ONLI') only — not on the USER-COMMAND toggles
@@ -764,6 +774,20 @@ START-OF-SELECTION.
                  | (keys { ls_dd-keys }, cadence { p_dcad }).|.
       ELSE.
         WRITE: / |  DELTA: register error: { lv_rerr }|.
+      ENDIF.
+      " Optional trigger-CDC tier: provision real DB triggers (delete-only) so the
+      " PHYSICAL deletes the watermark/change-doc methods can't see are captured too.
+      IF p_cdc = abap_true.
+        DATA(lv_cerr) = zcl_erpl_rev_cdc=>provision(
+          iv_target = lv_local
+          iv_source = condense( CONV string( p_tab ) )
+          iv_keys   = ls_dd-keys
+          iv_mode   = 'DELETE_ONLY' ).
+        IF lv_cerr IS INITIAL.
+          WRITE: / |  CDC: provisioned trigger-CDC (delete-only) on { p_tab }.|.
+        ELSE.
+          WRITE: / |  CDC: provision error: { lv_cerr }|.
+        ENDIF.
       ENDIF.
     ENDIF.
   ENDIF.

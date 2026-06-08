@@ -103,6 +103,15 @@ run ZCL_ERPL_REV_DELTATEST abap/zcl_erpl_rev_deltatest.abap
 echo "$OUT" | grep -qE 'DELTA RESULT pass=[0-9]+ fail=0' || fail "delta test ($OUT)"
 echo "   delta OK (watermark+idempotent, snapshot delete, real material change-doc/insert-only, orchestration)"
 
+# Trigger-CDC (opt-in physical-delete tier, ADR-0004): provisions REAL HANA triggers
+# on the source via the server-generated DDL, physically deletes rows, and proves one
+# CDC cycle reflects the deletes in the DuckDB target; idempotent re-run; teardown
+# leaves no orphan objects. Needs ZCL_ERPL_REV_CDC[TEST] + the CDC FMs (mkfm).
+echo "== Trigger-CDC E2E (real HANA triggers, physical deletes) =="
+run ZCL_ERPL_REV_CDCTEST abap/zcl_erpl_rev_cdctest.abap
+echo "$OUT" | grep -qE 'CDC RESULT pass=[0-9]+ fail=0' || fail "cdc test ($OUT)"
+echo "   trigger-CDC OK (provision real triggers, capture physical deletes, idempotent, teardown)"
+
 echo "== Partitioned full-load E2E (coordinator heap + workers + deferred PK) =="
 # Two workers append DISJOINT key ranges into one heap (iv_create=false,
 # iv_build_pk=false); the coordinator builds the PRIMARY KEY once. Proves the merge

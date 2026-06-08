@@ -109,6 +109,23 @@ CLASS zcl_erpl_rev_mkfm IMPLEMENTATION.
               exps = VALUE #( ( `EV_INS` ) ( `EV_UPD` ) ( `EV_DEL` ) ( `EV_ERROR` ) )
               txt  = 'erpl-rev: snapshot diff merge' ).
 
+        " Trigger-CDC FMs (opt-in physical-delete tier). CDC_PLAN returns the whole
+        " platform plan as one JSON string (EV_PLAN); CDC_APPLY applies one staged
+        " log batch and returns counts + the prune bound.
+        make( out  = out
+              name = 'Z_DUCKDB_CDC_PLAN'
+              imps = VALUE #( ( `IV_TARGET` ) ( `IV_SOURCE` ) ( `IV_KEYS` )
+                              ( `IV_MODE` ) ( `IV_PLATFORM` ) ( `IV_ACTION` ) )
+              exps = VALUE #( ( `EV_PLAN` ) ( `EV_ERROR` ) )
+              txt  = 'erpl-rev: CDC plan (DDL/read/prune)' ).
+
+        make( out  = out
+              name = 'Z_DUCKDB_CDC_APPLY'
+              imps = VALUE #( ( `IV_TARGET` ) ( `IV_STAGING` ) ( `IV_KEYS` ) )
+              exps = VALUE #( ( `EV_INS` ) ( `EV_UPD` ) ( `EV_DEL` )
+                              ( `EV_PRUNE` ) ( `EV_APPLIED` ) ( `EV_ERROR` ) )
+              txt  = 'erpl-rev: CDC apply staged log batch' ).
+
         " Streaming cursor FMs. EV_XDATA carries the binary sXML page (XSTRING).
         make( out  = out
               name = 'Z_DUCKDB_OPEN'

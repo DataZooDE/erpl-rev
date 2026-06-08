@@ -53,6 +53,32 @@ struct CursorPage {
     bool done = false;
 };
 
+// One row of the trigger-CDC state machine (_erpl_rev_cdc). `exists` is false when
+// the target is not registered.
+struct CdcState {
+    bool exists = false;
+    std::string target;
+    std::string source;
+    std::string keys;        // comma list
+    std::string platform;    // HANA
+    std::string mode;        // DELETE_ONLY | FULL_IUD
+    std::string log_table;
+    std::string status;      // PROVISIONED | SEEDED | ACTIVE | DISABLED
+    long long position = 0;  // last consumed log sequence
+};
+
+// Result of a CdcApply: the I/U/D counts the coalesced log batch produced, and the
+// prune bound — the confirmed log position ABAP may safely delete up to (`seq <=
+// prune_bound`). `applied` is false for an empty batch (nothing read, prune_bound =
+// the unchanged position).
+struct CdcApplyResult {
+    long long ins = 0;
+    long long upd = 0;
+    long long del = 0;
+    long long prune_bound = 0;
+    bool applied = false;
+};
+
 struct CursorStore;   // defined in the .cpp (owns DuckDB connections)
 
 class DuckDbBridge {
@@ -138,6 +164,29 @@ public:
     SnapshotResult SnapshotMerge(const std::string &target,
                                  const std::string &staging,
                                  const std::vector<std::string> &keys);
+
+    // --- Trigger-CDC state machine (_erpl_rev_cdc, created at boot) ----------
+    // Guarded server-side so ABAP can't drive an illegal transition. Register
+    // (re)creates the config in PROVISIONED with position 0; SetStatus enforces
+    // PROVISIONED->SEEDED->ACTIVE->DISABLED (and DISABLED->PROVISIONED re-enable);
+    // AdvancePosition is monotonic (a regression throws). State survives restart
+    // (it's a normal DuckDB table in the same store).
+    void CdcRegister(const std::string &target, const std::string &source,
+                     const std::string &keys, const std::string &platform,
+                     const std::string &mode, const std::string &log_table);
+    void CdcSetStatus(const std::string &target, const std::string &status);
+    void CdcAdvancePosition(const std::string &target, long long position);
+    CdcState CdcGet(const std::string &target);
+
+    // Apply one staged log batch to the target, atomically: coalesce the staging
+    // rows to one net op per key (latest by sequence), DELETE the net-deletes,
+    // upsert the net-inserts/updates (when staging carries the row image — full-IUD;
+    // delete-only staging has none), advance the position to the max consumed
+    // sequence, drop the staging table, and mark the run ACTIVE — all in one
+    // transaction (an error rolls everything back and leaves the position untouched).
+    // Returns the I/U/D counts and the prune bound. `keys` are the target key cols.
+    CdcApplyResult CdcApply(const std::string &target, const std::string &staging,
+                            const std::vector<std::string> &keys);
 
     // --- Streaming cursors (fixed-memory paging for large results) ----------
     // OpenCursor starts a streaming query on its OWN DuckDB connection (DuckDB
