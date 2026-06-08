@@ -14,7 +14,7 @@
 *&   [Run delta] run ONE delta cycle — the change is merged into `sflight`.
 *&   [Refresh]  just re-read the DuckDB target.
 *&
-*& The log pane (top) records every action + the cycle's ins/upd/del counts and a
+*& The log pane (left) records every action + the cycle's ins/upd/del counts and a
 *& SAP-source-vs-DuckDB row count; the ALV pane (bottom) shows the current DuckDB
 *& `sflight` contents — so you can watch a real SAP change flow into DuckDB and
 *& debug exactly what was loaded. No dynpro: a docking container built in PBO,
@@ -28,8 +28,8 @@ TYPES: gtt_txt TYPE STANDARD TABLE OF char255 WITH EMPTY KEY.
 
 DATA: go_dock   TYPE REF TO cl_gui_docking_container,
       go_split  TYPE REF TO cl_gui_splitter_container,
-      go_top    TYPE REF TO cl_gui_container,
-      go_bottom TYPE REF TO cl_gui_container,
+      go_left    TYPE REF TO cl_gui_container,
+      go_right TYPE REF TO cl_gui_container,
       go_logbox TYPE REF TO cl_gui_textedit,
       go_salv   TYPE REF TO cl_salv_table,
       go_msg    TYPE REF TO cl_gui_textedit,
@@ -37,46 +37,87 @@ DATA: go_dock   TYPE REF TO cl_gui_docking_container,
       gt_log    TYPE gtt_txt,            " demo log lines (newest at the bottom)
       gv_err    TYPE string.
 
-" Change target (also the input-enabled fields that keep the selection screen alive
-" so the docking container renders).
-PARAMETERS: p_carr TYPE s_carr_id,
-            p_conn TYPE s_conn_id,
-            p_date TYPE s_date.
-SELECTION-SCREEN BEGIN OF LINE.
-SELECTION-SCREEN PUSHBUTTON  2(18) b_setup USER-COMMAND setup.
-SELECTION-SCREEN PUSHBUTTON 21(18) b_run   USER-COMMAND run.
-SELECTION-SCREEN PUSHBUTTON 40(18) b_view  USER-COMMAND view.
-SELECTION-SCREEN END OF LINE.
-SELECTION-SCREEN BEGIN OF LINE.
-SELECTION-SCREEN COMMENT  2(18) c_one.
-SELECTION-SCREEN PUSHBUTTON 21(18) b_upd USER-COMMAND upd.
-SELECTION-SCREEN PUSHBUTTON 40(18) b_ins USER-COMMAND ins.
-SELECTION-SCREEN PUSHBUTTON 59(18) b_del USER-COMMAND del.
-SELECTION-SCREEN END OF LINE.
-" Mass operations (bulk demo flights in a far-future date range).
-PARAMETERS p_mass TYPE i DEFAULT 1000.
-SELECTION-SCREEN BEGIN OF LINE.
-SELECTION-SCREEN COMMENT  2(18) c_mass.
-SELECTION-SCREEN PUSHBUTTON 21(18) b_mupd USER-COMMAND mupd.
-SELECTION-SCREEN PUSHBUTTON 40(18) b_mins USER-COMMAND mins.
-SELECTION-SCREEN PUSHBUTTON 59(18) b_mdel USER-COMMAND mdel.
-SELECTION-SCREEN END OF LINE.
+" The screen is grouped into four framed blocks, each with a one-line description:
+"   Flight key  -> which flight the change buttons act on (also keeps the screen
+"                  alive so the docking container below renders)
+"   Lifecycle   -> load+register / run a cycle / refresh
+"   One flight  -> insert/update/delete the single keyed flight
+"   Many flights-> bulk demo-flight insert/update/delete
+
+" ── Flight key ───────────────────────────────────────────────────────────────
+SELECTION-SCREEN BEGIN OF BLOCK key WITH FRAME TITLE t_key.
+  SELECTION-SCREEN BEGIN OF LINE.
+  SELECTION-SCREEN COMMENT 1(28) c_carr FOR FIELD p_carr.
+  PARAMETERS p_carr TYPE s_carr_id.
+  SELECTION-SCREEN END OF LINE.
+  SELECTION-SCREEN BEGIN OF LINE.
+  SELECTION-SCREEN COMMENT 1(28) c_conn FOR FIELD p_conn.
+  PARAMETERS p_conn TYPE s_conn_id.
+  SELECTION-SCREEN END OF LINE.
+  SELECTION-SCREEN BEGIN OF LINE.
+  SELECTION-SCREEN COMMENT 1(28) c_date FOR FIELD p_date.
+  PARAMETERS p_date TYPE s_date.
+  SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN END OF BLOCK key.
+
+" ── Delta lifecycle ──────────────────────────────────────────────────────────
+SELECTION-SCREEN BEGIN OF BLOCK life WITH FRAME TITLE t_life.
+  SELECTION-SCREEN COMMENT /1(78) c_life1.
+  SELECTION-SCREEN BEGIN OF LINE.
+  SELECTION-SCREEN PUSHBUTTON  1(22) b_setup USER-COMMAND setup.
+  SELECTION-SCREEN PUSHBUTTON 25(22) b_run   USER-COMMAND run.
+  SELECTION-SCREEN PUSHBUTTON 49(22) b_view  USER-COMMAND view.
+  SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN END OF BLOCK life.
+
+" ── Change ONE flight (the key above) ────────────────────────────────────────
+SELECTION-SCREEN BEGIN OF BLOCK one WITH FRAME TITLE t_one.
+  SELECTION-SCREEN COMMENT /1(78) c_one1.
+  SELECTION-SCREEN BEGIN OF LINE.
+  SELECTION-SCREEN PUSHBUTTON  1(22) b_ins USER-COMMAND ins.
+  SELECTION-SCREEN PUSHBUTTON 25(22) b_upd USER-COMMAND upd.
+  SELECTION-SCREEN PUSHBUTTON 49(22) b_del USER-COMMAND del.
+  SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN END OF BLOCK one.
+
+" ── Change MANY flights (bulk demo flights) ──────────────────────────────────
+SELECTION-SCREEN BEGIN OF BLOCK many WITH FRAME TITLE t_many.
+  SELECTION-SCREEN COMMENT /1(78) c_many1.
+  SELECTION-SCREEN BEGIN OF LINE.
+  SELECTION-SCREEN COMMENT 1(28) c_mass FOR FIELD p_mass.
+  PARAMETERS p_mass TYPE i DEFAULT 1000.
+  SELECTION-SCREEN END OF LINE.
+  SELECTION-SCREEN BEGIN OF LINE.
+  SELECTION-SCREEN PUSHBUTTON  1(22) b_mins USER-COMMAND mins.
+  SELECTION-SCREEN PUSHBUTTON 25(22) b_mupd USER-COMMAND mupd.
+  SELECTION-SCREEN PUSHBUTTON 49(22) b_mdel USER-COMMAND mdel.
+  SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN END OF BLOCK many.
 
 INITIALIZATION.
-  b_setup = 'Setup (load+register)'.
+  t_key   = 'Flight key — which flight the change buttons act on'.
+  c_carr  = 'Airline / carrier'.
+  c_conn  = 'Connection number'.
+  c_date  = 'Flight date'.
+  t_life  = 'Delta lifecycle'.
+  c_life1 = 'Load SFLIGHT into DuckDB and register the snapshot delta; run a cycle; refresh.'.
+  b_setup = 'Setup (load + register)'.
   b_run   = 'Run delta cycle'.
   b_view  = 'Refresh view'.
-  c_one   = 'Single flight:'.
-  b_upd   = 'Update flight'.
+  t_one   = 'Change ONE flight (the key above)'.
+  c_one1  = 'Make a real, committed SAP change, then "Run delta cycle" to watch it land in DuckDB.'.
   b_ins   = 'Insert flight'.
+  b_upd   = 'Update price + seats'.
   b_del   = 'Delete flight'.
-  c_mass  = 'Mass (p_mass rows):'.
-  b_mupd  = 'Mass update'.
+  t_many  = 'Change MANY flights at once'.
+  c_many1 = 'Bulk demo flights (date >= 2099) so real SFLIGHT data is never touched.'.
+  c_mass  = 'How many flights'.
   b_mins  = 'Mass insert'.
+  b_mupd  = 'Mass update'.
   b_mdel  = 'Mass delete'.
   zcl_erpl_rev_deltadrv=>sflight_default(
     IMPORTING ev_carrid = p_carr ev_connid = p_conn ev_fldate = p_date ).
-  APPEND |Press Setup to full-load SFLIGHT into DuckDB and register the snapshot delta.| TO gt_log.
+  APPEND |Press "Setup (load + register)" to full-load SFLIGHT into DuckDB and register the snapshot delta.| TO gt_log.
 
 AT SELECTION-SCREEN.
   DATA lv_act TYPE syucomm.
@@ -87,9 +128,19 @@ AT SELECTION-SCREEN.
     PERFORM act USING lv_act.
     IF go_dock IS BOUND.
       go_dock->free( ).
-      CLEAR: go_dock, go_split, go_top, go_bottom, go_logbox, go_salv, go_msg.
+      CLEAR: go_dock, go_split, go_left, go_right, go_logbox, go_salv, go_msg.
     ENDIF.
   ENDIF.
+
+" F1 on the key fields explains what they identify.
+AT SELECTION-SCREEN ON HELP-REQUEST FOR p_carr.
+  MESSAGE 'Airline carrier ID, e.g. AA or LH. With the connection and date it pinpoints one flight.' TYPE 'I'.
+AT SELECTION-SCREEN ON HELP-REQUEST FOR p_conn.
+  MESSAGE 'Flight connection number for that carrier, e.g. 0017.' TYPE 'I'.
+AT SELECTION-SCREEN ON HELP-REQUEST FOR p_date.
+  MESSAGE 'Flight date. The single-flight buttons act on this exact flight; Insert clones one to this date.' TYPE 'I'.
+AT SELECTION-SCREEN ON HELP-REQUEST FOR p_mass.
+  MESSAGE 'How many far-future demo flights the Mass buttons create or change (default 1000).' TYPE 'I'.
 
 *&---------------------------------------------------------------------*
 FORM act USING iv_act TYPE syucomm.
@@ -147,7 +198,7 @@ FORM act USING iv_act TYPE syucomm.
 ENDFORM.
 
 *&---------------------------------------------------------------------*
-*&  PBO: docking container — log (top) + DuckDB `sflight` ALV (bottom).
+*&  PBO: docking container — log (left) + DuckDB `sflight` ALV (right).
 *&---------------------------------------------------------------------*
 AT SELECTION-SCREEN OUTPUT.
   IF go_dock IS INITIAL.
@@ -165,23 +216,24 @@ AT SELECTION-SCREEN OUTPUT.
 
     go_dock  = NEW #( repid = sy-repid dynnr = sy-dynnr
                       side  = cl_gui_docking_container=>dock_at_bottom ratio = 85 ).
-    go_split = NEW #( parent = go_dock rows = 2 columns = 1 ).
-    go_split->set_row_height( id = 1 height = 30 ).
-    go_top    = go_split->get_container( row = 1 column = 1 ).
-    go_bottom = go_split->get_container( row = 2 column = 1 ).
+    " Side-by-side split: demo log on the LEFT (~40%), DuckDB `sflight` ALV on the RIGHT.
+    go_split = NEW #( parent = go_dock rows = 1 columns = 2 ).
+    go_split->set_column_width( id = 1 width = 40 ).
+    go_left  = go_split->get_container( row = 1 column = 1 ).
+    go_right = go_split->get_container( row = 1 column = 2 ).
 
-    " Top pane: the demo log (read-only).
-    go_logbox = NEW #( parent = go_top wordwrap_mode = cl_gui_textedit=>wordwrap_off ).
+    " Left pane: the demo log (read-only).
+    go_logbox = NEW #( parent = go_left wordwrap_mode = cl_gui_textedit=>wordwrap_off ).
     go_logbox->set_readonly_mode( 1 ).
     go_logbox->set_text_as_r3table(
       EXPORTING table = CORRESPONDING gtt_txt( gt_log ) EXCEPTIONS OTHERS = 0 ).
 
-    " Bottom pane: the DuckDB `sflight` target, or a hint if it isn't loaded yet.
+    " Right pane: the DuckDB `sflight` target, or a hint if it isn't loaded yet.
     IF gr_result IS BOUND.
       FIELD-SYMBOLS <t> TYPE STANDARD TABLE.
       ASSIGN gr_result->* TO <t>.
       TRY.
-          cl_salv_table=>factory( EXPORTING r_container  = go_bottom
+          cl_salv_table=>factory( EXPORTING r_container  = go_right
                                   IMPORTING r_salv_table = go_salv
                                   CHANGING  t_table      = <t> ).
           DATA(lo_cols) = go_salv->get_columns( ).
@@ -202,7 +254,7 @@ AT SELECTION-SCREEN OUTPUT.
     ENDIF.
 
     IF gr_result IS NOT BOUND.
-      go_msg = NEW #( parent = go_bottom ).
+      go_msg = NEW #( parent = go_right ).
       go_msg->set_readonly_mode( 1 ).
       go_msg->set_text_as_r3table(
         EXPORTING table = VALUE gtt_txt(
