@@ -25,6 +25,7 @@ DATA: go_dock   TYPE REF TO cl_gui_docking_container,
       go_msg    TYPE REF TO cl_gui_textedit,
       gr_result TYPE REF TO data,        " dynamic result table (kept alive)
       gt_sql    TYPE gtt_txt,            " current editor content
+      gt_gen    TYPE gtt_txt,            " generated ABAP snippet (shown instead of the grid)
       gv_err    TYPE string,
       gv_total  TYPE i,                  " rows fetched into the grid
       gv_truncated TYPE abap_bool,       " capped before the result was exhausted
@@ -33,10 +34,14 @@ DATA: go_dock   TYPE REF TO cl_gui_docking_container,
 " An input-enabled field is required, else the selection screen is auto-skipped
 " and AT SELECTION-SCREEN OUTPUT never fires (nothing renders).
 PARAMETERS p_run AS CHECKBOX DEFAULT 'X'.
-SELECTION-SCREEN PUSHBUTTON /1(30) b_exec USER-COMMAND exec.
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN PUSHBUTTON  1(30) b_exec USER-COMMAND exec.
+SELECTION-SCREEN PUSHBUTTON 33(30) b_gen  USER-COMMAND gen.
+SELECTION-SCREEN END OF LINE.
 
 INITIALIZATION.
   b_exec = 'Execute DuckDB SQL'.
+  b_gen  = 'Generate ABAP snippet'.
   gt_sql = VALUE #( ( |SELECT 42 AS answer, 'hello duckdb' AS msg| ) ).
 
 *&---------------------------------------------------------------------*
@@ -45,7 +50,8 @@ INITIALIZATION.
 *&  (rebuilding side-steps changing the ALV's column structure in place).
 *&---------------------------------------------------------------------*
 AT SELECTION-SCREEN.
-  IF sy-ucomm = 'EXEC'.
+  IF sy-ucomm = 'EXEC' OR sy-ucomm = 'GEN'.
+    " Read the current editor content (both actions work on it).
     IF go_editor IS BOUND.
       " get_text_as_r3table declares CLASSIC exceptions; if none are mapped, a
       " raised one (notably POTENTIAL_DATA_LOSS) becomes an uncaught short dump.
@@ -63,30 +69,47 @@ AT SELECTION-SCREEN.
         RETURN.
       ENDIF.
     ENDIF.
-    DATA(lv_sql) = concat_lines_of( table = gt_sql sep = | | ).
+    CLEAR: gr_result, gv_err, gv_info, gv_total, gt_gen.
 
-    " Stream the result via the cursor FMs (fixed memory, binary sXML pages).
-    " Cap what the grid holds so a multi-million-row SELECT can't blow up the
-    " front end; the server stops pulling once the cap is reached.
-    CONSTANTS c_display_cap TYPE i VALUE 100000.
-    DATA(ls_res) = zcl_erpl_rev_util=>query_stream(
-                     iv_sql = lv_sql iv_maxrows = c_display_cap ).
-    CLEAR: gr_result, gv_err, gv_info, gv_total.
-    IF ls_res-error IS NOT INITIAL.
-      gv_err = ls_res-error.
+    IF sy-ucomm = 'GEN'.
+      " Generate a ready-to-paste ABAP snippet that runs THIS query. To make the
+      " loop concrete (a named field-symbol per column), introspect the result
+      " columns — but ONLY for a read-only statement, so Generate never executes DML.
+      DATA(lv_gsql) = concat_lines_of( table = gt_sql sep = | | ).
+      DATA(lv_head) = to_upper( lv_gsql ).
+      SHIFT lv_head LEFT DELETING LEADING ` `.
+      DATA lv_cols TYPE string.
+      IF lv_head CP 'SELECT*' OR lv_head CP 'WITH*'   OR lv_head CP 'FROM*'
+        OR lv_head CP 'DESCRIBE*' OR lv_head CP 'SHOW*' OR lv_head CP 'PRAGMA*'
+        OR lv_head CP 'VALUES*'   OR lv_head CP 'TABLE*'.
+        DATA(ls_probe) = zcl_erpl_rev_util=>query_stream( iv_sql = lv_gsql iv_maxrows = 1 ).
+        IF ls_probe-error IS INITIAL. lv_cols = ls_probe-columns. ENDIF.
+      ENDIF.
+      PERFORM gen_abap USING lv_cols.
     ELSE.
-      gr_result   = ls_res-data.
-      gv_total    = ls_res-row_count.
-      gv_truncated = ls_res-truncated.
-      gv_info     = |{ ls_res-row_count } row(s)|.
-      IF gr_result IS NOT BOUND.
-        gv_info = |statement ok, no result set ({ gv_info })|.
+      DATA(lv_sql) = concat_lines_of( table = gt_sql sep = | | ).
+      " Stream the result via the cursor FMs (fixed memory, binary sXML pages).
+      " Cap what the grid holds so a multi-million-row SELECT can't blow up the
+      " front end; the server stops pulling once the cap is reached.
+      CONSTANTS c_display_cap TYPE i VALUE 100000.
+      DATA(ls_res) = zcl_erpl_rev_util=>query_stream(
+                       iv_sql = lv_sql iv_maxrows = c_display_cap ).
+      IF ls_res-error IS NOT INITIAL.
+        gv_err = ls_res-error.
+      ELSE.
+        gr_result   = ls_res-data.
+        gv_total    = ls_res-row_count.
+        gv_truncated = ls_res-truncated.
+        gv_info     = |{ ls_res-row_count } row(s)|.
+        IF gr_result IS NOT BOUND.
+          gv_info = |statement ok, no result set ({ gv_info })|.
+        ENDIF.
       ENDIF.
     ENDIF.
 
     IF go_dock IS BOUND.
       go_dock->free( ).
-      CLEAR: go_dock, go_split, go_top, go_bottom, go_editor, go_salv.
+      CLEAR: go_dock, go_split, go_top, go_bottom, go_editor, go_salv, go_msg.
     ENDIF.
   ENDIF.
 
@@ -110,8 +133,14 @@ AT SELECTION-SCREEN OUTPUT.
     go_editor->set_text_as_r3table( EXPORTING table = gt_sql
                                     EXCEPTIONS OTHERS = 0 ).
 
-    " Bottom pane: result grid, or the error / info message as read-only text.
-    IF gr_result IS BOUND.
+    " Bottom pane: the generated ABAP snippet (after Generate), else the result
+    " grid, else the error / info message — all read-only.
+    IF gt_gen IS NOT INITIAL.
+      " Read-only, no word-wrap: select all (Ctrl+A) + copy (Ctrl+C) the snippet.
+      go_msg = NEW #( parent = go_bottom wordwrap_mode = cl_gui_textedit=>wordwrap_off ).
+      go_msg->set_readonly_mode( 1 ).
+      go_msg->set_text_as_r3table( EXPORTING table = gt_gen EXCEPTIONS OTHERS = 0 ).
+    ELSEIF gr_result IS BOUND.
       FIELD-SYMBOLS <t> TYPE STANDARD TABLE.
       ASSIGN gr_result->* TO <t>.
       TRY.
@@ -146,15 +175,104 @@ AT SELECTION-SCREEN OUTPUT.
       ENDTRY.
     ENDIF.
 
-    IF gr_result IS NOT BOUND.
+    IF gt_gen IS INITIAL AND gr_result IS NOT BOUND.
       DATA(lv_msg) = COND string( WHEN gv_err IS NOT INITIAL
                                   THEN |ERROR: { gv_err }|
                                   ELSE COND string( WHEN gv_info IS NOT INITIAL
                                                     THEN gv_info
-                                                    ELSE |Enter SQL above and press Execute.| ) ).
+                                                    ELSE |Enter SQL above; "Execute" runs it, "Generate ABAP snippet" emits paste-ready code.| ) ).
       go_msg = NEW #( parent = go_bottom ).
       go_msg->set_readonly_mode( 1 ).
       go_msg->set_text_as_r3table( EXPORTING table = VALUE gtt_txt( ( CONV char255( lv_msg ) ) )
                                    EXCEPTIONS OTHERS = 0 ).
     ENDIF.
   ENDIF.
+
+*&---------------------------------------------------------------------*
+*&  Build a ready-to-paste ABAP snippet that runs the CURRENT SQL via
+*&  erpl-rev and reads the typed result table. Lines go into gt_gen.
+*&---------------------------------------------------------------------*
+FORM gen_abap USING iv_cols TYPE string.
+  " Keep only the non-empty SQL lines so the literal isn't padded with blanks.
+  DATA lt_lines TYPE gtt_txt.
+  LOOP AT gt_sql INTO DATA(lv_ln).
+    IF lv_ln IS NOT INITIAL. APPEND lv_ln TO lt_lines. ENDIF.
+  ENDLOOP.
+  IF lt_lines IS INITIAL. APPEND |SELECT 1 AS x| TO lt_lines. ENDIF.
+
+  CLEAR gt_gen.
+  APPEND |* erpl-rev: run a DuckDB query and read its typed result.| TO gt_gen.
+  APPEND |* Generated by Z_ERPL_REV_SQL. Needs the erpl-rev RFC server + destination ERPL_REV.| TO gt_gen.
+  APPEND || TO gt_gen.
+
+  " The SQL as a multi-line string template:  |line1 | && |line2 | && ... |lineN|.
+  " Each line is escaped for |...| ( \ | { } -> \\ \| \{ \} ) and gets a trailing
+  " space so tokens don't merge across the concatenation.
+  DATA(lv_n) = lines( lt_lines ).
+  APPEND |  DATA(lv_sql) =| TO gt_gen.
+  LOOP AT lt_lines INTO lv_ln.
+    DATA(lv_e) = lv_ln.
+    REPLACE ALL OCCURRENCES OF `\` IN lv_e WITH `\\`.
+    REPLACE ALL OCCURRENCES OF `|` IN lv_e WITH `\|`.
+    REPLACE ALL OCCURRENCES OF `{` IN lv_e WITH `\{`.
+    REPLACE ALL OCCURRENCES OF `}` IN lv_e WITH `\}`.
+    IF sy-tabix < lv_n.
+      APPEND |    \|{ lv_e } \| &&| TO gt_gen.
+    ELSE.
+      APPEND |    \|{ lv_e }\|.| TO gt_gen.
+    ENDIF.
+  ENDLOOP.
+  APPEND || TO gt_gen.
+
+  APPEND |  DATA(ls_res) = zcl_erpl_rev_util=>query_stream( iv_sql = lv_sql ).| TO gt_gen.
+  APPEND |  IF ls_res-error IS NOT INITIAL.| TO gt_gen.
+  APPEND |    MESSAGE ls_res-error TYPE 'I'.   " the query failed| TO gt_gen.
+  APPEND |  ELSEIF ls_res-data IS BOUND.| TO gt_gen.
+  APPEND |    FIELD-SYMBOLS <tab> TYPE STANDARD TABLE.| TO gt_gen.
+  APPEND |    ASSIGN ls_res-data->* TO <tab>.   " a STANDARD TABLE typed from the result columns| TO gt_gen.
+  APPEND |    LOOP AT <tab> ASSIGNING FIELD-SYMBOL(<row>).| TO gt_gen.
+
+  " Concrete loop body: one named field-symbol per result column (introspected via a
+  " 1-row probe). Falls back to a generic comment when the columns aren't known
+  " (e.g. a non-SELECT statement, where we deliberately did NOT run the SQL).
+  TYPES: BEGIN OF ty_col, name TYPE string, type TYPE string, END OF ty_col.
+  DATA lt_cols TYPE STANDARD TABLE OF ty_col WITH EMPTY KEY.
+  IF iv_cols IS NOT INITIAL.
+    TRY.
+        /ui2/cl_json=>deserialize( EXPORTING json = iv_cols CHANGING data = lt_cols ).
+      CATCH cx_root ##NO_HANDLER.
+    ENDTRY.
+  ENDIF.
+
+  IF lt_cols IS NOT INITIAL.
+    " widest column name, so the ').' and the type comment line up.
+    DATA lv_w TYPE i.
+    LOOP AT lt_cols INTO DATA(ls_c).
+      IF strlen( ls_c-name ) > lv_w. lv_w = strlen( ls_c-name ). ENDIF.
+    ENDLOOP.
+    DATA lt_fs TYPE string_table.
+    LOOP AT lt_cols INTO ls_c.
+      DATA(lv_fs)  = to_lower( ls_c-name ).
+      " padding OUTSIDE the quotes/FS so the component name itself stays exact.
+      DATA(lv_pad) = repeat( val = ` ` occ = lv_w - strlen( ls_c-name ) ).
+      APPEND |      ASSIGN COMPONENT '{ ls_c-name }'{ lv_pad } OF STRUCTURE <row> | &&
+             |TO FIELD-SYMBOL(<{ lv_fs }>){ lv_pad }.   " { ls_c-type }| TO gt_gen.
+      APPEND |<{ lv_fs }>| TO lt_fs.
+    ENDLOOP.
+    " a ready example using the first few field-symbols.
+    DATA lv_eg TYPE string.
+    DATA lv_i  TYPE i.
+    LOOP AT lt_fs INTO DATA(lv_one).
+      lv_i = lv_i + 1.
+      IF lv_i > 4. EXIT. ENDIF.
+      lv_eg = COND #( WHEN lv_eg IS INITIAL THEN lv_one ELSE |{ lv_eg }, { lv_one }| ).
+    ENDLOOP.
+    APPEND |      " e.g.  WRITE: / { lv_eg }.| TO gt_gen.
+  ELSE.
+    APPEND |      " <row> has one component per SELECT column (= the DuckDB column names);| TO gt_gen.
+    APPEND |      " read them with  ASSIGN COMPONENT 'COLNAME' OF STRUCTURE <row> TO FIELD-SYMBOL(<c>).| TO gt_gen.
+  ENDIF.
+
+  APPEND |    ENDLOOP.| TO gt_gen.
+  APPEND |  ENDIF.| TO gt_gen.
+ENDFORM.
