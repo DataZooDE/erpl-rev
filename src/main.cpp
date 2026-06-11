@@ -10,6 +10,7 @@
 //   ERPL_REV_GWHOST      (default localhost)
 //   ERPL_REV_GWSERV      (default 3300)   -- sapgw00 on A4H
 #include "rfc_handlers.hpp"
+#include "duckdb_bridge.hpp"
 #include "logging.hpp"
 #include "sap_uc.hpp"
 
@@ -81,6 +82,7 @@ struct Cli {
     std::string init_file;
     bool init_file_set = false;
     bool help = false;
+    bool smoke = false;
 };
 
 void PrintHelp() {
@@ -102,6 +104,9 @@ void PrintHelp() {
         "                           postgres/ducklake/bigquery/iceberg targets.\n"
         "  --init-file <path>       Read boot SQL from a file (for multi-line ATTACH/\n"
         "                           secret scripts). Overrides --init-sql.\n"
+        "  --smoke                  Self-check: load + call the bundled SAP NW RFC\n"
+        "                           SDK and DuckDB, print their versions, exit 0.\n"
+        "                           Needs no SAP gateway (used by the CI smoke test).\n"
         "  -h, --help               Show this help and exit.\n\n"
         "Config is read from the environment; the flags above override it:\n"
         "  ERPL_REV_PROGRAM_ID    gateway PROGRAM_ID          (default ERPL_REV)\n"
@@ -159,11 +164,46 @@ Cli ParseArgs(int argc, SAP_UC **argv) {
             c.init_file_set = true;
         } else if (key == "-h" || key == "--help") {
             c.help = true;
+        } else if (key == "--smoke") {
+            c.smoke = true;
         } else {
             log::get().Warn("server", "ignoring unknown argument", {{"arg", a}});
         }
     }
     return c;
+}
+
+// Self-check behind --smoke: prove the bundled SAP NW RFC SDK and DuckDB
+// libraries actually load and are CALLABLE on this machine, with no SAP gateway.
+// Both libraries are linked (DT_NEEDED / DYLIB / DLL), so a missing or
+// arch-incompatible bundle already fails the process before main(); calling into
+// each one here additionally proves the symbols resolve. Prints a single grep-able
+// "smoke ok" line and exits 0 on success, 1 on failure. This is what the platform
+// smoke-test CI runs against the shipped single-file bundle on a clean runner.
+int RunSmoke() {
+    unsigned int maj = 0, min = 0, patch = 0;
+    const SAP_UC *ver = RfcGetVersion(&maj, &min, &patch);
+    std::string sapver = ver ? uc2std(ver) : std::string();
+    if (sapver.empty()) {
+        std::fputs("erpl-rev smoke FAILED: RfcGetVersion returned no version\n", stderr);
+        return 1;
+    }
+
+    std::string duckver;
+    try {
+        DuckDbBridge db("");   // in-memory; also exercises the boot DDL
+        QueryResult r = db.Query("SELECT version() AS v");
+        if (!r.rows.empty()) duckver = r.rows.front();
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "erpl-rev smoke FAILED: DuckDB self-check threw: %s\n", e.what());
+        return 1;
+    }
+
+    std::fprintf(stdout,
+                 "erpl-rev smoke ok: SAP NW RFC SDK %s (%u.%u.%u); DuckDB %s\n",
+                 sapver.c_str(), maj, min, patch, duckver.c_str());
+    std::fflush(stdout);
+    return 0;
 }
 
 void SAP_API OnStateChange(RFC_SERVER_HANDLE, RFC_STATE_CHANGE *c) {
@@ -179,6 +219,7 @@ int mainU(int argc, SAP_UC **argv) {
 
     Cli cli = ParseArgs(argc, argv);
     if (cli.help) { PrintHelp(); return 0; }
+    if (cli.smoke) return RunSmoke();
 
     std::signal(SIGINT, OnSigInt);
     std::signal(SIGTERM, OnSigInt);

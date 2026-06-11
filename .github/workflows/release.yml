@@ -69,8 +69,8 @@ jobs:
       - name: Assemble single-file bundle
         run: ./scripts/bundle.sh ${{ matrix.plat }} build/erpl_rev_server build/erpl_rev_launch "nwrfcsdk/${{ matrix.sub }}/lib" "vendor/duckdb-${DUCKDB_VERSION}" "dist/${{ matrix.asset }}"
 
-      - name: Smoke test (self-extract, no external libs)
-        run: env -u LD_LIBRARY_PATH -u DYLD_LIBRARY_PATH "./dist/${{ matrix.asset }}" --help
+      - name: Smoke test (self-extract, load bundled SAP SDK + DuckDB, no external libs)
+        run: env -u LD_LIBRARY_PATH -u DYLD_LIBRARY_PATH "./dist/${{ matrix.asset }}" --smoke
 
       - name: Package (tar.gz preserves the exec bit)
         run: tar -czf "dist/${{ matrix.asset }}.tar.gz" -C dist "${{ matrix.asset }}"
@@ -118,8 +118,8 @@ jobs:
       - name: Assemble single-file bundle
         run: .\scripts\bundle.ps1 -Server build\Release\erpl_rev_server.exe -Launcher build\Release\erpl_rev_launch.exe -SdkLib nwrfcsdk\win\lib -DuckdbDir "vendor\duckdb-$env:DUCKDB_VERSION" -Out dist\erpl-rev-windows-amd64.exe
 
-      - name: Smoke test (self-extract)
-        run: .\dist\erpl-rev-windows-amd64.exe --help
+      - name: Smoke test (self-extract, load bundled SAP SDK + DuckDB)
+        run: .\dist\erpl-rev-windows-amd64.exe --smoke
 
       - name: Package (zip)
         run: Compress-Archive -Force -Path dist\erpl-rev-windows-amd64.exe -DestinationPath dist\erpl-rev-windows-amd64.zip
