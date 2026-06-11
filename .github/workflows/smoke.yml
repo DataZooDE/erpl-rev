@@ -1,0 +1,93 @@
+name: Smoke test (published bundles)
+
+# Platform smoke test, totally independent of the build.
+#
+# Mirrors the erpl / erpl-web "can the extension load on every platform?" check:
+# it downloads the SHIPPED single-file bundle for each OS and runs it on a clean
+# runner — no build toolchain, no vcpkg, no SAP NW RFC SDK or DuckDB on disk — to
+# prove the C++ binary starts everywhere and the SAP libraries bundled next to it
+# actually load and are callable (`--smoke` calls RfcGetVersion + a DuckDB query,
+# which initialises the SAP SDK incl. its ICU dependency; no SAP gateway needed).
+#
+# Runs after a release is published (validating the exact published assets) and
+# on demand (workflow_dispatch) against any tag — never as part of the build.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to smoke-test (blank = latest release)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read       # gh release download
+
+jobs:
+  resolve:
+    name: Resolve release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.t.outputs.tag }}
+    steps:
+      - id: t
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          TAG="${EVENT_TAG:-$INPUT_TAG}"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)
+          fi
+          echo "Smoke-testing release tag: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  smoke:
+    name: smoke ${{ matrix.bin }}
+    needs: resolve
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  archive: erpl-rev-linux-amd64.tar.gz,  bin: erpl-rev-linux-amd64 }
+          - { os: macos-14,       archive: erpl-rev-macos-arm64.tar.gz,  bin: erpl-rev-macos-arm64 }
+          - { os: windows-latest, archive: erpl-rev-windows-amd64.zip,   bin: erpl-rev-windows-amd64.exe }
+    steps:
+      - name: Smoke-test the published bundle (posix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" -p "${{ matrix.archive }}" --clobber
+          tar -xzf "${{ matrix.archive }}"
+          chmod +x "${{ matrix.bin }}"
+          echo "::group::./${{ matrix.bin }} --smoke (no LD_LIBRARY_PATH / DYLD_LIBRARY_PATH)"
+          # Strip any inherited loader paths: the bundle must resolve its SAP SDK +
+          # DuckDB entirely from its own self-extracted directory.
+          out=$(env -u LD_LIBRARY_PATH -u DYLD_LIBRARY_PATH "./${{ matrix.bin }}" --smoke)
+          echo "$out"
+          echo "::endgroup::"
+          echo "$out" | grep -q "smoke ok"        || { echo "FAIL: no 'smoke ok' line"; exit 1; }
+          echo "$out" | grep -q "SAP NW RFC SDK"   || { echo "FAIL: SAP NW RFC SDK not reported loaded"; exit 1; }
+
+      - name: Smoke-test the published bundle (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          gh release download $env:TAG --repo $env:GITHUB_REPOSITORY -p "${{ matrix.archive }}" --clobber
+          Expand-Archive -Force "${{ matrix.archive }}" -DestinationPath .
+          $out = & ".\${{ matrix.bin }}" --smoke 2>&1 | Out-String
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0)            { Write-Error "smoke exited $LASTEXITCODE"; exit 1 }
+          if ($out -notmatch 'smoke ok')      { Write-Error "no 'smoke ok' line"; exit 1 }
+          if ($out -notmatch 'SAP NW RFC SDK'){ Write-Error "SAP NW RFC SDK not reported loaded"; exit 1 }
