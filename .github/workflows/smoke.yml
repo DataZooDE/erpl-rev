@@ -9,11 +9,15 @@ name: Smoke test (published bundles)
 # actually load and are callable (`--smoke` calls RfcGetVersion + a DuckDB query,
 # which initialises the SAP SDK incl. its ICU dependency; no SAP gateway needed).
 #
-# Runs after a release is published (validating the exact published assets) and
-# on demand (workflow_dispatch) against any tag — never as part of the build.
+# Runs automatically after the "Release bundles" build completes (workflow_run
+# fires for tag-published releases even though they are created by GITHUB_TOKEN,
+# which a `release: published` trigger would NOT — GitHub suppresses recursive
+# workflow triggering for token-created releases), and on demand against any tag.
+# Never part of the build itself.
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: ["Release bundles"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       tag:
@@ -34,12 +38,28 @@ jobs:
       - id: t
         env:
           GH_TOKEN: ${{ github.token }}
-          EVENT_TAG: ${{ github.event.release.tag_name }}
           INPUT_TAG: ${{ inputs.tag }}
+          # On workflow_run, head_branch is the ref that triggered the release
+          # build — the tag name (e.g. v2026.06.11) for a tag push, else "main".
+          RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
         run: |
-          TAG="${EVENT_TAG:-$INPUT_TAG}"
-          if [ -z "$TAG" ]; then
-            TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            # Only validate a successful release build that built a version tag.
+            if [ "$RUN_CONCLUSION" != "success" ]; then
+              echo "Release build concluded '$RUN_CONCLUSION' (not success); skipping."
+              echo "tag=" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+            case "$RUN_BRANCH" in
+              v*) TAG="$RUN_BRANCH" ;;
+              *)  echo "Release build ref '$RUN_BRANCH' is not a version tag; skipping."
+                  echo "tag=" >> "$GITHUB_OUTPUT"; exit 0 ;;
+            esac
+          else
+            TAG="$INPUT_TAG"
+            if [ -z "$TAG" ]; then
+              TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)
+            fi
           fi
           echo "Smoke-testing release tag: $TAG"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
@@ -47,6 +67,7 @@ jobs:
   smoke:
     name: smoke ${{ matrix.bin }}
     needs: resolve
+    if: needs.resolve.outputs.tag != ''
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
