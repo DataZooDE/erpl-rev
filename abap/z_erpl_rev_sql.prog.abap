@@ -107,7 +107,10 @@ AT SELECTION-SCREEN.
       " Generate a ready-to-paste ABAP snippet that runs THIS query. To make the
       " loop concrete (a named field-symbol per column), introspect the result
       " columns — but ONLY for a read-only statement, so Generate never executes DML.
-      DATA(lv_gsql) = concat_lines_of( table = gt_sql sep = | | ).
+      " Join with a newline (NOT a space): a space would fold the editor's lines
+      " into one, turning every '--' line comment into a comment that swallows the
+      " rest of the query. DuckDB parses the multi-line text directly.
+      DATA(lv_gsql) = concat_lines_of( table = gt_sql sep = cl_abap_char_utilities=>newline ).
       DATA(lv_head) = to_upper( lv_gsql ).
       SHIFT lv_head LEFT DELETING LEADING ` `.
       DATA lv_cols TYPE string.
@@ -119,7 +122,9 @@ AT SELECTION-SCREEN.
       ENDIF.
       PERFORM gen_abap USING lv_cols.
     ELSE.
-      DATA(lv_sql) = concat_lines_of( table = gt_sql sep = | | ).
+      " Newline join (see GEN above): preserves '--' line comments and multi-line
+      " statements instead of folding everything onto one comment-killed line.
+      DATA(lv_sql) = concat_lines_of( table = gt_sql sep = cl_abap_char_utilities=>newline ).
       " Stream the result via the cursor FMs (fixed memory, binary sXML pages).
       " Cap what the grid holds so a multi-million-row SELECT can't blow up the
       " front end; the server stops pulling once the cap is reached.
