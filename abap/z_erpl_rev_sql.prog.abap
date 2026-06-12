@@ -14,7 +14,10 @@
 *&---------------------------------------------------------------------*
 REPORT z_erpl_rev_sql.
 
-TYPES: gtt_txt TYPE STANDARD TABLE OF char255 WITH EMPTY KEY.
+TYPE-POOLS vrm.   " VRM_SET_VALUES listbox types (vrm_values) for the example dropdown
+
+TYPES: gtt_txt    TYPE STANDARD TABLE OF char255 WITH EMPTY KEY,
+       ty_demokey TYPE c LENGTH 2.   " example-dropdown key ('00'..'06')
 
 DATA: go_dock   TYPE REF TO cl_gui_docking_container,
       go_split  TYPE REF TO cl_gui_splitter_container,
@@ -38,11 +41,31 @@ SELECTION-SCREEN BEGIN OF LINE.
 SELECTION-SCREEN PUSHBUTTON  1(30) b_exec USER-COMMAND exec.
 SELECTION-SCREEN PUSHBUTTON 33(30) b_gen  USER-COMMAND gen.
 SELECTION-SCREEN END OF LINE.
+" Pick an example to drop a ready-to-run query into the editor above.
+SELECTION-SCREEN BEGIN OF LINE.
+SELECTION-SCREEN COMMENT 1(18) c_demo FOR FIELD p_demo.
+PARAMETERS p_demo TYPE ty_demokey AS LISTBOX VISIBLE LENGTH 55
+           USER-COMMAND demo DEFAULT '00'.
+SELECTION-SCREEN END OF LINE.
 
 INITIALIZATION.
   b_exec = 'Execute DuckDB SQL'.
   b_gen  = 'Generate ABAP snippet'.
+  c_demo = 'Example library'.
   gt_sql = VALUE #( ( |SELECT 42 AS answer, 'hello duckdb' AS msg| ) ).
+
+  " Populate the example dropdown. Picking an entry (USER-COMMAND DEMO) loads the
+  " matching query into the editor; the user then presses Execute.
+  DATA(lt_demo) = VALUE vrm_values(
+    ( key = '00' text = 'Load an example query...' )
+    ( key = '01' text = '1. DuckDB friendly SQL (synthetic, no network)' )
+    ( key = '02' text = '2. NYC taxi - public Parquet over HTTPS' )
+    ( key = '03' text = '3. MotherDuck - SUMMARIZE sample taxi' )
+    ( key = '04' text = '4. MotherDuck - top Hacker News stories' )
+    ( key = '05' text = '5. MotherDuck - list sample_data tables' )
+    ( key = '06' text = '6. MotherDuck - push a table to your instance' ) ).
+  CALL FUNCTION 'VRM_SET_VALUES'
+    EXPORTING id = 'P_DEMO' values = lt_demo.
 
 *&---------------------------------------------------------------------*
 *&  PAI: on Execute, read the editor, run the script, stash the result,
@@ -50,6 +73,15 @@ INITIALIZATION.
 *&  (rebuilding side-steps changing the ALV's column structure in place).
 *&---------------------------------------------------------------------*
 AT SELECTION-SCREEN.
+  " Example dropdown: load the chosen query into the editor and rebuild the panes.
+  IF sy-ucomm = 'DEMO'.
+    IF p_demo = '00'. RETURN. ENDIF.   " the prompt row is a no-op
+    PERFORM load_demo USING p_demo.
+    CLEAR: gr_result, gv_err, gv_info, gv_total, gt_gen, gv_truncated.
+    gv_info = |Example loaded. Edit if you like, then press "Execute DuckDB SQL".|.
+    PERFORM reset_ui.
+    RETURN.
+  ENDIF.
   IF sy-ucomm = 'EXEC' OR sy-ucomm = 'GEN'.
     " Read the current editor content (both actions work on it).
     IF go_editor IS BOUND.
@@ -107,10 +139,7 @@ AT SELECTION-SCREEN.
       ENDIF.
     ENDIF.
 
-    IF go_dock IS BOUND.
-      go_dock->free( ).
-      CLEAR: go_dock, go_split, go_top, go_bottom, go_editor, go_salv, go_msg.
-    ENDIF.
+    PERFORM reset_ui.
   ENDIF.
 
 *&---------------------------------------------------------------------*
@@ -275,4 +304,84 @@ FORM gen_abap USING iv_cols TYPE string.
 
   APPEND |    ENDLOOP.| TO gt_gen.
   APPEND |  ENDIF.| TO gt_gen.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&  Drop the container so PBO rebuilds the panes with fresh state.
+*&---------------------------------------------------------------------*
+FORM reset_ui.
+  IF go_dock IS BOUND.
+    go_dock->free( ).
+    CLEAR: go_dock, go_split, go_top, go_bottom, go_editor, go_salv, go_msg.
+  ENDIF.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*&  Load one of the bundled example queries into the editor buffer.
+*&  A small gallery of "impressive" DuckDB queries: the classic NYC-taxi
+*&  public-Parquet aggregate, MotherDuck's shared sample_data sets, and a
+*&  push-a-table-to-MotherDuck round-trip. The MotherDuck ones need the
+*&  server booted with `... ATTACH 'md:'` (token via motherduck_token).
+*&---------------------------------------------------------------------*
+FORM load_demo USING iv_key TYPE c.
+  CASE iv_key.
+    WHEN '01'.   " DuckDB 'friendly SQL' — pure, no network
+      gt_sql = VALUE #(
+        ( |-- DuckDB 'friendly SQL': generate a year of data, GROUP BY ALL, no boilerplate.| )
+        ( |SELECT| )
+        ( |    monthname(d)                                      AS month,| )
+        ( |    count(*)                                          AS days,| )
+        ( |    round(avg(15 + 12 * sin(dayofyear(d) / 58.0)), 1) AS avg_temp_c,| )
+        ( |    round(min(15 + 12 * sin(dayofyear(d) / 58.0)), 1) AS coldest,| )
+        ( |    round(max(15 + 12 * sin(dayofyear(d) / 58.0)), 1) AS hottest| )
+        ( |FROM range(TIMESTAMP '2024-01-01', TIMESTAMP '2025-01-01', INTERVAL 1 DAY) t(d)| )
+        ( |GROUP BY ALL| )
+        ( |ORDER BY min(d);| ) ).
+    WHEN '02'.   " NYC taxi over public Parquet (httpfs, needs internet egress)
+      gt_sql = VALUE #(
+        ( |-- 3M+ NYC taxi trips straight from public Parquet over HTTPS - no download.| )
+        ( |-- (DuckDB auto-loads httpfs; the file is the official NYC TLC open dataset.)| )
+        ( |SELECT| )
+        ( |    payment_type,| )
+        ( |    count(*)                     AS trips,| )
+        ( |    round(avg(trip_distance), 2) AS avg_miles,| )
+        ( |    round(avg(fare_amount), 2)   AS avg_fare,| )
+        ( |    round(avg(tip_amount), 2)    AS avg_tip| )
+        ( |FROM read_parquet('https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet')| )
+        ( |WHERE fare_amount > 0| )
+        ( |GROUP BY ALL| )
+        ( |ORDER BY trips DESC;| ) ).
+    WHEN '03'.   " MotherDuck shared sample_data — SUMMARIZE (schema-agnostic)
+      gt_sql = VALUE #(
+        ( |-- MotherDuck: every account has a shared read-only 'sample_data' database.| )
+        ( |-- Needs the server booted with: INSTALL motherduck; LOAD motherduck; ATTACH 'md:';| )
+        ( |-- SUMMARIZE profiles every column (stats, nulls, cardinality) - any schema.| )
+        ( |SUMMARIZE sample_data.nyc.taxi;| ) ).
+    WHEN '04'.   " MotherDuck Hacker News
+      gt_sql = VALUE #(
+        ( |-- Top Hacker News stories of all time (MotherDuck shared sample_data).| )
+        ( |-- Needs the server attached to MotherDuck (ATTACH 'md:').| )
+        ( |SELECT title, score, "by" AS author, to_timestamp(time) AS posted| )
+        ( |FROM sample_data.hn.hacker_news| )
+        ( |WHERE type = 'story' AND title IS NOT NULL| )
+        ( |ORDER BY score DESC| )
+        ( |LIMIT 50;| ) ).
+    WHEN '05'.   " Discover MotherDuck's shared sample tables
+      gt_sql = VALUE #(
+        ( |-- Discover what is inside MotherDuck's shared sample database.| )
+        ( |-- Needs the server attached to MotherDuck (ATTACH 'md:').| )
+        ( |SELECT database, schema, name| )
+        ( |FROM (SHOW ALL TABLES)| )
+        ( |WHERE database = 'sample_data'| )
+        ( |ORDER BY schema, name;| ) ).
+    WHEN '06'.   " Push a table into YOUR MotherDuck instance
+      gt_sql = VALUE #(
+        ( |-- Push a table to YOUR MotherDuck instance (needs ATTACH 'md:').| )
+        ( |-- Replace my_db with one of your MotherDuck databases.| )
+        ( |CREATE OR REPLACE TABLE _erpl_demo AS| )
+        ( |    SELECT i AS id, concat('item_', i) AS name, (i * 7) % 1000 AS qty| )
+        ( |    FROM range(1, 1001) t(i);| )
+        ( |CREATE OR REPLACE TABLE my_db.main.erpl_demo AS SELECT * FROM _erpl_demo;| )
+        ( |SELECT count(*) AS pushed, min(id) AS lo, max(id) AS hi FROM my_db.main.erpl_demo;| ) ).
+  ENDCASE.
 ENDFORM.
