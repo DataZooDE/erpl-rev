@@ -13,6 +13,7 @@
 #include "duckdb_bridge.hpp"
 #include "logging.hpp"
 #include "sap_uc.hpp"
+#include "erpl_rev_telemetry.hpp"
 
 #include <cctype>
 #include <chrono>
@@ -26,6 +27,11 @@
 #include <vector>
 
 #include "sapnwrfc.h"
+
+// Product version baked in at build time (CI passes -DERPL_REV_VERSION=X.Y.Z).
+#ifndef ERPL_REV_VERSION
+#define ERPL_REV_VERSION "dev"
+#endif
 
 using namespace erpl_rev;
 
@@ -83,6 +89,7 @@ struct Cli {
     bool init_file_set = false;
     bool help = false;
     bool smoke = false;
+    bool no_telemetry = false;
 };
 
 void PrintHelp() {
@@ -107,6 +114,7 @@ void PrintHelp() {
         "  --smoke                  Self-check: load + call the bundled SAP NW RFC\n"
         "                           SDK and DuckDB, print their versions, exit 0.\n"
         "                           Needs no SAP gateway (used by the CI smoke test).\n"
+        "  --no-telemetry           Disable anonymous usage telemetry for this run.\n"
         "  -h, --help               Show this help and exit.\n\n"
         "Config is read from the environment; the flags above override it:\n"
         "  ERPL_REV_PROGRAM_ID    gateway PROGRAM_ID          (default ERPL_REV)\n"
@@ -119,7 +127,9 @@ void PrintHelp() {
         "  ERPL_REV_DB_PATH       DuckDB file (:memory: for in-mem) (default erpl-rev.duckdb)\n"
         "  ERPL_REV_LOG_LEVEL     error|warn|info|debug|trace (default info)\n"
         "  ERPL_REV_LOG_FORMAT    console|json                (default console)\n"
-        "  ERPL_REV_LOG_COLOR     auto|always|never           (default auto)\n",
+        "  ERPL_REV_LOG_COLOR     auto|always|never           (default auto)\n"
+        "  ERPL_REV_NO_TELEMETRY  disable usage telemetry (truthy)\n"
+        "  DATAZOO_DISABLE_TELEMETRY  disable telemetry across all DataZoo tools\n",
         stderr);
 }
 
@@ -166,6 +176,8 @@ Cli ParseArgs(int argc, SAP_UC **argv) {
             c.help = true;
         } else if (key == "--smoke") {
             c.smoke = true;
+        } else if (key == "--no-telemetry") {
+            c.no_telemetry = true;
         } else {
             log::get().Warn("server", "ignoring unknown argument", {{"arg", a}});
         }
@@ -258,6 +270,18 @@ int mainU(int argc, SAP_UC **argv) {
         init_sql = cli.init_sql;
     }
 
+    // Anonymous usage telemetry (DataZooDE/posthog-telemetry): emit
+    // application_start / application_stop only — never SAP data, query text, or
+    // table/field names. Default-on; opt out via --no-telemetry,
+    // ERPL_REV_NO_TELEMETRY, or DATAZOO_DISABLE_TELEMETRY (the facade also
+    // re-checks the env vars). --help/--smoke return earlier, so they never emit.
+    // app_version drops any leading "v" so PostHog shows e.g. 2026.06.13,
+    // matching flapi's plain-semver app_version values.
+    std::string app_version = ERPL_REV_VERSION;
+    if (!app_version.empty() && app_version.front() == 'v') app_version.erase(0, 1);
+    ErplRevTelemetry telemetry;
+    if (cli.no_telemetry) telemetry.setEnabled(false);
+
     bool quack_running = false;
 
     try {
@@ -295,6 +319,8 @@ int mainU(int argc, SAP_UC **argv) {
         log::get().Info("server", "listening (Ctrl-C to stop)",
                         {{"program_id", program_id}, {"gwhost", gwhost}, {"gwserv", gwserv}});
 
+        telemetry.notifyStart(app_version);
+
         // Optionally expose this same in-process DuckDB to remote DuckDB clients
         // over the network via the quack extension. Treated as best-effort: if it
         // can't start (e.g. offline, engine < 1.5.3), keep serving RFC.
@@ -328,10 +354,13 @@ int mainU(int argc, SAP_UC **argv) {
                 log::get().Warn("quack", "stop failed", {{"error", e.what()}});
             }
         }
+        telemetry.notifyStop(app_version);
         RfcShutdownServer(server, 5, &info);
         RfcDestroyServer(server, &info);
         return 0;
     } catch (const std::exception &e) {
+        // Startup failed before application_start was emitted — don't send an
+        // orphan application_stop.
         log::get().Error("server", "fatal", {{"error", e.what()}});
         return 1;
     }
