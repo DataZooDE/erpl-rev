@@ -89,7 +89,13 @@ cls ZCL_ERPL_REV_REPLRUN  zcl_erpl_rev_replrun.abap  "Z_ERPL_REV_REPLICATE paral
 echo "== registered-server destination ERPL_REV (method='R') =="
 run ZCL_ERPL_REV_SETUP | grep -aiE 'OPTS|subrc' | head -2
 
-echo "== RFC function modules Z_DUCKDB_QUERY / Z_DUCKDB_INGEST =="
-run ZCL_ERPL_REV_MKFM | grep -aiE 'insert subrc|tfdir' | head -4
+echo "== function group ZERPL_REV (host for the RFC FMs) =="
+# MKFM inserts the FMs into ZERPL_REV via RS_FUNCTIONMODULE_INSERT, which needs
+# the group to already exist. Create it in $TMP (idempotent — ignore "exists")
+# so a clean-slate deploy works without a separate manual step.
+adt object create --type FUGR/F --name ZERPL_REV --package '$TMP' --description "erpl-rev RFC FMs" >/dev/null 2>&1 || true
+
+echo "== RFC function modules Z_DUCKDB_* =="
+run ZCL_ERPL_REV_MKFM | grep -aiE 'insert subrc|tfdir' | head -16
 
 echo "== done =="
