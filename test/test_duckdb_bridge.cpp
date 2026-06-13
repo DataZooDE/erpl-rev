@@ -36,6 +36,30 @@ TEST_CASE("Query aggregates NYC taxi parquet", "[bridge][query]") {
     REQUIRE(r.rows[1] == R"({"payment_type":"CASH","c":2,"s":12.50})");
 }
 
+TEST_CASE("Bridge turns on HTTP caching for fast multi-file remote reads", "[bridge][httpfs]") {
+    // Regression guard: with DuckDB's default httpfs_connection_caching=false and no
+    // HTTP metadata cache, a read_parquet over a long LIST of remote files opens a
+    // fresh TLS connection per range request — a handshake storm that hangs the
+    // server (and the synchronous SAP GUI) for minutes, while the duckdb CLI runs
+    // the same query in seconds. The bridge must enable HTTP metadata caching at
+    // construction (and, when httpfs is available, connection caching).
+    DuckDbBridge db;  // in-memory; ctor runs the global HTTP-cache config
+
+    auto meta = db.Query("SELECT CAST(current_setting('enable_http_metadata_cache') AS VARCHAR) AS v");
+    REQUIRE(meta.row_count == 1);
+    REQUIRE(meta.rows[0] == R"({"v":"true"})");
+
+    // Connection caching only exists once httpfs is loaded; assert it only when the
+    // ctor managed to load httpfs from the local extension cache (else skip — an
+    // air-gapped box without a cached httpfs legitimately won't have it).
+    auto loaded = db.Query(
+        "SELECT count(*) AS c FROM duckdb_extensions() WHERE extension_name='httpfs' AND loaded");
+    if (loaded.rows.size() == 1 && loaded.rows[0] == R"({"c":1})") {
+        auto cc = db.Query("SELECT CAST(current_setting('httpfs_connection_caching') AS VARCHAR) AS v");
+        REQUIRE(cc.rows[0] == R"({"v":"true"})");
+    }
+}
+
 TEST_CASE("JSON row parser handles strings, numbers, bool, null", "[json]") {
     auto rows = json::ParseRows(
         R"([{"id":1,"name":"a","flag":true,"note":null},{"id":2,"name":"b\"x"}])");
