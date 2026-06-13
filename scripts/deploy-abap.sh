@@ -79,7 +79,7 @@ cls ZCL_ERPL_REV_CDCTEST  zcl_erpl_rev_cdctest.abap  "trigger-CDC E2E (real HANA
 echo "== reports (worker before the report — the parallel report SUBMITs it) =="
 prog Z_ERPL_REV_REPL_WORKER z_erpl_rev_repl_worker.prog.abap "parallel-replication worker (one key range)"
 prog Z_ERPL_REV_REPLICATE z_erpl_rev_replicate.prog.abap "replicate SAP table -> DuckDB (serial + parallel)"
-prog Z_ERPL_REV_SQL       z_erpl_rev_sql.prog.abap       "DuckDB SQL console (docking-container UI)"
+prog Z_ERPL_REV_SQL       z_erpl_rev_sql.prog.abap       "DuckDB SQL console"
 prog Z_ERPL_REV_DELTA     z_erpl_rev_delta.prog.abap     "delta orchestration loop (cadence + lease)"
 prog Z_ERPL_REV_DELTA_SFLIGHT z_erpl_rev_delta_sflight.prog.abap "SFLIGHT delta demo (load/change/run/inspect, GUI)"
 

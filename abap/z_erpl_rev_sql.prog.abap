@@ -153,9 +153,10 @@ AT SELECTION-SCREEN.
 *&---------------------------------------------------------------------*
 AT SELECTION-SCREEN OUTPUT.
   IF go_dock IS INITIAL.
-    go_dock  = NEW #( repid = sy-repid dynnr = sy-dynnr
-                      side  = cl_gui_docking_container=>dock_at_bottom
-                      ratio = 88 ).
+    go_dock  = NEW #( repid   = sy-repid dynnr = sy-dynnr
+                      side    = cl_gui_docking_container=>dock_at_bottom
+                      caption = 'DuckDB SQL console'
+                      ratio   = 88 ).
     go_split = NEW #( parent = go_dock rows = 2 columns = 1 ).
     go_split->set_row_height( id = 1 height = 35 ).
     go_top    = go_split->get_container( row = 1 column = 1 ).
