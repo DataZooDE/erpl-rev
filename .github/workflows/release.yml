@@ -115,9 +115,12 @@ jobs:
 
       - name: Build (server + launcher)
         run: |
+          # x64-windows-static-md: statically link OpenSSL (no libssl/libcrypto
+          # DLLs in the single-file bundle) while keeping the dynamic CRT (/MD)
+          # to match the prebuilt DuckDB DLL.
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
-            -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
             -DERPL_REV_VERSION="$($env:GITHUB_REF_NAME -replace '^v','')" `
             -DDUCKDB_VERSION="$env:DUCKDB_VERSION" `
             -DDUCKDB_DIST="$PWD/vendor/duckdb-$env:DUCKDB_VERSION"
