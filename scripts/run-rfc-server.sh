@@ -34,7 +34,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$HERE"
 
 # --- config (env overrides, else these defaults) ----------------------------
-: "${ERPL_REV_PROGRAM_ID:=ERPL_REVERSE}"
+# PROGRAM_ID must match the ABAP registered destination (zcl_erpl_rev_setup
+# registers dest ERPL_REV with program=ERPL_REV) and the server's own default
+# (main.cpp / README). Anything else => CM_ALLOCATE_FAILURE_RETRY on CALL.
+: "${ERPL_REV_PROGRAM_ID:=ERPL_REV}"
 : "${ERPL_REV_GWHOST:=localhost}"
 : "${ERPL_REV_GWSERV:=3300}"
 : "${ERPL_REV_DB_PATH:=/tmp/erpl-rev.duckdb}"
