@@ -13,6 +13,13 @@ namespace erpl_rev {
 // replication targets; empty => env ERPL_REV_DUCKDB_INIT.
 void InstallHandlers(const std::string &db_path = "", const std::string &init_sql = "");
 
+// Release the shared DuckDbBridge (closes DuckDB and any attached catalogs).
+// Call once during shutdown, AFTER the RFC server is stopped so no handler can
+// touch the bridge — this runs the DuckDB/extension teardown while the runtime
+// is alive, instead of leaving it to the global's atexit destructor (where some
+// extensions, e.g. MotherDuck, crash logging from their own destructors).
+void ShutdownHandlers();
+
 // Start/stop the quack network server on the shared DuckDbBridge. Both take the
 // same mutex as the RFC handlers so DuckDB access stays serialised.
 // StartQuackServer returns quack_serve's result (JSON array, incl. auth token).

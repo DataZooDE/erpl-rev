@@ -357,6 +357,11 @@ int mainU(int argc, SAP_UC **argv) {
         telemetry.notifyStop(app_version);
         RfcShutdownServer(server, 5, &info);
         RfcDestroyServer(server, &info);
+        // Tear the DuckDB bridge down HERE, while the process runtime is still
+        // alive — not via the global's atexit destructor. DuckDB extensions
+        // (e.g. MotherDuck) log from their own destructors, which segfaults if
+        // it runs after their statics are gone during program exit.
+        ShutdownHandlers();
         return 0;
     } catch (const std::exception &e) {
         // Startup failed before application_start was emitted — don't send an
