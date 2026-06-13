@@ -269,6 +269,15 @@ unless you intend remote access.
 
 ---
 
+## Telemetry
+
+The server sends **anonymous** usage telemetry (`application_start` /
+`application_stop` with app/version/platform/DuckDB-version only — **no SAP
+data, query text, or table/field names**) to help us understand adoption. It is
+**on by default** and disabled by any one of `--no-telemetry`,
+`ERPL_REV_NO_TELEMETRY`, or `DATAZOO_DISABLE_TELEMETRY`. Air-gapped SAP hosts
+drop the request silently with zero impact. Details: [`docs/telemetry.md`](docs/telemetry.md).
+
 ## Docs
 
 - [`docs/delta.md`](docs/delta.md) — incremental extraction (watermark / change-doc / snapshot)
@@ -276,6 +285,7 @@ unless you intend remote access.
 - [`docs/enable-rfc-registration.md`](docs/enable-rfc-registration.md) — gateway registration / `reginfo`
 - [`docs/security.md`](docs/security.md) — Basis hardening, RFC user, SNC, ACLs
 - [`docs/sql-console.md`](docs/sql-console.md) — the in-GUI DuckDB SQL console
+- [`docs/telemetry.md`](docs/telemetry.md) — what's collected, where, and the three opt-outs
 
 ## License
 

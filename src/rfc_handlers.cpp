@@ -5,7 +5,6 @@
 #include "cdc_dialect.hpp"
 #include "json_util.hpp"
 #include "logging.hpp"
-#include "telemetry.hpp"
 
 #include <cstdlib>
 #include <cstring>
@@ -177,9 +176,6 @@ extern "C" RFC_RC SAP_API ZQueryImpl(RFC_CONNECTION_HANDLE,
         // `cap` of them. ABAP compares the two to know it was truncated.
         SetString(funcHandle, "EV_ROW_COUNT", std::to_string(qr.row_count));
         SetString(funcHandle, "EV_ERROR",     "");
-        Telemetry::Track("query_execution",
-                         {{"kind", "query"},
-                          {"row_count", std::to_string(qr.row_count), true}});
         log::get().Debug("rfc", "Z_DUCKDB_QUERY ok",
                          {{"total", (long long)qr.row_count},
                           {"shipped", (long long)qr.rows.size()},
@@ -253,9 +249,6 @@ extern "C" RFC_RC SAP_API ZSnapshotMergeImpl(RFC_CONNECTION_HANDLE,
         SetString(funcHandle, "EV_UPD",   std::to_string(r.upd));
         SetString(funcHandle, "EV_DEL",   std::to_string(r.del));
         SetString(funcHandle, "EV_ERROR", "");
-        Telemetry::Track("replication_execution",
-                         {{"mode", "snapshot_merge"},
-                          {"rows_affected", std::to_string(r.ins + r.upd + r.del), true}});
         log::get().Debug("rfc", "Z_DUCKDB_SNAPSHOT_MERGE ok",
                          {{"ins", r.ins}, {"upd", r.upd}, {"del", r.del}});
     } catch (const std::exception &e) {
@@ -361,9 +354,6 @@ extern "C" RFC_RC SAP_API ZCdcApplyImpl(RFC_CONNECTION_HANDLE,
         SetString(funcHandle, "EV_PRUNE",   std::to_string(r.prune_bound));
         SetString(funcHandle, "EV_APPLIED", r.applied ? "X" : "");
         SetString(funcHandle, "EV_ERROR",   "");
-        Telemetry::Track("replication_execution",
-                         {{"mode", "cdc_apply"},
-                          {"rows_affected", std::to_string(r.ins + r.upd + r.del), true}});
         log::get().Debug("rfc", "Z_DUCKDB_CDC_APPLY ok",
                          {{"ins", r.ins}, {"upd", r.upd}, {"del", r.del},
                           {"prune", r.prune_bound}});
@@ -390,9 +380,6 @@ extern "C" RFC_RC SAP_API ZOpenImpl(RFC_CONNECTION_HANDLE,
         SetString(funcHandle, "EV_HANDLE",  open.handle);
         SetString(funcHandle, "EV_COLUMNS", ColumnsToJson(open.columns));
         SetString(funcHandle, "EV_ERROR",   "");
-        // Cursor open is the other query entry point; row count isn't known
-        // until the cursor is drained, so only the kind is reported here.
-        Telemetry::Track("query_execution", {{"kind", "cursor"}});
         log::get().Debug("rfc", "Z_DUCKDB_OPEN ok",
                          {{"handle", open.handle},
                           {"cols", (long long)open.columns.size()}});

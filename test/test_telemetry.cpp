@@ -1,44 +1,50 @@
 #include <catch2/catch_test_macros.hpp>
 
-#include "telemetry.hpp"
+#include "erpl_rev_telemetry.hpp"
 
 #include <cstdlib>
-#include <mutex>
+#include <memory>
 #include <string>
-#include <vector>
-
-using namespace erpl_rev;
 
 namespace {
 
-struct Captured {
-    std::string                  event;
-    std::vector<Telemetry::Prop> props;
+// RAII helper to set/restore an env var so cases don't leak global state.
+struct EnvGuard {
+    EnvGuard(const char *name, const char *value) : name_(name) {
+        const char *existing = std::getenv(name);
+        has_prev_ = (existing != nullptr);
+        prev_     = existing ? existing : "";
+        ::setenv(name, value, 1);
+    }
+    ~EnvGuard() {
+        if (has_prev_) ::setenv(name_, prev_.c_str(), 1);
+        else           ::unsetenv(name_);
+    }
+    const char *name_;
+    std::string prev_;
+    bool        has_prev_;
 };
 
-// Thread-safe sink for the test backend (the worker calls it off-thread).
-struct Sink {
-    std::mutex            mu;
-    std::vector<Captured> events;
+// Records start/stop call counts and the args of the last call.
+struct CountingBackend : public erpl_rev::ITelemetryBackend {
+    int         start_calls = 0;
+    int         stop_calls  = 0;
+    std::string last_start_app, last_start_ver;
+    std::string last_stop_app,  last_stop_ver;
 
-    void clear() {
-        std::lock_guard<std::mutex> l(mu);
-        events.clear();
+    void captureStart(const std::string &app, const std::string &ver) override {
+        start_calls++;
+        last_start_app = app;
+        last_start_ver = ver;
     }
-    size_t size() {
-        std::lock_guard<std::mutex> l(mu);
-        return events.size();
+    void captureStop(const std::string &app, const std::string &ver) override {
+        stop_calls++;
+        last_stop_app = app;
+        last_stop_ver = ver;
     }
 };
 
-// Find a property value by key in a captured event.
-std::string PropValue(const Captured &c, const std::string &key) {
-    for (const auto &p : c.props)
-        if (p.key == key) return p.value;
-    return {};
-}
-
-// Make sure no ambient opt-out env var is set for the enabled-path tests.
+// Make sure no ambient opt-out env var is set for enabled-path cases.
 void ClearOptOutEnv() {
     ::unsetenv("ERPL_REV_NO_TELEMETRY");
     ::unsetenv("DATAZOO_DISABLE_TELEMETRY");
@@ -46,69 +52,82 @@ void ClearOptOutEnv() {
 
 } // namespace
 
-TEST_CASE("telemetry forwards events and properties to the backend", "[telemetry]") {
+using erpl_rev::ErplRevTelemetry;
+
+TEST_CASE("telemetry: enabled path forwards start/stop with app_name=erpl-rev", "[telemetry]") {
     ClearOptOutEnv();
-    Sink sink;
-    Telemetry::SetBackendForTesting(
-        [&sink](const std::string &event, const std::vector<Telemetry::Prop> &props) {
-            std::lock_guard<std::mutex> l(sink.mu);
-            sink.events.push_back({event, props});
-        });
+    auto mock = std::make_unique<CountingBackend>();
+    auto *raw = mock.get();
 
-    Telemetry::Initialize(/*user_disabled=*/false, "1.2.3");
-    REQUIRE(Telemetry::IsEnabled());
+    ErplRevTelemetry tel(std::move(mock));
+    tel.notifyStart("2026.06.13");
+    tel.notifyStop("2026.06.13");
 
-    Telemetry::Track("application_start");
-    Telemetry::Track("query_execution",
-                     {{"kind", "query"}, {"row_count", "42", true}});
-    Telemetry::Track("replication_execution",
-                     {{"mode", "cdc_apply"}, {"rows_affected", "7", true}});
-
-    // Shutdown drains the queue and joins the worker, so all events are visible.
-    Telemetry::Shutdown();
-    REQUIRE_FALSE(Telemetry::IsEnabled());
-
-    REQUIRE(sink.size() == 3);
-    CHECK(sink.events[0].event == "application_start");
-    CHECK(sink.events[0].props.empty());
-
-    CHECK(sink.events[1].event == "query_execution");
-    CHECK(PropValue(sink.events[1], "kind") == "query");
-    CHECK(PropValue(sink.events[1], "row_count") == "42");
-
-    CHECK(sink.events[2].event == "replication_execution");
-    CHECK(PropValue(sink.events[2], "mode") == "cdc_apply");
-    CHECK(PropValue(sink.events[2], "rows_affected") == "7");
-
-    Telemetry::SetBackendForTesting(nullptr);
+    REQUIRE(raw->start_calls == 1);
+    REQUIRE(raw->stop_calls == 1);
+    CHECK(raw->last_start_app == "erpl-rev");
+    CHECK(raw->last_stop_app == "erpl-rev");
+    CHECK(raw->last_start_ver == "2026.06.13");
+    CHECK(raw->last_stop_ver == "2026.06.13");
 }
 
-TEST_CASE("telemetry is a no-op when the user disables it", "[telemetry]") {
+TEST_CASE("telemetry: setEnabled(false) suppresses emission", "[telemetry]") {
     ClearOptOutEnv();
-    Sink sink;
-    Telemetry::SetBackendForTesting(
-        [&sink](const std::string &event, const std::vector<Telemetry::Prop> &props) {
-            (void)event; (void)props;
-            std::lock_guard<std::mutex> l(sink.mu);
-            sink.events.push_back({event, props});
-        });
+    auto mock = std::make_unique<CountingBackend>();
+    auto *raw = mock.get();
 
-    Telemetry::Initialize(/*user_disabled=*/true, "1.2.3");
-    CHECK_FALSE(Telemetry::IsEnabled());
+    ErplRevTelemetry tel(std::move(mock));
+    tel.setEnabled(false);
+    tel.notifyStart("1.0.0");
+    tel.notifyStop("1.0.0");
 
-    Telemetry::Track("application_start");
-    Telemetry::Shutdown();
-    CHECK(sink.size() == 0);
-
-    Telemetry::SetBackendForTesting(nullptr);
+    CHECK(raw->start_calls == 0);
+    CHECK(raw->stop_calls == 0);
 }
 
-TEST_CASE("telemetry respects the ERPL_REV_NO_TELEMETRY env var", "[telemetry]") {
+TEST_CASE("telemetry: ERPL_REV_NO_TELEMETRY suppresses emission", "[telemetry]") {
     ClearOptOutEnv();
-    ::setenv("ERPL_REV_NO_TELEMETRY", "1", /*overwrite=*/1);
+    EnvGuard guard("ERPL_REV_NO_TELEMETRY", "1");
+    auto mock = std::make_unique<CountingBackend>();
+    auto *raw = mock.get();
 
-    Telemetry::Initialize(/*user_disabled=*/false, "1.2.3");
-    CHECK_FALSE(Telemetry::IsEnabled());
+    ErplRevTelemetry tel(std::move(mock));
+    tel.notifyStart("1.0.0");
+    tel.notifyStop("1.0.0");
 
-    ::unsetenv("ERPL_REV_NO_TELEMETRY");
+    CHECK(raw->start_calls == 0);
+    CHECK(raw->stop_calls == 0);
+}
+
+TEST_CASE("telemetry: DATAZOO_DISABLE_TELEMETRY suppresses emission", "[telemetry]") {
+    ClearOptOutEnv();
+    EnvGuard guard("DATAZOO_DISABLE_TELEMETRY", "true");
+    auto mock = std::make_unique<CountingBackend>();
+    auto *raw = mock.get();
+
+    ErplRevTelemetry tel(std::move(mock));
+    tel.notifyStart("1.0.0");
+    tel.notifyStop("1.0.0");
+
+    CHECK(raw->start_calls == 0);
+    CHECK(raw->stop_calls == 0);
+}
+
+TEST_CASE("telemetry: falsey env var leaves telemetry enabled", "[telemetry]") {
+    ClearOptOutEnv();
+    EnvGuard guard("DATAZOO_DISABLE_TELEMETRY", "0");
+    auto mock = std::make_unique<CountingBackend>();
+    auto *raw = mock.get();
+
+    ErplRevTelemetry tel(std::move(mock));
+    tel.notifyStart("1.0.0");
+    tel.notifyStop("1.0.0");
+
+    CHECK(raw->start_calls == 1);
+    CHECK(raw->stop_calls == 1);
+}
+
+TEST_CASE("telemetry: production constructor instantiates without throwing", "[telemetry]") {
+    EnvGuard guard("DATAZOO_DISABLE_TELEMETRY", "1");   // ensure no real HTTP
+    REQUIRE_NOTHROW(ErplRevTelemetry{});
 }

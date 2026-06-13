@@ -13,7 +13,7 @@
 #include "duckdb_bridge.hpp"
 #include "logging.hpp"
 #include "sap_uc.hpp"
-#include "telemetry.hpp"
+#include "erpl_rev_telemetry.hpp"
 
 #include <cctype>
 #include <chrono>
@@ -270,9 +270,17 @@ int mainU(int argc, SAP_UC **argv) {
         init_sql = cli.init_sql;
     }
 
-    // Anonymous usage telemetry (opt-out via --no-telemetry / env). Started here
-    // so the worker is up before the server begins handling RFC calls.
-    Telemetry::Initialize(cli.no_telemetry, ERPL_REV_VERSION);
+    // Anonymous usage telemetry (DataZooDE/posthog-telemetry): emit
+    // application_start / application_stop only — never SAP data, query text, or
+    // table/field names. Default-on; opt out via --no-telemetry,
+    // ERPL_REV_NO_TELEMETRY, or DATAZOO_DISABLE_TELEMETRY (the facade also
+    // re-checks the env vars). --help/--smoke return earlier, so they never emit.
+    // app_version drops any leading "v" so PostHog shows e.g. 2026.06.13,
+    // matching flapi's plain-semver app_version values.
+    std::string app_version = ERPL_REV_VERSION;
+    if (!app_version.empty() && app_version.front() == 'v') app_version.erase(0, 1);
+    ErplRevTelemetry telemetry;
+    if (cli.no_telemetry) telemetry.setEnabled(false);
 
     bool quack_running = false;
 
@@ -311,7 +319,7 @@ int mainU(int argc, SAP_UC **argv) {
         log::get().Info("server", "listening (Ctrl-C to stop)",
                         {{"program_id", program_id}, {"gwhost", gwhost}, {"gwserv", gwserv}});
 
-        Telemetry::Track("application_start");
+        telemetry.notifyStart(app_version);
 
         // Optionally expose this same in-process DuckDB to remote DuckDB clients
         // over the network via the quack extension. Treated as best-effort: if it
@@ -346,13 +354,14 @@ int mainU(int argc, SAP_UC **argv) {
                 log::get().Warn("quack", "stop failed", {{"error", e.what()}});
             }
         }
+        telemetry.notifyStop(app_version);
         RfcShutdownServer(server, 5, &info);
         RfcDestroyServer(server, &info);
-        Telemetry::Shutdown();
         return 0;
     } catch (const std::exception &e) {
+        // Startup failed before application_start was emitted — don't send an
+        // orphan application_stop.
         log::get().Error("server", "fatal", {{"error", e.what()}});
-        Telemetry::Shutdown();
         return 1;
     }
 }

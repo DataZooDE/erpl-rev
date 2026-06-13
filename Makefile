@@ -49,7 +49,7 @@ GENERATOR := $(shell command -v ninja >/dev/null 2>&1 && echo Ninja || echo "Uni
 
 DIST ?= dist
 
-.PHONY: all build configure test run run-mem run-no-quack e2e duckdb-dist start-sap clean bundle
+.PHONY: all build configure test run run-mem run-no-quack e2e duckdb-dist submodules start-sap clean bundle
 
 all: build
 
@@ -68,11 +68,15 @@ $(DUCKDB_DIST)/libduckdb.so:
 	  || { echo "ERROR: DuckDB download checksum mismatch"; rm -f $(DUCKDB_DIST)/dist.zip; exit 1; }
 	cd $(DUCKDB_DIST) && unzip -o dist.zip && rm -f dist.zip
 
-configure: duckdb-dist
+configure: duckdb-dist submodules
 	cmake -S . -B $(BUILD_DIR) -G "$(GENERATOR)" \
 	      -DCMAKE_BUILD_TYPE=Release -DSAPNWRFC_HOME=$(NWRFC_HOME) \
-	      -DDUCKDB_DIST=$(DUCKDB_DIST) \
+	      -DDUCKDB_DIST=$(DUCKDB_DIST) -DDUCKDB_VERSION=$(DUCKDB_VERSION) \
 	      $(VCPKG_FLAGS)
+
+# The telemetry lib (third_party/posthog-telemetry) is a git submodule.
+submodules:
+	@git submodule update --init --recursive third_party/posthog-telemetry
 
 build: configure
 	cmake --build $(BUILD_DIR)
