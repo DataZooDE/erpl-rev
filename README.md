@@ -170,7 +170,26 @@ ERPL_REV_DB_PATH=erpl-rev.duckdb \
   ./build/erpl_rev_server            # add --quack for the network server
 # convenience: `make run` (quack on) or `make run-no-quack`
 ```
-For production, run it as a **systemd service** ([`deploy/erpl-rev.service`](deploy/erpl-rev.service)).
+For production, run it as a **systemd service** ([`deploy/erpl-rev.service`](deploy/erpl-rev.service))
+or via **Docker** (image below).
+
+#### Run with Docker
+
+Prebuilt `linux/amd64` images are published to GitHub Container Registry:
+
+```bash
+docker run -d --name erpl-rev \
+  -e ERPL_REV_GWHOST=<gateway-host> -e ERPL_REV_GWSERV=sapgw00 \
+  -e ERPL_REV_PROGRAM_ID=ERPL_REV \
+  -v erpl-data:/data \
+  ghcr.io/datazoode/erpl-rev:latest
+# add `--quack` (and `-p 9494:9494`) for the DuckDB network server
+```
+
+Config is entirely via `ERPL_REV_*` env vars; the DuckDB file lives on the
+`/data` volume. RFC registration is **outbound** to the gateway, so no inbound
+port is needed — the gateway's `reginfo` ACL must allow `ERPL_REV_PROGRAM_ID`
+from the container's host. See [`docs/docker.md`](docs/docker.md).
 
 ### 5. Smoke test
 - Run `ZCL_ERPL_REV_DIAG` → `PONG from erpl-rev`.
@@ -286,6 +305,7 @@ drop the request silently with zero impact. Details: [`docs/telemetry.md`](docs/
 - [`docs/security.md`](docs/security.md) — Basis hardening, RFC user, SNC, ACLs
 - [`docs/sql-console.md`](docs/sql-console.md) — the in-GUI DuckDB SQL console
 - [`docs/telemetry.md`](docs/telemetry.md) — what's collected, where, and the three opt-outs
+- [`docs/docker.md`](docs/docker.md) — running the container image from ghcr.io
 
 ## License
 

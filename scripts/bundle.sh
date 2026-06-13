@@ -13,20 +13,12 @@ SDK_LIB="${4:?nwrfcsdk <plat>/lib dir}"
 DUCKDB_DIR="${5:?duckdb dist dir}"
 OUT="${6:?output path}"
 
-case "$PLATFORM" in
-  linux) SAP_LIBS=(libsapnwrfc.so libsapucum.so libicudata.so.50 libicui18n.so.50 libicuuc.so.50); DUCKDB_LIB=libduckdb.so ;;
-  osx)   SAP_LIBS=(libsapnwrfc.dylib libsapucum.dylib libicudata.50.dylib libicui18n.50.dylib libicuuc.50.dylib); DUCKDB_LIB=libduckdb.dylib ;;
-  *) echo "unknown platform: $PLATFORM" >&2; exit 2 ;;
-esac
-
 STAGE="$(mktemp -d)"; trap 'rm -rf "$STAGE"' EXIT
-PAY="$STAGE/payload"; mkdir -p "$PAY"
+PAY="$STAGE/payload"
 
-cp "$SERVER" "$PAY/erpl_rev_server"
-for l in "${SAP_LIBS[@]}"; do cp "$SDK_LIB/$l" "$PAY/$l"; done
-cp "$DUCKDB_DIR/$DUCKDB_LIB" "$PAY/$DUCKDB_LIB"
-
-echo "Bundling $(ls "$PAY" | wc -l) files:"; ls -la "$PAY" | awk 'NR>1{print "  "$5"  "$NF}'
+# The runtime payload (inner server + SAP/ICU/DuckDB libs) is staged by the
+# shared helper so the bundle and the Docker image use the identical lib set.
+"$(dirname "$0")/stage_runtime.sh" "$PLATFORM" "$SERVER" "$SDK_LIB" "$DUCKDB_DIR" "$PAY"
 
 ( cd "$PAY" && tar -cf "$STAGE/payload.tar" * )
 SIZE="$(wc -c < "$STAGE/payload.tar")"

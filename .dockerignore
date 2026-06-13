@@ -1,0 +1,10 @@
+# The Docker build context is the CI-staged payload dir (scripts/stage_runtime.sh),
+# not the repo root. These entries keep the context lean if it is ever built from
+# the repo root locally.
+build/
+vendor/
+third_party/
+nwrfcsdk/
+dist/
+staged/
+.git/
