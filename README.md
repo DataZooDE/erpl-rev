@@ -48,8 +48,9 @@ makes DuckDB call *into* SAP, **erpl-rev has SAP call out into DuckDB.**
   (no ODP / SAPI / `RFC_READ_TABLE`). See [`docs/delta.md`](docs/delta.md).
 - **Land in the open lakehouse.** parquet / partitioned datasets, **DuckLake** or
   **Iceberg**, on local disk or **cloud object storage** (S3 / GCS / Azure).
-- **Publish into a warehouse.** `ATTACH` **Postgres / MySQL / BigQuery** and push
-  a SAP slice in with one SQL statement.
+- **Publish into a warehouse.** `ATTACH` **Postgres / MySQL / BigQuery / MotherDuck**
+  and push a SAP slice in with one SQL statement — see
+  [Push to MotherDuck](#push-to-motherduck-duckdbs-cloud) below.
 - **Fast & parallel** — a live 10M-row run (50-of-400-column BSEG-shaped table,
   BELNR-partitioned, on the A4H trial / loopback):
 
@@ -65,6 +66,41 @@ makes DuckDB call *into* SAP, **erpl-rev has SAP call out into DuckDB.**
 key range with a DuckDB `Appender` (~230× a naive per-row path); memory is bounded
 by batch size, and loads are restartable and idempotent
 ([`test/bench_ingest.cpp`](test/bench_ingest.cpp)).
+
+### Push to MotherDuck (DuckDB's cloud)
+
+[MotherDuck](https://motherduck.com) is just another DuckDB-attachable catalog, so
+the embedded engine reaches it exactly like Postgres / BigQuery / Iceberg — only the
+`ATTACH` and credentials differ. Point the server's boot init at MotherDuck once,
+then replicate or publish SAP slices straight into the cloud.
+
+**1. Boot the server attached to MotherDuck.** Supply the token via the
+`motherduck_token` env var (or a `CREATE SECRET` in an `--init-file`) — never commit it:
+```bash
+export motherduck_token='<your-md-token>'
+ERPL_REV_GWHOST=<gw> ERPL_REV_GWSERV=sapgw00 \
+  ./build/erpl_rev_server --db erpl-rev.duckdb \
+  --init-sql "INSTALL motherduck; LOAD motherduck; ATTACH 'md:';"
+```
+Your MotherDuck databases now appear as catalogs (e.g. `my_db.main.<table>`).
+
+**2. Push a SAP slice from ABAP** — stage locally, then publish to the cloud:
+```abap
+zcl_erpl_rev_util=>replicate( iv_tab = 'MARA' iv_target = 'mara' ).
+zcl_erpl_rev_util=>publish(                       " FULL = overwrite, APPEND = insert
+  iv_source = 'mara' iv_kind = 'TABLE'
+  iv_dest   = 'my_db.main.mara' iv_mode = 'FULL' ).
+```
+The *publish* field of `Z_ERPL_REV_REPLICATE` does the same from the GUI.
+
+**3. Query MotherDuck from the SQL console.** `Z_ERPL_REV_SQL` ships an **example
+dropdown** with ready-to-run queries: the classic NYC-taxi public-Parquet aggregate,
+MotherDuck's shared `sample_data` (taxi + Hacker News), a `SUMMARIZE`, and a
+push-a-table round-trip — pick one and hit *Execute*.
+
+> The released bundle ships DuckDB with `parquet` / `json` built in; `motherduck`
+> (and `httpfs`) auto-install from `extensions.duckdb.org` on first use, so the host
+> needs outbound HTTPS — or pre-stage the extension for air-gapped systems.
 
 ---
 
