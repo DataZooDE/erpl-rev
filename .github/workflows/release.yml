@@ -1,14 +1,12 @@
 name: Release bundles
 
-# Builds the single-file self-extracting binary for Linux, macOS and Windows and
-# the linux/amd64 Docker image.
-#   - version tag (v*)  -> bundles + GitHub release + image tagged :<version> :latest
-#   - push to main      -> image only, tagged :edge  (bundles/release are skipped)
-#   - workflow_dispatch -> bundles (no release)
+# Builds the single-file self-extracting binary for Linux, macOS and Windows.
+# Run manually (workflow_dispatch) or on a version tag (v*), which also publishes
+# a GitHub release with the three artifacts attached AND a linux/amd64 Docker
+# image (ghcr.io/datazoode/erpl-rev:<version> + :latest).
 on:
   workflow_dispatch:
   push:
-    branches: [main]
     tags: ['v*']
 
 permissions:
@@ -21,8 +19,6 @@ env:
 jobs:
   posix:
     name: bundle ${{ matrix.asset }}
-    # Bundles are for releases / manual runs only — a main push builds just the image.
-    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -91,7 +87,6 @@ jobs:
 
   windows:
     name: bundle erpl-rev-windows-amd64
-    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -185,8 +180,9 @@ jobs:
 
   docker:
     name: Docker image (linux/amd64 -> ghcr.io)
-    # Self-contained linux build (does not need the posix bundle), so it can run
-    # on a plain main push for :edge as well as on tags for :<version>/:latest.
+    # Build & publish the image only for a release (a v* tag) — same gate as the
+    # release job. Tagged with the release version and :latest.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -196,6 +192,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive   # third_party/posthog-telemetry (telemetry lib)
+
+      - name: Resolve version
+        id: ver
+        run: echo "v=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"   # v2026.06.13 -> 2026.06.13
 
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y ninja-build unzip
@@ -223,12 +223,10 @@ jobs:
 
       - name: Build server (linux/amd64)
         run: |
-          # Tag build -> the semver (no leading v); main push -> an -edge marker.
-          if [ "$GITHUB_REF_TYPE" = tag ]; then VERSION="${GITHUB_REF_NAME#v}"; else VERSION="0.0.0-edge"; fi
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_TARGET_TRIPLET=x64-linux \
-            -DERPL_REV_VERSION="$VERSION" \
+            -DERPL_REV_VERSION="${{ steps.ver.outputs.v }}" \
             -DDUCKDB_VERSION="${DUCKDB_VERSION}" \
             -DDUCKDB_DIST="$PWD/vendor/duckdb-${DUCKDB_VERSION}"
           cmake --build build
@@ -248,18 +246,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/datazoode/erpl-rev
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha
-            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
-            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
-
       - name: Build and push (context = the staged payload)
         uses: docker/build-push-action@v6
         with:
@@ -267,5 +253,6 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: |
+            ghcr.io/datazoode/erpl-rev:${{ steps.ver.outputs.v }}
+            ghcr.io/datazoode/erpl-rev:latest

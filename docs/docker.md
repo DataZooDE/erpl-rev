@@ -1,12 +1,11 @@
 # Running erpl-rev with Docker
 
-erpl-rev publishes a `linux/amd64` container image to GitHub Container Registry:
+Each release publishes a `linux/amd64` container image to GitHub Container
+Registry, tagged with the release version and `latest`:
 
 ```
 ghcr.io/datazoode/erpl-rev:latest        # newest release
 ghcr.io/datazoode/erpl-rev:<version>     # a specific release, e.g. 2026.06.13
-ghcr.io/datazoode/erpl-rev:edge          # latest main (unreleased)
-ghcr.io/datazoode/erpl-rev:sha-<commit>  # exact commit
 ```
 
 The image bundles the server, the SAP NW RFC SDK runtime libs, ICU, and DuckDB —
