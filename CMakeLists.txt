@@ -7,6 +7,12 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# Product version baked in for telemetry. CI passes -DERPL_REV_VERSION=X.Y.Z;
+# otherwise it falls back to "dev" (see src/telemetry.cpp).
+if(NOT DEFINED ERPL_REV_VERSION OR ERPL_REV_VERSION STREQUAL "")
+  set(ERPL_REV_VERSION "dev")
+endif()
+
 # Platform sub-dir of the repo-local NW RFC SDK (gitignored; provided locally or
 # fetched from S3 in CI — same convention as DataZooDE/erpl).
 if(WIN32)
@@ -51,6 +57,11 @@ endif()
 find_package(Catch2 3 CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 
+# Telemetry HTTP client (cpp-httplib + OpenSSL, both from vcpkg). Static via the
+# x64-linux triplet so the portable bundle gains no new runtime .so.
+find_package(httplib CONFIG REQUIRED)
+find_package(OpenSSL REQUIRED)
+
 # --- SAP build definitions (64-bit Unicode, per platform) --------------------
 if(WIN32)
   add_compile_definitions(SAPonNT WIN32 SAPwithUNICODE SAPwithTHREADS
@@ -78,11 +89,15 @@ add_executable(erpl_rev_server
   src/json_util.cpp
   src/sxml_binary.cpp
   src/logging.cpp
+  src/telemetry.cpp
   src/main.cpp)
 target_include_directories(erpl_rev_server PRIVATE
   "${SAPNWRFC_HOME}/include" "${DUCKDB_INCLUDE}" src)
+target_compile_definitions(erpl_rev_server PRIVATE
+  ERPL_REV_VERSION="${ERPL_REV_VERSION}")
 target_link_libraries(erpl_rev_server PRIVATE
-  ${SAP_LIBS} ${DUCKDB_LIB} Threads::Threads ${CMAKE_DL_LIBS})
+  ${SAP_LIBS} ${DUCKDB_LIB} Threads::Threads ${CMAKE_DL_LIBS}
+  httplib::httplib OpenSSL::SSL OpenSSL::Crypto)
 
 # So the extracted inner binary finds the bundled libs sitting next to it
 # (belt-and-suspenders with the launcher's loader-path env var).
@@ -106,16 +121,19 @@ if(EXISTS "${DUCKDB_LIB}")
     test/test_duckdb_bridge.cpp
     test/test_cdc_dialect.cpp
     test/test_sxml_binary.cpp
+    test/test_telemetry.cpp
     test/bench_ingest.cpp
     src/duckdb_bridge.cpp
     src/cdc_dialect.cpp
     src/json_util.cpp
-    src/sxml_binary.cpp)
+    src/sxml_binary.cpp
+    src/telemetry.cpp)
   target_include_directories(erpl_rev_tests PRIVATE src "${DUCKDB_INCLUDE}")
   target_compile_definitions(erpl_rev_tests PRIVATE
     ERPL_REV_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
   target_link_libraries(erpl_rev_tests PRIVATE
-    ${DUCKDB_LIB} Threads::Threads Catch2::Catch2WithMain)
+    ${DUCKDB_LIB} Threads::Threads Catch2::Catch2WithMain
+    httplib::httplib OpenSSL::SSL OpenSSL::Crypto)
   if(APPLE)
     set_target_properties(erpl_rev_tests PROPERTIES BUILD_RPATH "${DUCKDB_DIST}")
   elseif(UNIX)

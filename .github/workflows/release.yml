@@ -63,6 +63,7 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }} \
+            -DERPL_REV_VERSION="${GITHUB_REF_NAME#v}" \
             -DDUCKDB_DIST="$PWD/vendor/duckdb-${DUCKDB_VERSION}"
           cmake --build build
 
@@ -112,6 +113,7 @@ jobs:
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DERPL_REV_VERSION="$($env:GITHUB_REF_NAME -replace '^v','')" `
             -DDUCKDB_DIST="$PWD/vendor/duckdb-$env:DUCKDB_VERSION"
           cmake --build build --config Release
 

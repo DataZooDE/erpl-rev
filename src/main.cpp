@@ -13,6 +13,7 @@
 #include "duckdb_bridge.hpp"
 #include "logging.hpp"
 #include "sap_uc.hpp"
+#include "telemetry.hpp"
 
 #include <cctype>
 #include <chrono>
@@ -26,6 +27,11 @@
 #include <vector>
 
 #include "sapnwrfc.h"
+
+// Product version baked in at build time (CI passes -DERPL_REV_VERSION=X.Y.Z).
+#ifndef ERPL_REV_VERSION
+#define ERPL_REV_VERSION "dev"
+#endif
 
 using namespace erpl_rev;
 
@@ -83,6 +89,7 @@ struct Cli {
     bool init_file_set = false;
     bool help = false;
     bool smoke = false;
+    bool no_telemetry = false;
 };
 
 void PrintHelp() {
@@ -107,6 +114,7 @@ void PrintHelp() {
         "  --smoke                  Self-check: load + call the bundled SAP NW RFC\n"
         "                           SDK and DuckDB, print their versions, exit 0.\n"
         "                           Needs no SAP gateway (used by the CI smoke test).\n"
+        "  --no-telemetry           Disable anonymous usage telemetry for this run.\n"
         "  -h, --help               Show this help and exit.\n\n"
         "Config is read from the environment; the flags above override it:\n"
         "  ERPL_REV_PROGRAM_ID    gateway PROGRAM_ID          (default ERPL_REV)\n"
@@ -119,7 +127,9 @@ void PrintHelp() {
         "  ERPL_REV_DB_PATH       DuckDB file (:memory: for in-mem) (default erpl-rev.duckdb)\n"
         "  ERPL_REV_LOG_LEVEL     error|warn|info|debug|trace (default info)\n"
         "  ERPL_REV_LOG_FORMAT    console|json                (default console)\n"
-        "  ERPL_REV_LOG_COLOR     auto|always|never           (default auto)\n",
+        "  ERPL_REV_LOG_COLOR     auto|always|never           (default auto)\n"
+        "  ERPL_REV_NO_TELEMETRY  disable usage telemetry (truthy)\n"
+        "  DATAZOO_DISABLE_TELEMETRY  disable telemetry across all DataZoo tools\n",
         stderr);
 }
 
@@ -166,6 +176,8 @@ Cli ParseArgs(int argc, SAP_UC **argv) {
             c.help = true;
         } else if (key == "--smoke") {
             c.smoke = true;
+        } else if (key == "--no-telemetry") {
+            c.no_telemetry = true;
         } else {
             log::get().Warn("server", "ignoring unknown argument", {{"arg", a}});
         }
@@ -258,6 +270,10 @@ int mainU(int argc, SAP_UC **argv) {
         init_sql = cli.init_sql;
     }
 
+    // Anonymous usage telemetry (opt-out via --no-telemetry / env). Started here
+    // so the worker is up before the server begins handling RFC calls.
+    Telemetry::Initialize(cli.no_telemetry, ERPL_REV_VERSION);
+
     bool quack_running = false;
 
     try {
@@ -295,6 +311,8 @@ int mainU(int argc, SAP_UC **argv) {
         log::get().Info("server", "listening (Ctrl-C to stop)",
                         {{"program_id", program_id}, {"gwhost", gwhost}, {"gwserv", gwserv}});
 
+        Telemetry::Track("application_start");
+
         // Optionally expose this same in-process DuckDB to remote DuckDB clients
         // over the network via the quack extension. Treated as best-effort: if it
         // can't start (e.g. offline, engine < 1.5.3), keep serving RFC.
@@ -330,9 +348,11 @@ int mainU(int argc, SAP_UC **argv) {
         }
         RfcShutdownServer(server, 5, &info);
         RfcDestroyServer(server, &info);
+        Telemetry::Shutdown();
         return 0;
     } catch (const std::exception &e) {
         log::get().Error("server", "fatal", {{"error", e.what()}});
+        Telemetry::Shutdown();
         return 1;
     }
 }
