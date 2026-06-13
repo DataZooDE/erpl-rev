@@ -34,24 +34,23 @@ DATA: go_dock   TYPE REF TO cl_gui_docking_container,
       gv_truncated TYPE abap_bool,       " capped before the result was exhausted
       gv_info   TYPE string.
 
-" An input-enabled field is required, else the selection screen is auto-skipped
-" and AT SELECTION-SCREEN OUTPUT never fires (nothing renders).
-PARAMETERS p_run AS CHECKBOX DEFAULT 'X'.
+" One toolbar line: [Execute] [Generate]  Examples: <picker>.
+" The example picker doubles as the field that keeps this screen alive: a
+" selection screen with no input field is auto-skipped (AT SELECTION-SCREEN
+" OUTPUT never fires, nothing renders); p_demo is a PARAMETERS field, so no
+" separate dummy parameter is needed.
 SELECTION-SCREEN BEGIN OF LINE.
 SELECTION-SCREEN PUSHBUTTON  1(30) b_exec USER-COMMAND exec.
 SELECTION-SCREEN PUSHBUTTON 33(30) b_gen  USER-COMMAND gen.
-SELECTION-SCREEN END OF LINE.
-" Pick an example to drop a ready-to-run query into the editor above.
-SELECTION-SCREEN BEGIN OF LINE.
-SELECTION-SCREEN COMMENT 1(18) c_demo FOR FIELD p_demo.
-PARAMETERS p_demo TYPE ty_demokey AS LISTBOX VISIBLE LENGTH 55
+SELECTION-SCREEN COMMENT    65(9) c_demo FOR FIELD p_demo.
+PARAMETERS p_demo TYPE ty_demokey AS LISTBOX VISIBLE LENGTH 45
            USER-COMMAND demo DEFAULT '00'.
 SELECTION-SCREEN END OF LINE.
 
 INITIALIZATION.
   b_exec = 'Execute DuckDB SQL'.
   b_gen  = 'Generate ABAP snippet'.
-  c_demo = 'Example library'.
+  c_demo = 'Examples'.
   gt_sql = VALUE #( ( |SELECT 42 AS answer, 'hello duckdb' AS msg| ) ).
 
   " Populate the example dropdown. Picking an entry (USER-COMMAND DEMO) loads the
