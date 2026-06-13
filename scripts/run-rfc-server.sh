@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Start the erpl-rev RFC server with MotherDuck and/or BigQuery attached.
+# Start the erpl-rev RFC server, optionally with MotherDuck and/or BigQuery
+# attached (both opt-in via the environment — see below).
 #
 # Both cloud catalogs are OPT-IN via the environment, so this script carries no
 # secrets or site-specific values — put those in your shell profile (~/.bashrc):
@@ -18,8 +19,8 @@
 # Prerequisite: the server is built ->  cmake --build build
 #
 # Usage:
-#   scripts/run-cloud.sh            # start (refuses if one is already running)
-#   scripts/run-cloud.sh -r         # restart: stop any running server, then start
+#   scripts/run-rfc-server.sh       # start (refuses if one is already running)
+#   scripts/run-rfc-server.sh -r    # restart: stop any running server, then start
 #
 # Other overrides (env):
 #   ERPL_REV_PROGRAM_ID   gateway PROGRAM_ID      (default ERPL_REVERSE)
