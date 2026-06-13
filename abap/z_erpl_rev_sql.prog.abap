@@ -59,7 +59,7 @@ INITIALIZATION.
   DATA(lt_demo) = VALUE vrm_values(
     ( key = '00' text = 'Load an example query...' )
     ( key = '01' text = '1. DuckDB friendly SQL (synthetic, no network)' )
-    ( key = '02' text = '2. NYC taxi - public Parquet over HTTPS' )
+    ( key = '02' text = '2. NYC taxi - 12 monthly Parquet files, 40M+ rows (HTTPS)' )
     ( key = '03' text = '3. MotherDuck - SUMMARIZE sample taxi' )
     ( key = '04' text = '4. MotherDuck - top Hacker News stories' )
     ( key = '05' text = '5. MotherDuck - list sample_data tables' )
@@ -323,10 +323,11 @@ ENDFORM.
 
 *&---------------------------------------------------------------------*
 *&  Load one of the bundled example queries into the editor buffer.
-*&  A small gallery of "impressive" DuckDB queries: the classic NYC-taxi
-*&  public-Parquet aggregate, MotherDuck's shared sample_data sets, and a
-*&  push-a-table-to-MotherDuck round-trip. The MotherDuck ones need the
-*&  server booted with `... ATTACH 'md:'` (token via motherduck_token).
+*&  A small gallery of "impressive" DuckDB queries: a multi-file NYC-taxi
+*&  aggregate over a year of public Parquet (12 files, 40M+ rows),
+*&  MotherDuck's shared sample_data sets, and a push-a-table-to-MotherDuck
+*&  round-trip. The MotherDuck ones need the server booted with
+*&  `... ATTACH 'md:'` (token via motherduck_token).
 *&---------------------------------------------------------------------*
 FORM load_demo USING iv_key TYPE c.
   CASE iv_key.
@@ -342,20 +343,26 @@ FORM load_demo USING iv_key TYPE c.
         ( |FROM range(TIMESTAMP '2024-01-01', TIMESTAMP '2025-01-01', INTERVAL 1 DAY) t(d)| )
         ( |GROUP BY ALL| )
         ( |ORDER BY min(d);| ) ).
-    WHEN '02'.   " NYC taxi over public Parquet (httpfs, needs internet egress)
+    WHEN '02'.   " NYC taxi over MANY public Parquet files (httpfs, needs internet egress)
       gt_sql = VALUE #(
-        ( |-- 3M+ NYC taxi trips straight from public Parquet over HTTPS - no download.| )
-        ( |-- (DuckDB auto-loads httpfs; the file is the official NYC TLC open dataset.)| )
+        ( |-- 40M+ NYC taxi trips across ALL 12 monthly Parquet files of 2024 - no download.| )
+        ( |-- read_parquet takes the whole LIST of remote files and scans them in parallel:| )
+        ( |-- union_by_name aligns the per-file schemas, filename tags each row's source file.| )
+        ( |-- (DuckDB auto-loads httpfs; files are the official NYC TLC open dataset.)| )
+        ( |SET http_retries = 8;| )
         ( |SELECT| )
-        ( |    payment_type,| )
+        ( |    filename[-15:-9]             AS month,| )
         ( |    count(*)                     AS trips,| )
         ( |    round(avg(trip_distance), 2) AS avg_miles,| )
         ( |    round(avg(fare_amount), 2)   AS avg_fare,| )
         ( |    round(avg(tip_amount), 2)    AS avg_tip| )
-        ( |FROM read_parquet('https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet')| )
+        ( |FROM read_parquet(| )
+        ( |    list_transform(range(1, 13),| )
+        ( |        lambda m: printf('https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-%02d.parquet', m)),| )
+        ( |    union_by_name = true, filename = true)| )
         ( |WHERE fare_amount > 0| )
         ( |GROUP BY ALL| )
-        ( |ORDER BY trips DESC;| ) ).
+        ( |ORDER BY month;| ) ).
     WHEN '03'.   " MotherDuck shared sample_data — SUMMARIZE (schema-agnostic)
       gt_sql = VALUE #(
         ( |-- MotherDuck: every account has a shared read-only 'sample_data' database.| )
