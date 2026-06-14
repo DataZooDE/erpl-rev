@@ -12,6 +12,9 @@ permissions:
   id-token: write
   contents: read
 
+env:
+  DUCKDB_VERSION: "1.5.3"
+
 jobs:
   build-and-test:
     name: Build server + run tests (Linux)
@@ -48,3 +51,53 @@ jobs:
 
       - name: Run tests
         run: make test
+
+  build-windows:
+    # MSVC-only catch: the release Windows bundle is built only on tags, so a
+    # Windows-only compile break (e.g. POSIX setenv in a test) used to slip
+    # through to the release. Build + test the same x64-windows-static-md
+    # configuration here on every push/PR.
+    name: Build server + run tests (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive   # third_party/posthog-telemetry (telemetry lib)
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: 11bbc873e00e9e58d4e9dffb30b7a5493a030e0b
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::331993160594:role/ErplGithubOicdRole
+          role-session-name: ErplRevGithubOidcSessionWin
+          aws-region: eu-west-1
+
+      - name: Download SAP NW RFC SDK (Windows)
+        run: .\scripts\download_and_extract_nwrfc.ps1 's3://erpl-resources/sapnwrfc/nwrfc750P_13-70002755_win.zip' '.\nwrfcsdk\win\'
+
+      - name: Fetch DuckDB
+        run: |
+          curl.exe -sL --fail -o duckdb.zip "https://github.com/duckdb/duckdb/releases/download/v$env:DUCKDB_VERSION/libduckdb-windows-amd64.zip"
+          New-Item -ItemType Directory -Force -Path "vendor\duckdb-$env:DUCKDB_VERSION" | Out-Null
+          Expand-Archive -Force duckdb.zip -DestinationPath "vendor\duckdb-$env:DUCKDB_VERSION"
+
+      - name: Build (server + launcher + tests)
+        run: |
+          # x64-windows-static-md mirrors the release build (static OpenSSL, dynamic
+          # CRT to match the prebuilt DuckDB DLL). Builds all targets incl. tests.
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
+            -DDUCKDB_VERSION="$env:DUCKDB_VERSION" `
+            -DDUCKDB_DIST="$PWD/vendor/duckdb-$env:DUCKDB_VERSION"
+          cmake --build build --config Release
+
+      - name: Run tests
+        run: |
+          # The test exe needs duckdb.dll on PATH (it doesn't link the SAP libs).
+          $env:PATH = "$PWD\vendor\duckdb-$env:DUCKDB_VERSION;$env:PATH"
+          .\build\Release\erpl_rev_tests.exe
