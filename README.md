@@ -128,11 +128,18 @@ native/ADBC BW path reads cross-client). Full guide: [`docs/security.md`](docs/s
 
 ## Install & setup
 
-**Prefer a prebuilt binary?** Each [release](https://github.com/DataZooDE/erpl-rev/releases)
-ships a **single self-extracting file** per OS (`erpl-rev-linux-amd64`,
-`erpl-rev-macos-arm64`, `erpl-rev-windows-amd64.exe`) that bundles the SAP NW RFC
-SDK + DuckDB — download it, run it, nothing else to install. To build that file
-from source yourself: `make bundle` → `dist/erpl-rev`. To build the plain server:
+**Just want to run it?** This is the recommended way — grab the **single
+self-extracting binary** for your OS from the
+[latest release](https://github.com/DataZooDE/erpl-rev/releases)
+(`erpl-rev-linux-amd64`, `erpl-rev-macos-arm64`, `erpl-rev-windows-amd64.exe`) and
+run it. It bundles the SAP NW RFC SDK + ICU + DuckDB, self-extracts on first
+launch, and needs **no `LD_LIBRARY_PATH`** and nothing else installed. Or use
+**Docker** — `docker pull ghcr.io/datazoode/erpl-rev:latest` — the image bakes the
+**same** bundle (see [Run with Docker](#run-with-docker)). Either way you still do
+the one-time SAP-side wiring (**step 3**) and then run it (**step 4**).
+
+> The numbered steps below **build from source** — only needed to develop erpl-rev
+> or to produce the bundle yourself (`make bundle` → `dist/erpl-rev`).
 
 ### Prerequisites
 - Linux host with **CMake ≥ 3.16**, a **C++17** compiler, **Ninja**, and **vcpkg**
@@ -165,6 +172,10 @@ Production = import the ABAP transport and run the setup classrun — full guide
 - gateway registration allowed for the server's host — [`docs/enable-rfc-registration.md`](docs/enable-rfc-registration.md).
 
 ### 4. Run the server
+Running the **downloaded release binary** (or the Docker image) needs no setup —
+just `./erpl-rev-linux-amd64` with the `ERPL_REV_*` env below; the bundle
+self-extracts and sets its own loader path. The `LD_LIBRARY_PATH` line is **only**
+for the from-source `build/erpl_rev_server`, whose libs live elsewhere in the tree:
 ```bash
 export LD_LIBRARY_PATH=$PWD/nwrfcsdk/linux/lib:$PWD/vendor/duckdb-1.5.3
 ERPL_REV_GWHOST=<gateway-host> ERPL_REV_GWSERV=sapgw00 \
