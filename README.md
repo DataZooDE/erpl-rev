@@ -152,8 +152,10 @@ make duckdb-dist                       # fetch prebuilt libduckdb 1.5.3 into ven
 ### 2. Build & test
 ```bash
 make build      # -> build/erpl_rev_server + build/erpl_rev_tests
-make test       # 44 Catch2 cases against real DuckDB
+make test       # the Catch2 suite against real DuckDB (no mocks)
 ```
+`make build` also initialises the `third_party/posthog-telemetry` submodule, so a
+fresh clone needs no extra `git submodule` step.
 
 ### 3. Wire up the SAP side (one-time)
 Production = import the ABAP transport and run the setup classrun — full guide in
@@ -168,8 +170,18 @@ export LD_LIBRARY_PATH=$PWD/nwrfcsdk/linux/lib:$PWD/vendor/duckdb-1.5.3
 ERPL_REV_GWHOST=<gateway-host> ERPL_REV_GWSERV=sapgw00 \
 ERPL_REV_DB_PATH=erpl-rev.duckdb \
   ./build/erpl_rev_server            # add --quack for the network server
-# convenience: `make run` (quack on) or `make run-no-quack`
+# convenience: `make run` (quack on), `make run-mem` (in-memory), or `make run-no-quack`
 ```
+Easiest is **[`scripts/run-rfc-server.sh`](scripts/run-rfc-server.sh)**: it sets
+`LD_LIBRARY_PATH`, registers as `ERPL_REV`, and — opt-in via the environment —
+attaches **MotherDuck** (`motherduck_token`) and/or **BigQuery**
+(`ERPL_REV_BQ_PROJECT`). Pass `-r` to restart.
+
+To publish to **external / cloud catalogs** (parquet, postgres, ducklake,
+bigquery, motherduck), give DuckDB boot SQL that runs `INSTALL`/`LOAD`/`ATTACH`
+(and `CREATE SECRET`) once on a global connection — via `--init-sql "<sql>"`,
+`--init-file <path>`, or the `ERPL_REV_DUCKDB_INIT` env var.
+
 For production, run it as a **systemd service** ([`deploy/erpl-rev.service`](deploy/erpl-rev.service))
 or via **Docker** (image below).
 
@@ -189,10 +201,15 @@ docker run -d --name erpl-rev \
 Config is entirely via `ERPL_REV_*` env vars; the DuckDB file lives on the
 `/data` volume. RFC registration is **outbound** to the gateway, so no inbound
 port is needed — the gateway's `reginfo` ACL must allow `ERPL_REV_PROGRAM_ID`
-from the container's host. See [`docs/docker.md`](docs/docker.md).
+from the container's host. Add `--quack` and publish `-p 9494:9494` for the
+network server; `docker run --rm ghcr.io/datazoode/erpl-rev:latest --smoke`
+checks a pulled image loads with no gateway. See [`docs/docker.md`](docs/docker.md).
 
 ### 5. Smoke test
-- Run `ZCL_ERPL_REV_DIAG` → `PONG from erpl-rev`.
+- `./build/erpl_rev_server --smoke` (or the bundled binary) — loads the SAP NW RFC
+  SDK + DuckDB and prints their versions; needs no gateway.
+- `Z_ERPL_REV_SQL` (`SE38`) → run `SELECT 42` to confirm the ABAP → server → DuckDB
+  round-trip (server must be running and registered).
 - Run `Z_ERPL_REV_REPLICATE` (`SE38`) on a small table and check row parity.
 
 ---
@@ -261,8 +278,11 @@ CLI flags override env (**flag > env > default**); `--help` prints the full surf
 | Gateway host / service | — | `ERPL_REV_GWHOST` / `ERPL_REV_GWSERV` | `localhost` / `3300` |
 | Parallel registrations | — | `ERPL_REV_REG_COUNT` | `5` |
 | Enable quack | `--quack[=<listen>]` | `ERPL_REV_QUACK` | off |
-| Quack bind / token | `--quack-listen` / `--quack-token` | `ERPL_REV_QUACK_LISTEN` / `ERPL_REV_QUACK_TOKEN` | `quack:localhost` / random |
-| DuckDB file | `--db <path>` | `ERPL_REV_DB_PATH` | `:memory:` |
+| Quack bind / token | `--quack-listen` / `--quack-token` | `ERPL_REV_QUACK_LISTEN` / `ERPL_REV_QUACK_TOKEN` | `quack:localhost` (port 9494) / random |
+| DuckDB file | `--db <path>` | `ERPL_REV_DB_PATH` | `erpl-rev.duckdb` (`:memory:` for in-mem) |
+| Boot init SQL | `--init-sql` / `--init-file` | `ERPL_REV_DUCKDB_INIT` | — (ATTACH/secrets for external/cloud targets) |
+| Telemetry opt-out | `--no-telemetry` | `ERPL_REV_NO_TELEMETRY` / `DATAZOO_DISABLE_TELEMETRY` | on by default ([docs](docs/telemetry.md)) |
+| Self-check & exit | `--smoke` | — | — |
 | Logging | — | `ERPL_REV_LOG_{LEVEL,FORMAT,COLOR}` | `info` / `console` / `auto` |
 
 A file-backed `--db` makes ingested (and quack-served) data durable across
