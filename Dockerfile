@@ -1,47 +1,44 @@
 # syntax=docker/dockerfile:1
 #
-# Runtime image for the erpl-rev RFC server. The binary + its runtime libs are
-# built/staged in CI (scripts/stage_runtime.sh) and the build context IS that
-# staged directory — this Dockerfile only assembles the runtime layer, it does
-# not compile. See docs/docker.md.
+# Runtime image for the erpl-rev RFC server. It bakes the EXACT single
+# self-extracting bundle published on the release page (`erpl-rev-linux-amd64`):
+# the launcher unpacks the inner server + SAP NW RFC libs + ICU + DuckDB into a
+# temp cache on first run and sets the loader path itself — so the image deploys
+# the same artifact a customer downloads, and needs no LD_LIBRARY_PATH. The CI
+# `docker run … --smoke` step verifies it. See docs/docker.md.
 FROM ubuntu:24.04
 
-# erpl_rev_server static-links libstdc++/libgcc and OpenSSL, so beyond the
-# bundled SAP/DuckDB/ICU libs it needs only a few base libs: libstdc++6 +
-# libgcc (pulled in by libduckdb.so and the SAP libs), libuuid1, and TLS roots
-# for the (opt-out) telemetry POST.
+# The extracted inner server + libduckdb.so need libstdc++6/libgcc + libuuid1;
+# ca-certificates is for the (opt-out) telemetry POST. The SAP/ICU/DuckDB libs
+# themselves travel inside the bundle.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       libstdc++6 libuuid1 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /opt/erpl-rev
+# The single self-extracting bundle — same file as the GitHub release asset.
+COPY erpl-rev /usr/local/bin/erpl-rev
 
-# Build context = the staged payload: erpl_rev_server + libsapnwrfc.so,
-# libsapucum.so, libicu{data,i18n,uc}.so.50, libduckdb.so.
-COPY . /opt/erpl-rev/
-
-# libsapnwrfc.so dlopen()s the ICU libs BY NAME, so the binary's $ORIGIN rpath
-# alone is not enough — point the loader at the lib dir explicitly. Sensible
-# container defaults; every ERPL_REV_* var can be overridden at `docker run`.
-ENV LD_LIBRARY_PATH=/opt/erpl-rev \
-    ERPL_REV_DB_PATH=/data/erpl-rev.duckdb \
+# Sensible container defaults; every ERPL_REV_* var is overridable at `docker run`.
+# No LD_LIBRARY_PATH: the launcher self-extracts to $TMPDIR (default /tmp) and sets
+# it for the inner server. Mount an emptyDir at /tmp if the rootfs is read-only.
+ENV ERPL_REV_DB_PATH=/data/erpl-rev.duckdb \
     ERPL_REV_LOG_FORMAT=json
 
-# Run unprivileged; /data holds the persisted DuckDB file (mount a volume).
 RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin erpl \
-    && mkdir -p /data && chown erpl:erpl /data
+    && mkdir -p /data && chown erpl:erpl /data \
+    && chmod +x /usr/local/bin/erpl-rev
 USER erpl
-VOLUME ["/data"]
 
+VOLUME ["/data"]
 # Only relevant when the optional quack network server is enabled (--quack).
 # RFC registration is OUTBOUND to the SAP gateway, so no RFC port is exposed.
 EXPOSE 9494
 
 LABEL org.opencontainers.image.title="erpl-rev" \
-      org.opencontainers.image.description="Query and replicate SAP through DuckDB — a registered RFC server bridging ABAP RFC into DuckDB." \
+      org.opencontainers.image.description="Query and replicate SAP through DuckDB — a registered RFC server bridging ABAP RFC into DuckDB (self-extracting bundle)." \
       org.opencontainers.image.url="https://github.com/DataZooDE/erpl-rev" \
       org.opencontainers.image.source="https://github.com/DataZooDE/erpl-rev" \
       org.opencontainers.image.licenses="BUSL-1.1" \
       org.opencontainers.image.vendor="DataZoo GmbH"
 
-ENTRYPOINT ["/opt/erpl-rev/erpl_rev_server"]
+ENTRYPOINT ["/usr/local/bin/erpl-rev"]

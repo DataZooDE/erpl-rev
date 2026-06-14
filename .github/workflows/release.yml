@@ -180,64 +180,42 @@ jobs:
 
   docker:
     name: Docker image (linux/amd64 -> ghcr.io)
-    # Build & publish the image only for a release (a v* tag) — same gate as the
-    # release job. Tagged with the release version and :latest.
+    # The image bakes the EXACT linux bundle the posix job built — so what's
+    # downloaded and what's deployed in Docker are the same, single artifact (no
+    # separate build/stage path). Release-only, gated to v* tags like the release job.
+    needs: [posix]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write      # GitHub OIDC -> AWS (fetch the SAP NW RFC SDK)
       packages: write      # push to ghcr.io
     steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive   # third_party/posthog-telemetry (telemetry lib)
+      - uses: actions/checkout@v4   # for the Dockerfile + .dockerignore
 
       - name: Resolve version
         id: ver
         run: echo "v=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"   # v2026.06.13 -> 2026.06.13
 
-      - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y ninja-build unzip
-
-      - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
+      - name: Download the linux bundle (from the posix job)
+        uses: actions/download-artifact@v4
         with:
-          vcpkgGitCommitId: 11bbc873e00e9e58d4e9dffb30b7a5493a030e0b
+          name: erpl-rev-linux-amd64.tar.gz
+          path: dl
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::331993160594:role/ErplGithubOicdRole
-          role-session-name: ErplRevDockerOidc
-          aws-region: eu-west-1
-
-      - name: Fetch SAP NW RFC SDK
-        run: ./scripts/download_and_extract_nwrfc.sh "s3://erpl-resources/sapnwrfc/nwrfc750P_13-70002752_linux.zip" "./nwrfcsdk/linux/"
-
-      - name: Fetch DuckDB
+      - name: Assemble the Docker build context
         run: |
-          curl -sL --fail -o duckdb.zip "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/libduckdb-linux-amd64.zip"
-          mkdir -p "vendor/duckdb-${DUCKDB_VERSION}"
-          unzip -o duckdb.zip -d "vendor/duckdb-${DUCKDB_VERSION}"
+          mkdir -p ctx
+          tar -xzf dl/erpl-rev-linux-amd64.tar.gz -C ctx   # -> ctx/erpl-rev-linux-amd64
+          mv ctx/erpl-rev-linux-amd64 ctx/erpl-rev          # the name the Dockerfile COPYs
+          cp Dockerfile .dockerignore ctx/
 
-      - name: Build server (linux/amd64)
+      - name: Build the image (linux/amd64)
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
-            -DVCPKG_TARGET_TRIPLET=x64-linux \
-            -DERPL_REV_VERSION="${{ steps.ver.outputs.v }}" \
-            -DDUCKDB_VERSION="${DUCKDB_VERSION}" \
-            -DDUCKDB_DIST="$PWD/vendor/duckdb-${DUCKDB_VERSION}"
-          cmake --build build
+          docker build -t "ghcr.io/datazoode/erpl-rev:${{ steps.ver.outputs.v }}" \
+                       -t "ghcr.io/datazoode/erpl-rev:latest" ctx
 
-      - name: Stage runtime payload (shared with the bundle)
-        run: ./scripts/stage_runtime.sh linux build/erpl_rev_server nwrfcsdk/linux/lib "vendor/duckdb-${DUCKDB_VERSION}" staged
-
-      - name: Smoke test the staged payload (loads SAP SDK + DuckDB, no gateway)
-        run: env -u LD_LIBRARY_PATH LD_LIBRARY_PATH="$PWD/staged" staged/erpl_rev_server --smoke
-
-      - uses: docker/setup-buildx-action@v3
+      - name: Smoke-test the image (runs the bundle, no gateway)
+        run: docker run --rm "ghcr.io/datazoode/erpl-rev:${{ steps.ver.outputs.v }}" --smoke
 
       - name: Log in to ghcr.io
         uses: docker/login-action@v3
@@ -246,13 +224,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push (context = the staged payload)
-        uses: docker/build-push-action@v6
-        with:
-          context: staged
-          file: Dockerfile
-          platforms: linux/amd64
-          push: true
-          tags: |
-            ghcr.io/datazoode/erpl-rev:${{ steps.ver.outputs.v }}
-            ghcr.io/datazoode/erpl-rev:latest
+      - name: Push
+        run: |
+          docker push "ghcr.io/datazoode/erpl-rev:${{ steps.ver.outputs.v }}"
+          docker push "ghcr.io/datazoode/erpl-rev:latest"

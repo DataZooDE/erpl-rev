@@ -8,9 +8,15 @@ ghcr.io/datazoode/erpl-rev:latest        # newest release
 ghcr.io/datazoode/erpl-rev:<version>     # a specific release, e.g. 2026.06.13
 ```
 
-The image bundles the server, the SAP NW RFC SDK runtime libs, ICU, and DuckDB —
-the same payload as the single-file release bundle. It runs as a non-root user
-(`uid 10001`) and stores its DuckDB file on a `/data` volume.
+The image **bakes the exact `erpl-rev-linux-amd64` self-extracting bundle from the
+same release** (server + SAP NW RFC SDK libs + ICU + DuckDB). On start the bundle's
+launcher extracts to a temp dir and sets its own loader path — so the image needs
+no `LD_LIBRARY_PATH`, and what you `docker pull` is the same artifact you'd download.
+CI smoke-tests the built image (`docker run --rm … --smoke`) before pushing. It runs
+as a non-root user (`uid 10001`) and stores its DuckDB file on a `/data` volume.
+
+> The launcher self-extracts to `$TMPDIR` (default `/tmp`) on first run. If you run
+> with a read-only root filesystem, mount a writable `emptyDir` at `/tmp`.
 
 ## Quick start
 
