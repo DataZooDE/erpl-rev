@@ -5,11 +5,20 @@
 #include "sxml_binary.hpp"
 
 #include <atomic>
+#include <filesystem>
 #include <string>
 #include <thread>
 #include <vector>
 
 using namespace erpl_rev;
+
+// Portable temp path: under the OS temp dir, with forward slashes. DuckDB accepts
+// '/' on every platform (and it sidesteps backslash escaping in SQL literals);
+// std::remove accepts it too. Replaces hardcoded "/tmp/…" so the tests run on
+// Windows as well as Linux/macOS.
+static std::string TmpPath(const std::string &name) {
+    return (std::filesystem::temp_directory_path() / name).generic_string();
+}
 
 // Absolute path to the sample parquet, injected by CMake (ERPL_REV_DATA_DIR),
 // so the test is independent of the working directory it's launched from.
@@ -79,7 +88,7 @@ TEST_CASE("Ingest INSERT writes rows and parquet", "[bridge][ingest]") {
     DuckDbBridge db;
     db.Execute("CREATE TABLE sales(id INTEGER PRIMARY KEY, region VARCHAR, amount DOUBLE)");
 
-    std::string out = "/tmp/erpl_rev_test_insert.parquet";
+    std::string out = TmpPath("erpl_rev_test_insert.parquet");
     auto n = db.Ingest("sales",
                        R"([{"id":1,"region":"EU","amount":10.0},
                            {"id":2,"region":"US","amount":20.5}])",
@@ -166,13 +175,13 @@ TEST_CASE("Publish: local table -> parquet (single file + partitioned)", "[bridg
     DuckDbBridge db;
     db.Execute("CREATE TABLE holding AS SELECT i AS id, 'v'||(i%3) AS grp FROM range(1000) t(i)");
 
-    const std::string file = "/tmp/erpl_pub_single.parquet";
+    const std::string file = TmpPath("erpl_pub_single.parquet");
     db.Execute("COPY (SELECT * FROM holding) TO '" + file + "' (FORMAT parquet)");
     REQUIRE(db.Query("SELECT count(*) AS c FROM read_parquet('" + file + "')").rows[0]
             == R"({"c":1000})");
 
     // partitioned dataset: a directory of grp=… parts, re-readable as one relation.
-    const std::string dir = "/tmp/erpl_pub_ds";
+    const std::string dir = TmpPath("erpl_pub_ds");
     db.Execute("COPY (SELECT * FROM holding) TO '" + dir +
                "' (FORMAT parquet, PARTITION_BY (grp), OVERWRITE_OR_IGNORE 1)");
     REQUIRE(db.Query("SELECT count(*) AS c FROM read_parquet('" + dir +
@@ -184,7 +193,7 @@ TEST_CASE("Publish: local table -> parquet (single file + partitioned)", "[bridg
 TEST_CASE("Publish: local table -> attached catalog (CTAS)", "[bridge][publish][attach]") {
     // A second DuckDB file is a faithful proxy for postgres/ducklake/bigquery: the
     // CREATE TABLE <cat>.<schema>.<tbl> AS SELECT path is identical across catalogs.
-    const std::string ext = "/tmp/erpl_pub_ext.duckdb";
+    const std::string ext = TmpPath("erpl_pub_ext.duckdb");
     std::remove(ext.c_str()); std::remove((ext + ".wal").c_str());
     DuckDbBridge db("", "ATTACH '" + ext + "' AS extdb;");   // boot-time ATTACH, as in production
     db.Execute("CREATE TABLE holding AS SELECT i AS id, i*2 AS dbl FROM range(500) t(i)");
@@ -203,8 +212,8 @@ TEST_CASE("Publish: DuckLake catalog if the extension is available", "[bridge][p
     // DuckLake is the most write-complete lakehouse target. The extension may be
     // absent offline — SKIP loudly rather than fail.
     std::unique_ptr<DuckDbBridge> db;
-    const std::string meta = "/tmp/erpl_pub_lake.ducklake";
-    const std::string data = "/tmp/erpl_pub_lake_files";
+    const std::string meta = TmpPath("erpl_pub_lake.ducklake");
+    const std::string data = TmpPath("erpl_pub_lake_files");
     std::remove(meta.c_str());
     try {
         db = std::make_unique<DuckDbBridge>(
@@ -812,7 +821,7 @@ TEST_CASE("CDC state: position is monotonic", "[bridge][cdc][state]") {
 }
 
 TEST_CASE("CDC state: survives a restart (file-backed)", "[bridge][cdc][state]") {
-    const std::string path = "/tmp/erpl_cdc_state_test.duckdb";
+    const std::string path = TmpPath("erpl_cdc_state_test.duckdb");
     std::remove(path.c_str());
     std::remove((path + ".wal").c_str());
     {
