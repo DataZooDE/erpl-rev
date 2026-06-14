@@ -53,13 +53,10 @@ jobs:
         run: make test
 
   build-windows:
-    # MSVC-only catch: the release Windows bundle is built only on tags, so a
-    # Windows-only COMPILE break (e.g. POSIX setenv in a test) used to slip
-    # through to the release. Compile the same x64-windows-static-md
-    # configuration (server + launcher + tests) here on every push/PR so such
-    # breaks fail fast. Tests are *run* on Linux only — a few cases hardcode
-    # POSIX /tmp paths and aren't Windows-portable yet (separate follow-up).
-    name: Compile (Windows)
+    # The release Windows bundle is built only on tags, so Windows-only breaks
+    # used to slip to the release. Build the same x64-windows-static-md config
+    # (server + launcher + tests) AND run the suite here on every push/PR.
+    name: Build server + run tests (Windows)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -98,3 +95,9 @@ jobs:
             -DDUCKDB_VERSION="$env:DUCKDB_VERSION" `
             -DDUCKDB_DIST="$PWD/vendor/duckdb-$env:DUCKDB_VERSION"
           cmake --build build --config Release
+
+      - name: Run tests
+        run: |
+          # The test exe needs duckdb.dll on PATH (it doesn't link the SAP libs).
+          $env:PATH = "$PWD\vendor\duckdb-$env:DUCKDB_VERSION;$env:PATH"
+          .\build\Release\erpl_rev_tests.exe
