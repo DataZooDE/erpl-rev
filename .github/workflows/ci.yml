@@ -54,10 +54,12 @@ jobs:
 
   build-windows:
     # MSVC-only catch: the release Windows bundle is built only on tags, so a
-    # Windows-only compile break (e.g. POSIX setenv in a test) used to slip
-    # through to the release. Build + test the same x64-windows-static-md
-    # configuration here on every push/PR.
-    name: Build server + run tests (Windows)
+    # Windows-only COMPILE break (e.g. POSIX setenv in a test) used to slip
+    # through to the release. Compile the same x64-windows-static-md
+    # configuration (server + launcher + tests) here on every push/PR so such
+    # breaks fail fast. Tests are *run* on Linux only — a few cases hardcode
+    # POSIX /tmp paths and aren't Windows-portable yet (separate follow-up).
+    name: Compile (Windows)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -88,16 +90,11 @@ jobs:
       - name: Build (server + launcher + tests)
         run: |
           # x64-windows-static-md mirrors the release build (static OpenSSL, dynamic
-          # CRT to match the prebuilt DuckDB DLL). Builds all targets incl. tests.
+          # CRT to match the prebuilt DuckDB DLL). Builds all targets incl. tests, so
+          # an MSVC-only compile error fails here instead of at release time.
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
             -DDUCKDB_VERSION="$env:DUCKDB_VERSION" `
             -DDUCKDB_DIST="$PWD/vendor/duckdb-$env:DUCKDB_VERSION"
           cmake --build build --config Release
-
-      - name: Run tests
-        run: |
-          # The test exe needs duckdb.dll on PATH (it doesn't link the SAP libs).
-          $env:PATH = "$PWD\vendor\duckdb-$env:DUCKDB_VERSION;$env:PATH"
-          .\build\Release\erpl_rev_tests.exe
