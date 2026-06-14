@@ -6,6 +6,17 @@
 #include <memory>
 #include <string>
 
+// MSVC has no POSIX setenv/unsetenv — provide portable shims (via _putenv_s) so the
+// env-guard cases below build on Windows as well as Linux/macOS.
+#ifdef _WIN32
+static int setenv(const char *name, const char *value, int /*overwrite*/) {
+    return _putenv_s(name, value);
+}
+static int unsetenv(const char *name) {
+    return _putenv_s(name, "");   // empty value removes the variable on Windows
+}
+#endif
+
 namespace {
 
 // RAII helper to set/restore an env var so cases don't leak global state.
