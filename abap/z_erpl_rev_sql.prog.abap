@@ -345,24 +345,17 @@ FORM load_demo USING iv_key TYPE c.
         ( |ORDER BY min(d);| ) ).
     WHEN '02'.   " NYC taxi over MANY public Parquet files (httpfs, needs internet egress)
       gt_sql = VALUE #(
-        ( |-- 40M+ NYC taxi trips across ALL 12 monthly Parquet files of 2024 - no download.| )
-        ( |-- read_parquet takes the whole LIST of remote files and scans them in parallel:| )
-        ( |-- union_by_name aligns the per-file schemas, filename tags each row's source file.| )
-        ( |-- (DuckDB auto-loads httpfs; files are the official NYC TLC open dataset.)| )
-        ( |SET http_retries = 8;| )
-        ( |SELECT| )
-        ( |    filename[-15:-9]             AS month,| )
-        ( |    count(*)                     AS trips,| )
-        ( |    round(avg(trip_distance), 2) AS avg_miles,| )
-        ( |    round(avg(fare_amount), 2)   AS avg_fare,| )
-        ( |    round(avg(tip_amount), 2)    AS avg_tip| )
+        ( |-- 40M+ NYC taxi trips across ALL 12 monthly Parquet files of 2024.| )
+        ( |-- read_parquet takes the whole LIST of remote files; union_by_name aligns| )
+        ( |-- the per-file schemas. count(*) is answered from Parquet METADATA - no row| )
+        ( |-- scan, no download - so it returns in seconds (a full aggregate over 40M| )
+        ( |-- remote rows would block the GUI for minutes; keep heavy scans out of the| )
+        ( |-- synchronous console). DuckDB auto-loads httpfs; files are the NYC TLC dataset.| )
+        ( |SELECT count(*) AS trips_2024| )
         ( |FROM read_parquet(| )
         ( |    list_transform(range(1, 13),| )
         ( |        lambda m: printf('https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-%02d.parquet', m)),| )
-        ( |    union_by_name = true, filename = true)| )
-        ( |WHERE fare_amount > 0| )
-        ( |GROUP BY ALL| )
-        ( |ORDER BY month;| ) ).
+        ( |    union_by_name = true);| ) ).
     WHEN '03'.   " MotherDuck shared sample_data — SUMMARIZE (schema-agnostic)
       gt_sql = VALUE #(
         ( |-- MotherDuck: every account has a shared read-only 'sample_data' database.| )

@@ -122,6 +122,11 @@ void InstallHandlers(const std::string &db_path, const std::string &init_sql) {
                       {"db", db_path.empty() ? ":memory:" : db_path}});
 }
 
+void ShutdownHandlers() {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    g_bridge.reset();   // close DuckDB + attached catalogs while the runtime is alive
+}
+
 std::string StartQuackServer(const std::string &listen, bool allow_other_host,
                              const std::string &token) {
     std::lock_guard<std::mutex> lk(g_mtx);

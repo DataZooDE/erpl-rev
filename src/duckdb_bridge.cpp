@@ -185,6 +185,20 @@ DuckDbBridge::DuckDbBridge(const std::string &path, const std::string &init_sql)
     auto r = con.Query("SET GLOBAL preserve_insertion_order=false");
     if (r->HasError())
         throw std::runtime_error("DuckDB config failed: " + r->GetError());
+
+    // Remote (httpfs) reads of MANY files — e.g. a SQL-console read_parquet over a
+    // long list like the 12/72-month NYC-taxi example — otherwise open a fresh TLS
+    // connection per range request. With default httpfs_connection_caching=false
+    // that is a handshake storm that, compounded by retries/CloudFront throttling,
+    // hangs the server (and the synchronous SAP GUI) for minutes even though the
+    // duckdb CLI runs the same query in seconds. Cache remote file metadata and
+    // REUSE HTTP connections so multi-file remote reads stay fast.
+    con.Query("SET GLOBAL enable_http_metadata_cache=true");   // core setting; offline-safe
+    // httpfs_connection_caching only exists once httpfs is loaded. Load it from the
+    // local extension cache (no INSTALL => no network, so an air-gapped boot just
+    // skips this); a later remote query auto-loads it anyway.
+    if (!con.Query("LOAD httpfs")->HasError())
+        con.Query("SET GLOBAL httpfs_connection_caching=true");
     // Delta registry + runtime state — created once, always (independent of the
     // optional boot init_sql). Both the per-target config and the watermark/lease
     // state for incremental extraction live here; ABAP reads/writes it through
