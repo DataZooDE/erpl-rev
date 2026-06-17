@@ -11,8 +11,8 @@ Type=simple
 User=erpl
 Group=erpl
 
-# NW RFC SDK (libsapnwrfc/ICU) + vendored DuckDB 1.5.3 must be on the library path
-Environment=LD_LIBRARY_PATH=/opt/nwrfcsdk/lib:/opt/erpl/duckdb-1.5.3
+# NW RFC SDK (libsapnwrfc/ICU) + vendored DuckDB 1.5.4 must be on the library path
+Environment=LD_LIBRARY_PATH=/opt/nwrfcsdk/lib:/opt/erpl/duckdb-1.5.4
 
 # Gateway / registration (match the reginfo allow-list)
 Environment=ERPL_REV_PROGRAM_ID=ERPL_REV

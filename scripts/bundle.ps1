@@ -6,7 +6,7 @@ param(
   [Parameter(Mandatory)][string]$Server,    # build\erpl_rev_server.exe
   [Parameter(Mandatory)][string]$Launcher,  # build\erpl_rev_launch.exe
   [Parameter(Mandatory)][string]$SdkLib,    # nwrfcsdk\win\lib
-  [Parameter(Mandatory)][string]$DuckdbDir, # vendor\duckdb-1.5.3
+  [Parameter(Mandatory)][string]$DuckdbDir, # vendor\duckdb-1.5.4
   [Parameter(Mandatory)][string]$Out        # dist\erpl-rev-windows-amd64.exe
 )
 $ErrorActionPreference = 'Stop'

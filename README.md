@@ -153,7 +153,7 @@ as `erpl`). Download it from the SAP Software Center, or copy it from an `erpl`
 checkout. DuckDB is fetched as an official prebuilt:
 ```bash
 cp -a /path/to/nwrfcsdk ./nwrfcsdk     # provides nwrfcsdk/linux/{include,lib}
-make duckdb-dist                       # fetch prebuilt libduckdb 1.5.3 into vendor/
+make duckdb-dist                       # fetch prebuilt libduckdb 1.5.4 into vendor/
 ```
 
 ### 2. Build & test
@@ -177,7 +177,7 @@ just `./erpl-rev-linux-amd64` with the `ERPL_REV_*` env below; the bundle
 self-extracts and sets its own loader path. The `LD_LIBRARY_PATH` line is **only**
 for the from-source `build/erpl_rev_server`, whose libs live elsewhere in the tree:
 ```bash
-export LD_LIBRARY_PATH=$PWD/nwrfcsdk/linux/lib:$PWD/vendor/duckdb-1.5.3
+export LD_LIBRARY_PATH=$PWD/nwrfcsdk/linux/lib:$PWD/vendor/duckdb-1.5.4
 ERPL_REV_GWHOST=<gateway-host> ERPL_REV_GWSERV=sapgw00 \
 ERPL_REV_DB_PATH=erpl-rev.duckdb \
   ./build/erpl_rev_server            # add --quack for the network server
@@ -273,7 +273,7 @@ ABAP ──CALL FUNCTION 'Z_DUCKDB_QUERY'/'Z_DUCKDB_INGEST' DESTINATION 'ERPL_RE
 A registered RFC server (`RfcCreateServer`/`RfcLaunchServer`) hosts a handful of
 function modules whose payloads are **JSON / binary-sXML over scalar `STRING`
 params** — schema-generic, so no custom DDIC structures. It links the official
-prebuilt **DuckDB 1.5.3** (`libduckdb.so`, parquet+json+quack built in); our code
+prebuilt **DuckDB 1.5.4** (`libduckdb.so`, parquet+json+quack built in); our code
 plus libstdc++/libgcc are static, leaving only `libduckdb.so` and the SAP `.so`
 trio dynamic.
 

@@ -1043,3 +1043,67 @@ TEST_CASE("IngestBxml UPSERT: exact A4H delta shape (client PK + DECIMAL ts)", "
     REQUIRE(db.Query("SELECT client AS c FROM mt2 WHERE id='0000000001'").rows[0] == R"({"c":"001"})");
     REQUIRE(db.Query("SELECT count(*) AS c FROM mt2 WHERE client IS NULL").rows[0] == R"({"c":0})");
 }
+
+// Regression for the DuckDB 1.5.3 ON CONFLICT key-NULL bug (fixed in 1.5.4, #22825):
+// a conflict-resolving write whose source carries SAP's UPPERCASE column names used
+// to mis-map the arbiter and NULL the (NOT NULL) leading key column. The native
+// MERGE INTO apply must UPDATE the matched row in place, leaving the key intact.
+TEST_CASE("IngestBxml UPSERT: uppercase leading-key column survives a conflicting update",
+          "[bridge][ingest][upsert][regression]") {
+    DuckDbBridge db;
+    std::string ddl = "CREATE TABLE IF NOT EXISTS mk(id INTEGER PRIMARY KEY, v VARCHAR);";
+    sxml::Table s; s.columns = {"ID","V"}; s.rows = {{"1","a"},{"2","b"}};
+    db.IngestBxml("mk", sxml::Encode("DATA", s), IngestMode::Upsert, {"id"}, "", "SET threads TO 1;", ddl);
+    // Upsert that UPDATES the existing key id=1 (the conflict path) and inserts id=3.
+    sxml::Table u; u.columns = {"ID","V"}; u.rows = {{"1","A"},{"3","c"}};
+    db.IngestBxml("mk", sxml::Encode("DATA", u), IngestMode::Upsert, {"id"}, "", "", ddl);
+    REQUIRE(db.Query("SELECT count(*) AS c FROM mk").rows[0] == R"({"c":3})");
+    REQUIRE(db.Query("SELECT v FROM mk WHERE id=1").rows[0] == R"({"v":"A"})");      // updated, not NULLed
+    REQUIRE(db.Query("SELECT count(*) AS c FROM mk WHERE id IS NULL").rows[0] == R"({"c":0})");
+}
+
+// Edge cases for the native MERGE INTO apply (replacing the old DELETE+INSERT).
+TEST_CASE("IngestBxml MERGE: delete-miss is a no-op, update-miss inserts, insert-hit replaces",
+          "[bridge][ingest][merge][edge]") {
+    DuckDbBridge db;
+    std::string ddl = "CREATE TABLE IF NOT EXISTS e1(id INTEGER PRIMARY KEY, v VARCHAR);";
+    sxml::Table s; s.columns = {"ID","V"}; s.rows = {{"1","a"},{"2","b"}};
+    db.IngestBxml("e1", sxml::Encode("DATA", s), IngestMode::Upsert, {"id"}, "", "SET threads TO 1;", ddl);
+    // D on missing key 9 (no-op), U on missing key 3 (insert), I on existing key 1 (replace).
+    sxml::Table d; d.columns = {"ID","V","OP"};
+    d.rows = {{"9","","D"},{"3","c","U"},{"1","A","I"}};
+    db.IngestBxml("e1", sxml::Encode("DATA", d), IngestMode::Merge, {"id"}, "", "", "", "OP");
+    REQUIRE(db.Query("SELECT count(*) AS c FROM e1").rows[0] == R"({"c":3})");      // 1,2,3
+    REQUIRE(db.Query("SELECT v FROM e1 WHERE id=1").rows[0] == R"({"v":"A"})");     // I replaced
+    REQUIRE(db.Query("SELECT v FROM e1 WHERE id=3").rows[0] == R"({"v":"c"})");     // U inserted
+}
+
+TEST_CASE("SnapshotMerge: empty staging deletes all; fresh target inserts all",
+          "[bridge][snapshot][edge]") {
+    DuckDbBridge db;
+    db.Execute("CREATE TABLE es(id INTEGER PRIMARY KEY, v VARCHAR)");
+    db.Execute("INSERT INTO es VALUES (1,'a'),(2,'b')");
+    db.Execute("CREATE TABLE es__snap(id INTEGER PRIMARY KEY, v VARCHAR)");   // empty snapshot
+    auto r1 = db.SnapshotMerge("es", "es__snap", {"id"});
+    REQUIRE(r1.del == 2); REQUIRE(r1.ins == 0); REQUIRE(r1.upd == 0);
+    REQUIRE(db.Query("SELECT count(*) AS c FROM es").rows[0] == R"({"c":0})");
+    // now a snapshot that adds two fresh rows
+    db.Execute("CREATE TABLE es__snap(id INTEGER PRIMARY KEY, v VARCHAR)");
+    db.Execute("INSERT INTO es__snap VALUES (5,'e'),(6,'f')");
+    auto r2 = db.SnapshotMerge("es", "es__snap", {"id"});
+    REQUIRE(r2.ins == 2); REQUIRE(r2.del == 0);
+    REQUIRE(db.Query("SELECT count(*) AS c FROM es").rows[0] == R"({"c":2})");
+}
+
+TEST_CASE("SnapshotMerge: all-key table (no non-key columns to update)",
+          "[bridge][snapshot][edge]") {
+    DuckDbBridge db;
+    db.Execute("CREATE TABLE ek(a INTEGER, b INTEGER, PRIMARY KEY(a,b))");
+    db.Execute("INSERT INTO ek VALUES (1,1),(2,2)");
+    db.Execute("CREATE TABLE ek__snap(a INTEGER, b INTEGER, PRIMARY KEY(a,b))");
+    db.Execute("INSERT INTO ek__snap VALUES (2,2),(3,3)");   // keep (2,2), add (3,3), drop (1,1)
+    auto r = db.SnapshotMerge("ek", "ek__snap", {"a","b"});
+    REQUIRE(r.ins == 1); REQUIRE(r.del == 1); REQUIRE(r.upd == 1);
+    REQUIRE(db.Query("SELECT count(*) AS c FROM ek").rows[0] == R"({"c":2})");
+    REQUIRE(db.Query("SELECT count(*) AS c FROM ek WHERE a=3 AND b=3").rows[0] == R"({"c":1})");
+}

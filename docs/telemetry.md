@@ -25,7 +25,7 @@ Each event carries only these properties:
 | `app_name` | `erpl-rev` | constant, identifies the product |
 | `app_version` | `2026.06.13` | release version (git tag, without the leading `v`) |
 | `platform` | `linux_amd64` | OS/arch, detected at compile time |
-| `duckdb_version` | `1.5.3` | bundled DuckDB engine version |
+| `duckdb_version` | `1.5.4` | bundled DuckDB engine version |
 | `distinct_id` | *(hash)* | anonymous, stable SHA-256 of the machine id |
 
 **Nothing else.** Explicitly **never** sent: SAP system data, connection

@@ -60,15 +60,16 @@ find_package(Threads REQUIRED)
 # --- Telemetry: DataZooDE/posthog-telemetry submodule ------------------------
 # The shared lib needs DuckDB's patched httplib header (third_party/httplib) plus
 # DuckDB's source includes, which the prebuilt DUCKDB_DIST (amalgamation only)
-# does not ship. Fetch the matching DuckDB v1.5.3 SOURCE (headers only) and hand
+# does not ship. Fetch the matching DuckDB v1.5.4 SOURCE (headers only) and hand
 # the submodule the two paths it expects — mirroring flapi's "Expose DuckDB
-# paths" block. OpenSSL is linked statically via the vcpkg static triplet, so the
+# paths" block. Fetch the matching DuckDB v1.5.4 SOURCE (headers only).
+# OpenSSL is linked statically via the vcpkg static triplet, so the
 # single-file bundle gains no new runtime .so/.dylib/.dll.
 find_package(OpenSSL REQUIRED)
 
 # Must match the prebuilt DUCKDB_DIST engine (Makefile passes the same value).
 if(NOT DEFINED DUCKDB_VERSION OR DUCKDB_VERSION STREQUAL "")
-  set(DUCKDB_VERSION "1.5.3")
+  set(DUCKDB_VERSION "1.5.4")
 endif()
 
 include(FetchContent)
