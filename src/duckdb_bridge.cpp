@@ -676,53 +676,62 @@ long long DuckDbBridge::IngestBxml(const std::string &target,
         if (!collist.empty()) collist += ",";
         collist += LowerName(tbl.columns[i]);
     }
-    // Apply mode. Upsert/Merge with keys apply as DELETE-then-INSERT, NOT
-    // `INSERT … ON CONFLICT DO UPDATE`. With DuckDB 1.5.3 a conflict-resolving
-    // INSERT (`ON CONFLICT` and `INSERT OR REPLACE` alike) whose source is the
-    // Appender-populated staging in the SAME connection NULLs the leading key
-    // column of the proposed row → "NOT NULL constraint failed". This was isolated
-    // to the in-connection Appender source (a plain INSERT from the same staging is
-    // fine; ON CONFLICT against a separate, committed table read on another
-    // connection — as SnapshotMerge does — is also fine; materialising the staging
-    // first does NOT help). DELETE the incoming keys then a plain INSERT is the same
-    // full-row-replace end state and dodges the engine bug; in DuckDB an UPDATE is
-    // itself a delete+insert (MVCC), and a delta package only carries CHANGED rows,
-    // so there is no extra write cost. (See test/test_duckdb_bridge.cpp merge cases.)
+    // Apply mode. Upsert/Merge with keys apply as one native, atomic `MERGE INTO`.
+    // (DuckDB 1.5.4 fixes the bug that previously forced a DELETE-then-INSERT
+    // workaround: #22825 made the INSERT…SELECT ON CONFLICT column match
+    // case-insensitive — our staging clone carries SAP's UPPERCASE names, so a
+    // conflict-resolving write used to mis-map the arbiter and NULL the key — and
+    // #23014 hardened MERGE INTO WHEN NOT MATCHED binding.) The source projection
+    // casts the VARCHAR/BLOB staging cells to the target types, so the ON keys are
+    // type-compatible and a bad cast aborts the single statement, leaving the target
+    // unchanged. (See test/test_duckdb_bridge.cpp merge cases.)
     const bool upsert = (mode == IngestMode::Upsert || mode == IngestMode::Merge) &&
                         !key_cols.empty();
-    std::string sel = "SELECT " + proj + " FROM " + stg;
-    if (merge) sel += " WHERE lower(" + opl + ") IN ('i','u')";   // exclude deletes from the insert
-    const std::string ins = "INSERT INTO " + target + " (" + collist + ") " + sel;
 
     if (upsert) {
-        // Key tuple + staging key projection (cast VARCHAR staging keys to the target
-        // key types so the `(keys) IN (SELECT keys …)` comparison is type-compatible).
-        std::string keytuple, keysel;
+        auto is_key = [&](const std::string &cn) {
+            for (auto &k : key_cols) if (LowerName(k) == cn) return true;
+            return false;
+        };
+        // ON predicate over the keys; SET list + INSERT value list over the non-key
+        // (and non-op) columns. Keys are never updated.
+        std::string on, setlist, svals;
         for (size_t i = 0; i < key_cols.size(); i++) {
+            if (i) on += " AND ";
             const std::string k = LowerName(key_cols[i]);
-            if (i) { keytuple += ","; keysel += ","; }
-            keytuple += k;
-            auto it = tcol.find(k);
-            const bool textual = it == tcol.end() ||
-                                 it->second.id() == duckdb::LogicalTypeId::VARCHAR ||
-                                 it->second.id() == duckdb::LogicalTypeId::BLOB;
-            keysel += textual ? k : (k + "::" + it->second.ToString());
+            on += "t." + k + " = s." + k;
         }
-        // Delete every incoming key (I/U rows are replaced, D rows are removed), then
-        // insert the I/U rows — atomically, so a bad cast rolls back the whole package.
-        const std::string del = "DELETE FROM " + target + " WHERE (" + keytuple + ") IN (SELECT " +
-                                keysel + " FROM " + stg + ")";
-        Exec(con, "BEGIN");
-        try {
-            Exec(con, del);
-            Exec(con, ins);
-            Exec(con, "COMMIT");
-        } catch (...) {
-            Exec(con, "ROLLBACK");
-            throw;
+        for (size_t i = 0; i < tbl.columns.size(); i++) {
+            if (is_op(tbl.columns[i])) continue;
+            const std::string cn = LowerName(tbl.columns[i]);
+            if (!svals.empty()) svals += ",";
+            svals += "s." + cn;
+            if (is_key(cn)) continue;
+            if (!setlist.empty()) setlist += ",";
+            setlist += cn + "=s." + cn;
         }
+        // Source: the cast projection, plus the op control column for delta MERGE.
+        std::string src = "SELECT " + proj;
+        if (merge) src += ", " + opl;
+        src += " FROM " + stg;
+
+        std::string m = "MERGE INTO " + target + " AS t USING (" + src + ") AS s ON " + on;
+        if (merge) {
+            // op_col (I/U/D) drives the action: delete D rows, upsert I/U rows.
+            m += " WHEN MATCHED AND lower(s." + opl + ") = 'd' THEN DELETE";
+            if (!setlist.empty())
+                m += " WHEN MATCHED AND lower(s." + opl + ") IN ('i','u') THEN UPDATE SET " + setlist;
+            m += " WHEN NOT MATCHED AND lower(s." + opl + ") IN ('i','u') THEN INSERT (" +
+                 collist + ") VALUES (" + svals + ")";
+        } else {
+            if (!setlist.empty()) m += " WHEN MATCHED THEN UPDATE SET " + setlist;
+            m += " WHEN NOT MATCHED THEN INSERT (" + collist + ") VALUES (" + svals + ")";
+        }
+        Exec(con, m);
     } else {
-        Exec(con, ins);
+        std::string sel = "SELECT " + proj + " FROM " + stg;
+        if (merge) sel += " WHERE lower(" + opl + ") IN ('i','u')";   // exclude deletes
+        Exec(con, "INSERT INTO " + target + " (" + collist + ") " + sel);
     }
 
     if (!parquet_out.empty())
@@ -776,29 +785,29 @@ SnapshotResult DuckDbBridge::SnapshotMerge(const std::string &target,
         res.del = cr->GetValue(2, 0).GetValue<int64_t>();
     }
 
-    // Upsert all of staging + delete target keys absent from staging + drop the
-    // staging table, atomically. (HLD §4.3.)
-    std::string upsert = "INSERT INTO " + target + " SELECT * FROM " + staging + " ON CONFLICT (";
-    for (size_t i = 0; i < keys.size(); i++) { if (i) upsert += ","; upsert += LowerName(keys[i]); }
-    upsert += ")";
-    {
-        std::string set;
-        for (auto &cn : cols) {
-            bool is_key = false;
-            for (auto &k : keys) if (LowerName(k) == cn) { is_key = true; break; }
-            if (is_key) continue;
-            if (!set.empty()) set += ",";
-            set += cn + "=excluded." + cn;
-        }
-        upsert += set.empty() ? " DO NOTHING" : (" DO UPDATE SET " + set);
+    // Reconcile the full snapshot onto the target with one native MERGE INTO:
+    // update matched keys, insert new keys, delete target keys absent from the
+    // snapshot — then drop the staging table, atomically. (HLD §4.3.)
+    std::string setlist, collist, svals;
+    for (auto &cn : cols) {
+        if (!collist.empty()) { collist += ","; svals += ","; }
+        collist += cn;
+        svals += "s." + cn;
+        bool is_key = false;
+        for (auto &k : keys) if (LowerName(k) == cn) { is_key = true; break; }
+        if (is_key) continue;
+        if (!setlist.empty()) setlist += ",";
+        setlist += cn + "=s." + cn;
     }
-    const std::string del = "DELETE FROM " + target + " t WHERE NOT EXISTS "
-                            "(SELECT 1 FROM " + staging + " s WHERE " + key_join("t", "s") + ")";
+    std::string m = "MERGE INTO " + target + " AS t USING " + staging + " AS s ON " +
+                    key_join("t", "s");
+    if (!setlist.empty()) m += " WHEN MATCHED THEN UPDATE SET " + setlist;   // no-op if all-key
+    m += " WHEN NOT MATCHED THEN INSERT (" + collist + ") VALUES (" + svals + ")";
+    m += " WHEN NOT MATCHED BY SOURCE THEN DELETE";
 
     Exec(con, "BEGIN");
     try {
-        Exec(con, upsert);
-        Exec(con, del);
+        Exec(con, m);
         Exec(con, "DROP TABLE " + staging);
         Exec(con, "COMMIT");
     } catch (...) {

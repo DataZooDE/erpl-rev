@@ -6,7 +6,7 @@ Two parts: (1) import the **ABAP transport** into the SAP system, (2) install th
 ## 0. Prerequisites
 - SAP NetWeaver AS ABAP **7.40 SP05+** (tested on A4H / ABAP 7.5x).
 - A host for the external server (Linux) with: the **SAP NW RFC SDK** (`libsapnwrfc.so`
-  trio + ICU), the vendored **DuckDB 1.5.3** libs, network access to the SAP **gateway**
+  trio + ICU), the vendored **DuckDB 1.5.4** libs, network access to the SAP **gateway**
   (`sapgw<nr>`, default port 33<nr>).
 - Transport import authority (Basis) and a dedicated RFC user (see security.md §4).
 
@@ -41,7 +41,7 @@ the same path the Theobald transports document.)
 ## 3. Install + start the external server
 ```
 # on the server host (as the service account)
-export LD_LIBRARY_PATH=$NWRFC/lib:/path/to/duckdb-1.5.3
+export LD_LIBRARY_PATH=$NWRFC/lib:/path/to/duckdb-1.5.4
 export ERPL_REV_GWHOST=<gateway-host> ERPL_REV_GWSERV=sapgw<nr>
 export ERPL_REV_PROGRAM_ID=ERPL_REV ERPL_REV_DB_PATH=/var/lib/erpl/erpl.duckdb
 # external publish targets (optional): ATTACH/secrets in an init file (chmod 600)

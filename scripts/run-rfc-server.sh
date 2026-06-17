@@ -77,7 +77,7 @@ else
 fi
 
 # --- run --------------------------------------------------------------------
-export LD_LIBRARY_PATH="$HERE/nwrfcsdk/linux/lib:$HERE/vendor/duckdb-1.5.3${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$HERE/nwrfcsdk/linux/lib:$HERE/vendor/duckdb-1.5.4${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export ERPL_REV_PROGRAM_ID ERPL_REV_GWHOST ERPL_REV_GWSERV
 
 echo "erpl-rev: program_id=$ERPL_REV_PROGRAM_ID gw=$ERPL_REV_GWHOST:$ERPL_REV_GWSERV db=$ERPL_REV_DB_PATH"
