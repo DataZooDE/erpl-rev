@@ -129,7 +129,8 @@ void PrintHelp() {
         "  ERPL_REV_LOG_FORMAT    console|json                (default console)\n"
         "  ERPL_REV_LOG_COLOR     auto|always|never           (default auto)\n"
         "  ERPL_REV_NO_TELEMETRY  disable usage telemetry (truthy)\n"
-        "  DATAZOO_DISABLE_TELEMETRY  disable telemetry across all DataZoo tools\n",
+        "  DATAZOO_DISABLE_TELEMETRY  disable telemetry across all DataZoo tools\n"
+        "  ERPL_REV_TELEMETRY_SAMPLE_RATE  sample rfc_call events, 0<r<=1 (default 1)\n",
         stderr);
 }
 
@@ -270,17 +271,28 @@ int mainU(int argc, SAP_UC **argv) {
         init_sql = cli.init_sql;
     }
 
-    // Anonymous usage telemetry (DataZooDE/posthog-telemetry): emit
-    // application_start / application_stop only — never SAP data, query text, or
-    // table/field names. Default-on; opt out via --no-telemetry,
-    // ERPL_REV_NO_TELEMETRY, or DATAZOO_DISABLE_TELEMETRY (the facade also
-    // re-checks the env vars). --help/--smoke return earlier, so they never emit.
-    // app_version drops any leading "v" so PostHog shows e.g. 2026.06.13,
-    // matching flapi's plain-semver app_version values.
+    // Anonymous usage telemetry (DataZooDE/posthog-telemetry, shared schema v2):
+    // this is a long-running server, so install_kind="server" and one
+    // $session_id per uptime. Emits server_started at boot, one rfc_call per
+    // bridge FM invocation, and $exception on failure — NEVER SAP data, SQL
+    // text, table/field names, or error messages. Default-on; a single opt-out
+    // (--no-telemetry, ERPL_REV_NO_TELEMETRY, or DATAZOO_DISABLE_TELEMETRY)
+    // short-circuits everything. --help/--smoke return earlier, so never emit.
+    // app_version drops any leading "v" so PostHog shows e.g. 2026.06.13.
     std::string app_version = ERPL_REV_VERSION;
     if (!app_version.empty() && app_version.front() == 'v') app_version.erase(0, 1);
-    ErplRevTelemetry telemetry;
-    if (cli.no_telemetry) telemetry.setEnabled(false);
+    auto &telemetry = GlobalTelemetry();
+    telemetry.setEnabled(!cli.no_telemetry);
+    {
+        const char *rate_env = std::getenv("ERPL_REV_TELEMETRY_SAMPLE_RATE");
+        if (rate_env && *rate_env) telemetry.setSampling(std::atof(rate_env));
+        const char *edition_env = std::getenv("ERPL_REV_EDITION");
+        const std::string edition = (edition_env && *edition_env) ? edition_env : "oss";
+        telemetry.configureProduct(app_version, edition);
+        telemetry.associateDeployment();
+        if (const char *lic = std::getenv("ERPL_REV_LICENSE_ID"); lic && *lic)
+            telemetry.associateAccount(lic);
+    }
 
     bool quack_running = false;
 
@@ -319,7 +331,10 @@ int mainU(int argc, SAP_UC **argv) {
         log::get().Info("server", "listening (Ctrl-C to stop)",
                         {{"program_id", program_id}, {"gwhost", gwhost}, {"gwserv", gwserv}});
 
-        telemetry.notifyStart(app_version);
+        // Bounded counts/kinds only — never gateway host/service or db path.
+        int reg_count_n = 5;
+        try { reg_count_n = (int)std::stoll(reg_count); } catch (...) {}
+        telemetry.serverStarted(quack_enabled, reg_count_n);
 
         // Optionally expose this same in-process DuckDB to remote DuckDB clients
         // over the network via the quack extension. Treated as best-effort: if it
@@ -354,7 +369,9 @@ int mainU(int argc, SAP_UC **argv) {
                 log::get().Warn("quack", "stop failed", {{"error", e.what()}});
             }
         }
-        telemetry.notifyStop(app_version);
+        // Drain buffered telemetry before exit: the library's at-exit handler
+        // discards in-flight events by design, so a server must flush explicitly.
+        telemetry.flush();
         RfcShutdownServer(server, 5, &info);
         RfcDestroyServer(server, &info);
         // Tear the DuckDB bridge down HERE, while the process runtime is still

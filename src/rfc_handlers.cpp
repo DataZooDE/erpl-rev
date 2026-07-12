@@ -5,7 +5,9 @@
 #include "cdc_dialect.hpp"
 #include "json_util.hpp"
 #include "logging.hpp"
+#include "erpl_rev_telemetry.hpp"
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -17,6 +19,35 @@
 namespace erpl_rev {
 
 namespace {
+
+// RAII telemetry scope for a bridge FM handler. Times the call and, on
+// destruction, emits one `rfc_call` feature with {fm, status, duration_ms}.
+// `fm` is a fixed enum; the SQL/target/handle/error text NEVER leave the box.
+// Call fail(error_class) from the catch block to mark it failed and emit an
+// enumerated $exception. Emits through GlobalTelemetry() because handlers run
+// on SAP SDK worker threads.
+class RfcCallScope {
+public:
+    explicit RfcCallScope(const char *fm)
+        : fm_(fm), t0_(std::chrono::steady_clock::now()) {}
+    ~RfcCallScope() {
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - t0_).count();
+        GlobalTelemetry().rfcCall(fm_, ok_, ms);
+    }
+    RfcCallScope(const RfcCallScope &) = delete;
+    RfcCallScope &operator=(const RfcCallScope &) = delete;
+
+    void fail(const char *error_class) {
+        ok_ = false;
+        GlobalTelemetry().error(error_class, fm_);
+    }
+
+private:
+    const char *fm_;
+    std::chrono::steady_clock::time_point t0_;
+    bool ok_ = true;
+};
 
 // One shared DuckDB for the server lifetime. Query/Ingest/cursor handlers each use
 // their OWN duckdb::Connection (DuckDB allows many concurrent connections on one DB),
@@ -145,6 +176,7 @@ using namespace erpl_rev;
 extern "C" RFC_RC SAP_API ZPingImpl(RFC_CONNECTION_HANDLE,
                                     RFC_FUNCTION_HANDLE funcHandle,
                                     RFC_ERROR_INFO *errorInfo) {
+    RfcCallScope _tc("ping");
     try {
         std::string req = GetChars(funcHandle, "REQUTEXT", 255);
         SetChars(funcHandle, "ECHOTEXT", req);
@@ -152,6 +184,7 @@ extern "C" RFC_RC SAP_API ZPingImpl(RFC_CONNECTION_HANDLE,
         log::get().Info("rfc", "STFC_CONNECTION", {{"req", req}});
         return RFC_OK;
     } catch (const std::exception &e) {
+        _tc.fail("rfc_error");
         log::get().Error("rfc", "STFC_CONNECTION failed", {{"error", e.what()}});
         std::memset(errorInfo, 0, sizeof(*errorInfo));
         errorInfo->code = RFC_EXTERNAL_FAILURE;
@@ -166,6 +199,7 @@ extern "C" RFC_RC SAP_API ZPingImpl(RFC_CONNECTION_HANDLE,
 extern "C" RFC_RC SAP_API ZQueryImpl(RFC_CONNECTION_HANDLE,
                                      RFC_FUNCTION_HANDLE funcHandle,
                                      RFC_ERROR_INFO *) {
+    RfcCallScope _tc("query");
     try {
         std::string sql = GetString(funcHandle, "IV_SQL");
         log::get().Info("rfc", "Z_DUCKDB_QUERY", {{"sql", sql}});
@@ -186,6 +220,7 @@ extern "C" RFC_RC SAP_API ZQueryImpl(RFC_CONNECTION_HANDLE,
                           {"shipped", (long long)qr.rows.size()},
                           {"truncated", qr.truncated ? "true" : "false", false}});
     } catch (const std::exception &e) {
+        _tc.fail("sql_error");
         log::get().Error("rfc", "Z_DUCKDB_QUERY failed", {{"error", e.what()}});
         SetString(funcHandle, "EV_ERROR", e.what());
     }
@@ -195,6 +230,7 @@ extern "C" RFC_RC SAP_API ZQueryImpl(RFC_CONNECTION_HANDLE,
 extern "C" RFC_RC SAP_API ZIngestImpl(RFC_CONNECTION_HANDLE,
                                       RFC_FUNCTION_HANDLE funcHandle,
                                       RFC_ERROR_INFO *) {
+    RfcCallScope _tc("ingest");
     try {
         std::string target  = GetString(funcHandle, "IV_TARGET");
         std::string mode    = GetString(funcHandle, "IV_MODE");
@@ -230,6 +266,7 @@ extern "C" RFC_RC SAP_API ZIngestImpl(RFC_CONNECTION_HANDLE,
         SetString(funcHandle, "EV_ERROR", "");
         log::get().Debug("rfc", "Z_DUCKDB_INGEST ok", {{"rows_affected", n}});
     } catch (const std::exception &e) {
+        _tc.fail("ingest_error");
         log::get().Error("rfc", "Z_DUCKDB_INGEST failed", {{"error", e.what()}});
         SetString(funcHandle, "EV_ERROR", e.what());
     }
@@ -242,6 +279,7 @@ extern "C" RFC_RC SAP_API ZIngestImpl(RFC_CONNECTION_HANDLE,
 extern "C" RFC_RC SAP_API ZSnapshotMergeImpl(RFC_CONNECTION_HANDLE,
                                              RFC_FUNCTION_HANDLE funcHandle,
                                              RFC_ERROR_INFO *) {
+    RfcCallScope _tc("snapshot_merge");
     try {
         std::string target  = GetString(funcHandle, "IV_TARGET");
         std::string staging = GetString(funcHandle, "IV_STAGING");
@@ -257,6 +295,7 @@ extern "C" RFC_RC SAP_API ZSnapshotMergeImpl(RFC_CONNECTION_HANDLE,
         log::get().Debug("rfc", "Z_DUCKDB_SNAPSHOT_MERGE ok",
                          {{"ins", r.ins}, {"upd", r.upd}, {"del", r.del}});
     } catch (const std::exception &e) {
+        _tc.fail("sql_error");
         log::get().Error("rfc", "Z_DUCKDB_SNAPSHOT_MERGE failed", {{"error", e.what()}});
         SetString(funcHandle, "EV_ERROR", e.what());
     }
@@ -271,6 +310,7 @@ extern "C" RFC_RC SAP_API ZSnapshotMergeImpl(RFC_CONNECTION_HANDLE,
 extern "C" RFC_RC SAP_API ZCdcPlanImpl(RFC_CONNECTION_HANDLE,
                                        RFC_FUNCTION_HANDLE funcHandle,
                                        RFC_ERROR_INFO *) {
+    RfcCallScope _tc("cdc_plan");
     try {
         std::string target   = GetString(funcHandle, "IV_TARGET");
         std::string source   = GetString(funcHandle, "IV_SOURCE");
@@ -334,6 +374,7 @@ extern "C" RFC_RC SAP_API ZCdcPlanImpl(RFC_CONNECTION_HANDLE,
         SetString(funcHandle, "EV_PLAN", js);
         SetString(funcHandle, "EV_ERROR", "");
     } catch (const std::exception &e) {
+        _tc.fail("cdc_error");
         log::get().Error("rfc", "Z_DUCKDB_CDC_PLAN failed", {{"error", e.what()}});
         SetString(funcHandle, "EV_PLAN", "");
         SetString(funcHandle, "EV_ERROR", e.what());
@@ -346,6 +387,7 @@ extern "C" RFC_RC SAP_API ZCdcPlanImpl(RFC_CONNECTION_HANDLE,
 extern "C" RFC_RC SAP_API ZCdcApplyImpl(RFC_CONNECTION_HANDLE,
                                         RFC_FUNCTION_HANDLE funcHandle,
                                         RFC_ERROR_INFO *) {
+    RfcCallScope _tc("cdc_apply");
     try {
         std::string target  = GetString(funcHandle, "IV_TARGET");
         std::string staging = GetString(funcHandle, "IV_STAGING");
@@ -363,6 +405,7 @@ extern "C" RFC_RC SAP_API ZCdcApplyImpl(RFC_CONNECTION_HANDLE,
                          {{"ins", r.ins}, {"upd", r.upd}, {"del", r.del},
                           {"prune", r.prune_bound}});
     } catch (const std::exception &e) {
+        _tc.fail("cdc_error");
         log::get().Error("rfc", "Z_DUCKDB_CDC_APPLY failed", {{"error", e.what()}});
         SetString(funcHandle, "EV_ERROR", e.what());
     }
@@ -376,6 +419,7 @@ extern "C" RFC_RC SAP_API ZCdcApplyImpl(RFC_CONNECTION_HANDLE,
 extern "C" RFC_RC SAP_API ZOpenImpl(RFC_CONNECTION_HANDLE,
                                     RFC_FUNCTION_HANDLE funcHandle,
                                     RFC_ERROR_INFO *) {
+    RfcCallScope _tc("cursor_open");
     try {
         std::string sql = GetString(funcHandle, "IV_SQL");
         log::get().Info("rfc", "Z_DUCKDB_OPEN", {{"sql", sql}});
@@ -389,6 +433,7 @@ extern "C" RFC_RC SAP_API ZOpenImpl(RFC_CONNECTION_HANDLE,
                          {{"handle", open.handle},
                           {"cols", (long long)open.columns.size()}});
     } catch (const std::exception &e) {
+        _tc.fail("sql_error");
         log::get().Error("rfc", "Z_DUCKDB_OPEN failed", {{"error", e.what()}});
         SetString(funcHandle, "EV_ERROR", e.what());
     }
@@ -398,6 +443,7 @@ extern "C" RFC_RC SAP_API ZOpenImpl(RFC_CONNECTION_HANDLE,
 extern "C" RFC_RC SAP_API ZFetchImpl(RFC_CONNECTION_HANDLE,
                                      RFC_FUNCTION_HANDLE funcHandle,
                                      RFC_ERROR_INFO *) {
+    RfcCallScope _tc("cursor_fetch");
     try {
         std::string handle = GetString(funcHandle, "IV_HANDLE");
         std::string prows  = GetString(funcHandle, "IV_PAGE_ROWS");
@@ -417,6 +463,7 @@ extern "C" RFC_RC SAP_API ZFetchImpl(RFC_CONNECTION_HANDLE,
                           {"bytes", (long long)page.bxml.size()},
                           {"done", page.done ? "true" : "false", false}});
     } catch (const std::exception &e) {
+        _tc.fail("cursor_error");
         log::get().Error("rfc", "Z_DUCKDB_FETCH failed", {{"error", e.what()}});
         SetString(funcHandle, "EV_ERROR", e.what());
     }
@@ -426,12 +473,14 @@ extern "C" RFC_RC SAP_API ZFetchImpl(RFC_CONNECTION_HANDLE,
 extern "C" RFC_RC SAP_API ZCloseImpl(RFC_CONNECTION_HANDLE,
                                      RFC_FUNCTION_HANDLE funcHandle,
                                      RFC_ERROR_INFO *) {
+    RfcCallScope _tc("cursor_close");
     try {
         std::string handle = GetString(funcHandle, "IV_HANDLE");
         g_bridge->CloseCursor(handle);
         SetString(funcHandle, "EV_ERROR", "");
         log::get().Debug("rfc", "Z_DUCKDB_CLOSE ok", {{"handle", handle}});
     } catch (const std::exception &e) {
+        _tc.fail("cursor_error");
         log::get().Error("rfc", "Z_DUCKDB_CLOSE failed", {{"error", e.what()}});
         SetString(funcHandle, "EV_ERROR", e.what());
     }

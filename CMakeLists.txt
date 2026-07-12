@@ -124,7 +124,7 @@ target_compile_definitions(erpl_rev_server PRIVATE
   ERPL_REV_DUCKDB_VERSION="${DUCKDB_VERSION}")
 target_link_libraries(erpl_rev_server PRIVATE
   ${SAP_LIBS} ${DUCKDB_LIB} Threads::Threads ${CMAKE_DL_LIBS}
-  posthog_telemetry)
+  posthog_telemetry OpenSSL::Crypto)
 
 # So the extracted inner binary finds the bundled libs sitting next to it
 # (belt-and-suspenders with the launcher's loader-path env var).
@@ -161,7 +161,7 @@ if(EXISTS "${DUCKDB_LIB}")
     ERPL_REV_DUCKDB_VERSION="${DUCKDB_VERSION}")
   target_link_libraries(erpl_rev_tests PRIVATE
     ${DUCKDB_LIB} Threads::Threads Catch2::Catch2WithMain
-    posthog_telemetry)
+    posthog_telemetry OpenSSL::Crypto)
   if(APPLE)
     set_target_properties(erpl_rev_tests PROPERTIES BUILD_RPATH "${DUCKDB_DIST}")
   elseif(UNIX)
