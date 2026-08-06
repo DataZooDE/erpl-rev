@@ -319,6 +319,19 @@ unless you intend remote access.
 
 ---
 
+## Feedback
+
+If `erpl-rev` misbehaves, please [open an issue](https://github.com/DataZooDE/erpl-rev/issues).
+This is a registered RFC server talking to gateways and SAP releases we cannot reproduce
+here, so a report with your setup is the fastest path to a fix.
+
+If it saved you time, a star on the repo helps others find it.
+
+Because this process usually runs under a service manager rather than on a terminal, the
+feedback pointer is emitted as an INFO log line at startup — where operators actually read
+it. On an interactive start you also get a small banner, at most once a day; silence both
+with `DATAZOO_NO_BANNER=1`.
+
 ## Telemetry
 
 The server sends **anonymous** usage telemetry (`application_start` /
