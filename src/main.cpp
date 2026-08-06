@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "sapnwrfc.h"
+#include "datazoo_banner.hpp"
 
 // Product version baked in at build time (CI passes -DERPL_REV_VERSION=X.Y.Z).
 #ifndef ERPL_REV_VERSION
@@ -92,6 +93,10 @@ struct Cli {
     bool no_telemetry = false;
 };
 
+// Identity for the feedback banner, the startup log line and the issue hint.
+static constexpr datazoo::BannerInfo kBanner {"erpl-rev", ERPL_REV_VERSION,
+                                              "https://github.com/DataZooDE/erpl-rev"};
+
 void PrintHelp() {
     std::fputs(
         "erpl-rev — ABAP RFC -> DuckDB bridge server\n\n"
@@ -130,7 +135,9 @@ void PrintHelp() {
         "  ERPL_REV_LOG_COLOR     auto|always|never           (default auto)\n"
         "  ERPL_REV_NO_TELEMETRY  disable usage telemetry (truthy)\n"
         "  DATAZOO_DISABLE_TELEMETRY  disable telemetry across all DataZoo tools\n"
-        "  ERPL_REV_TELEMETRY_SAMPLE_RATE  sample rfc_call events, 0<r<=1 (default 1)\n",
+        "  ERPL_REV_TELEMETRY_SAMPLE_RATE  sample rfc_call events, 0<r<=1 (default 1)\n"
+        "  DATAZOO_NO_BANNER      suppress the startup feedback banner (truthy)\n\n"
+        "Bugs, feedback and stars: https://github.com/DataZooDE/erpl-rev\n",
         stderr);
 }
 
@@ -233,6 +240,13 @@ int mainU(int argc, SAP_UC **argv) {
     Cli cli = ParseArgs(argc, argv);
     if (cli.help) { PrintHelp(); return 0; }
     if (cli.smoke) return RunSmoke();
+
+    // Two surfaces, because this process almost never runs on a terminal. The
+    // banner is for the operator who starts it by hand; the log line is for the
+    // far more common case -- systemd, a container, an SAP gateway service --
+    // where stderr is a file nobody is watching live but everybody reads later.
+    datazoo::ShowBannerStandalone(kBanner);
+    log::get().Info("startup", datazoo::FeedbackLine(kBanner));
 
     std::signal(SIGINT, OnSigInt);
     std::signal(SIGTERM, OnSigInt);
@@ -384,6 +398,10 @@ int mainU(int argc, SAP_UC **argv) {
         // Startup failed before application_start was emitted — don't send an
         // orphan application_stop.
         log::get().Error("server", "fatal", {{"error", e.what()}});
+        // A fatal is the one moment an operator definitely wants the tracker.
+        // Routine per-request errors are deliberately left unannotated: this
+        // process runs for weeks, and a link on every error line becomes noise.
+        log::get().Error("server", datazoo::IssueHint(kBanner).substr(1));
         return 1;
     }
 }

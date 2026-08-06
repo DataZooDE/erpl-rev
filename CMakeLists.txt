@@ -88,6 +88,11 @@ set(DUCKDB_SRC_INCLUDE "${duckdb_source_SOURCE_DIR}/src/include")
 set(DUCKDB_THIRD_PARTY "${duckdb_source_SOURCE_DIR}/third_party")
 add_subdirectory(third_party/posthog-telemetry)
 
+# Feedback banner (header-only). Telemetry ON so a printed banner is counted as
+# a banner_shown event through the instance configured above.
+set(DATAZOO_BANNER_TELEMETRY ON CACHE BOOL "" FORCE)
+add_subdirectory(third_party/datazoo-banner)
+
 # --- SAP build definitions (64-bit Unicode, per platform) --------------------
 if(WIN32)
   add_compile_definitions(SAPonNT WIN32 SAPwithUNICODE SAPwithTHREADS
@@ -124,7 +129,7 @@ target_compile_definitions(erpl_rev_server PRIVATE
   ERPL_REV_DUCKDB_VERSION="${DUCKDB_VERSION}")
 target_link_libraries(erpl_rev_server PRIVATE
   ${SAP_LIBS} ${DUCKDB_LIB} Threads::Threads ${CMAKE_DL_LIBS}
-  posthog_telemetry OpenSSL::Crypto)
+  posthog_telemetry datazoo_banner OpenSSL::Crypto)
 
 # So the extracted inner binary finds the bundled libs sitting next to it
 # (belt-and-suspenders with the launcher's loader-path env var).
@@ -161,7 +166,7 @@ if(EXISTS "${DUCKDB_LIB}")
     ERPL_REV_DUCKDB_VERSION="${DUCKDB_VERSION}")
   target_link_libraries(erpl_rev_tests PRIVATE
     ${DUCKDB_LIB} Threads::Threads Catch2::Catch2WithMain
-    posthog_telemetry OpenSSL::Crypto)
+    posthog_telemetry datazoo_banner OpenSSL::Crypto)
   if(APPLE)
     set_target_properties(erpl_rev_tests PROPERTIES BUILD_RPATH "${DUCKDB_DIST}")
   elseif(UNIX)
