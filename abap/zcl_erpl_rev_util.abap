@@ -651,6 +651,32 @@ CLASS zcl_erpl_rev_util IMPLEMENTATION.
     DATA(lo_struct) = cl_abap_structdescr=>create( lt_comp ).
     DATA(lo_tab) = cl_abap_tabledescr=>create( lo_struct ).
 
+    " A fixed RAW is TRANSPORTED as an XSTRING, not as the source's x LENGTH n.
+    "
+    " asXML serialises a fixed X field with its trailing zero bytes REMOVED: a
+    " RAW(16) holding DEADBEEF and twelve nulls comes out as four bytes, and an
+    " all-zero RAW(16) comes out as an empty element. The same value in an
+    " XSTRING is serialised whole, and assigning one to the other loses nothing.
+    " (Both checked on the live system before being relied on.)
+    "
+    " The SELECT still reads into the SOURCE types, because
+    " `INTO CORRESPONDING FIELDS` will not write a RAW column into an XSTRING --
+    " it short-dumps. So the widening happens row by row after the read, and
+    " only for tables that actually have a fixed RAW, so nothing else pays for it.
+    DATA lt_tcomp TYPE cl_abap_structdescr=>component_table.
+    DATA lv_raw TYPE abap_bool VALUE abap_false.
+    LOOP AT lt_comp INTO DATA(ls_tc).
+      IF ls_tc-type->type_kind = cl_abap_typedescr=>typekind_hex.
+        ls_tc-type = cl_abap_elemdescr=>get_xstring( ).
+        lv_raw = abap_true.
+      ENDIF.
+      APPEND ls_tc TO lt_tcomp.
+    ENDLOOP.
+    DATA(lo_tstruct) = COND #( WHEN lv_raw = abap_true
+                               THEN cl_abap_structdescr=>create( lt_tcomp )
+                               ELSE lo_struct ).
+    DATA(lo_ttab) = cl_abap_tabledescr=>create( lo_tstruct ).
+
     " Full-load replace: (re)create the target up front as a HEAP — no PRIMARY KEY
     " — so a re-run is idempotent and, crucially, the packages INSERT without
     " paying per-package ART-index maintenance. The PRIMARY KEY is built ONCE at
@@ -710,6 +736,12 @@ CLASS zcl_erpl_rev_util IMPLEMENTATION.
     DATA lr_pkg TYPE REF TO data.
     CREATE DATA lr_pkg TYPE HANDLE lo_tab.
     FIELD-SYMBOLS <pkg> TYPE STANDARD TABLE.
+
+    " The transport image of a package, allocated only when a fixed RAW is present.
+    DATA lr_tpk TYPE REF TO data.
+    DATA lr_trow TYPE REF TO data.
+    FIELD-SYMBOLS <tpk> TYPE STANDARD TABLE.
+    FIELD-SYMBOLS <trow> TYPE any.
     ASSIGN lr_pkg->* TO <pkg>.
 
     DATA: lv_first  TYPE abap_bool VALUE abap_true,
@@ -786,7 +818,26 @@ CLASS zcl_erpl_rev_util IMPLEMENTATION.
           lv_total = lv_total + lines( <pkg> ).
 
           DATA(lo_w) = cl_sxml_string_writer=>create( type = if_sxml=>co_xt_binary ).
-          CALL TRANSFORMATION id SOURCE data = <pkg> RESULT XML lo_w.
+          IF lv_raw = abap_true.
+            " Widen every fixed RAW to an XSTRING before serialising, so its
+            " trailing zero bytes survive. See the note beside lt_tcomp.
+            IF lr_tpk IS INITIAL.
+              CREATE DATA lr_tpk TYPE HANDLE lo_ttab.
+              ASSIGN lr_tpk->* TO <tpk>.
+              CREATE DATA lr_trow TYPE HANDLE lo_tstruct.
+              ASSIGN lr_trow->* TO <trow>.
+            ENDIF.
+            CLEAR <tpk>.
+            FIELD-SYMBOLS <prow> TYPE any.
+            LOOP AT <pkg> ASSIGNING <prow>.
+              CLEAR <trow>.
+              MOVE-CORRESPONDING <prow> TO <trow>.
+              INSERT <trow> INTO TABLE <tpk>.
+            ENDLOOP.
+            CALL TRANSFORMATION id SOURCE data = <tpk> RESULT XML lo_w.
+          ELSE.
+            CALL TRANSFORMATION id SOURCE data = <pkg> RESULT XML lo_w.
+          ENDIF.
           DATA(lv_xdata) = lo_w->get_output( ).
           IF lv_first = abap_true.
             " First package carries init (+ddl for delta only — full-load already

@@ -256,8 +256,8 @@ background. Mirrors SLT's `LTRS` knobs — details below.
 Reads are **package-wise** (keyset pagination, 50k/batch) so memory is bounded;
 full-load-replace makes a crashed run safely re-runnable. The data-identity test
 (`zcl_erpl_rev_difftest`) compares target vs source cell-by-cell (SFLIGHT,
-ZWIDE_BSEG, REPOSRC + a negative control). *Known limit:* the binary path drops
-trailing zero bytes of fixed `RAW` columns. *Future:* delta/incremental loads.
+ZWIDE_BSEG, REPOSRC + a negative control), **byte for byte including trailing
+zeros** — `RAW` columns replicate faithfully.
 </details>
 
 ---
