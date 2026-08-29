@@ -546,197 +546,233 @@ long long DuckDbBridge::IngestBxml(const std::string &target,
                                    const std::string &init_sql,
                                    const std::string &ddl,
                                    const std::string &op_col) {
-    // Own connection: the staging TEMP table, the Appender and the INSERT…SELECT
-    // all run on it, so concurrent ingests (async pipeline / partitioned loads)
-    // don't collide (TEMP tables are connection-local) and don't serialize.
+    // Own connection: the appended package and the statement that consumes it
+    // run on it, so concurrent ingests (async pipeline / partitioned loads)
+    // don't collide and don't serialize.
     duckdb::Connection con(*db_);
     if (!init_sql.empty()) Exec(con, init_sql);
     if (!ddl.empty()) Exec(con, ddl);
 
-    sxml::Table tbl = bxml.empty() ? sxml::Table{} : sxml::Decode(bxml);
-    if (tbl.rows.empty()) {
-        if (!parquet_out.empty())
-            Exec(con, "COPY " + target + " TO " + SqlQuote(parquet_out) + " (FORMAT PARQUET)");
-        return 0;
-    }
+    // Streamed, not materialised. `Decode` would build the whole package as a
+    // vector<vector<string>> first -- 21 million std::string allocations and
+    // ~0.5 GiB resident for a 50k-row, 420-column package -- only for the loop
+    // below to copy every cell straight back out into DuckDB's vectors. The
+    // streaming form hands each row over as views into `bxml`, so the copy into
+    // DuckDB is the only one that happens.
+    sxml::Table tbl;   // columns only; rows never populated on this path
 
     // Bulk path (benchmarked ~250x the old per-row INSERT, see test/bench_ingest):
-    // append the package's RAW string cells into a VARCHAR/BLOB staging clone,
-    // then ONE vectorized, atomic `INSERT … SELECT <casts>` into the target.
-    // DuckDB's set-based VARCHAR->type cast gives the same result as the old
-    // literal path; binary columns stage as BLOB and pass through.
+    // append the package's RAW string cells straight into a QueryAppender, whose
+    // ColumnDataCollection is injected into ONE vectorized, atomic statement as a
+    // never-materialized CTE named `src_rel`, with per-column casts in the
+    // projection. This replaced a physical VARCHAR/BLOB staging TEMP table: that
+    // table was written once and read once, but still paid full storage cost on
+    // the way in -- string statistics, HyperLogLog distinct counts, UTF-8
+    // analysis and dictionary compression, ~16% of ingest time in the flamegraph,
+    // all of it discarded immediately afterwards.
+    const std::string src_rel = "erpl_pkg";
 
-    // Target column types, in the BXML column order (target names fold to lower).
-    auto desc = con.Query("SELECT * FROM " + target + " LIMIT 0");
-    if (desc->HasError())
-        throw std::runtime_error("DuckDB describe failed: " + desc->GetError());
-    std::unordered_map<std::string, duckdb::LogicalType> tcol;
-    for (duckdb::idx_t c = 0; c < desc->ColumnCount(); c++)
-        tcol.emplace(LowerName(desc->names[c]), desc->types[c]);
+    // Delta MERGE: the payload may carry a control op column (I/U/D). It is
+    // appended (so the DELETE can read it) but is NOT a target column -- exclude
+    // it from the INSERT column list and the projection. mode==Merge with no
+    // op_col is a plain key-based upsert. Hoisted above the decode because the
+    // statement has to exist before the first row is appended.
+    const std::string opl = LowerName(op_col);
+    const bool merge = (mode == IngestMode::Merge) && !opl.empty();
+    auto is_op = [&](const std::string &c) { return !opl.empty() && LowerName(c) == opl; };
+    const bool upsert = (mode == IngestMode::Upsert || mode == IngestMode::Merge) &&
+                        !key_cols.empty();
 
+    // Columns first, then rows -- the streaming decode calls back with the
+    // column names once, before any row, which is exactly the order this needs:
+    // the statement cannot be built until the columns are known, and the rows
+    // can then be appended as they are parsed.
     std::vector<duckdb::LogicalType> coltypes;
-    coltypes.reserve(tbl.columns.size());
-    for (auto &cn : tbl.columns) {
-        auto it = tcol.find(LowerName(cn));
-        coltypes.push_back(it != tcol.end() ? it->second
-                                            : duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR));
-    }
+    std::unique_ptr<duckdb::QueryAppender> app;
+    duckdb::DataChunk chunk;
+    size_t ncols = 0, nrows = 0, in_chunk = 0;
 
-    // Staging clone: BLOB for binary target columns, VARCHAR for everything else.
-    const std::string stg = target + "__erpl_stg";
-    {
-        std::string s = "CREATE OR REPLACE TEMP TABLE " + stg + " (";
-        for (size_t i = 0; i < tbl.columns.size(); i++) {
-            if (i) s += ",";
-            bool is_blob = coltypes[i].id() == duckdb::LogicalTypeId::BLOB;
-            s += tbl.columns[i] + (is_blob ? " BLOB" : " VARCHAR");
+    auto on_columns = [&](const std::vector<std::string> &cols) {
+        tbl.columns = cols;
+        ncols = cols.size();
+
+        // Target column types, in the BXML column order (target names fold to lower).
+        auto desc = con.Query("SELECT * FROM " + target + " LIMIT 0");
+        if (desc->HasError())
+            throw std::runtime_error("DuckDB describe failed: " + desc->GetError());
+        std::unordered_map<std::string, duckdb::LogicalType> tcol;
+        for (duckdb::idx_t c = 0; c < desc->ColumnCount(); c++)
+            tcol.emplace(LowerName(desc->names[c]), desc->types[c]);
+        coltypes.reserve(ncols);
+        for (auto &cn : cols) {
+            auto it = tcol.find(LowerName(cn));
+            coltypes.push_back(it != tcol.end()
+                                   ? it->second
+                                   : duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR));
         }
-        s += ")";
-        Exec(con, s);
-    }
 
-    // Append the package COLUMN-WISE: fill VARCHAR/BLOB DuckDB vectors and append
-    // whole DataChunks (~+20% over the per-cell Appender — far fewer Append calls,
-    // a tight per-column inner loop). Cells are raw strings/bytes; the vectorized
-    // INSERT…SELECT below casts them to the target types. (No NULLs: a decoded BXML
-    // cell is always present — empty element = "".)
-    {
-        const size_t ncols = tbl.columns.size();
+        // Appended package: BLOB for binary target columns, VARCHAR otherwise.
         duckdb::vector<duckdb::LogicalType> vtypes;
         vtypes.reserve(ncols);
         for (size_t i = 0; i < ncols; i++)
             vtypes.push_back(coltypes[i].id() == duckdb::LogicalTypeId::BLOB
-                                 ? duckdb::LogicalType::BLOB : duckdb::LogicalType::VARCHAR);
-        const std::string empty;
-        duckdb::Appender app(con, stg);
-        duckdb::DataChunk chunk;
-        chunk.Initialize(duckdb::Allocator::DefaultAllocator(), vtypes);
-        const size_t nrows = tbl.rows.size();
-        for (size_t base = 0; base < nrows; base += STANDARD_VECTOR_SIZE) {
-            const size_t blk =
-                (nrows - base < STANDARD_VECTOR_SIZE) ? (nrows - base) : STANDARD_VECTOR_SIZE;
-            chunk.Reset();
-            for (size_t c = 0; c < ncols; c++) {
-                duckdb::Vector &v = chunk.data[c];
-                auto out = duckdb::FlatVector::GetData<duckdb::string_t>(v);
-                for (size_t k = 0; k < blk; k++) {
-                    const auto &row = tbl.rows[base + k];
-                    const std::string &cell = c < row.size() ? row[c] : empty;
-                    // AddStringOrBlob: no UTF-8 validation — fits both VARCHAR text
-                    // and raw BLOB bytes.
-                    out[k] = duckdb::StringVector::AddStringOrBlob(v, cell.data(), cell.size());
-                }
+                                 ? duckdb::LogicalType::BLOB
+                                 : duckdb::LogicalType::VARCHAR);
+        duckdb::vector<std::string> vnames(cols.begin(), cols.end());
+
+        // One set-based statement with per-column casts (atomic: a bad cast
+        // aborts the whole package and leaves the target unchanged).
+        // Use the target's actual (lowercased) column names everywhere. An
+        // UPPERCASE target column list in `INSERT … (COLS) … ON CONFLICT`
+        // mis-maps the conflict arbiter and nulls the key -- lowercase (matching
+        // the stored names) is safe.
+        std::string proj;
+        for (size_t i = 0; i < cols.size(); i++) {
+            if (is_op(cols[i])) continue;
+            if (!proj.empty()) proj += ",";
+            const std::string cn = LowerName(cols[i]);
+            switch (coltypes[i].id()) {
+                case duckdb::LogicalTypeId::BLOB:
+                case duckdb::LogicalTypeId::VARCHAR:
+                    proj += cn;                                                  // passthrough
+                    break;
+                case duckdb::LogicalTypeId::DATE:
+                    // An initial/blank DATS has no valid date: the kernel renders it
+                    // as "0000-00-00" (zero) or "    -  -  " (blank, 8 spaces). Map any
+                    // date made up of nothing but blanks and dashes, plus the zero-date,
+                    // to NULL; a genuinely malformed non-blank date still errors loudly.
+                    // `trim(c,' -')` is the two-argument trim (strip that character set
+                    // from both ends), exactly equivalent to the `trim(replace(c,'-',''))`
+                    // this replaced -- both are empty iff every character is a blank or a
+                    // dash -- but one pass over the cell instead of two, and no
+                    // intermediate string. Worth it: it runs on every DATS cell of every
+                    // row, and the pair showed up at 2.7% of ingest in the flamegraph.
+                    proj += "CASE WHEN " + cn + "='0000-00-00' OR trim(" + cn +
+                            ",' -') = '' THEN NULL ELSE " + cn + "::DATE END";
+                    break;
+                default:
+                    proj += cn + "::" + coltypes[i].ToString();
+                    break;
             }
-            chunk.SetCardinality(blk);
-            app.AppendDataChunk(chunk);
+            proj += " AS " + cn;   // name the projected column so a CTAS clone keeps it
         }
-        app.Close();
-    }
-
-    // One set-based INSERT … SELECT with per-column casts (atomic: a bad cast
-    // aborts the whole package and leaves the target unchanged).
-    // Use the target's actual (lowercased) column names everywhere. An UPPERCASE
-    // target column list in `INSERT … (COLS) … ON CONFLICT` mis-maps the conflict
-    // arbiter and nulls the key — lowercase (matching the stored names) is safe.
-    // Delta MERGE: the payload may carry a control op column (I/U/D). It is staged
-    // (so the DELETE can read it) but is NOT a target column — exclude it from the
-    // INSERT column list and the projection. mode==Merge with no op_col is a plain
-    // key-based upsert.
-    const std::string opl = LowerName(op_col);
-    const bool merge = (mode == IngestMode::Merge) && !opl.empty();
-    auto is_op = [&](const std::string &c) { return !opl.empty() && LowerName(c) == opl; };
-
-    std::string proj;
-    for (size_t i = 0; i < tbl.columns.size(); i++) {
-        if (is_op(tbl.columns[i])) continue;
-        if (!proj.empty()) proj += ",";
-        const std::string cn = LowerName(tbl.columns[i]);
-        switch (coltypes[i].id()) {
-            case duckdb::LogicalTypeId::BLOB:
-            case duckdb::LogicalTypeId::VARCHAR:
-                proj += cn;                                                  // passthrough
-                break;
-            case duckdb::LogicalTypeId::DATE:
-                // An initial/blank DATS has no valid date: the kernel renders it
-                // as "0000-00-00" (zero) or "    -  -  " (blank, 8 spaces). Map any
-                // date with no digits (strip '-', trim) plus the zero-date to NULL;
-                // a genuinely malformed non-blank date still errors loudly.
-                proj += "CASE WHEN " + cn + "='0000-00-00' OR trim(replace(" + cn +
-                        ",'-','')) = '' THEN NULL ELSE " + cn + "::DATE END";
-                break;
-            default:
-                proj += cn + "::" + coltypes[i].ToString();
-                break;
+        std::string collist;
+        for (size_t i = 0; i < cols.size(); i++) {
+            if (is_op(cols[i])) continue;
+            if (!collist.empty()) collist += ",";
+            collist += LowerName(cols[i]);
         }
-        proj += " AS " + cn;   // name the projected column so a CTAS clone keeps it
-    }
-    std::string collist;
-    for (size_t i = 0; i < tbl.columns.size(); i++) {
-        if (is_op(tbl.columns[i])) continue;
-        if (!collist.empty()) collist += ",";
-        collist += LowerName(tbl.columns[i]);
-    }
-    // Apply mode. Upsert/Merge with keys apply as one native, atomic `MERGE INTO`.
-    // (DuckDB 1.5.4 fixes the bug that previously forced a DELETE-then-INSERT
-    // workaround: #22825 made the INSERT…SELECT ON CONFLICT column match
-    // case-insensitive — our staging clone carries SAP's UPPERCASE names, so a
-    // conflict-resolving write used to mis-map the arbiter and NULL the key — and
-    // #23014 hardened MERGE INTO WHEN NOT MATCHED binding.) The source projection
-    // casts the VARCHAR/BLOB staging cells to the target types, so the ON keys are
-    // type-compatible and a bad cast aborts the single statement, leaving the target
-    // unchanged. (See test/test_duckdb_bridge.cpp merge cases.)
-    const bool upsert = (mode == IngestMode::Upsert || mode == IngestMode::Merge) &&
-                        !key_cols.empty();
 
-    if (upsert) {
-        auto is_key = [&](const std::string &cn) {
-            for (auto &k : key_cols) if (LowerName(k) == cn) return true;
-            return false;
-        };
-        // ON predicate over the keys; SET list + INSERT value list over the non-key
-        // (and non-op) columns. Keys are never updated.
-        std::string on, setlist, svals;
-        for (size_t i = 0; i < key_cols.size(); i++) {
-            if (i) on += " AND ";
-            const std::string k = LowerName(key_cols[i]);
-            on += "t." + k + " = s." + k;
-        }
-        for (size_t i = 0; i < tbl.columns.size(); i++) {
-            if (is_op(tbl.columns[i])) continue;
-            const std::string cn = LowerName(tbl.columns[i]);
-            if (!svals.empty()) svals += ",";
-            svals += "s." + cn;
-            if (is_key(cn)) continue;
-            if (!setlist.empty()) setlist += ",";
-            setlist += cn + "=s." + cn;
-        }
-        // Source: the cast projection, plus the op control column for delta MERGE.
-        std::string src = "SELECT " + proj;
-        if (merge) src += ", " + opl;
-        src += " FROM " + stg;
+        // Apply mode. Upsert/Merge with keys apply as one native, atomic
+        // `MERGE INTO`. (DuckDB 1.5.4 fixes the bug that previously forced a
+        // DELETE-then-INSERT workaround: #22825 made the INSERT…SELECT ON
+        // CONFLICT column match case-insensitive -- our appended package carries
+        // SAP's UPPERCASE names, so a conflict-resolving write used to mis-map
+        // the arbiter and NULL the key -- and #23014 hardened MERGE INTO WHEN NOT
+        // MATCHED binding.) The source projection casts the VARCHAR/BLOB cells to
+        // the target types, so the ON keys are type-compatible and a bad cast
+        // aborts the single statement, leaving the target unchanged.
+        // (See test/test_duckdb_bridge.cpp merge cases.)
+        std::string sql;
+        if (upsert) {
+            auto is_key = [&](const std::string &cn) {
+                for (auto &k : key_cols) if (LowerName(k) == cn) return true;
+                return false;
+            };
+            // ON predicate over the keys; SET list + INSERT value list over the non-key
+            // (and non-op) columns. Keys are never updated.
+            std::string on, setlist, svals;
+            for (size_t i = 0; i < key_cols.size(); i++) {
+                if (i) on += " AND ";
+                const std::string k = LowerName(key_cols[i]);
+                on += "t." + k + " = s." + k;
+            }
+            for (size_t i = 0; i < cols.size(); i++) {
+                if (is_op(cols[i])) continue;
+                const std::string cn = LowerName(cols[i]);
+                if (!svals.empty()) svals += ",";
+                svals += "s." + cn;
+                if (is_key(cn)) continue;
+                if (!setlist.empty()) setlist += ",";
+                setlist += cn + "=s." + cn;
+            }
+            // Source: the cast projection, plus the op control column for delta MERGE.
+            std::string src = "SELECT " + proj;
+            if (merge) src += ", " + opl;
+            src += " FROM " + src_rel;
 
-        std::string m = "MERGE INTO " + target + " AS t USING (" + src + ") AS s ON " + on;
-        if (merge) {
-            // op_col (I/U/D) drives the action: delete D rows, upsert I/U rows.
-            m += " WHEN MATCHED AND lower(s." + opl + ") = 'd' THEN DELETE";
-            if (!setlist.empty())
-                m += " WHEN MATCHED AND lower(s." + opl + ") IN ('i','u') THEN UPDATE SET " + setlist;
-            m += " WHEN NOT MATCHED AND lower(s." + opl + ") IN ('i','u') THEN INSERT (" +
-                 collist + ") VALUES (" + svals + ")";
+            sql = "MERGE INTO " + target + " AS t USING (" + src + ") AS s ON " + on;
+            if (merge) {
+                // op_col (I/U/D) drives the action: delete D rows, upsert I/U rows.
+                sql += " WHEN MATCHED AND lower(s." + opl + ") = 'd' THEN DELETE";
+                if (!setlist.empty())
+                    sql += " WHEN MATCHED AND lower(s." + opl + ") IN ('i','u') THEN UPDATE SET " + setlist;
+                sql += " WHEN NOT MATCHED AND lower(s." + opl + ") IN ('i','u') THEN INSERT (" +
+                       collist + ") VALUES (" + svals + ")";
+            } else {
+                if (!setlist.empty()) sql += " WHEN MATCHED THEN UPDATE SET " + setlist;
+                sql += " WHEN NOT MATCHED THEN INSERT (" + collist + ") VALUES (" + svals + ")";
+            }
         } else {
-            if (!setlist.empty()) m += " WHEN MATCHED THEN UPDATE SET " + setlist;
-            m += " WHEN NOT MATCHED THEN INSERT (" + collist + ") VALUES (" + svals + ")";
+            std::string sel = "SELECT " + proj + " FROM " + src_rel;
+            if (merge) sel += " WHERE lower(" + opl + ") IN ('i','u')";   // exclude deletes
+            sql = "INSERT INTO " + target + " (" + collist + ") " + sel;
         }
-        Exec(con, m);
-    } else {
-        std::string sel = "SELECT " + proj + " FROM " + stg;
-        if (merge) sel += " WHERE lower(" + opl + ") IN ('i','u')";   // exclude deletes
-        Exec(con, "INSERT INTO " + target + " (" + collist + ") " + sel);
+
+        app = std::make_unique<duckdb::QueryAppender>(con, sql, vtypes, vnames, src_rel);
+        chunk.Initialize(duckdb::Allocator::DefaultAllocator(), vtypes);
+        chunk.Reset();
+    };
+
+    // One row into the pending DataChunk; flush a full one. Cells are the
+    // decoder's views into `bxml`, so AddStringOrBlob's copy is the only one.
+    // (No NULLs: a decoded BXML cell is always present -- empty element = "".)
+    auto on_row = [&](const std::vector<std::string_view> &vals) {
+        for (size_t c = 0; c < ncols; c++) {
+            duckdb::Vector &v = chunk.data[c];
+            auto out = duckdb::FlatVector::GetData<duckdb::string_t>(v);
+            std::string_view cell = c < vals.size() ? vals[c] : std::string_view();
+            // AddStringOrBlob: no UTF-8 validation -- fits both VARCHAR text and
+            // raw BLOB bytes.
+            out[in_chunk] = duckdb::StringVector::AddStringOrBlob(v, cell.data(), cell.size());
+        }
+        ++in_chunk;
+        ++nrows;
+        if (in_chunk == STANDARD_VECTOR_SIZE) {
+            chunk.SetCardinality(in_chunk);
+            app->AppendDataChunk(chunk);
+            chunk.Reset();
+            in_chunk = 0;
+        }
+    };
+
+    if (!bxml.empty()) sxml::DecodeStreaming(bxml, on_columns, on_row);
+
+    if (nrows == 0) {
+        if (!parquet_out.empty())
+            Exec(con, "COPY " + target + " TO " + SqlQuote(parquet_out) + " (FORMAT PARQUET)");
+        return 0;
     }
+    if (in_chunk) {
+        chunk.SetCardinality(in_chunk);
+        app->AppendDataChunk(chunk);
+    }
+    // A QueryAppender runs its statement once per flush, and BaseAppender flushes
+    // on its own every DEFAULT_FLUSH_COUNT (204800) rows. Our packages are well
+    // under that -- one flush, one statement -- but an oversized one must not be
+    // able to half-apply, so the whole append is one explicit transaction.
+    con.BeginTransaction();
+    try {
+        app->Close();
+    } catch (...) {
+        con.Rollback();
+        throw;
+    }
+    con.Commit();
 
     if (!parquet_out.empty())
         Exec(con, "COPY " + target + " TO " + SqlQuote(parquet_out) + " (FORMAT PARQUET)");
-    return static_cast<long long>(tbl.rows.size());
+    return static_cast<long long>(nrows);
 }
 
 SnapshotResult DuckDbBridge::SnapshotMerge(const std::string &target,

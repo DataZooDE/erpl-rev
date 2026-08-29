@@ -1,8 +1,10 @@
 #include "sxml_binary.hpp"
 
+#include <deque>
+#include <string_view>
+
 #include <algorithm>
 #include <stdexcept>
-#include <unordered_map>
 
 namespace erpl_rev {
 namespace sxml {
@@ -117,11 +119,16 @@ struct Reader {
         if (i >= s.size()) throw std::runtime_error("sXML: unexpected end of input");
         return (unsigned char)s[i++];
     }
-    std::string read(size_t n) {
+    std::string read(size_t n) { return std::string(read_view(n)); }
+    // A view into the caller's buffer. The payload outlives every decode, so a
+    // cell that arrives in one chunk -- almost all of them -- needs no storage
+    // of its own. `substr` here allocated one string per chunk, which at 420
+    // columns is 21 million allocations per 50k-row package.
+    std::string_view read_view(size_t n) {
         if (i + n > s.size()) throw std::runtime_error("sXML: truncated content");
-        std::string r = s.substr(i, n);
+        std::string_view v(s.data() + i, n);
         i += n;
-        return r;
+        return v;
     }
     int readId() {  // inverse of PutId
         unsigned char b = get();
@@ -171,8 +178,17 @@ struct Reader {
 };
 
 struct Elem {
-    std::string name;
-    std::string text;
+    // A view into the interned name held by the decoder's `id_name` map. That
+    // map is node-based, so its stored strings never move and the view stays
+    // valid for the whole decode. Owning the name here meant a heap allocation
+    // per element -- one to copy it out of the map and one to move it in -- which
+    // for a 420-column, 50k-row package is 42 million allocations that exist only
+    // to be read once, by name, on the very first row.
+    std::string_view name;
+    // A view into the payload for the common single-chunk value, so no storage
+    // is allocated for it; a value that spans chunks is concatenated into the
+    // decoder's arena and this points there.
+    std::string_view text;
     bool has_text = false;
 };
 
@@ -244,28 +260,45 @@ std::string StreamEncoder::Finish() {
     return std::move(out_);
 }
 
-Table Decode(const std::string &bytes) {
+void DecodeStreaming(const std::string &bytes,
+                     const std::function<void(const std::vector<std::string> &)> &on_columns,
+                     const std::function<void(const std::vector<std::string_view> &)> &on_row) {
     Reader r(bytes);
     if (r.read(4) != "BXML") throw std::runtime_error("sXML: missing BXML magic");
 
-    std::unordered_map<int, std::string> id_name;
+    // Interned element names, indexed directly by id. `readId` is a one- or
+    // two-byte form capped at ((0x3F<<6)|0x3F) = 4095, so the id space is small,
+    // dense and known -- a flat table hits it with one load where the hash map
+    // this replaced hashed an int on every element of every row. Fixed size, so
+    // it never reallocates and the views handed out as Elem::name stay valid.
+    // An empty slot means "id never interned", which is the same fallback the
+    // map's missing-key branch gave.
+    static constexpr int kMaxNameId = 4096;
+    std::vector<std::string> id_name(kMaxNameId);
     std::vector<Elem> stack;
-    Table out;
     bool columns_locked = false;
-    std::vector<std::string> cur_cols;   // names seen in the current <item>
-    std::vector<std::string> cur_vals;
+    std::vector<std::string> cur_cols;        // names seen in the current <item>
+    std::vector<std::string_view> cur_vals;   // views into `bytes` or `arena`
+    // Backing store for values that arrive in more than one chunk, which cannot
+    // be a view into `bytes` because they are a concatenation. A deque, not a
+    // vector: the views point into these strings, so growth must not move them.
+    // Lives as long as the row, since that is when the views are consumed --
+    // holding it in the Elem instead left a dangling view the moment the
+    // element was popped, which is a row's worth of cells before `on_row`.
+    std::deque<std::string> arena;
 
     // A name interned by EncodeItem that becomes an element only if immediately
     // followed by a TagStart (otherwise it's a namespace prefix / attribute name).
     std::string pending;
     bool have_pending = false;
 
-    auto open_elem = [&](const std::string &name) {
-        stack.push_back({name, "", false});
+    auto open_elem = [&](std::string_view name) {
+        stack.push_back(Elem{name, std::string_view{}, false});
         size_t depth = stack.size();
         if (depth == 4) {                 // <item> — a new row
             cur_cols.clear();
             cur_vals.clear();
+            arena.clear();
         }
     };
 
@@ -289,9 +322,17 @@ Table Decode(const std::string &bytes) {
                 r.get();
                 int id = r.readId();
                 r.get();                  // flag byte (unused)
-                std::string name;
-                if (have_pending) { name = pending; id_name[id] = name; have_pending = false; }
-                else              { name = id_name.count(id) ? id_name[id] : std::string(); }
+                // Intern on first sight, then only ever look up. `find` once --
+                // `count()` followed by `operator[]` hashed the id twice, on
+                // every element of every row.
+                std::string_view name;
+                if (id < 0 || id >= kMaxNameId)
+                    throw std::runtime_error("sXML: name id out of range");
+                if (have_pending) {
+                    id_name[id] = pending;
+                    have_pending = false;
+                }
+                name = id_name[id];
                 open_elem(name);
                 break;
             }
@@ -319,27 +360,45 @@ Table Decode(const std::string &bytes) {
                 // peek-terminator, so a chunk-length byte of 0x3E is read as a
                 // length, never mistaken for TagEnd (the old REPOSRC bug).
                 unsigned char tok = b;
-                std::string val;
+                // The first chunk is taken as a view; a second one (rare -- the
+                // kernel caps text chunks at 1024 characters) promotes the value
+                // to owned storage and concatenates from there. Values used to
+                // be built by `val += r.read(...)`, which allocated a string per
+                // chunk and then copied the result twice more on the way out.
+                std::string_view first;
+                std::string joined;
+                bool have_first = false;
+                bool multi = false;
                 while (!r.eof() && r.peek() == tok) {
                     r.get();                       // consume the chunk token
-                    val += r.read(r.readLen());    // length is a byte count
+                    std::string_view chunk = r.read_view(r.readLen());
+                    if (!have_first) { first = chunk; have_first = true; }
+                    else {
+                        if (!multi) { joined.assign(first); multi = true; }
+                        joined.append(chunk);
+                    }
                 }
-                if (!stack.empty()) { stack.back().text = val; stack.back().has_text = true; }
+                if (!stack.empty()) {
+                    Elem &e = stack.back();
+                    if (multi) e.text = arena.emplace_back(std::move(joined));
+                    else       e.text = first;
+                    e.has_text = true;
+                }
                 break;
             }
             case TAG_END: {               // close element
                 r.get();
                 if (stack.empty()) break;
                 size_t depth = stack.size();
-                Elem e = stack.back();
-                stack.pop_back();
                 if (depth == 5) {                       // column close
-                    if (!columns_locked) cur_cols.push_back(e.name);
-                    cur_vals.push_back(e.has_text ? e.text : std::string());
+                    Elem &e = stack.back();
+                    if (!columns_locked) cur_cols.emplace_back(e.name);
+                    cur_vals.push_back(e.has_text ? e.text : std::string_view());
                 } else if (depth == 4) {                // item close -> row
-                    if (!columns_locked) { out.columns = cur_cols; columns_locked = true; }
-                    out.rows.push_back(cur_vals);
+                    if (!columns_locked) { on_columns(cur_cols); columns_locked = true; }
+                    on_row(cur_vals);
                 }
+                stack.pop_back();
                 break;
             }
             default:
@@ -347,6 +406,22 @@ Table Decode(const std::string &bytes) {
                 break;
         }
     }
+}
+
+Table Decode(const std::string &bytes) {
+    // The materialising form, kept for callers that want the whole table --
+    // round-trip tests, and Encode's counterpart. Every cell is copied here, so
+    // prefer DecodeStreaming on a hot path.
+    Table out;
+    DecodeStreaming(
+        bytes,
+        [&](const std::vector<std::string> &cols) { out.columns = cols; },
+        [&](const std::vector<std::string_view> &vals) {
+            std::vector<std::string> row;
+            row.reserve(vals.size());
+            for (auto v : vals) row.emplace_back(v);
+            out.rows.push_back(std::move(row));
+        });
     return out;
 }
 

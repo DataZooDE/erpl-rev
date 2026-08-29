@@ -31,6 +31,8 @@
 #pragma once
 
 #include <string>
+#include <string_view>
+#include <functional>
 #include <vector>
 
 namespace erpl_rev {
@@ -51,6 +53,20 @@ struct Table {
 // std::runtime_error on malformed input. Column set is taken from the first
 // <item>; later items map by element name.
 Table Decode(const std::string &bytes);
+
+// Decode without building a Table.
+//
+// `on_columns` is called once, when the first row's column names are known;
+// `on_row` once per row with that row's cells as views INTO `bytes`. The views
+// are valid for the duration of the call only -- copy anything kept.
+//
+// This exists because materialising the table is the expensive part, not the
+// parsing: a 50k-row package of a 420-column table is 21 million std::string
+// allocations and roughly half a gigabyte of resident memory, for data that a
+// consumer immediately copies elsewhere and drops. Streaming it costs neither.
+void DecodeStreaming(const std::string &bytes,
+                     const std::function<void(const std::vector<std::string> &)> &on_columns,
+                     const std::function<void(const std::vector<std::string_view> &)> &on_row);
 
 // Encode a Table into byte-exact BXML matching what the ABAP kernel emits for
 // `CALL TRANSFORMATION id SOURCE <node> = <itab>`. `node` is the root element

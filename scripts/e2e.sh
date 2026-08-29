@@ -15,6 +15,9 @@ NW="${SAPNWRFC_HOME:-$HERE/nwrfcsdk/linux}/lib"
 # pure-Rust shim). Both must produce identical results -- that equality is the
 # acceptance test for removing the SDK.
 RFC_BACKEND="${RFC_BACKEND:-sdk}"
+# shared or static, proto backend only. Static puts the shim inside the binary,
+# so `ldd` shows no RFC library at all.
+RFC_LINK="${RFC_LINK:-shared}"
 ERPL_PROTO_ROOT="${ERPL_PROTO_ROOT:-}"
 if [ "$RFC_BACKEND" = proto ]; then RFC_LIB_DIR="$ERPL_PROTO_ROOT/target/release"; else RFC_LIB_DIR="$NW"; fi
 VCPKG="${VCPKG_ROOT:-$HOME/.local/share/vcpkg}"
@@ -35,7 +38,8 @@ if [ "$RFC_BACKEND" = proto ]; then
     || fail "build erpl-proto's nwrfc shim"
 fi
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-      -DRFC_BACKEND="$RFC_BACKEND" -DERPL_PROTO_ROOT="$ERPL_PROTO_ROOT" \
+      -DRFC_BACKEND="$RFC_BACKEND" -DRFC_LINK="$RFC_LINK" \
+      -DERPL_PROTO_ROOT="$ERPL_PROTO_ROOT" \
       -DCMAKE_TOOLCHAIN_FILE="$VCPKG/scripts/buildsystems/vcpkg.cmake" \
       -DVCPKG_TARGET_TRIPLET="$TRIPLET" -DVCPKG_HOST_TRIPLET="$TRIPLET" \
       >/dev/null 2>&1 || fail "configure"
@@ -180,6 +184,14 @@ if [ "$RFC_BACKEND" = proto ]; then
     fail "libsapucum or ICU is still linked"
   fi
   echo "   nothing loaded from $NW; no libsapucum, no ICU"
+  if [ "$RFC_LINK" = static ]; then
+    # The shim is inside the binary, so there must be no RFC shared object at
+    # all -- not even erpl-proto's own.
+    if ldd ./build/erpl_rev_server | grep -i sapnwrfc; then
+      fail "RFC_LINK=static but an RFC shared object is still loaded"
+    fi
+    echo "   RFC backend linked statically; no RFC shared object at all"
+  fi
 fi
 
 echo "== E2E PASSED =="
