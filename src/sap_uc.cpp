@@ -5,6 +5,24 @@
 
 namespace erpl_rev {
 
+size_t uclen(const SAP_UC *s) {
+    if (s == nullptr) return 0;
+    size_t n = 0;
+    while (s[n] != 0) n++;
+    return n;
+}
+
+void uccpy(SAP_UC *dst, const SAP_UC *src, size_t cap) {
+    if (dst == nullptr || cap == 0) return;
+    size_t n = 0;
+    // cap counts the terminator, so copy at most cap-1 units and terminate.
+    // strncpyU does not guarantee termination on truncation; this does, because
+    // every caller here hands the result to an API that reads to NUL.
+    while (n + 1 < cap && src != nullptr && src[n] != 0) { dst[n] = src[n]; n++; }
+    dst[n] = 0;
+}
+
+
 std::string uc2std(const SAP_UC *uc, unsigned len) {
     if (uc == nullptr || len == 0) return {};
     RFC_ERROR_INFO info;
@@ -19,7 +37,7 @@ std::string uc2std(const SAP_UC *uc, unsigned len) {
 
 std::string uc2std(const SAP_UC *uc) {
     if (uc == nullptr) return {};
-    return uc2std(uc, static_cast<unsigned>(strlenU(uc)));
+    return uc2std(uc, static_cast<unsigned>(uclen(uc)));
 }
 
 std::vector<SAP_UC> std2uc(const std::string &s) {
@@ -39,8 +57,8 @@ std::vector<SAP_UC> std2uc(const std::string &s) {
 std::string error2std(const RFC_ERROR_INFO &e) {
     std::string msg = "code=" + std::to_string(static_cast<int>(e.code)) +
                       " group=" + std::to_string(static_cast<int>(e.group));
-    if (strlenU(e.key) > 0)     msg += " key=" + uc2std(e.key);
-    if (strlenU(e.message) > 0) msg += " message=" + uc2std(e.message);
+    if (uclen(e.key) > 0)     msg += " key=" + uc2std(e.key);
+    if (uclen(e.message) > 0) msg += " message=" + uc2std(e.message);
     return msg;
 }
 

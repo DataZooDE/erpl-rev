@@ -141,10 +141,10 @@ void PrintHelp() {
         stderr);
 }
 
-Cli ParseArgs(int argc, SAP_UC **argv) {
+Cli ParseArgs(int argc, char **argv) {
     Cli c;
     for (int i = 1; i < argc; i++) {
-        std::string a = uc2std(argv[i]);
+        std::string a = argv[i];
         std::string key = a, inval;
         bool has_inval = false;
         auto eq = a.find('=');
@@ -156,7 +156,7 @@ Cli ParseArgs(int argc, SAP_UC **argv) {
         // Value for flags that take one: prefer "--flag=value", else next token.
         auto take_value = [&]() -> std::string {
             if (has_inval) return inval;
-            if (i + 1 < argc) return uc2std(argv[++i]);
+            if (i + 1 < argc) return argv[++i];
             return "";
         };
 
@@ -234,7 +234,15 @@ void SAP_API OnStateChange(RFC_SERVER_HANDLE, RFC_STATE_CHANGE *c) {
 
 } // namespace
 
-int mainU(int argc, SAP_UC **argv) {
+// A plain `main`, not the SDK's `mainU`.
+//
+// `mainU` is a macro in sapucrfc.h that generates a real `main` calling
+// `nlsui_initialize()` and `nlsui_alloc_wcsar()` to hand the program a UTF-16
+// argv. Both live in **libsapucum**, so using it would keep a SAP shared object
+// on the link line after libsapnwrfc is gone. Nothing here wants UTF-16 argv
+// anyway — every flag was converted straight back to UTF-8 — so taking
+// `char **` removes a dependency and a round trip at once.
+int main(int argc, char **argv) {
     log::get().Configure();
 
     Cli cli = ParseArgs(argc, argv);
