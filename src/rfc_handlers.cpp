@@ -189,7 +189,7 @@ extern "C" RFC_RC SAP_API ZPingImpl(RFC_CONNECTION_HANDLE,
         std::memset(errorInfo, 0, sizeof(*errorInfo));
         errorInfo->code = RFC_EXTERNAL_FAILURE;
         auto m = std2uc(std::string("ping failed: ") + e.what());
-        strncpyU(errorInfo->message, m.data(), sizeof(errorInfo->message)/sizeof(SAP_UC));
+        uccpy(errorInfo->message, m.data(), sizeof(errorInfo->message)/sizeof(SAP_UC));
         return RFC_EXTERNAL_FAILURE;
     }
 }

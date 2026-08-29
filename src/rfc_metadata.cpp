@@ -13,7 +13,7 @@ void AddParam(RFC_FUNCTION_DESC_HANDLE desc, const char *name, RFCTYPE type,
     RFC_PARAMETER_DESC p;
     std::memset(&p, 0, sizeof(p));
     auto uname = std2uc(name);
-    strncpyU(p.name, uname.data(), sizeof(p.name) / sizeof(SAP_UC));
+    uccpy(p.name, uname.data(), sizeof(p.name) / sizeof(SAP_UC));
     p.type = type;
     p.direction = dir;
     p.nucLength = nuc_len;

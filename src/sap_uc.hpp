@@ -11,6 +11,19 @@
 
 namespace erpl_rev {
 
+// SAP_UC (UTF-16) string primitives.
+//
+// The SDK supplies these as `strlenU` / `strncpyU`, but those resolve to
+// `strlenU16` / `strncpyU16` in **libsapucum** — a second SAP shared object,
+// separate from libsapnwrfc, and one a pure-Rust RFC backend does not replace
+// (it implements the RFC ABI, not SAP's string library). Two functions are not
+// worth a dependency that would outlive the SDK removal, so they are spelled
+// out here. Backend-neutral: nothing about them is SAP-specific beyond the type.
+size_t uclen(const SAP_UC *s);
+// Copies at most `cap` units *including* the terminator, always terminating.
+void   uccpy(SAP_UC *dst, const SAP_UC *src, size_t cap);
+
+
 // Decode a SAP_UC buffer to a UTF-8 std::string.
 std::string uc2std(const SAP_UC *uc);                       // null-terminated
 std::string uc2std(const SAP_UC *uc, unsigned len);

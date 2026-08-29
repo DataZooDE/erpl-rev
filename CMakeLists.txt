@@ -23,21 +23,71 @@ else()
   set(_sdk_sub linux)
 endif()
 
-# --- SAP NW RFC SDK ----------------------------------------------------------
-set(SAPNWRFC_HOME "" CACHE PATH "Path to the SAP NW RFC SDK platform dir")
-if(NOT SAPNWRFC_HOME)
-  get_filename_component(SAPNWRFC_HOME "${CMAKE_CURRENT_SOURCE_DIR}/nwrfcsdk/${_sdk_sub}" ABSOLUTE)
+# --- RFC backend -------------------------------------------------------------
+# Which implementation of the NW RFC C ABI to build against:
+#   sdk   - SAP's closed-source libsapnwrfc (+ libsapucum, + ICU), downloaded
+#           from SAP and vendored under nwrfcsdk/.
+#   proto - erpl-proto's pure-Rust drop-in shim, which exports the same C ABI
+#           and ships its own sapnwrfc.h, so building needs no SAP download at
+#           all.
+#
+# The two are ABI-identical, so this is purely a change of header and link
+# target: not one source file has an #ifdef for it.
+set(RFC_BACKEND "sdk" CACHE STRING "RFC implementation: sdk | proto")
+set_property(CACHE RFC_BACKEND PROPERTY STRINGS sdk proto)
+if(NOT RFC_BACKEND MATCHES "^(sdk|proto)$")
+  message(FATAL_ERROR "RFC_BACKEND must be 'sdk' or 'proto', got '${RFC_BACKEND}'")
 endif()
-if(NOT EXISTS "${SAPNWRFC_HOME}/include/sapnwrfc.h")
-  message(FATAL_ERROR "NW RFC SDK not found at ${SAPNWRFC_HOME}; provide nwrfcsdk/${_sdk_sub} or set -DSAPNWRFC_HOME=...")
+# Shared or static, for the proto backend only: SAP ships no static library.
+set(RFC_LINK "shared" CACHE STRING "How to link the RFC backend: shared | static")
+set_property(CACHE RFC_LINK PROPERTY STRINGS shared static)
+if(RFC_BACKEND STREQUAL "sdk" AND RFC_LINK STREQUAL "static")
+  message(FATAL_ERROR "RFC_LINK=static needs RFC_BACKEND=proto; SAP ships no static libsapnwrfc")
 endif()
-# Names resolve across platforms: lib{sapnwrfc,sapucum}.{so,dylib} / {sapnwrfc,libsapucum}.lib
-find_library(SAP_NWRFC_LIB sapnwrfc PATHS "${SAPNWRFC_HOME}/lib" NO_DEFAULT_PATH)
-find_library(SAP_UCUM_LIB  sapucum  PATHS "${SAPNWRFC_HOME}/lib" NO_DEFAULT_PATH)
-if(NOT SAP_NWRFC_LIB OR NOT SAP_UCUM_LIB)
-  message(FATAL_ERROR "Could not find sapnwrfc/sapucum under ${SAPNWRFC_HOME}/lib")
+
+if(RFC_BACKEND STREQUAL "proto")
+  # erpl-proto's shim, built by `cargo build --release -p erpl-proto-nwrfc`. The
+  # shared object is named libsapnwrfc.so on purpose - a consumer resolves it by
+  # SONAME - and the crate emits a staticlib beside it.
+  set(ERPL_PROTO_ROOT "" CACHE PATH "Path to an erpl-proto checkout")
+  if(NOT ERPL_PROTO_ROOT)
+    message(FATAL_ERROR "RFC_BACKEND=proto needs -DERPL_PROTO_ROOT=<erpl-proto checkout>")
+  endif()
+  set(RFC_INCLUDE "${ERPL_PROTO_ROOT}/crates/erpl-proto-nwrfc/include")
+  if(NOT EXISTS "${RFC_INCLUDE}/sapnwrfc.h")
+    message(FATAL_ERROR "erpl-proto's sapnwrfc.h not found at ${RFC_INCLUDE}")
+  endif()
+  if(RFC_LINK STREQUAL "static")
+    set(_rfc_lib "${ERPL_PROTO_ROOT}/target/release/${CMAKE_STATIC_LIBRARY_PREFIX}sapnwrfc${CMAKE_STATIC_LIBRARY_SUFFIX}")
+  else()
+    set(_rfc_lib "${ERPL_PROTO_ROOT}/target/release/${CMAKE_SHARED_LIBRARY_PREFIX}sapnwrfc${CMAKE_SHARED_LIBRARY_SUFFIX}")
+  endif()
+  if(NOT EXISTS "${_rfc_lib}")
+    message(FATAL_ERROR
+      "${_rfc_lib} is missing.\n"
+      "Build it with: cargo build --release -p erpl-proto-nwrfc --manifest-path ${ERPL_PROTO_ROOT}/Cargo.toml")
+  endif()
+  set(SAP_LIBS "${_rfc_lib}")
+  message(STATUS "erpl-rev RFC backend: proto (${_rfc_lib})")
+else()
+  # --- SAP NW RFC SDK --------------------------------------------------------
+  set(SAPNWRFC_HOME "" CACHE PATH "Path to the SAP NW RFC SDK platform dir")
+  if(NOT SAPNWRFC_HOME)
+    get_filename_component(SAPNWRFC_HOME "${CMAKE_CURRENT_SOURCE_DIR}/nwrfcsdk/${_sdk_sub}" ABSOLUTE)
+  endif()
+  if(NOT EXISTS "${SAPNWRFC_HOME}/include/sapnwrfc.h")
+    message(FATAL_ERROR "NW RFC SDK not found at ${SAPNWRFC_HOME}; provide nwrfcsdk/${_sdk_sub}, set -DSAPNWRFC_HOME=..., or build with -DRFC_BACKEND=proto")
+  endif()
+  # Names resolve across platforms: lib{sapnwrfc,sapucum}.{so,dylib} / {sapnwrfc,libsapucum}.lib
+  find_library(SAP_NWRFC_LIB sapnwrfc PATHS "${SAPNWRFC_HOME}/lib" NO_DEFAULT_PATH)
+  find_library(SAP_UCUM_LIB  sapucum  PATHS "${SAPNWRFC_HOME}/lib" NO_DEFAULT_PATH)
+  if(NOT SAP_NWRFC_LIB OR NOT SAP_UCUM_LIB)
+    message(FATAL_ERROR "Could not find sapnwrfc/sapucum under ${SAPNWRFC_HOME}/lib")
+  endif()
+  set(SAP_LIBS ${SAP_NWRFC_LIB} ${SAP_UCUM_LIB})
+  set(RFC_INCLUDE "${SAPNWRFC_HOME}/include")
+  message(STATUS "erpl-rev RFC backend: sdk (${SAPNWRFC_HOME})")
 endif()
-set(SAP_LIBS ${SAP_NWRFC_LIB} ${SAP_UCUM_LIB})
 
 # --- DuckDB (self-contained dist: libduckdb + amalgamated duckdb.hpp) --------
 set(DUCKDB_DIST "" CACHE PATH "Standalone DuckDB dist dir (libduckdb + duckdb.hpp)")
@@ -94,7 +144,15 @@ set(DATAZOO_BANNER_TELEMETRY ON CACHE BOOL "" FORCE)
 add_subdirectory(third_party/datazoo-banner)
 
 # --- SAP build definitions (64-bit Unicode, per platform) --------------------
-if(WIN32)
+#
+# Only for the SDK backend. Without SAPwithUNICODE, sapucrfc.h silently typedefs
+# SAP_UC to a one-byte char while the library keeps writing UTF-16, and every
+# string API overruns its buffer by 2x. erpl-proto's header has no such switch -
+# SAP_UC is uint16_t unconditionally - so under the proto backend these are not
+# merely unnecessary but a per-platform detail to get wrong for no gain.
+if(RFC_BACKEND STREQUAL "proto")
+  # nothing to define
+elseif(WIN32)
   add_compile_definitions(SAPonNT WIN32 SAPwithUNICODE SAPwithTHREADS
                           UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
 elseif(APPLE)
@@ -123,7 +181,7 @@ add_executable(erpl_rev_server
   src/erpl_rev_telemetry.cpp
   src/main.cpp)
 target_include_directories(erpl_rev_server PRIVATE
-  "${SAPNWRFC_HOME}/include" "${DUCKDB_INCLUDE}" src)
+  "${RFC_INCLUDE}" "${DUCKDB_INCLUDE}" src)
 target_compile_definitions(erpl_rev_server PRIVATE
   ERPL_REV_VERSION="${ERPL_REV_VERSION}"
   ERPL_REV_DUCKDB_VERSION="${DUCKDB_VERSION}")

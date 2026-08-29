@@ -11,6 +11,12 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NW="${SAPNWRFC_HOME:-$HERE/nwrfcsdk/linux}/lib"
+# Which NW RFC C ABI to exercise: `sdk` (SAP's) or `proto` (erpl-proto's
+# pure-Rust shim). Both must produce identical results -- that equality is the
+# acceptance test for removing the SDK.
+RFC_BACKEND="${RFC_BACKEND:-sdk}"
+ERPL_PROTO_ROOT="${ERPL_PROTO_ROOT:-}"
+if [ "$RFC_BACKEND" = proto ]; then RFC_LIB_DIR="$ERPL_PROTO_ROOT/target/release"; else RFC_LIB_DIR="$NW"; fi
 VCPKG="${VCPKG_ROOT:-$HOME/.local/share/vcpkg}"
 TRIPLET="${VCPKG_TRIPLET:-x64-linux}"
 # Credentials come from the environment — never hardcode. Export SAP_PASSWORD before
@@ -23,7 +29,13 @@ SRV=""
 fail() { echo "E2E FAIL: $*" >&2; [ -n "$SRV" ] && kill "$SRV" 2>/dev/null; exit 1; }
 
 echo "== build =="
+if [ "$RFC_BACKEND" = proto ]; then
+  cargo build --release -p erpl-proto-nwrfc \
+        --manifest-path "$ERPL_PROTO_ROOT/Cargo.toml" >/dev/null 2>&1 \
+    || fail "build erpl-proto's nwrfc shim"
+fi
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DRFC_BACKEND="$RFC_BACKEND" -DERPL_PROTO_ROOT="$ERPL_PROTO_ROOT" \
       -DCMAKE_TOOLCHAIN_FILE="$VCPKG/scripts/buildsystems/vcpkg.cmake" \
       -DVCPKG_TARGET_TRIPLET="$TRIPLET" -DVCPKG_HOST_TRIPLET="$TRIPLET" \
       >/dev/null 2>&1 || fail "configure"
@@ -37,7 +49,7 @@ rm -f /tmp/erpl_rev_sap_export.parquet
 # throwaway file (removed around the run) — never the persistent default.
 E2E_DB="/tmp/erpl_e2e_$$.duckdb"
 rm -f "$E2E_DB" "$E2E_DB".wal
-LD_LIBRARY_PATH="$NW" ./build/erpl_rev_server --db "$E2E_DB" >/tmp/erpl_e2e_srv.log 2>&1 &
+LD_LIBRARY_PATH="$RFC_LIB_DIR" ./build/erpl_rev_server --db "$E2E_DB" >/tmp/erpl_e2e_srv.log 2>&1 &
 SRV=$!
 sleep 6
 ps -p "$SRV" >/dev/null || { cat /tmp/erpl_e2e_srv.log; fail "server died"; }
@@ -156,4 +168,18 @@ echo "   bw OK (ADBC read -> DuckDB: view + parameterized SQLScript table functi
 
 kill "$SRV" 2>/dev/null; sleep 1
 rm -f "$E2E_DB" "$E2E_DB".wal
+if [ "$RFC_BACKEND" = proto ]; then
+  echo "== SDK-absence check =="
+  # Matched on the resolved *path*, not the SONAME: erpl-proto's shim is called
+  # libsapnwrfc.so on purpose, so a name check cannot tell it from SAP's and
+  # would fail on exactly the binary we want.
+  if ldd ./build/erpl_rev_server | grep -F "$NW/"; then
+    fail "a library is still being loaded from the SAP NW RFC SDK at $NW"
+  fi
+  if ldd ./build/erpl_rev_server | grep -Ei 'libsapucum|libicu'; then
+    fail "libsapucum or ICU is still linked"
+  fi
+  echo "   nothing loaded from $NW; no libsapucum, no ICU"
+fi
+
 echo "== E2E PASSED =="

@@ -25,6 +25,14 @@ BUILD_DIR := build
 # DUCKDB_DIST option follows suit.
 DUCKDB_VERSION ?= 1.5.4
 DUCKDB_DIST ?= $(CURDIR)/vendor/duckdb-$(DUCKDB_VERSION)
+
+# Which NW RFC C ABI to build against: `sdk` (SAP's, vendored under nwrfcsdk/)
+# or `proto` (erpl-proto's pure-Rust shim, which also supplies sapnwrfc.h, so no
+# SAP download is needed at all):
+#   make build RFC_BACKEND=proto ERPL_PROTO_ROOT=/path/to/erpl-proto
+RFC_BACKEND ?= sdk
+RFC_LINK ?= shared
+ERPL_PROTO_ROOT ?=
 # Override DUCKDB_URL/DUCKDB_SHA256 for non-Linux dists (osx-universal / windows-amd64).
 DUCKDB_URL ?= https://github.com/duckdb/duckdb/releases/download/v$(DUCKDB_VERSION)/libduckdb-linux-amd64.zip
 # Pinned SHA256 of libduckdb-linux-amd64.zip v1.5.4 — verified on download (supply
@@ -42,7 +50,14 @@ VCPKG_FLAGS := -DCMAKE_TOOLCHAIN_FILE=$(VCPKG_TOOLCHAIN) \
 
 # libsapnwrfc.so dlopen()s the ICU libs by name at runtime, so the server (and
 # anything linking libduckdb.so) needs these dirs on LD_LIBRARY_PATH.
+# Under the proto backend the SAP lib dir is deliberately kept OFF the path: if
+# anything still reached for libsapnwrfc or ICU the run would fail here rather
+# than quietly succeed on a leftover.
+ifeq ($(RFC_BACKEND),proto)
+RUN_ENV := LD_LIBRARY_PATH=$(ERPL_PROTO_ROOT)/target/release:$(DUCKDB_LIB)
+else
 RUN_ENV := LD_LIBRARY_PATH=$(NWRFC_LIB):$(DUCKDB_LIB)
+endif
 
 # Prefer Ninja when available, else fall back to Make generator.
 GENERATOR := $(shell command -v ninja >/dev/null 2>&1 && echo Ninja || echo "Unix Makefiles")
@@ -68,11 +83,24 @@ $(DUCKDB_DIST)/libduckdb.so:
 	  || { echo "ERROR: DuckDB download checksum mismatch"; rm -f $(DUCKDB_DIST)/dist.zip; exit 1; }
 	cd $(DUCKDB_DIST) && unzip -o dist.zip && rm -f dist.zip
 
-configure: duckdb-dist submodules
+CONFIGURE_DEPS := duckdb-dist submodules
+ifeq ($(RFC_BACKEND),proto)
+CONFIGURE_DEPS += proto-shim
+endif
+
+configure: $(CONFIGURE_DEPS)
 	cmake -S . -B $(BUILD_DIR) -G "$(GENERATOR)" \
 	      -DCMAKE_BUILD_TYPE=Release -DSAPNWRFC_HOME=$(NWRFC_HOME) \
 	      -DDUCKDB_DIST=$(DUCKDB_DIST) -DDUCKDB_VERSION=$(DUCKDB_VERSION) \
+	      -DRFC_BACKEND=$(RFC_BACKEND) -DRFC_LINK=$(RFC_LINK) \
+	      -DERPL_PROTO_ROOT=$(ERPL_PROTO_ROOT) \
 	      $(VCPKG_FLAGS)
+
+# erpl-proto's nwrfc shim; only needed for RFC_BACKEND=proto. The crate emits
+# the shared object and the static archive together, so this serves both links.
+proto-shim:
+	@test -n "$(ERPL_PROTO_ROOT)" || { echo "set ERPL_PROTO_ROOT=<erpl-proto checkout>"; exit 1; }
+	cargo build --release -p erpl-proto-nwrfc --manifest-path $(ERPL_PROTO_ROOT)/Cargo.toml
 
 # The telemetry lib (third_party/posthog-telemetry) is a git submodule.
 submodules:
