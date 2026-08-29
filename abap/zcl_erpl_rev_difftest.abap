@@ -65,12 +65,13 @@ CLASS zcl_erpl_rev_difftest IMPLEMENTATION.
         CONDENSE n NO-GAPS.
         rv = n.
       WHEN 'RAW' OR 'LRAW' OR 'RSTR'.
-        rv = |{ <v> }|.                       " xstring -> uppercase hex
-        " KNOWN LIMITATION: the BXML/asXML binary pipeline drops TRAILING zero
-        " bytes of a fixed RAW field (a 16-byte RAW ending 0x00 arrives shorter;
-        " an all-zero RAW arrives empty). Normalize by trimming trailing 00 so the
-        " check compares the faithfully-carried bytes. (See README caveat.)
-        REPLACE PCRE '(00)+$' IN rv WITH ``.
+        rv = |{ <v> }|.                       " xstring -> uppercase hex, whole
+        " Compared byte for byte, trailing zeros included. Both sides used to
+        " trim '(00)+$' because the pipeline dropped them; trimming
+        " "symmetrically" sounds harmless and is not. ZWIDE_BSEG's
+        " blob0001..blob0004 are all-zero RAW(16) on every row, so both sides
+        " reduced to empty and a column replicated as an EMPTY BLOB compared
+        " equal to sixteen zero bytes -- 3000 rows x 390 columns of it.
       WHEN OTHERS.                             " CHAR/CLNT/NUMC/CUKY/UNIT/LANG/...
         rv = CONV string( <v> ).
         REPLACE PCRE '\s+$' IN rv WITH ``.     " right-trim (CHAR blank-pad)
@@ -99,10 +100,7 @@ CLASS zcl_erpl_rev_difftest IMPLEMENTATION.
            OR 'DEC' OR 'CURR' OR 'QUAN'.
         rv = |coalesce(cast({ c } as varchar),'')|.
       WHEN 'RAW' OR 'LRAW' OR 'RSTR'.
-        " Strip trailing 00 to match sap_cell: fixed RAW loses trailing zero bytes
-        " in the asXML pipeline, so trim BOTH sides symmetrically (no-op when the
-        " value carries no trailing 00, e.g. RSTR — verified byte-identical).
-        rv = |coalesce(regexp_replace(hex({ c }),'(00)+$',''),'')|.
+        rv = |coalesce(hex({ c }),'')|.       " full hex; see sap_cell
       WHEN OTHERS.
         rv = |coalesce(rtrim({ c }),'')|.
     ENDCASE.
