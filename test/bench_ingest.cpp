@@ -490,3 +490,73 @@ TEST_CASE("cursor-encode bench: GetValue+Table vs flat+StreamEncoder", "[bench][
                   tnew, tnew > 0 ? nrow / tnew : 0.0, tnew > 0 ? told / tnew : 0.0);
     WARN(buf);
 }
+
+// Where does an ingest actually spend its time?
+//
+// The strategy comparison above answers "which insert mechanism", but the
+// handler does three things per package and only one of them is the insert:
+// decode the BXML, append the cells into the staging clone, then one
+// INSERT…SELECT with casts. A live 100k-row ZWIDE_BSEG replication spends 60%
+// of its wall clock inside this process, so knowing which third that is decides
+// what is worth optimising.
+//
+// Shaped like the real thing: 420 columns, the width of ZWIDE_BSEG.
+TEST_CASE("ingest phase split: decode / append / apply", "[bench][.]") {
+    constexpr int NCOL = 420;
+    constexpr int NROW = 50000;   // one package, as the replicator sends
+
+    // Column names and a DDL matching the live shape: mostly VARCHAR with a
+    // scattering of the other families ZWIDE_BSEG carries.
+    erpl_rev::sxml::Table t;
+    std::string ddl = "CREATE TABLE IF NOT EXISTS phz (";
+    for (int c = 0; c < NCOL; c++) {
+        char nm[32];
+        std::snprintf(nm, sizeof nm, "COL%04d", c);
+        t.columns.emplace_back(nm);
+        if (c) ddl += ",";
+        ddl += std::string(nm) + (c % 7 == 0   ? " BIGINT"
+                                  : c % 7 == 1 ? " DECIMAL(15,2)"
+                                  : c % 7 == 2 ? " DATE"
+                                               : " VARCHAR");
+    }
+    ddl += ");";
+
+    t.rows.reserve(NROW);
+    for (int r = 0; r < NROW; r++) {
+        std::vector<std::string> row;
+        row.reserve(NCOL);
+        for (int c = 0; c < NCOL; c++) {
+            if (c % 7 == 0)      row.emplace_back(std::to_string(r * 31 + c));
+            else if (c % 7 == 1) row.emplace_back("12.50");
+            else if (c % 7 == 2) row.emplace_back("2024-01-15");
+            else                 row.emplace_back("abcdefghij");
+        }
+        t.rows.push_back(std::move(row));
+    }
+
+    const std::string bxml = erpl_rev::sxml::Encode("DATA", t);
+    WARN("payload: " << NROW << " rows x " << NCOL << " cols, "
+                     << bxml.size() / (1024 * 1024) << " MiB BXML");
+
+    // Decode alone.
+    auto t0 = clk::now();
+    erpl_rev::sxml::Table decoded = erpl_rev::sxml::Decode(bxml);
+    auto t1 = clk::now();
+    REQUIRE(decoded.rows.size() == NROW);
+
+    // Decode + stage + insert, as IngestBxml does it end to end.
+    erpl_rev::DuckDbBridge db;
+    auto t2 = clk::now();
+    auto n = db.IngestBxml("phz", bxml, erpl_rev::IngestMode::Insert, {}, "", "SET threads TO 1;", ddl);
+    auto t3 = clk::now();
+    REQUIRE(n == NROW);
+
+    auto ms = [](auto a, auto b) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
+    };
+    const long dec = ms(t0, t1), all = ms(t2, t3);
+    WARN("decode        " << dec << " ms");
+    WARN("ingest total  " << all << " ms  (" << (NROW * 1000L / (all ? all : 1)) << " rows/s)");
+    WARN("append+apply  " << (all - dec) << " ms  (decode is "
+                          << (all ? 100 * dec / all : 0) << "% of ingest)");
+}
