@@ -26,19 +26,6 @@ TRIPLET="${VCPKG_TRIPLET:-x64-linux}"
 # running (for the A4H trial it's the SAP-published developer-edition default).
 : "${SAP_PASSWORD:?set SAP_PASSWORD in the environment before running}"
 ADT=(--host localhost --port 50000 --user DEVELOPER --client 001 --password-env SAP_PASSWORD)
-# The ABAP sources moved to erpl (see scripts/deploy-abap.sh and DataZooDE/erpl#123),
-# so they are no longer under this repo's abap/. Resolve them from an erpl checkout
-# the same way deploy-abap.sh does, and say so loudly if it is missing -- silently
-# skipping the drivers would make the suite fail with an activation error that names
-# nothing, or worse, read green.
-ERPL_DIR="${ERPL_DIR:-$HERE/../erpl}"
-ABAP_DIR="$ERPL_DIR/scripts/sap/assets/rev/abap"
-if [ ! -d "$ABAP_DIR" ]; then
-    echo "E2E FAIL: no erpl checkout with the ABAP assets" >&2
-    echo "  looked in: $ABAP_DIR" >&2
-    echo "  set ERPL_DIR to an erpl checkout, or clone erpl beside this repository." >&2
-    exit 1
-fi
 
 cd "$HERE"
 SRV=""
@@ -72,7 +59,7 @@ sleep 6
 ps -p "$SRV" >/dev/null || { cat /tmp/erpl_e2e_srv.log; fail "server died"; }
 
 run() {  # cls file -> $OUT (cleaned). Uses ABSOLUTE --file path.
-  local cls="$1" file="$ABAP_DIR/$(basename "$2")"
+  local cls="$1" file="$HERE/$2"
   uvx erpl-adt "${ADT[@]}" object create --type CLAS/OC --name "$cls" \
       --package '$TMP' --description e2e >/dev/null 2>&1
   uvx erpl-adt "${ADT[@]}" source write "$cls" --file "$file" --activate >/dev/null 2>&1 \
