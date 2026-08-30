@@ -221,11 +221,28 @@ jobs:
       - name: Assert the proto bundle links no SAP library
         shell: pwsh
         run: |
-          # dumpbin is the Windows equivalent of ldd/otool. Any RFC or ICU import
-          # means the shim did not end up inside the exe.
-          $dump = & "$(Split-Path (Get-Command cl.exe).Source)\dumpbin.exe" /dependents build\Release\erpl_rev_server.exe
-          if ($dump -match 'sapnwrfc|sapucum|icu') {
-            Write-Error "proto bundle still imports an RFC or ICU library"; exit 1
+          # dumpbin is the Windows ldd, but cl.exe is not on PATH in this job, so
+          # locate the toolchain with vswhere. If that fails, fall back to
+          # scanning the image: a DLL import name appears verbatim as ASCII in
+          # the PE import table, so the check still holds without the tool.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = $null
+          if (Test-Path $vswhere) {
+            $vs = & $vswhere -latest -products * -property installationPath
+            if ($vs) { $dumpbin = Get-ChildItem -Path $vs -Filter dumpbin.exe -Recurse -ErrorAction SilentlyContinue |
+                                  Select-Object -First 1 -ExpandProperty FullName }
+          }
+          $exe = "build\Release\erpl_rev_server.exe"
+          if ($dumpbin) {
+            Write-Host "using $dumpbin"
+            $deps = & $dumpbin /dependents $exe | Out-String
+          } else {
+            Write-Host "dumpbin not found; scanning the image for import names"
+            $bytes = [System.IO.File]::ReadAllBytes($exe)
+            $deps  = [System.Text.Encoding]::ASCII.GetString($bytes)
+          }
+          if ($deps -match 'sapnwrfc|sapucum|icuuc|icudt|icuin') {
+            Write-Error "proto build still imports an RFC or ICU library"; exit 1
           }
           Write-Host "no RFC or ICU import; DuckDB is the only bundled library"
 

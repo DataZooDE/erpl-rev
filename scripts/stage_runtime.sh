@@ -29,7 +29,12 @@ if [ "$SDK_LIB" = "-" ]; then SAP_LIBS=(); fi
 
 mkdir -p "$OUT"
 cp "$SERVER" "$OUT/erpl_rev_server"
-for l in "${SAP_LIBS[@]}"; do cp "$SDK_LIB/$l" "$OUT/$l"; done
+# Guard the expansion: macOS ships bash 3.2, where "${arr[@]}" on an EMPTY array
+# counts as unbound under `set -u` and aborts. Linux's bash 5 expands it to
+# nothing and carries on, so this only bites on the mac.
+if [ "${#SAP_LIBS[@]}" -gt 0 ]; then
+    for l in "${SAP_LIBS[@]}"; do cp "$SDK_LIB/$l" "$OUT/$l"; done
+fi
 cp "$DUCKDB_DIR/$DUCKDB_LIB" "$OUT/$DUCKDB_LIB"
 
 echo "Staged $(ls "$OUT" | wc -l) files into $OUT:"
