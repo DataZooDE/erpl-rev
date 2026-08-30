@@ -21,10 +21,14 @@ using namespace erpl_rev;
 
 namespace {
 
-// gzip-frame a string, the way cl_abap_gzip=>compress_binary does on the ABAP side.
-std::string Gzip(const std::string &in, int level = Z_DEFAULT_COMPRESSION) {
+// Frame a string the way the ABAP side does: the ASCII magic "ERPZ" followed by
+// a RAW DEFLATE stream, which is what cl_abap_gzip=>compress_binary emits (no
+// gzip and no zlib header -- verified on the trial).
+// `window` selects the framing: -15 raw deflate, 15+16 real gzip.
+std::string Deflate(const std::string &in, int window = -15,
+                    int level = Z_DEFAULT_COMPRESSION) {
     z_stream zs{};
-    REQUIRE(deflateInit2(&zs, level, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) == Z_OK);
+    REQUIRE(deflateInit2(&zs, level, Z_DEFLATED, window, 8, Z_DEFAULT_STRATEGY) == Z_OK);
     zs.next_in = reinterpret_cast<Bytef *>(const_cast<char *>(in.data()));
     zs.avail_in = static_cast<uInt>(in.size());
     std::string out;
@@ -37,8 +41,11 @@ std::string Gzip(const std::string &in, int level = Z_DEFAULT_COMPRESSION) {
         out.append(buf.data(), buf.size() - zs.avail_out);
     } while (rc == Z_OK);
     deflateEnd(&zs);
-    return out;
+    return window < 0 ? std::string(kDeflateMagic) + out : out;
 }
+
+// A real gzip stream, to prove the alternate framing is still accepted.
+std::string Gzip(const std::string &in) { return Deflate(in, 15 + 16); }
 
 // A small package: two columns, three rows.
 std::string SamplePackage() {
@@ -50,26 +57,30 @@ std::string SamplePackage() {
 
 } // namespace
 
-TEST_CASE("payload: gzip is recognised, sXML is left alone", "[payload]") {
+TEST_CASE("payload: a framed payload is recognised, sXML is left alone", "[payload]") {
     const std::string raw = SamplePackage();
     REQUIRE(raw.rfind("BXML", 0) == 0);
-    REQUIRE_FALSE(IsGzip(raw));
-    REQUIRE(IsGzip(Gzip(raw)));
+    REQUIRE_FALSE(IsCompressed(raw));
+    REQUIRE(IsCompressed(Deflate(raw)));
+    REQUIRE(IsCompressed(Gzip(raw)));
 
     // Left alone means byte-identical, not merely decodable.
     REQUIRE(MaybeInflate(raw) == raw);
+    REQUIRE(MaybeInflate(Deflate(raw)) == raw);
     REQUIRE(MaybeInflate(Gzip(raw)) == raw);
 }
 
-TEST_CASE("payload: empty and near-empty inputs are not mistaken for gzip", "[payload]") {
-    REQUIRE_FALSE(IsGzip(""));
-    REQUIRE_FALSE(IsGzip("\x1f"));            // one byte of the magic
+TEST_CASE("payload: short and unframed inputs are not mistaken for compressed", "[payload]") {
+    REQUIRE_FALSE(IsCompressed(""));
+    REQUIRE_FALSE(IsCompressed("\x1f"));       // one byte of the gzip magic
+    REQUIRE_FALSE(IsCompressed("ERP"));        // three bytes of ours
+    REQUIRE_FALSE(IsCompressed("BXML"));       // an uncompressed package
     REQUIRE(MaybeInflate("") == "");
     REQUIRE(MaybeInflate("\x1f") == "\x1f");
 }
 
 TEST_CASE("payload: a corrupt or truncated stream fails as an inflate error", "[payload]") {
-    const std::string gz = Gzip(SamplePackage());
+    const std::string gz = Deflate(SamplePackage());
 
     // Truncated mid-stream.
     REQUIRE_THROWS_WITH(MaybeInflate(gz.substr(0, gz.size() / 2)),
@@ -85,17 +96,33 @@ TEST_CASE("payload: a corrupt or truncated stream fails as an inflate error", "[
                         Catch::Matchers::ContainsSubstring("payload inflate failed"));
 }
 
+TEST_CASE("payload: trailing data after the stream is rejected", "[payload]") {
+    // Stopping at the first Z_STREAM_END and returning would silently drop a
+    // second gzip member or any trailing bytes. The sXML decoder reads to EOF
+    // without checking that its element stack closed, so a short payload would
+    // land as missing rows rather than as an error -- silent data loss.
+    const std::string one = Deflate(SamplePackage());
+    REQUIRE_THROWS_WITH(MaybeInflate(one + std::string("junk")),
+                        Catch::Matchers::ContainsSubstring("trailing data"));
+
+    // Two concatenated gzip members: valid per RFC 1952, but we decode one
+    // package per call, so reject rather than quietly return the first.
+    const std::string gz = Gzip(SamplePackage());
+    REQUIRE_THROWS_WITH(MaybeInflate(gz + gz),
+                        Catch::Matchers::ContainsSubstring("payload inflate failed"));
+}
+
 TEST_CASE("payload: the inflated-size cap is enforced", "[payload]") {
     // A megabyte of zeros compresses to about a kilobyte -- the shape of a
     // decompression bomb, and the reason MaybeInflate takes a limit at all.
-    const std::string bomb = Gzip(std::string(1024 * 1024, '\0'));
+    const std::string bomb = Deflate(std::string(1024 * 1024, '\0'));
     REQUIRE(bomb.size() < 8192);
     REQUIRE_THROWS_WITH(MaybeInflate(bomb, 4096),
                         Catch::Matchers::ContainsSubstring("exceeds the limit"));
     REQUIRE(MaybeInflate(bomb, 2 * 1024 * 1024).size() == 1024 * 1024);
 }
 
-TEST_CASE("payload: a gzipped package ingests to the same rows as the raw one", "[payload]") {
+TEST_CASE("payload: a compressed package ingests to the same rows as the raw one", "[payload]") {
     const std::string raw = SamplePackage();
 
     DuckDbBridge db("");
@@ -103,7 +130,7 @@ TEST_CASE("payload: a gzipped package ingests to the same rows as the raw one", 
     db.Query("CREATE TABLE t_gz  (mandt VARCHAR, sgtxt VARCHAR)");
 
     REQUIRE(db.IngestBxml("t_raw", raw, IngestMode::Insert, {}, "", "", "", "") == 3);
-    REQUIRE(db.IngestBxml("t_gz", Gzip(raw), IngestMode::Insert, {}, "", "", "", "") == 3);
+    REQUIRE(db.IngestBxml("t_gz", Deflate(raw), IngestMode::Insert, {}, "", "", "", "") == 3);
 
     auto r = db.Query("SELECT count(*) FROM t_raw a JOIN t_gz b USING (mandt, sgtxt)");
     REQUIRE(r.rows.size() == 1);
@@ -131,7 +158,7 @@ TEST_CASE("payload: binary (BLOB) cells survive the compressed path byte-for-byt
     db.Query("CREATE TABLE b_raw (k VARCHAR, b BLOB)");
     db.Query("CREATE TABLE b_gz  (k VARCHAR, b BLOB)");
     REQUIRE(db.IngestBxml("b_raw", raw, IngestMode::Insert, {}, "", "", "", "") == 2);
-    REQUIRE(db.IngestBxml("b_gz", Gzip(raw), IngestMode::Insert, {}, "", "", "", "") == 2);
+    REQUIRE(db.IngestBxml("b_gz", Deflate(raw), IngestMode::Insert, {}, "", "", "", "") == 2);
 
     auto r = db.Query("SELECT count(*) FROM b_raw a JOIN b_gz b USING (k) "
                       "WHERE a.b IS NOT DISTINCT FROM b.b");

@@ -557,7 +557,7 @@ long long DuckDbBridge::IngestBxml(const std::string &target,
     // just to reach the decoder.
     std::string inflated;
     const std::string *payload = &bxml;
-    if (IsGzip(bxml)) {
+    if (IsCompressed(bxml)) {
         inflated = MaybeInflate(bxml);
         payload = &inflated;
     }
