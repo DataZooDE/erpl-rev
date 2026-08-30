@@ -287,13 +287,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve version
-        id: version
-        run: echo "v=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      # On a tag this is the release version. On a dispatch rehearsal
+      # GITHUB_REF_NAME is the BRANCH, so the naive strip produced wheels
+      # versioned "main" -- which bin-to-wheel happily accepted. Use a valid
+      # placeholder there, and validate either way: a malformed tag would
+      # otherwise sail through the whole release and fail at the upload, with
+      # the artefacts already built and the tag already pushed.
+      - name: Resolve version
+        id: version
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            v="${GITHUB_REF_NAME#v}"
+          else
+            v="0.0.0.dev0+$(git rev-parse --short HEAD)"
+          fi
+          pip install -q packaging
+          python -c "import sys; from packaging.version import Version; Version(sys.argv[1])" "$v" \
+            || { echo "::error::'$v' is not a valid PEP 440 version"; exit 1; }
+          echo "v=$v" >> "$GITHUB_OUTPUT"
+          echo "wheel version: $v"
 
       - uses: actions/download-artifact@v4
         with:
