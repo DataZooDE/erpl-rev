@@ -64,17 +64,32 @@ jobs:
         if: matrix.rfc == 'sdk'
         run: ./scripts/download_and_extract_nwrfc.sh "s3://erpl-resources/sapnwrfc/${{ matrix.sdk }}" "./nwrfcsdk/${{ matrix.sub }}/"
 
-      # erpl-proto is a private repository, so this needs a token with read
-      # access to it. Without the secret the job fails here with a clear
-      # message rather than silently falling back to the SAP SDK.
+      # erpl-proto is private, so the checkout needs credentials. Reuse the
+      # read-only GitHub App the other repositories already authenticate with
+      # (erpl's _extension_build.yml mints tokens for erpl, erpl-bics, erpl-odp
+      # and erpl-proto the same way) rather than minting a personal token that
+      # belongs to one person and expires without warning.
+      #
+      # The two secrets must be visible to THIS repository: promote them to
+      # organisation secrets with erpl-rev in scope, or add them here.
+      - name: Mint a read-only token for erpl-proto
+        if: matrix.rfc == 'proto'
+        id: proto_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.REPO_READONLY_GITHUB_APP_ID }}
+          private-key: ${{ secrets.REPO_READONLY_GITHUB_APP_KEY }}
+          repositories: "erpl-proto"
+
+      # No submodules: erpl-proto has none, and asking for them would widen the
+      # access this token needs for nothing.
       - name: Check out erpl-proto (RFC backend)
         if: matrix.rfc == 'proto'
         uses: actions/checkout@v4
         with:
           repository: DataZooDE/erpl-proto
-          token: ${{ secrets.ERPL_PROTO_TOKEN }}
+          token: ${{ steps.proto_token.outputs.token }}
           path: .erpl-proto
-          submodules: recursive
 
       - name: Build the pure-Rust RFC shim (static)
         if: matrix.rfc == 'proto'
