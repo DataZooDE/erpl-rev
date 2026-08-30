@@ -275,10 +275,14 @@ jobs:
   # wrapped here is the SELF-EXTRACTING bundle, so the wheel carries DuckDB too
   # and unpacks it to a per-version temp dir on first run -- there is still
   # nothing else to install.
+  # Deliberately NOT gated on a tag: building the wheels is the half of the PyPI
+  # path that can fail for ordinary reasons (a renamed artefact, a missing
+  # platform, a bin-to-wheel change), and a `workflow_dispatch` run rehearses it
+  # for free. Publishing stays tag-only, so a dispatch proves the wheels without
+  # burning a version number -- a PyPI release cannot be replaced.
   pypi-wheels:
     name: Build Python wheels
     needs: [posix, windows]
-    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
