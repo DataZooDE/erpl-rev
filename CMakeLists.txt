@@ -68,7 +68,25 @@ if(RFC_BACKEND STREQUAL "proto")
       "Build it with: cargo build --release -p erpl-proto-nwrfc --manifest-path ${ERPL_PROTO_ROOT}/Cargo.toml")
   endif()
   set(SAP_LIBS "${_rfc_lib}")
-  message(STATUS "erpl-rev RFC backend: proto (${_rfc_lib})")
+  # A Rust staticlib does not carry its own dependencies: the C++ consumer must
+  # name them or the link fails with unresolved symbols that read like our bug.
+  # Linux got away with nothing here only because its set is implicit. These are
+  # the lists `cargo rustc -- --print native-static-libs` reports for the shim,
+  # captured per platform by erpl-proto's `cross` CI job.
+  if(RFC_LINK STREQUAL "static")
+    if(WIN32)
+      # kernel32 ntdll userenv ws2_32 dbghelp, plus /defaultlib:msvcrt -- the
+      # DYNAMIC CRT, which is what the x64-windows-static-md triplet also uses,
+      # so the two agree. A mismatch here shows up as duplicate CRT symbols.
+      list(APPEND SAP_LIBS ntdll userenv ws2_32 dbghelp)
+    elseif(APPLE)
+      # -lSystem -lc -lm, all implicit in the default macOS link line.
+    else()
+      # -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc, all implicit on Linux; the
+      # explicit Threads/dl links elsewhere in this file already cover them.
+    endif()
+  endif()
+  message(STATUS "erpl-rev RFC backend: proto (${_rfc_lib}), link=${RFC_LINK}")
 else()
   # --- SAP NW RFC SDK --------------------------------------------------------
   set(SAPNWRFC_HOME "" CACHE PATH "Path to the SAP NW RFC SDK platform dir")
