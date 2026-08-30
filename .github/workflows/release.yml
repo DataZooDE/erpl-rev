@@ -158,6 +158,12 @@ jobs:
           name: ${{ matrix.asset }}.tar.gz
           path: dist/${{ matrix.asset }}.tar.gz
 
+      # The wheel wraps the raw self-extracting binary, not the tarball.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+
   windows:
     name: bundle erpl-rev-windows-amd64
     runs-on: windows-latest
@@ -256,6 +262,96 @@ jobs:
         with:
           name: erpl-rev-windows-amd64.zip
           path: dist\erpl-rev-windows-amd64.zip
+
+      # The wheel wraps the raw self-extracting exe, not the zip.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-erpl-rev-windows-amd64
+          path: dist\erpl-rev-windows-amd64.exe
+
+  # --- PyPI -------------------------------------------------------------------
+  # `uvx erpl-rev` / `pip install erpl-rev`, the same way erpl-adt ships: each
+  # platform's prebuilt binary is wrapped in a wheel with bin-to-wheel. What gets
+  # wrapped here is the SELF-EXTRACTING bundle, so the wheel carries DuckDB too
+  # and unpacks it to a per-version temp dir on first run -- there is still
+  # nothing else to install.
+  pypi-wheels:
+    name: Build Python wheels
+    needs: [posix, windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        run: echo "v=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: binaries
+
+      - name: Build a wheel per platform
+        run: |
+          pip install "bin-to-wheel @ git+https://github.com/DataZooDE/bin-to-wheel.git@main"
+          mkdir -p dist
+          # <artifact dir>:<file in it>:<bin-to-wheel platform>
+          entries=(
+            "binary-erpl-rev-linux-amd64:erpl-rev-linux-amd64:linux-x86_64"
+            "binary-erpl-rev-macos-arm64:erpl-rev-macos-arm64:macos-arm64"
+            "binary-erpl-rev-windows-amd64:erpl-rev-windows-amd64.exe:windows-x64"
+          )
+          for e in "${entries[@]}"; do
+            IFS=: read -r dir file plat <<<"$e"
+            path="binaries/$dir/$file"
+            # A missing binary must fail the release, not warn: a silently
+            # absent platform would publish an incomplete set to PyPI, and PyPI
+            # releases cannot be replaced.
+            [ -f "$path" ] || { echo "::error::missing $path"; exit 1; }
+            chmod +x "$path" || true
+            python -m bin_to_wheel \
+              --name erpl-rev \
+              --version "${{ steps.version.outputs.v }}" \
+              --binary "$path" \
+              --platform "$plat" \
+              --output-dir dist \
+              --entry-point erpl-rev \
+              --description "SAP RFC server bridging ABAP into DuckDB" \
+              --author "DataZoo GmbH" \
+              --license BUSL-1.1 \
+              --url https://github.com/DataZooDE/erpl-rev \
+              --readme README.md
+          done
+          ls -la dist/*.whl
+          n=$(ls dist/*.whl | wc -l)
+          [ "$n" -eq 3 ] || { echo "::error::expected 3 wheels, got $n"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pypi-wheels
+          path: dist/*.whl
+
+  pypi-publish:
+    name: Publish to PyPI
+    needs: pypi-wheels
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/erpl-rev
+    permissions:
+      id-token: write        # Trusted Publishing: no API token to store or rotate
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: pypi-wheels
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
 
   release:
     name: Publish release
