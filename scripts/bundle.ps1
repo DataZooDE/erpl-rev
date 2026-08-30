@@ -5,7 +5,11 @@
 param(
   [Parameter(Mandatory)][string]$Server,    # build\erpl_rev_server.exe
   [Parameter(Mandatory)][string]$Launcher,  # build\erpl_rev_launch.exe
-  [Parameter(Mandatory)][string]$SdkLib,    # nwrfcsdk\win\lib
+  # nwrfcsdk\win\lib, or "-" when the RFC backend is linked statically
+  # (RFC_BACKEND=proto RFC_LINK=static): the shim is inside the exe, so there is
+  # no SAP SDK and no ICU to stage and the payload is DuckDB alone. Mirrors the
+  # "-" sentinel scripts/stage_runtime.sh takes on POSIX.
+  [Parameter(Mandatory)][string]$SdkLib,
   [Parameter(Mandatory)][string]$DuckdbDir, # vendor\duckdb-1.5.4
   [Parameter(Mandatory)][string]$Out        # dist\erpl-rev-windows-amd64.exe
 )
@@ -18,7 +22,9 @@ New-Item -ItemType Directory -Path $pay -Force | Out-Null
 Copy-Item $Server (Join-Path $pay 'erpl_rev_server.exe')
 # All runtime DLLs the SDK ships (sapnwrfc.dll, libsapucum.dll, icu*.dll —
 # whatever the SDK version names them), plus DuckDB.
-Get-ChildItem (Join-Path $SdkLib '*.dll') | ForEach-Object { Copy-Item $_.FullName $pay }
+if ($SdkLib -ne '-') {
+  Get-ChildItem (Join-Path $SdkLib '*.dll') | ForEach-Object { Copy-Item $_.FullName $pay }
+}
 Copy-Item (Join-Path $DuckdbDir 'duckdb.dll') (Join-Path $pay 'duckdb.dll')
 
 Write-Host "Bundling:"; Get-ChildItem $pay | ForEach-Object { "  {0,12}  {1}" -f $_.Length, $_.Name }
