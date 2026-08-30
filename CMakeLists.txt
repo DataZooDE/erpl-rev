@@ -117,6 +117,11 @@ find_package(Threads REQUIRED)
 # single-file bundle gains no new runtime .so/.dylib/.dll.
 find_package(OpenSSL REQUIRED)
 
+# zlib inflates a gzip-framed ingest payload (src/payload.cpp). Like OpenSSL it
+# comes from the vcpkg static triplet, so the single-file bundle gains no new
+# runtime .so/.dylib/.dll and DuckDB stays the only bundled library.
+find_package(ZLIB REQUIRED)
+
 # Must match the prebuilt DUCKDB_DIST engine (Makefile passes the same value).
 if(NOT DEFINED DUCKDB_VERSION OR DUCKDB_VERSION STREQUAL "")
   set(DUCKDB_VERSION "1.5.4")
@@ -177,6 +182,7 @@ add_executable(erpl_rev_server
   src/cdc_dialect.cpp
   src/json_util.cpp
   src/sxml_binary.cpp
+  src/payload.cpp
   src/logging.cpp
   src/erpl_rev_telemetry.cpp
   src/main.cpp)
@@ -187,7 +193,7 @@ target_compile_definitions(erpl_rev_server PRIVATE
   ERPL_REV_DUCKDB_VERSION="${DUCKDB_VERSION}")
 target_link_libraries(erpl_rev_server PRIVATE
   ${SAP_LIBS} ${DUCKDB_LIB} Threads::Threads ${CMAKE_DL_LIBS}
-  posthog_telemetry datazoo_banner OpenSSL::Crypto)
+  posthog_telemetry datazoo_banner OpenSSL::Crypto ZLIB::ZLIB)
 
 # So the extracted inner binary finds the bundled libs sitting next to it
 # (belt-and-suspenders with the launcher's loader-path env var).
@@ -211,12 +217,14 @@ if(EXISTS "${DUCKDB_LIB}")
     test/test_duckdb_bridge.cpp
     test/test_cdc_dialect.cpp
     test/test_sxml_binary.cpp
+    test/test_payload.cpp
     test/test_telemetry.cpp
     test/bench_ingest.cpp
     src/duckdb_bridge.cpp
     src/cdc_dialect.cpp
     src/json_util.cpp
     src/sxml_binary.cpp
+    src/payload.cpp
     src/erpl_rev_telemetry.cpp)
   target_include_directories(erpl_rev_tests PRIVATE src "${DUCKDB_INCLUDE}")
   target_compile_definitions(erpl_rev_tests PRIVATE
@@ -224,7 +232,7 @@ if(EXISTS "${DUCKDB_LIB}")
     ERPL_REV_DUCKDB_VERSION="${DUCKDB_VERSION}")
   target_link_libraries(erpl_rev_tests PRIVATE
     ${DUCKDB_LIB} Threads::Threads Catch2::Catch2WithMain
-    posthog_telemetry datazoo_banner OpenSSL::Crypto)
+    posthog_telemetry datazoo_banner OpenSSL::Crypto ZLIB::ZLIB)
   if(APPLE)
     set_target_properties(erpl_rev_tests PROPERTIES BUILD_RPATH "${DUCKDB_DIST}")
   elseif(UNIX)
