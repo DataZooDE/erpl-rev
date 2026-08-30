@@ -24,12 +24,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # rfc: which RFC implementation to link. `proto` is erpl-proto's
+          # pure-Rust one, linked statically, so the bundle carries no SAP NW
+          # RFC SDK and no ICU. Linux only for now: that is the combination the
+          # 13-stage live suite runs against a real ABAP system. erpl-proto is
+          # only `cargo check`-verified on macOS/Windows -- never linked, never
+          # run against SAP -- so those stay on the SDK until CI proves them.
           - { os: ubuntu-latest, sub: linux, plat: linux, triplet: x64-linux,
               sdk: nwrfc750P_13-70002752_linux.zip, duckdb: libduckdb-linux-amd64.zip,
-              asset: erpl-rev-linux-amd64 }
+              asset: erpl-rev-linux-amd64, rfc: proto }
           - { os: macos-14, sub: osx, plat: osx, triplet: arm64-osx,
               sdk: nwrfc750P_13-80008131_osx_arm.zip, duckdb: libduckdb-osx-universal.zip,
-              asset: erpl-rev-macos-arm64 }
+              asset: erpl-rev-macos-arm64, rfc: sdk }
     steps:
       - uses: actions/checkout@v4
         with:
@@ -45,7 +51,9 @@ jobs:
         with:
           vcpkgGitCommitId: 11bbc873e00e9e58d4e9dffb30b7a5493a030e0b
 
+      # Only the SDK arms pull from S3; the proto arm needs no AWS at all.
       - name: Configure AWS credentials
+        if: matrix.rfc == 'sdk'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::331993160594:role/ErplGithubOicdRole
@@ -53,7 +61,24 @@ jobs:
           aws-region: eu-west-1
 
       - name: Fetch SAP NW RFC SDK
+        if: matrix.rfc == 'sdk'
         run: ./scripts/download_and_extract_nwrfc.sh "s3://erpl-resources/sapnwrfc/${{ matrix.sdk }}" "./nwrfcsdk/${{ matrix.sub }}/"
+
+      # erpl-proto is a private repository, so this needs a token with read
+      # access to it. Without the secret the job fails here with a clear
+      # message rather than silently falling back to the SAP SDK.
+      - name: Check out erpl-proto (RFC backend)
+        if: matrix.rfc == 'proto'
+        uses: actions/checkout@v4
+        with:
+          repository: DataZooDE/erpl-proto
+          token: ${{ secrets.ERPL_PROTO_TOKEN }}
+          path: .erpl-proto
+          submodules: recursive
+
+      - name: Build the pure-Rust RFC shim (static)
+        if: matrix.rfc == 'proto'
+        run: cargo build --release -p erpl-proto-nwrfc --manifest-path .erpl-proto/Cargo.toml
 
       - name: Fetch DuckDB
         run: |
@@ -68,13 +93,36 @@ jobs:
             -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }} \
             -DERPL_REV_VERSION="${GITHUB_REF_NAME#v}" \
             -DDUCKDB_VERSION="${DUCKDB_VERSION}" \
-            -DDUCKDB_DIST="$PWD/vendor/duckdb-${DUCKDB_VERSION}"
+            -DDUCKDB_DIST="$PWD/vendor/duckdb-${DUCKDB_VERSION}" \
+            -DRFC_BACKEND="${RFC_BACKEND}" -DRFC_LINK="${RFC_LINK}" \
+            -DERPL_PROTO_ROOT="$PWD/.erpl-proto"
           cmake --build build
+        env:
+          RFC_BACKEND: ${{ matrix.rfc }}
+          RFC_LINK: ${{ matrix.rfc == 'proto' && 'static' || 'shared' }}
 
+      # "-" as the SDK lib dir means "statically linked RFC backend, nothing
+      # to stage": the proto bundle carries DuckDB and nothing else.
       - name: Assemble single-file bundle
-        run: ./scripts/bundle.sh ${{ matrix.plat }} build/erpl_rev_server build/erpl_rev_launch "nwrfcsdk/${{ matrix.sub }}/lib" "vendor/duckdb-${DUCKDB_VERSION}" "dist/${{ matrix.asset }}"
+        run: |
+          SDKLIB="nwrfcsdk/${{ matrix.sub }}/lib"
+          [ "${{ matrix.rfc }}" = proto ] && SDKLIB="-"
+          ./scripts/bundle.sh ${{ matrix.plat }} build/erpl_rev_server build/erpl_rev_launch \
+            "$SDKLIB" "vendor/duckdb-${DUCKDB_VERSION}" "dist/${{ matrix.asset }}"
 
-      - name: Smoke test (self-extract, load bundled SAP SDK + DuckDB, no external libs)
+      - name: Assert the proto bundle links no SAP library
+        if: matrix.rfc == 'proto'
+        run: |
+          # The shim is inside the binary, so nothing SAP-shaped may be linked --
+          # not even erpl-proto's own shared object. Matching on the resolved
+          # path is not enough here: the shim is deliberately named
+          # libsapnwrfc.so, so any RFC shared object at all is a failure.
+          if ldd build/erpl_rev_server | grep -Ei 'sapnwrfc|libsapucum|libicu'; then
+            echo "::error::proto bundle still links an RFC or ICU library"; exit 1
+          fi
+          echo "no RFC or ICU shared object; DuckDB is the only bundled library"
+
+      - name: Smoke test (self-extract, no external libs)
         run: env -u LD_LIBRARY_PATH -u DYLD_LIBRARY_PATH "./dist/${{ matrix.asset }}" --smoke
 
       - name: Package (tar.gz preserves the exec bit)
@@ -166,8 +214,12 @@ jobs:
             **erpl-rev — query and replicate SAP through DuckDB.**
 
             Single self-extracting binaries — download the one for your OS, then
-            run it. They bundle the SAP NW RFC SDK + DuckDB, so there is nothing
-            else to install.
+            run it. There is nothing else to install.
+
+            The **Linux** build talks RFC through `erpl-proto`, our pure-Rust
+            implementation, linked statically — it carries no SAP NW RFC SDK and
+            no ICU, only DuckDB. The macOS and Windows builds still bundle the
+            SAP NW RFC SDK + DuckDB.
 
             | OS | Asset |
             |----|-------|

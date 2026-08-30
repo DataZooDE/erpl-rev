@@ -151,7 +151,9 @@ add_subdirectory(third_party/datazoo-banner)
 # SAP_UC is uint16_t unconditionally - so under the proto backend these are not
 # merely unnecessary but a per-platform detail to get wrong for no gain.
 if(RFC_BACKEND STREQUAL "proto")
-  # nothing to define
+  # No SAP platform switches. One define, so --smoke can name the backend it
+  # actually contains rather than claiming SAP's SDK.
+  add_compile_definitions(ERPL_RFC_BACKEND_PROTO)
 elseif(WIN32)
   add_compile_definitions(SAPonNT WIN32 SAPwithUNICODE SAPwithTHREADS
                           UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)

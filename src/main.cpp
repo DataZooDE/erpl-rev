@@ -193,8 +193,12 @@ Cli ParseArgs(int argc, char **argv) {
     return c;
 }
 
-// Self-check behind --smoke: prove the bundled SAP NW RFC SDK and DuckDB
-// libraries actually load and are CALLABLE on this machine, with no SAP gateway.
+// Self-check behind --smoke: prove the RFC backend and DuckDB actually load and
+// are CALLABLE on this machine, with no SAP gateway. The RFC backend is either
+// SAP's NW RFC SDK or erpl-proto's pure-Rust implementation of the same C ABI,
+// so the label is chosen at compile time -- reporting "SAP NW RFC SDK" for a
+// build that contains none of it would be a false claim in the one line the
+// release CI greps for.
 // Both libraries are linked (DT_NEEDED / DYLIB / DLL), so a missing or
 // arch-incompatible bundle already fails the process before main(); calling into
 // each one here additionally proves the symbols resolve. Prints a single grep-able
@@ -219,9 +223,14 @@ int RunSmoke() {
         return 1;
     }
 
+#ifdef ERPL_RFC_BACKEND_PROTO
+    const char *backend = "RFC backend";   // the version string already names erpl-proto
+#else
+    const char *backend = "SAP NW RFC SDK";
+#endif
     std::fprintf(stdout,
-                 "erpl-rev smoke ok: SAP NW RFC SDK %s (%u.%u.%u); DuckDB %s\n",
-                 sapver.c_str(), maj, min, patch, duckver.c_str());
+                 "erpl-rev smoke ok: %s %s (%u.%u.%u); DuckDB %s\n",
+                 backend, sapver.c_str(), maj, min, patch, duckver.c_str());
     std::fflush(stdout);
     return 0;
 }

@@ -12,7 +12,10 @@ set -euo pipefail
 
 PLATFORM="${1:?platform: linux|osx}"
 SERVER="${2:?server binary}"
-SDK_LIB="${3:?nwrfcsdk <plat>/lib dir}"
+# Pass "-" when the RFC backend is linked statically (RFC_BACKEND=proto
+# RFC_LINK=static): the shim is inside the binary, so there is no SAP NW RFC
+# SDK and no ICU to stage and the payload is DuckDB alone.
+SDK_LIB="${3:?nwrfcsdk <plat>/lib dir, or - for a statically linked RFC backend}"
 DUCKDB_DIR="${4:?duckdb dist dir}"
 OUT="${5:?output dir}"
 
@@ -21,6 +24,8 @@ case "$PLATFORM" in
   osx)   SAP_LIBS=(libsapnwrfc.dylib libsapucum.dylib libicudata.50.dylib libicui18n.50.dylib libicuuc.50.dylib); DUCKDB_LIB=libduckdb.dylib ;;
   *) echo "unknown platform: $PLATFORM" >&2; exit 2 ;;
 esac
+
+if [ "$SDK_LIB" = "-" ]; then SAP_LIBS=(); fi
 
 mkdir -p "$OUT"
 cp "$SERVER" "$OUT/erpl_rev_server"
