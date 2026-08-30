@@ -5,6 +5,7 @@
   "builtin-baseline": "11bbc873e00e9e58d4e9dffb30b7a5493a030e0b",
   "dependencies": [
     "catch2",
-    "openssl"
+    "openssl",
+    "zlib"
   ]
 }

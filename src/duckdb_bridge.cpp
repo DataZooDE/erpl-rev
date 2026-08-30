@@ -1,4 +1,5 @@
 #include "duckdb_bridge.hpp"
+#include "payload.hpp"
 #include "json_util.hpp"
 #include "sxml_binary.hpp"
 
@@ -549,6 +550,18 @@ long long DuckDbBridge::IngestBxml(const std::string &target,
     // Own connection: the appended package and the statement that consumes it
     // run on it, so concurrent ingests (async pipeline / partitioned loads)
     // don't collide and don't serialize.
+    // The package may arrive gzip-framed (the ABAP side compresses wide payloads;
+    // see src/payload.hpp). Inflating here rather than in the RFC handler keeps
+    // the unit suite on the same path the server takes. Bind by pointer so the
+    // uncompressed path -- still the default, and up to ~180 MB -- is not copied
+    // just to reach the decoder.
+    std::string inflated;
+    const std::string *payload = &bxml;
+    if (IsCompressed(bxml)) {
+        inflated = MaybeInflate(bxml);
+        payload = &inflated;
+    }
+
     duckdb::Connection con(*db_);
     if (!init_sql.empty()) Exec(con, init_sql);
     if (!ddl.empty()) Exec(con, ddl);
@@ -746,7 +759,7 @@ long long DuckDbBridge::IngestBxml(const std::string &target,
         }
     };
 
-    if (!bxml.empty()) sxml::DecodeStreaming(bxml, on_columns, on_row);
+    if (!payload->empty()) sxml::DecodeStreaming(*payload, on_columns, on_row);
 
     if (nrows == 0) {
         if (!parquet_out.empty())
