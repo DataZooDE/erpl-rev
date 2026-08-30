@@ -1,101 +1,38 @@
 #!/bin/bash
-# Idempotent (re)deploy of all erpl-rev ABAP objects to the A4H trial.
+# Deploy erpl-rev's ABAP objects to the A4H trial.
 #
-# The trial periodically wipes/reverts runtime + $TMP objects (FMs, classes),
-# silently breaking E2E. Re-run this any time to restore a known-good state:
-#   - classes (typemap, util, mkfm, setup, reports, test drivers)
-#   - the registered-server destination ERPL_REV (method='R')
-#   - the RFC FMs Z_DUCKDB_QUERY / Z_DUCKDB_INGEST (run zcl_erpl_rev_mkfm)
+# THIS IS NOW A SHIM. The objects themselves live in erpl
+# (erpl/scripts/sap/assets/rev/abap) and are deployed by erpl's provisioner, so each one
+# exists once rather than once per repo.
 #
-# Usage: scripts/deploy-abap.sh
+# The move happened because the *order* matters and could not be expressed from here:
+# activating the BW Modeling services restarts the ABAP instance, and restarting the
+# instance re-materialises every PSE from the database -- destroying the SNC and wsRFC
+# certificate trust erpl-proto's live tests depend on. erpl's provision.d encodes that
+# sequence. See DataZooDE/erpl#123.
+#
+#   scripts/deploy-abap.sh          # deploy erpl-rev's objects (delegates to erpl)
+#
+# To provision the whole trial -- BW services, every repo's fixtures, certificates, BW
+# test data -- run erpl's provisioner instead:
+#
+#   erpl/scripts/sap/provision.sh
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-AB="$HERE/abap"
-# Credentials from the environment — never hardcode. Export SAP_PASSWORD first.
-: "${SAP_PASSWORD:?set SAP_PASSWORD in the environment before running}"
-A=(--host localhost --port 50000 --user DEVELOPER --client 001 --password-env SAP_PASSWORD)
-adt() { uvx erpl-adt "${A[@]}" "$@"; }
 
-cls() {  # cls <NAME> <file> [<DESC>]
-  adt object create --type CLAS/OC --name "$1" --package '$TMP' --description "${3:-erpl-rev}" >/dev/null 2>&1
-  if adt source write "$1" --file "$AB/$2" --activate 2>&1 | grep -aiqE 'Activated'; then
-    echo "  OK   $1"; else echo "  WARN $1 (activation — check)"; fi
-}
-prog() {  # prog <NAME> <file> [<DESC>]
-  adt object create --type PROG/P --name "$1" --package '$TMP' --description "${3:-erpl-rev}" >/dev/null 2>&1
-  if adt source write "$1" --file "$AB/$2" --activate 2>&1 | grep -aiqE 'Activated'; then
-    echo "  OK   $1"; else echo "  WARN $1 (activation — check)"; fi
-}
-tabl() {  # tabl <NAME> <file> [<DESC>]
-  adt object create --type TABL/DT --name "$1" --package '$TMP' --description "${3:-erpl-rev}" >/dev/null 2>&1
-  if adt source write "$1" --type TABL --file "$AB/$2" --activate 2>&1 | grep -aiqE 'Activated'; then
-    echo "  OK   $1"; else echo "  WARN $1 (activation — check)"; fi
-}
-intf() {  # intf <NAME> <file> [<DESC>]
-  adt object create --type INTF/OI --name "$1" --package '$TMP' --description "${3:-erpl-rev}" >/dev/null 2>&1
-  if adt source write "$1" --type INTF --file "$AB/$2" --activate 2>&1 | grep -aiqE 'Activated'; then
-    echo "  OK   $1"; else echo "  WARN $1 (activation — check)"; fi
-}
-run() { adt object run "$1" 2>&1 | tr -cd 'A-Za-z0-9 ={}_.:()[] \n-'; }
+ERPL_DIR="${ERPL_DIR:-$HERE/../erpl}"
+if [ ! -x "$ERPL_DIR/scripts/sap/provision.sh" ]; then
+    # Loudly, not silently. These objects are what the live E2E tests call; without them
+    # the suite fails with a read timeout that names nothing, or skips and reads green.
+    cat >&2 <<MSG
+erpl-rev's ABAP objects now live in erpl, and no erpl checkout was found.
 
-echo "== example data: wide BSEG-shaped table (420 cols) =="
-tabl ZWIDE_BSEG zwide_bseg.ddl "wide BSEG repro (erpl-rev)"
-cls  ZCL_WIDE_BSEG zcl_wide_bseg.abap "populate ZWIDE_BSEG"
+  looked in: $ERPL_DIR
 
-echo "== delta test table (numeric watermark column) =="
-tabl ZDELTA_WM zdelta_wm.ddl "delta watermark test table (erpl-rev)"
-# Populate only if empty/absent (100k rows ~ tens of seconds). Uncomment to seed:
-#   run ZCL_WIDE_BSEG | grep -aiE 'populated|rows'
+Set ERPL_DIR to an erpl checkout, or clone erpl beside this repository, then re-run.
+Nothing was deployed.
+MSG
+    exit 1
+fi
 
-echo "== interfaces (before util — replicate signature references it) =="
-intf ZIF_ERPL_REV_PROGRESS zif_erpl_rev_progress.intf.abap "replicate progress callback"
-
-echo "== classes (typemap + interface before util — util depends on them) =="
-cls ZCL_ERPL_REV_TYPEMAP  zcl_erpl_rev_typemap.abap  "DDIC<->DuckDB type map"
-cls ZCL_ERPL_REV_UTIL     zcl_erpl_rev_util.abap     "query/describe/replicate"
-cls ZCL_ERPL_REV_DELTA    zcl_erpl_rev_delta.abap    "delta engine (state + 4 readers)"
-cls ZCL_ERPL_REV_DELTADRV zcl_erpl_rev_deltadrv.abap "delta change-injection driver"
-cls ZCL_ERPL_REV_CDC      zcl_erpl_rev_cdc.abap      "trigger-CDC thin executor (provision/run/teardown)"
-cls ZCL_ERPL_REV_MKFM     zcl_erpl_rev_mkfm.abap     "create RFC FMs"
-cls ZCL_ERPL_REV_SETUP    zcl_erpl_rev_setup.abap    "create registered dest"
-cls ZCL_ERPL_REV_TYPETEST zcl_erpl_rev_typetest.abap "typemap tests"
-cls ZCL_ERPL_REV_UTILTEST zcl_erpl_rev_utiltest.abap "util tests"
-cls ZCL_ERPL_REV_REPLTEST zcl_erpl_rev_repltest.abap "replicate tests"
-cls ZCL_ERPL_REV_WIDETEST zcl_erpl_rev_widetest.abap "wide replicate tests"
-cls ZCL_ERPL_REV_CONSOLETEST zcl_erpl_rev_consoletest.abap "console realistic query tests (arbitrary column names)"
-cls ZCL_ERPL_REV_SLTTEST  zcl_erpl_rev_slttest.abap  "SLT-like replication tests (projection + source filter)"
-cls ZCL_ERPL_REV_DIFFTEST zcl_erpl_rev_difftest.abap "data-identity check (replicated == SAP source, every cell)"
-cls ZCL_ERPL_REV_PARTEST  zcl_erpl_rev_partest.abap  "partitioned full-load + auto partition-col/job-count tests"
-cls ZCL_ERPL_REV_PUBTEST  zcl_erpl_rev_pubtest.abap  "external target publish (parquet/dataset/attached catalog)"
-cls ZCL_ERPL_REV_CDSTEST  zcl_erpl_rev_cdstest.abap  "CDS view source (describe/keys/params/discovery/publish)"
-cls ZCL_ERPL_REV_BWTEST   zcl_erpl_rev_bwtest.abap   "BW/native (ADBC) source vs a HANA-view stand-in"
-cls ZCL_ERPL_REV_DELTATEST zcl_erpl_rev_deltatest.abap "delta E2E (watermark/snapshot/changedoc/insert-only/orchestration)"
-cls ZCL_ERPL_REV_CDCTEST  zcl_erpl_rev_cdctest.abap  "trigger-CDC E2E (real HANA triggers, physical deletes)"
-# NB: the CDS source tests need the DDLS fixtures ZERPL_C_FLIGHTS + ZERPL_CP_FLIGHTS
-# (abap/zerpl_c_flights.ddls.abap, abap/zerpl_cp_flights.ddls.abap) deployed once via
-# `erpl-adt object create --type DDLS/DF` + `source write --type DDLS --activate`
-# (DDLS activation can exceed the ADT HTTP timeout; it still completes server-side).
-
-echo "== reports (worker before the report — the parallel report SUBMITs it) =="
-prog Z_ERPL_REV_REPL_WORKER z_erpl_rev_repl_worker.prog.abap "parallel-replication worker (one key range)"
-prog Z_ERPL_REV_REPLICATE z_erpl_rev_replicate.prog.abap "replicate SAP table -> DuckDB (serial + parallel)"
-prog Z_ERPL_REV_SQL       z_erpl_rev_sql.prog.abap       "DuckDB SQL console"
-prog Z_ERPL_REV_DELTA     z_erpl_rev_delta.prog.abap     "delta orchestration loop (cadence + lease)"
-prog Z_ERPL_REV_DELTA_SFLIGHT z_erpl_rev_delta_sflight.prog.abap "SFLIGHT delta demo (load/change/run/inspect, GUI)"
-
-echo "== report-path E2E classrun (SUBMITs the report's parallel branch) =="
-cls ZCL_ERPL_REV_REPLRUN  zcl_erpl_rev_replrun.abap  "Z_ERPL_REV_REPLICATE parallel-branch E2E"
-
-echo "== registered-server destination ERPL_REV (method='R') =="
-run ZCL_ERPL_REV_SETUP | grep -aiE 'OPTS|subrc' | head -2
-
-echo "== function group ZERPL_REV (host for the RFC FMs) =="
-# MKFM inserts the FMs into ZERPL_REV via RS_FUNCTIONMODULE_INSERT, which needs
-# the group to already exist. Create it in $TMP (idempotent — ignore "exists")
-# so a clean-slate deploy works without a separate manual step.
-adt object create --type FUGR/F --name ZERPL_REV --package '$TMP' --description "erpl-rev RFC FMs" >/dev/null 2>&1 || true
-
-echo "== RFC function modules Z_DUCKDB_* =="
-run ZCL_ERPL_REV_MKFM | grep -aiE 'insert subrc|tfdir' | head -16
-
-echo "== done =="
+exec "$ERPL_DIR/scripts/sap/provision.sh" --only 25 "$@"
