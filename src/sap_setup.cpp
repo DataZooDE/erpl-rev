@@ -134,6 +134,7 @@ void PrintHelp() {
         "  serve (default)          Run the RFC server.\n"
         "  doctor                   Diagnose the SAP-side setup. Never writes.\n"
         "  setup                    Diagnose, show what will change, do it, verify it.\n"
+        "  sql <statement>          Run DuckDB SQL against the running server.\n"
         "\nsetup / doctor options:\n"
         "  --sap-host <h>           ADT host   (env SAP_HOST, default localhost)\n"
         "  --sap-port <p>           ADT port   (env SAP_PORT, default 50000)\n"

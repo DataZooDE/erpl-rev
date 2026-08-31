@@ -284,8 +284,11 @@ in the SAP GUI: type any query (over replicated SAP data, cloud parquet, or
 attached catalogs) and get an ALV grid back; or call the query FM from ABAP and
 receive typed rows. From an external DuckDB client (with `--quack`):
 ```sql
-ATTACH 'quack:host:9494' AS r (TOKEN '<token>');
-SELECT * FROM r.<table>;            -- query the live in-process data
+-- from any DuckDB client
+INSTALL quack; LOAD quack;
+SELECT * FROM quack_query('quack:host:9494',
+                          'SELECT * FROM <table>',
+                          token => '<token>');   -- the live in-process data
 ```
 
 **Replicate a table** — `Z_ERPL_REV_REPLICATE` (`SE38`): pick the source (F4 to
