@@ -34,15 +34,15 @@ jobs:
           # answer RfcGetVersion (erpl-proto's `cross` CI job plus the smoke test
           # below) -- but NOT yet against a live SAP system. See erpl-rev#75.
           - { os: ubuntu-latest, sub: linux, plat: linux, triplet: x64-linux,
-              sdk: nwrfc750P_13-70002752_linux.zip, duckdb: libduckdb-linux-amd64.zip,
+              sdk: nwrfc750P_13-70002752_linux.zip,
               asset: erpl-rev-linux-amd64, rfc: proto }
           - { os: macos-14, sub: osx, plat: osx, triplet: arm64-osx,
-              sdk: nwrfc750P_13-80008131_osx_arm.zip, duckdb: libduckdb-osx-universal.zip,
+              sdk: nwrfc750P_13-80008131_osx_arm.zip,
               asset: erpl-rev-macos-arm64, rfc: proto }
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive   # third_party/posthog-telemetry (telemetry lib)
+          submodules: recursive   # duckdb (linked statically) + posthog-telemetry
 
       - name: Install build tools
         run: |
@@ -98,20 +98,15 @@ jobs:
         if: matrix.rfc == 'proto'
         run: cargo build --release -p erpl-proto-nwrfc --manifest-path .erpl-proto/Cargo.toml
 
-      - name: Fetch DuckDB
-        run: |
-          curl -sL --fail -o duckdb.zip "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/${{ matrix.duckdb }}"
-          mkdir -p "vendor/duckdb-${DUCKDB_VERSION}"
-          unzip -o duckdb.zip -d "vendor/duckdb-${DUCKDB_VERSION}"
-
-      - name: Build (server + launcher)
+      # DuckDB is built from the pinned `duckdb/` submodule and linked in, so
+      # there is no release zip to fetch and nothing to stage beside the binary.
+      - name: Build (static DuckDB)
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }} \
             -DERPL_REV_VERSION="${GITHUB_REF_NAME#v}" \
             -DDUCKDB_VERSION="${DUCKDB_VERSION}" \
-            -DDUCKDB_DIST="$PWD/vendor/duckdb-${DUCKDB_VERSION}" \
             -DRFC_BACKEND="${RFC_BACKEND}" -DRFC_LINK="${RFC_LINK}" \
             -DERPL_PROTO_ROOT="$PWD/.erpl-proto"
           cmake --build build
@@ -119,16 +114,13 @@ jobs:
           RFC_BACKEND: ${{ matrix.rfc }}
           RFC_LINK: ${{ matrix.rfc == 'proto' && 'static' || 'shared' }}
 
-      # "-" as the SDK lib dir means "statically linked RFC backend, nothing
-      # to stage": the proto bundle carries DuckDB and nothing else.
-      - name: Assemble single-file bundle
+      - name: Stage the binary as the release asset
         run: |
-          SDKLIB="nwrfcsdk/${{ matrix.sub }}/lib"
-          [ "${{ matrix.rfc }}" = proto ] && SDKLIB="-"
-          ./scripts/bundle.sh ${{ matrix.plat }} build/erpl_rev_server build/erpl_rev_launch \
-            "$SDKLIB" "vendor/duckdb-${DUCKDB_VERSION}" "dist/${{ matrix.asset }}"
+          mkdir -p dist
+          cp build/erpl_rev_server "dist/${{ matrix.asset }}"
+          chmod +x "dist/${{ matrix.asset }}"
 
-      - name: Assert the proto bundle links no SAP library
+      - name: Assert the binary links no SAP or DuckDB library
         if: matrix.rfc == 'proto'
         shell: bash
         run: |
@@ -143,11 +135,14 @@ jobs:
             deps="$(ldd build/erpl_rev_server)"
           fi
           if grep -Ei 'sapnwrfc|libsapucum|libicu' <<<"$deps"; then
-            echo "::error::proto bundle still links an RFC or ICU library"; exit 1
+            echo "::error::binary still links an RFC or ICU library"; exit 1
           fi
-          echo "no RFC or ICU shared object; DuckDB is the only bundled library"
+          if grep -Ei 'libduckdb' <<<"$deps"; then
+            echo "::error::DuckDB is meant to be linked statically"; exit 1
+          fi
+          echo "no RFC, ICU or DuckDB shared object; the binary stands alone"
 
-      - name: Smoke test (self-extract, no external libs)
+      - name: Smoke test (no external libs)
         run: env -u LD_LIBRARY_PATH -u DYLD_LIBRARY_PATH "./dist/${{ matrix.asset }}" --smoke
 
       - name: Package (tar.gz preserves the exec bit)
@@ -158,7 +153,7 @@ jobs:
           name: ${{ matrix.asset }}.tar.gz
           path: dist/${{ matrix.asset }}.tar.gz
 
-      # The wheel wraps the raw self-extracting binary, not the tarball.
+      # The wheel wraps the raw binary, not the tarball.
       - uses: actions/upload-artifact@v4
         with:
           name: binary-${{ matrix.asset }}
@@ -170,7 +165,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive   # third_party/posthog-telemetry (telemetry lib)
+          submodules: recursive   # duckdb (linked statically) + posthog-telemetry
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -199,32 +194,26 @@ jobs:
       - name: Build the pure-Rust RFC shim (static)
         run: cargo build --release -p erpl-proto-nwrfc --manifest-path .erpl-proto/Cargo.toml
 
-      - name: Fetch DuckDB
-        run: |
-          curl.exe -sL --fail -o duckdb.zip "https://github.com/duckdb/duckdb/releases/download/v$env:DUCKDB_VERSION/libduckdb-windows-amd64.zip"
-          New-Item -ItemType Directory -Force -Path "vendor\duckdb-$env:DUCKDB_VERSION" | Out-Null
-          Expand-Archive -Force duckdb.zip -DestinationPath "vendor\duckdb-$env:DUCKDB_VERSION"
-
-      - name: Build (server + launcher)
+      - name: Build (static DuckDB)
         run: |
           # x64-windows-static-md: statically link OpenSSL (no libssl/libcrypto
-          # DLLs in the single-file bundle) while keeping the dynamic CRT (/MD)
-          # to match the prebuilt DuckDB DLL.
+          # DLLs beside the exe) while keeping the dynamic CRT (/MD), which is
+          # what DuckDB's own build expects.
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
             -DERPL_REV_VERSION="$($env:GITHUB_REF_NAME -replace '^v','')" `
             -DDUCKDB_VERSION="$env:DUCKDB_VERSION" `
-            -DDUCKDB_DIST="$PWD/vendor/duckdb-$env:DUCKDB_VERSION" `
             -DRFC_BACKEND=proto -DRFC_LINK=static `
             -DERPL_PROTO_ROOT="$PWD/.erpl-proto"
           cmake --build build --config Release
 
-      - name: Assemble single-file bundle
-        # -SdkLib '-' : the shim is inside the exe, so the payload is DuckDB alone.
-        run: .\scripts\bundle.ps1 -Server build\Release\erpl_rev_server.exe -Launcher build\Release\erpl_rev_launch.exe -SdkLib '-' -DuckdbDir "vendor\duckdb-$env:DUCKDB_VERSION" -Out dist\erpl-rev-windows-amd64.exe
+      - name: Stage the binary as the release asset
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item build\Release\erpl_rev_server.exe dist\erpl-rev-windows-amd64.exe
 
-      - name: Assert the proto bundle links no SAP library
+      - name: Assert the binary links no SAP or DuckDB library
         shell: pwsh
         run: |
           # dumpbin is the Windows ldd, but cl.exe is not on PATH in this job, so

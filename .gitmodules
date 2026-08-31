@@ -4,3 +4,6 @@
 [submodule "third_party/datazoo-banner"]
 	path = third_party/datazoo-banner
 	url = https://github.com/DataZooDE/duckdb-extension-banner.git
+[submodule "duckdb"]
+	path = duckdb
+	url = https://github.com/duckdb/duckdb.git
