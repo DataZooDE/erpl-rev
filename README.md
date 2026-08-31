@@ -128,15 +128,31 @@ native/ADBC BW path reads cross-client). Full guide: [`docs/security.md`](docs/s
 
 ## Install & setup
 
-**Just want to run it?** This is the recommended way — grab the **single
-self-extracting binary** for your OS from the
-[latest release](https://github.com/DataZooDE/erpl-rev/releases)
-(`erpl-rev-linux-amd64`, `erpl-rev-macos-arm64`, `erpl-rev-windows-amd64.exe`) and
-run it. It bundles the SAP NW RFC SDK + ICU + DuckDB, self-extracts on first
-launch, and needs **no `LD_LIBRARY_PATH`** and nothing else installed. Or use
-**Docker** — `docker pull ghcr.io/datazoode/erpl-rev:latest` — the image bakes the
-**same** bundle (see [Run with Docker](#run-with-docker)). Either way you still do
-the one-time SAP-side wiring (**step 3**) and then run it (**step 4**).
+**Just want to run it?** Use `uvx` — nothing to download, nothing to unpack:
+
+```bash
+uvx erpl-rev --help          # runs the server; no install, no clone
+uvx erpl-rev --smoke         # prove the RFC backend and DuckDB both load
+```
+
+or `pip install erpl-rev` if you would rather have it on `PATH`. Wheels are
+published for Linux x86-64, macOS arm64 and Windows x64.
+
+Three ways to get the same server, pick whichever suits:
+
+| | how | notes |
+|---|---|---|
+| **PyPI** | `uvx erpl-rev` / `pip install erpl-rev` | fastest; any Python 3 |
+| **Release binary** | download from [releases](https://github.com/DataZooDE/erpl-rev/releases) | one self-extracting file, no Python |
+| **Docker** | `docker pull ghcr.io/datazoode/erpl-rev:latest` | bakes the same bundle — see [Run with Docker](#run-with-docker) |
+
+All three carry **DuckDB and nothing else**: since `v2026.08.30` the RFC protocol
+is [`erpl-proto`](https://erpl.io/blog/sap-rfc-protocol-byte-by-byte), our pure-Rust
+implementation, linked statically — so there is no SAP NW RFC SDK, no ICU, and no
+`LD_LIBRARY_PATH` to set.
+
+Whichever you pick you still do the one-time SAP-side wiring (**step 3**) and then
+run it (**step 4**).
 
 > The numbered steps below **build from source** — only needed to develop erpl-rev
 > or to produce the bundle yourself (`make bundle` → `dist/erpl-rev`).
@@ -226,6 +242,18 @@ checks a pulled image loads with no gateway. See [`docs/docker.md`](docs/docker.
 ---
 
 ## Quick start
+
+**Start the server** — from PyPI, with nothing installed beforehand:
+
+```bash
+uvx erpl-rev                              # file-backed in ./erpl-rev.duckdb
+uvx erpl-rev --db :memory:                # throwaway, nothing on disk
+uvx erpl-rev --quack                      # + expose DuckDB to external clients
+```
+
+It registers its `PROGRAM_ID` at the SAP gateway and waits for ABAP to call out to
+it. The SAP side (destination + the `Z_DUCKDB_*` function modules) is the one-time
+setup in **step 3** above.
 
 **Query SAP data with SQL** — `Z_ERPL_REV_SQL` (`SE38`) opens a DuckDB SQL console
 in the SAP GUI: type any query (over replicated SAP data, cloud parquet, or
