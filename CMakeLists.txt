@@ -3,6 +3,20 @@ project(erpl_rev CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+if(MSVC)
+  # Static CRT (/MT), to match DuckDB. duckdb/CMakeLists.txt sets
+  # CMAKE_MSVC_RUNTIME_LIBRARY unconditionally as a plain variable, so it wins
+  # inside its own subdirectory and cannot be overridden from here -- the only
+  # workable direction is for us to match it. Mixing the two produces LNK2038
+  # "mismatch detected for 'RuntimeLibrary'" for every DuckDB object.
+  #
+  # This is why the Windows triplet is x64-windows-static and no longer
+  # x64-windows-static-md: the -md variant existed to match the prebuilt DuckDB
+  # DLL, which no longer exists. A fully static CRT also means one fewer thing
+  # the machine has to have installed.
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>" CACHE STRING "")
+endif()
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
@@ -107,30 +121,90 @@ else()
   message(STATUS "erpl-rev RFC backend: sdk (${SAPNWRFC_HOME})")
 endif()
 
-# --- DuckDB (self-contained dist: libduckdb + amalgamated duckdb.hpp) --------
-set(DUCKDB_DIST "" CACHE PATH "Standalone DuckDB dist dir (libduckdb + duckdb.hpp)")
-if(NOT DUCKDB_DIST)
-  message(FATAL_ERROR "DUCKDB_DIST not set; run `make duckdb-dist` or pass -DDUCKDB_DIST=<dir>")
+# --- DuckDB -----------------------------------------------------------------
+# Static by default, from the pinned `duckdb/` submodule.
+#
+# The prebuilt libduckdb_static.a in DuckDB's release zip cannot be linked: it
+# leaves duckdb::ExtensionHelper::LoadAllExtensions undefined *inside the
+# archive*, expecting extension libraries the zip does not ship.
+# `dummy_static_extension_loader`, a target of the DuckDB build itself, is what
+# provides that symbol -- which is why this needs the source, not the release.
+#
+# Autoloading and autoinstall stay ON: the static loader covers *statically
+# linked* extensions (there are none), and the server still installs `quack` and
+# opportunistically loads `httpfs` at runtime. Turning these off would build
+# fine and then fail at the first `INSTALL quack`.
+# Reported by --smoke and stamped into telemetry; the engine itself comes from
+# the submodule, so this is a label, not a selector.
+if(NOT DEFINED DUCKDB_VERSION OR DUCKDB_VERSION STREQUAL "")
+  set(DUCKDB_VERSION "1.5.5")
 endif()
-set(DUCKDB_INCLUDE "${DUCKDB_DIST}")
+
+# DuckDB is built from the pinned `duckdb/` submodule and linked statically.
+# There is deliberately no prebuilt-libduckdb path: DuckDB's release
+# amalgamation and its in-tree headers do not agree on their own API (result
+# column names are `string` in one and `Identifier` in the other), so supporting
+# both means a compatibility shim on every call site -- for a path CI would
+# never exercise and which would rot unnoticed. One engine, always tested.
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/duckdb/CMakeLists.txt")
+  message(FATAL_ERROR
+    "duckdb/ submodule is empty -- run `git submodule update --init --recursive`.")
+endif()
+
+# We want the engine, not DuckDB's own shell, unit tests or benchmarks. Those
+# add minutes per platform per build, and its test tree resolves a relative
+# source path against *our* source dir, so configuring it fails outright.
+#
+# BUILD_UNITTESTS in particular is not merely slow: with it ON, DuckDB exposes
+# internals that are private in a normal build, so code can compile against
+# members it has no business touching and then break the moment the flag flips.
+# DuckDB derives its version string from `git describe`. In a shallow submodule
+# clone that produces nonsense -- "v1.6.0-dev82307" for a checkout sitting
+# exactly on the v1.5.4 tag -- which then goes into --smoke output, telemetry and
+# the extension-repository path. State it instead of deriving it.
+set(DUCKDB_EXPLICIT_VERSION "v${DUCKDB_VERSION}" CACHE STRING "" FORCE)
+
+set(BUILD_UNITTESTS OFF CACHE BOOL "" FORCE)
+set(BUILD_SHELL OFF CACHE BOOL "" FORCE)
+set(BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+
+# Autoloading and autoinstall stay ON: the statically linked set below is the
+# engine's built-in extensions, while the server still installs `quack` and
+# opportunistically loads `httpfs` at runtime.
+set(ENABLE_EXTENSION_AUTOLOADING TRUE)
+set(ENABLE_EXTENSION_AUTOINSTALL TRUE)
+set(DUCKDB_EXTENSION_CONFIGS "${CMAKE_CURRENT_SOURCE_DIR}/cmake/duckdb_extensions.cmake")
 if(WIN32)
-  set(DUCKDB_LIB "${DUCKDB_DIST}/duckdb.lib")        # import lib; duckdb.dll bundled at runtime
-elseif(APPLE)
-  set(DUCKDB_LIB "${DUCKDB_DIST}/libduckdb.dylib")
-else()
-  set(DUCKDB_LIB "${DUCKDB_DIST}/libduckdb.so")
+  set(DUCKDB_EXPLICIT_PLATFORM "windows_amd64")
 endif()
+
+add_subdirectory(duckdb EXCLUDE_FROM_ALL)
+set(DUCKDB_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/duckdb/src/include")
+
+# duckdb_static, then the real generated loader, then the extension archives it
+# calls into. NOT dummy_static_extension_loader: that target exists for the
+# prebuilt libduckdb_static.a, which ships without a loader. Linking it here
+# satisfies the loader symbol with a no-op, so the extensions below compile in
+# and then never register -- which surfaces as 58 unit tests failing on icu
+# operators, not as anything mentioning extensions.
+set(DUCKDB_LIB
+    duckdb_static
+    duckdb_generated_extension_loader
+    core_functions_extension
+    parquet_extension
+    icu_extension
+    json_extension
+    autocomplete_extension)
 
 # Catch2 from vcpkg (manifest mode); toolchain supplied by the Makefile/CI.
 find_package(Catch2 3 CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 
 # --- Telemetry: DataZooDE/posthog-telemetry submodule ------------------------
-# The shared lib needs DuckDB's patched httplib header (third_party/httplib) plus
-# DuckDB's source includes, which the prebuilt DUCKDB_DIST (amalgamation only)
-# does not ship. Fetch the matching DuckDB v1.5.4 SOURCE (headers only) and hand
-# the submodule the two paths it expects — mirroring flapi's "Expose DuckDB
-# paths" block. Fetch the matching DuckDB v1.5.4 SOURCE (headers only).
+# The shared lib needs DuckDB's patched httplib header (third_party/httplib)
+# plus DuckDB's source includes. Both come from the duckdb/ submodule, which is
+# the same tree the engine is compiled from — so the headers cannot drift from
+# the engine, which they could when this was a separate tarball download.
 # OpenSSL is linked statically via the vcpkg static triplet, so the
 # single-file bundle gains no new runtime .so/.dylib/.dll.
 find_package(OpenSSL REQUIRED)
@@ -145,25 +219,9 @@ find_package(ZLIB REQUIRED)
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_abap.cmake")
 erpl_generate_abap_assets(ERPL_ABAP_GENERATED)
 
-# Must match the prebuilt DUCKDB_DIST engine (Makefile passes the same value).
-if(NOT DEFINED DUCKDB_VERSION OR DUCKDB_VERSION STREQUAL "")
-  set(DUCKDB_VERSION "1.5.4")
-endif()
 
-include(FetchContent)
-if(POLICY CMP0169)
-  cmake_policy(SET CMP0169 OLD)  # allow FetchContent_Populate (headers only)
-endif()
-FetchContent_Declare(duckdb_source
-  URL https://github.com/duckdb/duckdb/archive/refs/tags/v${DUCKDB_VERSION}.tar.gz
-  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
-FetchContent_GetProperties(duckdb_source)
-if(NOT duckdb_source_POPULATED)
-  message(STATUS "Fetching DuckDB v${DUCKDB_VERSION} source (headers only for posthog-telemetry)")
-  FetchContent_Populate(duckdb_source)
-endif()
-set(DUCKDB_SRC_INCLUDE "${duckdb_source_SOURCE_DIR}/src/include")
-set(DUCKDB_THIRD_PARTY "${duckdb_source_SOURCE_DIR}/third_party")
+set(DUCKDB_SRC_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/duckdb/src/include")
+set(DUCKDB_THIRD_PARTY "${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party")
 add_subdirectory(third_party/posthog-telemetry)
 
 # Feedback banner (header-only). Telemetry ON so a printed banner is counted as
@@ -214,6 +272,18 @@ add_executable(erpl_rev_server
   src/logging.cpp
   src/erpl_rev_telemetry.cpp
   src/main.cpp)
+
+# DuckDB is linked INTO this executable, so a loaded .duckdb_extension resolves
+# its duckdb:: symbols against the binary rather than a libduckdb.so. -rdynamic
+# keeps those symbols in the dynamic table.
+#
+# Measured: httpfs and quack both load correctly WITHOUT this, so it is not
+# load-bearing for the extensions erpl-rev uses today. It is kept because flapi,
+# which loads its whole extension set as prebuilt binaries, does need it -- and
+# an extension that does resolve host symbols fails as a segfault inside its own
+# LoadInternal, which reads as a broken extension rather than a missing flag.
+set_target_properties(erpl_rev_server PROPERTIES ENABLE_EXPORTS TRUE)
+
 target_include_directories(erpl_rev_server PRIVATE
   "${RFC_INCLUDE}" "${DUCKDB_INCLUDE}" src)
 target_compile_definitions(erpl_rev_server PRIVATE
@@ -233,14 +303,8 @@ elseif(UNIX)
     BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
 endif()
 
-# --- Self-extracting launcher (the single-file distributable wraps this) -----
-add_executable(erpl_rev_launch launcher/erpl_rev_launch.cpp)
-if(UNIX AND NOT APPLE)
-  target_link_options(erpl_rev_launch PRIVATE -static-libstdc++ -static-libgcc)
-endif()
-
 # --- DuckDB-bridge Catch2 tests ----------------------------------------------
-if(EXISTS "${DUCKDB_LIB}")
+if(TRUE)  # tests always build; DuckDB is in-tree
   add_executable(erpl_rev_tests
     test/test_duckdb_bridge.cpp
     test/test_cdc_dialect.cpp
@@ -265,11 +329,7 @@ if(EXISTS "${DUCKDB_LIB}")
   target_link_libraries(erpl_rev_tests PRIVATE
     ${DUCKDB_LIB} Threads::Threads Catch2::Catch2WithMain
     posthog_telemetry datazoo_banner OpenSSL::Crypto ZLIB::ZLIB)
-  if(APPLE)
-    set_target_properties(erpl_rev_tests PROPERTIES BUILD_RPATH "${DUCKDB_DIST}")
-  elseif(UNIX)
-    set_target_properties(erpl_rev_tests PROPERTIES BUILD_RPATH "${DUCKDB_DIST}")
-  endif()
+  # No BUILD_RPATH: DuckDB is inside the binary, so there is nothing to find.
 else()
   message(WARNING "libduckdb not found at ${DUCKDB_LIB}; skipping tests.")
 endif()
