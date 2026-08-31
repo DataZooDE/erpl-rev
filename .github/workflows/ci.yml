@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 env:
-  DUCKDB_VERSION: "1.5.4"
+  DUCKDB_VERSION: "1.5.5"
 
 jobs:
   build-and-test:
@@ -51,6 +51,45 @@ jobs:
 
       - name: Run tests
         run: make test
+
+  build-macos:
+    # macOS had no CI at all: it was built only by the release workflow, on a
+    # tag, which is the worst place to discover a platform break. It matters more
+    # now that DuckDB is compiled from source rather than downloaded prebuilt.
+    #
+    # This builds the SDK backend rather than the release's proto backend, so it
+    # needs no erpl-proto token; the point here is that the C++ and the DuckDB
+    # build work on arm64 macOS, which is the part that was untested.
+    name: Build server + run tests (macOS)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive   # duckdb (linked statically) + posthog-telemetry
+
+      - name: Install build tools
+        run: brew install ninja
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: 11bbc873e00e9e58d4e9dffb30b7a5493a030e0b
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::331993160594:role/ErplGithubOicdRole
+          role-session-name: ErplRevGithubOidcSession
+          aws-region: eu-west-1
+
+      - name: Download SAP NW RFC SDK (macOS arm64)
+        run: ./scripts/download_and_extract_nwrfc.sh 's3://erpl-resources/sapnwrfc/nwrfc750P_13-80008131_osx_arm.zip' './nwrfcsdk/osx/'
+
+      - name: Build (server + tests)
+        run: make build NWRFC_HOME="$PWD/nwrfcsdk/osx" VCPKG_TRIPLET=arm64-osx
+
+      - name: Run tests
+        run: make test NWRFC_HOME="$PWD/nwrfcsdk/osx" VCPKG_TRIPLET=arm64-osx
 
   build-windows:
     # The release Windows bundle is built only on tags, so Windows-only breaks
