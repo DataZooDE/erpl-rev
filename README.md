@@ -138,6 +138,30 @@ uvx erpl-rev --smoke         # prove the RFC backend and DuckDB both load
 or `pip install erpl-rev` if you would rather have it on `PATH`. Wheels are
 published for Linux x86-64, macOS arm64 and Windows x64.
 
+### Then set up the SAP side
+
+Getting the binary was always easy; getting SAP ready used to be an afternoon
+across four documents — a type-T destination, a function group, eight
+`Z_DUCKDB_*` modules, fourteen ABAP objects, a `reginfo` line. Two commands now
+do what a client can do, and hand over what it cannot:
+
+```bash
+uvx erpl-rev doctor          # read-only: what is missing, and the fix for each
+uvx erpl-rev setup --dry-run # the exact change set, nothing written
+uvx erpl-rev setup           # deploy, then prove a round trip before claiming success
+```
+
+`setup` deploys the ABAP over ADT, creates the destination and the function
+modules, and **only reports success once ABAP has actually called back out
+through the registered server** — "the objects exist" is not the same claim.
+Re-running it changes nothing. Every write needs a terminal confirmation or an
+explicit `--yes`.
+
+Two things genuinely cannot be done from a client: the gateway `reginfo`
+allow-list and the `gw/acl_mode` profile parameters. For those `setup` writes
+`erpl-rev-basis-handout.md`, filled in for your system, with nothing left to
+compose. See [docs/INSTALL.md](docs/INSTALL.md) for the manual path.
+
 Three ways to get the same server, pick whichever suits:
 
 | | how | notes |
