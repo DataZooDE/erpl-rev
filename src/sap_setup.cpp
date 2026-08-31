@@ -19,6 +19,11 @@
 #include <sstream>
 
 #ifdef _WIN32
+// winsock2 must precede windows.h, or windows.h pulls in the winsock 1.1
+// declarations and every socket symbol collides.
+#include <winsock2.h>
+#include <ws2tcpip.h>   // addrinfo / getaddrinfo
+#include <io.h>         // _isatty
 #include <windows.h>
 #else
 #include <netdb.h>
@@ -275,7 +280,21 @@ std::string GwService(const std::string &gwserv) {
 // most expensive failure to debug after the fact.
 // ---------------------------------------------------------------------------
 
+#ifdef _WIN32
+// Winsock refuses every call until the process has initialised it. Without
+// this, getaddrinfo() fails with WSANOTINITIALISED and doctor reports a
+// perfectly healthy gateway as unreachable -- a wrong diagnosis is worse than
+// no diagnosis, because it sends people to look at firewalls.
+struct WinsockInit {
+    WinsockInit() { WSADATA d; WSAStartup(MAKEWORD(2, 2), &d); }
+    ~WinsockInit() { WSACleanup(); }
+};
+#endif
+
 bool TcpReachable(const std::string &host, const std::string &port) {
+#ifdef _WIN32
+    static WinsockInit winsock;   // once per process, torn down at exit
+#endif
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -297,6 +316,9 @@ bool TcpReachable(const std::string &host, const std::string &port) {
 }
 
 std::string LocalHostname() {
+#ifdef _WIN32
+    static WinsockInit winsock;   // gethostname needs it too
+#endif
     char buf[256] = {0};
     if (::gethostname(buf, sizeof(buf) - 1) == 0 && buf[0]) return buf;
     return "<this-host>";
