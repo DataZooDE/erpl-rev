@@ -54,7 +54,7 @@ jobs:
 
   build-windows:
     # The release Windows bundle is built only on tags, so Windows-only breaks
-    # used to slip to the release. Build the same x64-windows-static-md config
+    # used to slip to the release. Build the same x64-windows-static config
     # (server + tests) AND run the suite here on every push/PR.
     name: Build server + run tests (Windows)
     runs-on: windows-latest
@@ -80,13 +80,13 @@ jobs:
 
       - name: Build (server + tests)
         run: |
-          # x64-windows-static-md mirrors the release build: static OpenSSL,
-          # dynamic CRT (/MD), DuckDB compiled from the pinned submodule and
-          # linked in. Builds all targets incl. tests, so an MSVC-only compile
-          # error fails here instead of at release time.
+          # x64-windows-static mirrors the release build: static OpenSSL and a
+          # static CRT (/MT) to match DuckDB, compiled from the pinned submodule
+          # and linked in. Builds all targets incl. tests, so an MSVC-only
+          # compile error fails here instead of at release time.
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
-            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static `
             -DDUCKDB_VERSION="$env:DUCKDB_VERSION"
           cmake --build build --config Release
 

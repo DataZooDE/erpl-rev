@@ -3,6 +3,20 @@ project(erpl_rev CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+if(MSVC)
+  # Static CRT (/MT), to match DuckDB. duckdb/CMakeLists.txt sets
+  # CMAKE_MSVC_RUNTIME_LIBRARY unconditionally as a plain variable, so it wins
+  # inside its own subdirectory and cannot be overridden from here -- the only
+  # workable direction is for us to match it. Mixing the two produces LNK2038
+  # "mismatch detected for 'RuntimeLibrary'" for every DuckDB object.
+  #
+  # This is why the Windows triplet is x64-windows-static and no longer
+  # x64-windows-static-md: the -md variant existed to match the prebuilt DuckDB
+  # DLL, which no longer exists. A fully static CRT also means one fewer thing
+  # the machine has to have installed.
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>" CACHE STRING "")
+endif()
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
