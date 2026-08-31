@@ -12,6 +12,7 @@
 #include "rfc_handlers.hpp"
 #include "duckdb_bridge.hpp"
 #include "logging.hpp"
+#include "sap_setup.hpp"
 #include "sap_uc.hpp"
 #include "erpl_rev_telemetry.hpp"
 
@@ -76,7 +77,10 @@ bool ListenIsLoopback(const std::string &listen) {
 // Parsed command-line options. *_set marks "seen on the command line" so the
 // resolver can apply CLI-over-env precedence without conflating an explicit
 // empty value with "unset".
+enum class Verb { Serve, Setup, Doctor };
+
 struct Cli {
+    Verb verb = Verb::Serve;
     bool quack = false;
     std::string quack_listen;
     bool quack_listen_set = false;
@@ -91,6 +95,9 @@ struct Cli {
     bool help = false;
     bool smoke = false;
     bool no_telemetry = false;
+    // setup / doctor
+    setup::Options setup;
+    bool bad_args = false;      // an unknown flag; refuse to run rather than guess
 };
 
 // Identity for the feedback banner, the startup log line and the issue hint.
@@ -143,7 +150,24 @@ void PrintHelp() {
 
 Cli ParseArgs(int argc, char **argv) {
     Cli c;
-    for (int i = 1; i < argc; i++) {
+    int first = 1;
+    // A leading bare word is a verb. No verb keeps the historical behaviour --
+    // `erpl-rev` with flags alone still starts the server -- so nothing that
+    // works today stops working.
+    if (argc > 1 && argv[1][0] != '-') {
+        const std::string v = argv[1];
+        if (v == "serve") { c.verb = Verb::Serve; first = 2; }
+        else if (v == "setup")  { c.verb = Verb::Setup;  first = 2; }
+        else if (v == "doctor") { c.verb = Verb::Doctor; first = 2; }
+        else {
+            std::fprintf(stderr, "erpl-rev: unknown command '%s'\n"
+                                 "Commands: serve (default), setup, doctor. Try --help.\n",
+                         v.c_str());
+            c.bad_args = true;
+            return c;
+        }
+    }
+    for (int i = first; i < argc; i++) {
         std::string a = argv[i];
         std::string key = a, inval;
         bool has_inval = false;
@@ -186,8 +210,14 @@ Cli ParseArgs(int argc, char **argv) {
             c.smoke = true;
         } else if (key == "--no-telemetry") {
             c.no_telemetry = true;
+        } else if (setup::ParseOption(key, has_inval, take_value, c.setup)) {
+            // consumed by setup/doctor
         } else {
-            log::get().Warn("server", "ignoring unknown argument", {{"arg", a}});
+            // Refuse rather than warn. A typo'd flag that is merely logged leaves
+            // a server running with a configuration nobody asked for, and the
+            // warning is lost in the log by the time that matters.
+            std::fprintf(stderr, "erpl-rev: unknown option '%s'. Try --help.\n", a.c_str());
+            c.bad_args = true;
         }
     }
     return c;
@@ -255,8 +285,12 @@ int main(int argc, char **argv) {
     log::get().Configure();
 
     Cli cli = ParseArgs(argc, argv);
-    if (cli.help) { PrintHelp(); return 0; }
+    if (cli.bad_args) return 2;
+    if (cli.help) { PrintHelp(); setup::PrintHelp(); return 0; }
     if (cli.smoke) return RunSmoke();
+    // setup/doctor run and exit, like --smoke: they never start the server.
+    if (cli.verb == Verb::Doctor) return setup::RunDoctor(cli.setup);
+    if (cli.verb == Verb::Setup)  return setup::RunSetup(cli.setup);
 
     // Two surfaces, because this process almost never runs on a terminal. The
     // banner is for the operator who starts it by hand; the log line is for the

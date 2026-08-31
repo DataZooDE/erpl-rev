@@ -140,6 +140,11 @@ find_package(OpenSSL REQUIRED)
 # runtime .so/.dylib/.dll and DuckDB stays the only bundled library.
 find_package(ZLIB REQUIRED)
 
+# The ABAP objects `erpl-rev setup` deploys, compiled into the binary: a PyPI
+# install has no checkout to read them from.
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_abap.cmake")
+erpl_generate_abap_assets(ERPL_ABAP_GENERATED)
+
 # Must match the prebuilt DUCKDB_DIST engine (Makefile passes the same value).
 if(NOT DEFINED DUCKDB_VERSION OR DUCKDB_VERSION STREQUAL "")
   set(DUCKDB_VERSION "1.5.4")
@@ -203,6 +208,9 @@ add_executable(erpl_rev_server
   src/json_util.cpp
   src/sxml_binary.cpp
   src/payload.cpp
+  src/adt.cpp
+  src/sap_setup.cpp
+  ${ERPL_ABAP_GENERATED}
   src/logging.cpp
   src/erpl_rev_telemetry.cpp
   src/main.cpp)
@@ -239,13 +247,17 @@ if(EXISTS "${DUCKDB_LIB}")
     test/test_sxml_binary.cpp
     test/test_payload.cpp
     test/test_telemetry.cpp
+    test/test_sap_setup.cpp
     test/bench_ingest.cpp
     src/duckdb_bridge.cpp
     src/cdc_dialect.cpp
     src/json_util.cpp
     src/sxml_binary.cpp
     src/payload.cpp
-    src/erpl_rev_telemetry.cpp)
+    src/erpl_rev_telemetry.cpp
+    src/sap_setup.cpp
+    src/adt.cpp
+    ${ERPL_ABAP_GENERATED})
   target_include_directories(erpl_rev_tests PRIVATE src "${DUCKDB_INCLUDE}")
   target_compile_definitions(erpl_rev_tests PRIVATE
     ERPL_REV_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"

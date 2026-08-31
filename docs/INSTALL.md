@@ -1,7 +1,22 @@
 # erpl-rev — Installation (SAP transport + server)
 
-Two parts: (1) import the **ABAP transport** into the SAP system, (2) install the
+Two parts: (1) get the **ABAP objects** into the SAP system, (2) install the
 **external server** + wire up the gateway. Read `docs/security.md` alongside this.
+
+> **Try `erpl-rev setup` first.** If you installed via `uvx erpl-rev`, most of this
+> document is automated:
+>
+> ```
+> uvx erpl-rev doctor          # read-only: what is missing, and the fix for each
+> uvx erpl-rev setup --dry-run # the exact change set, nothing written
+> uvx erpl-rev setup           # deploy, then prove a round trip before claiming success
+> ```
+>
+> `setup` deploys the production ABAP objects over ADT, creates the function group,
+> the type-T destination and the eight `Z_DUCKDB_*` modules, and writes
+> `erpl-rev-basis-handout.md` with the two things a client genuinely cannot do — the
+> `reginfo` line and the RFC user. Re-running it is idempotent. The rest of this
+> document is the manual path, and what the handout refers to.
 
 ## 0. Prerequisites
 - SAP NetWeaver AS ABAP **7.40 SP05+** (tested on A4H / ABAP 7.5x).
@@ -31,10 +46,12 @@ Use **`ARCHIVFILE_CLIENT_TO_SERVER`** (SE37) to upload both files to the server'
 the same path the Theobald transports document.)
 
 ## 2. Post-import setup (run once)
-1. Run report/classrun **`ZCL_ERPL_REV_SETUP`** (or `Z_ERPL_REV_SETUP`): creates the
-   type-T **`ERPL_REV`** destination in **registration mode** (`method='R'`),
-   pointing at your gateway; verifies the `ZERPL_REV` FMs exist; prints the exact
-   `reginfo` line to add.
+1. Run classrun **`ZCL_ERPL_REV_SETUP`**: creates the type-T **`ERPL_REV`**
+   destination in **registration mode** (`method='R'`), pointing at your gateway.
+   Then run **`ZCL_ERPL_REV_MKFM`**, which creates the eight `Z_DUCKDB_*` function
+   modules in function group `ZERPL_REV` (create the group in SE80 first).
+   For the `reginfo` line filled in for your host, run `erpl-rev setup
+   --print-runbook`, or compose it from security.md §2.
 2. Add the **`reginfo`** allow-list line (security.md §2) and reload the ACL in SMGW.
 3. Create the **RFC user** + assign role **`ZERPL_REV_RFC`** (security.md §4).
 
