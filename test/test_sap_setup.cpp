@@ -231,18 +231,61 @@ TEST_CASE("MKFM is judged by TFDIR, not by the insert return code", "[setup]") {
         out += std::string(n) + " tfdir subrc=0 fmode=R\n";
     }
     std::string why;
-    CHECK(MkfmSucceeded(out, kFunctionModuleCount, why));
+    CHECK(MkfmSucceeded(out, FunctionModuleNames(), why));
 
     SECTION("a module that exists but is not remote-enabled does not count") {
         // fmode blank: callable in ABAP, invisible over RFC.
         auto broken = out;
         const auto p = broken.find("Z_DUCKDB_CLOSE tfdir subrc=0 fmode=R");
         broken.replace(p, 36, "Z_DUCKDB_CLOSE tfdir subrc=0 fmode= ");
-        CHECK_FALSE(MkfmSucceeded(broken, kFunctionModuleCount, why));
+        CHECK_FALSE(MkfmSucceeded(broken, FunctionModuleNames(), why));
         CHECK_THAT(why, ContainsSubstring("7 of 8"));
     }
     SECTION("invalid_function_pool: nothing was created, class still exited 0") {
         CHECK_FALSE(MkfmSucceeded("Z_DUCKDB_QUERY insert subrc=4 invalid_function_pool\n",
-                                  kFunctionModuleCount, why));
+                                  FunctionModuleNames(), why));
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// False-pass regressions. Every input below was accepted by the first version
+// of these parsers, which matched loose substrings anywhere in the output and
+// counted anonymous fragments. A parser that decides whether a customer's ERP
+// was configured correctly has to be exact.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("RFCDES options are matched as exact tokens, not prefixes", "[setup]") {
+    std::string why;
+
+    SECTION("a longer PROGRAM_ID must not satisfy a shorter one") {
+        CHECK_FALSE(SetupClassSucceeded(
+            "setup subrc=0 opts=[H=%%RFCSERVER%%,g=sapgw00,N=ERPL_REV2,]",
+            "ERPL_REV", "sapgw00", why));
+    }
+    SECTION("a longer gateway service must not satisfy a shorter one") {
+        // Expecting sapgw0 on a destination pointing at sapgw00 is a real
+        // mismatch: instance 0 is not instance 00's gateway.
+        CHECK_FALSE(SetupClassSucceeded(
+            "setup subrc=0 opts=[H=%%RFCSERVER%%,g=sapgw00,N=ERPL_REV,]",
+            "ERPL_REV", "sapgw0", why));
+    }
+    SECTION("values echoed elsewhere in the output do not count") {
+        // The destination is empty; the expected values appear only in a
+        // diagnostic line. Reading them from anywhere would report success on a
+        // system with no usable destination at all.
+        CHECK_FALSE(SetupClassSucceeded(
+            "setup subrc=0 opts=[]\n"
+            "debug: H=%%RFCSERVER%% N=ERPL_REV g=sapgw00\n",
+            "ERPL_REV", "sapgw00", why));
+    }
+}
+
+TEST_CASE("MKFM lines are bound to module names", "[setup]") {
+    // One module reporting eight times is not eight modules.
+    std::string out;
+    for (int i = 0; i < 8; i++) out += "Z_DUCKDB_QUERY tfdir subrc=0 fmode=R\n";
+    std::string why;
+    CHECK_FALSE(MkfmSucceeded(out, FunctionModuleNames(), why));
+    CHECK_THAT(why, ContainsSubstring("Z_DUCKDB_CLOSE"));   // names what is absent
 }

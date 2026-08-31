@@ -1,5 +1,10 @@
 #include "sap_setup.hpp"
 
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 #include "abap_assets.hpp"
 #include "adt.hpp"
 
@@ -149,19 +154,39 @@ bool WriteConfig(const std::map<std::string, std::string> &kv) {
     if (p.empty()) return false;
     std::error_code ec;
     std::filesystem::create_directories(p.parent_path(), ec);
+
+    std::string body =
+        "# erpl-rev setup. Written by `erpl-rev setup`; safe to edit by hand.\n"
+        "# Precedence: command-line flags > environment > this file.\n";
+    for (const auto &[k, v] : kv) body += k + " = " + v + "\n";
+
+#ifndef _WIN32
+    // Write to a fresh 0600 temp file and rename over the target, rather than
+    // truncating the real file and chmod'ing afterwards. The obvious version
+    // has a window -- between create-under-umask and chmod -- in which a file
+    // that may hold a password is world-readable, and it also leaves the
+    // config truncated if the process dies mid-write. Rename is atomic.
+    const auto tmp = p.parent_path() / (p.filename().string() + ".tmp");
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) return false;
+    size_t off = 0;
+    while (off < body.size()) {
+        const ssize_t n = ::write(fd, body.data() + off, body.size() - off);
+        if (n <= 0) { ::close(fd); ::unlink(tmp.c_str()); return false; }
+        off += static_cast<size_t>(n);
+    }
+    // The rename can outrun the data otherwise, leaving a config of NULs after
+    // a crash -- cheap insurance for a file written about once.
+    ::fsync(fd);
+    ::close(fd);
+    if (::rename(tmp.c_str(), p.c_str()) != 0) { ::unlink(tmp.c_str()); return false; }
+    return true;
+#else
     std::ofstream out(p, std::ios::trunc);
     if (!out) return false;
-    out << "# erpl-rev setup. Written by `erpl-rev setup`; safe to edit by hand.\n"
-        << "# Precedence: command-line flags > environment > this file.\n";
-    for (const auto &[k, v] : kv) out << k << " = " << v << "\n";
-    out.close();
-#ifndef _WIN32
-    // 0600: this file names a system and a user, and may hold a password.
-    std::filesystem::permissions(p,
-        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
-        std::filesystem::perm_options::replace, ec);
+    out << body;
+    return out.good();
 #endif
-    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -206,7 +231,7 @@ void OfferToSave(const Options &o) {
         cfg.count("host") && cfg["host"] == o.host &&
         cfg.count("client") && cfg["client"] == o.client &&
         cfg.count("user") && cfg["user"] == o.user &&
-        (!o.save_password || cfg.count("password"));
+        (o.save_password ? cfg.count("password") > 0 : cfg.count("password") == 0);
     if (already) return;
 
     const auto path = ConfigPath();
@@ -221,6 +246,10 @@ void OfferToSave(const Options &o) {
     cfg["gwserv"] = o.gwserv;
     cfg["program_id"] = o.program_id;
     if (!o.package.empty()) cfg["package"] = o.package;
+    // Consent to store a password is given per run, not inherited from whatever
+    // is already in the file: without this, one --save-password keeps the secret
+    // alive through every later save that did not ask for it.
+    cfg.erase("password");
     if (o.save_password) {
         cfg["password"] = o.password;
         std::cout << "  ! --save-password: the password goes into " << path.string()
@@ -499,51 +528,118 @@ Plan MakePlan(const Diagnosis &d, const Options &o) {
     return p;
 }
 
+const std::vector<std::string> &FunctionModuleNames() {
+    static const std::vector<std::string> kNames = {
+        "Z_DUCKDB_QUERY", "Z_DUCKDB_INGEST", "Z_DUCKDB_SNAPSHOT_MERGE",
+        "Z_DUCKDB_CDC_PLAN", "Z_DUCKDB_CDC_APPLY", "Z_DUCKDB_OPEN",
+        "Z_DUCKDB_FETCH", "Z_DUCKDB_CLOSE",
+    };
+    return kNames;
+}
+
+namespace {
+
+// The one line of classrun output that starts with `prefix`, or empty.
+// Deciding anything from a substring found *somewhere* in the output is how a
+// diagnostic echo of the expected value turns into a false pass; a decision is
+// only ever read from the line that reported it.
+std::string LineStartingWith(const std::string &output, const std::string &prefix) {
+    size_t pos = 0;
+    while (pos <= output.size()) {
+        const size_t eol = output.find('\n', pos);
+        const size_t len = (eol == std::string::npos ? output.size() : eol) - pos;
+        if (output.compare(pos, prefix.size(), prefix) == 0)
+            return output.substr(pos, len);
+        if (eol == std::string::npos) break;
+        pos = eol + 1;
+    }
+    return std::string();
+}
+
+// Pull an exact `key=value` out of the comma-separated RFCDES option string.
+// Exact, not prefix: `N=ERPL_REV` must not be satisfied by `N=ERPL_REV2`, and
+// `g=sapgw0` must not be satisfied by `g=sapgw00`.
+bool OptionEquals(const std::string &opts, const std::string &key,
+                  const std::string &want) {
+    size_t pos = 0;
+    while (pos <= opts.size()) {
+        const size_t comma = opts.find(',', pos);
+        const size_t len = (comma == std::string::npos ? opts.size() : comma) - pos;
+        const std::string tok = opts.substr(pos, len);
+        const size_t eq = tok.find('=');
+        if (eq != std::string::npos && tok.substr(0, eq) == key)
+            return tok.substr(eq + 1) == want;
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    return false;
+}
+
+} // namespace
+
 bool SetupClassSucceeded(const std::string &output, const std::string &program_id,
                          const std::string &gwservice, std::string &why) {
-    // The class ends with a line read back out of RFCDES, e.g.
-    //   setup subrc=0 opts=[H=%%RFCSERVER%%,g=sapgw00,N=ERPL_REV,...]
+    // The class ends with one line read back out of RFCDES, e.g.
+    //   setup subrc=0 opts=[H=%%RFCSERVER%%,g=sapgw00,N=ERPL_REV,Y=2,...]
     // subrc is the SELECT's, so subrc=0 means the destination row really exists
     // -- a stronger statement than the swallowed FM return code.
-    const auto pos = output.find("setup subrc=");
-    if (pos == std::string::npos) {
+    const std::string line = LineStartingWith(output, "setup subrc=");
+    if (line.empty()) {
         why = "ZCL_ERPL_REV_SETUP printed no result line (short dump?)";
         return false;
     }
-    if (output.compare(pos, 14, "setup subrc=0 ") != 0) {
+    if (line.compare(0, 14, "setup subrc=0 ") != 0) {
         why = "the ERPL destination is not in RFCDES after the run";
         return false;
     }
+    const size_t ob = line.find("opts=[");
+    const size_t cb = ob == std::string::npos ? std::string::npos : line.rfind(']');
+    if (ob == std::string::npos || cb == std::string::npos || cb < ob) {
+        why = "could not read the destination options back from RFCDES";
+        return false;
+    }
+    const std::string opts = line.substr(ob + 6, cb - (ob + 6));
+
     // H=%%RFCSERVER%% is registration mode. Without it the destination is in
     // "Start" mode, which fails much later as an empty SYSTEM_FAILURE.
-    if (output.find("H=%%RFCSERVER%%") == std::string::npos) {
+    if (!OptionEquals(opts, "H", "%%RFCSERVER%%")) {
         why = "destination exists but is not in registration mode (method='R')";
         return false;
     }
-    if (output.find("N=" + program_id) == std::string::npos) {
+    if (!OptionEquals(opts, "N", program_id)) {
         why = "destination PROGRAM_ID is not " + program_id;
         return false;
     }
     // Catches the shipped-`sapgw00`-on-instance-42 case at the moment it happens
     // rather than as a connection that never arrives.
-    if (output.find("g=" + gwservice) == std::string::npos) {
+    if (!OptionEquals(opts, "g", gwservice)) {
         why = "destination gateway service is not " + gwservice;
         return false;
     }
     return true;
 }
 
-bool MkfmSucceeded(const std::string &output, size_t expected, std::string &why) {
-    // One `<NAME> tfdir subrc=0 fmode=R` per module, read back from TFDIR after
-    // the insert. fmode=R is the part that matters: a module that exists but is
-    // not remote-enabled cannot be called over RFC at all.
-    size_t found = 0;
-    for (size_t p = 0; (p = output.find("tfdir subrc=0 fmode=R", p)) != std::string::npos;
-         p += 21)
-        found++;
-    if (found < expected) {
-        why = std::to_string(found) + " of " + std::to_string(expected) +
-              " Z_DUCKDB_* modules are remote-enabled in TFDIR";
+bool MkfmSucceeded(const std::string &output, const std::vector<std::string> &expected,
+                   std::string &why) {
+    // One `<NAME> tfdir subrc=0 fmode=R` line per module, read back from TFDIR
+    // after the insert. fmode=R is the part that matters: a module that exists
+    // but is not remote-enabled cannot be called over RFC at all.
+    //
+    // Bound to the name each time: counting bare `tfdir subrc=0 fmode=R`
+    // fragments would accept one module reporting eight times.
+    std::vector<std::string> missing;
+    for (const auto &name : expected) {
+        if (LineStartingWith(output, name + " tfdir subrc=0 fmode=R").empty())
+            missing.push_back(name);
+    }
+    if (!missing.empty()) {
+        why = std::to_string(expected.size() - missing.size()) + " of " +
+              std::to_string(expected.size()) +
+              " Z_DUCKDB_* modules are remote-enabled in TFDIR; missing: ";
+        for (size_t i = 0; i < missing.size(); i++) {
+            if (i) why += ", ";
+            why += missing[i];
+        }
         return false;
     }
     return true;
@@ -555,7 +651,11 @@ std::string RenderBasisHandout(const Diagnosis &d, const Options &o,
     s << "# erpl-rev — steps that need Basis rights\n\n"
       << "Generated by `erpl-rev setup` for SAP system " << o.host << ":" << o.port
       << " (client " << o.client << ").\n"
-      << "Everything else has already been done; these are the parts a client cannot do.\n\n"
+      // With --print-runbook nothing has run yet, so claiming otherwise would
+      // send a Basis team looking for objects that are not there.
+      << (d.checks.empty()
+              ? "These are the parts a client cannot do; the rest is what `erpl-rev setup` will do.\n\n"
+              : "Everything else has already been done; these are the parts a client cannot do.\n\n")
       << "## 1. Allow the gateway registration\n\n"
       << "The server registers the PROGRAM_ID `" << o.program_id << "` at gateway `"
       << o.gwhost << ":" << o.gwserv << "`.\n"
@@ -816,7 +916,7 @@ int RunSetup(Options o) {
     if (p.run_mkfm) {
         auto r = adt::RunClass(conn, "ZCL_ERPL_REV_MKFM");
         std::string why;
-        const bool ok = r.ok() && MkfmSucceeded(r.output, kFunctionModuleCount, why);
+        const bool ok = r.ok() && MkfmSucceeded(r.output, FunctionModuleNames(), why);
         std::cout << (ok ? "  ok   " : "  FAIL ") << "ZCL_ERPL_REV_MKFM (function modules)\n";
         if (!ok) {
             failures++;

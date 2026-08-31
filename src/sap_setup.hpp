@@ -110,8 +110,10 @@ Plan MakePlan(const Diagnosis &d, const Options &o);
 std::string RenderBasisHandout(const Diagnosis &d, const Options &o,
                                const std::string &server_host);
 
-// How many Z_DUCKDB_* modules ZCL_ERPL_REV_MKFM is expected to leave behind.
-constexpr size_t kFunctionModuleCount = 8;
+// The Z_DUCKDB_* modules ZCL_ERPL_REV_MKFM is expected to leave behind, by
+// name. Counting them is not enough: one module reporting success eight times
+// counts the same as eight modules reporting once.
+const std::vector<std::string> &FunctionModuleNames();
 
 // Did the classruns actually do their job?
 //
@@ -125,6 +127,7 @@ constexpr size_t kFunctionModuleCount = 8;
 // `why` receives a human-readable reason when the answer is false.
 bool SetupClassSucceeded(const std::string &output, const std::string &program_id,
                          const std::string &gwservice, std::string &why);
-bool MkfmSucceeded(const std::string &output, size_t expected, std::string &why);
+bool MkfmSucceeded(const std::string &output, const std::vector<std::string> &expected,
+                   std::string &why);
 
 } // namespace erpl_rev::setup
