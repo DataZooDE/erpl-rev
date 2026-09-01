@@ -243,8 +243,57 @@ fi
 $CLI sync run t000_cli --yes >/dev/null 2>&1 || fail "sync run failed"
 echo "   sync create/ls/run, and the granularity gate still applies"
 
-# 7. Nothing may be left behind in the customer's system.
-LEFT="$(adt search 'ZCL_ERPL_REV_CLI*' 2>/dev/null | grep -c ZCL_ERPL_REV_CLI || true)"
+# 7. The driver: parameters as data, no generated ABAP, no authorisation.
+#    Deploy it first -- setup ships it, but this suite deploys via deploy-abap.sh.
+adt object create --type CLAS/OC --name ZCL_ERPL_REV_CLIDRV --package '$TMP' \
+    --description 'erpl-rev CLI command driver' >/dev/null 2>&1 || true
+adt source write ZCL_ERPL_REV_CLIDRV --file "$HERE/abap/zcl_erpl_rev_clidrv.abap" --activate \
+  2>&1 | grep -qE "Activated|Nothing to activate" || fail "clidrv did not activate"
+
+# --queue-only must not touch SAP: run it with the credentials stripped.
+QOUT="$(env -u SAP_USER -u SAP_PASSWORD -u ERPL_REV_SAP_PASSWORD \
+        $CLI replicate --table T000 --target t000_q --queue-only --yes 2>&1)"
+grep -q "Queued as command" <<<"$QOUT" || fail "--queue-only did not queue: $QOUT"
+CID="$(sed -n 's/.*Queued as command \([0-9]*\).*/\1/p' <<<"$QOUT" | head -1)"
+[ -n "$CID" ] || fail "no command id in: $QOUT"
+
+# The heartbeat drains it -- the path that needs no SAP rights from the CLI.
+cat > /tmp/erpl_e2e_tick_$$.abap <<'ABAPTICK'
+CLASS zcl_erpl_e2e_tick DEFINITION PUBLIC FINAL CREATE PUBLIC.
+  PUBLIC SECTION.
+    INTERFACES if_oo_adt_classrun.
+ENDCLASS.
+CLASS zcl_erpl_e2e_tick IMPLEMENTATION.
+  METHOD if_oo_adt_classrun~main.
+    " The report writes a list. A classrun has nowhere to put one, so it has to
+    " be captured to memory or the SUBMIT dumps.
+    SUBMIT z_erpl_rev_delta WITH p_once = abap_true
+      EXPORTING LIST TO MEMORY AND RETURN.
+    DATA lt TYPE STANDARD TABLE OF abaplist.
+    CALL FUNCTION 'LIST_FROM_MEMORY' TABLES listobject = lt EXCEPTIONS OTHERS = 1.
+    CALL FUNCTION 'LIST_FREE_MEMORY' EXCEPTIONS OTHERS = 0.
+    out->write( 'tick' ).
+  ENDMETHOD.
+ENDCLASS.
+ABAPTICK
+adt object create --type CLAS/OC --name ZCL_ERPL_E2E_TICK --package '$TMP' \
+    --description 'e2e heartbeat tick' >/dev/null 2>&1 || true
+adt source write ZCL_ERPL_E2E_TICK --file "/tmp/erpl_e2e_tick_$$.abap" --activate >/dev/null 2>&1
+adt object run ZCL_ERPL_E2E_TICK >/dev/null 2>&1 || fail "heartbeat tick failed"
+rm -f "/tmp/erpl_e2e_tick_$$.abap"
+
+ST="$($CLI sql "SELECT status FROM _erpl_rev_cli_cmd WHERE cmd_id = $CID" \
+      --format csv --quiet 2>/dev/null | tail -1)"
+[ "$ST" = "DONE" ] || fail "queued command $CID is '$ST', not DONE"
+QROWS="$($CLI sql "SELECT count(*) AS n FROM t000_q" --format csv --quiet 2>/dev/null | tail -1)"
+[ "${QROWS:-0}" -gt 0 ] || fail "the queued replicate loaded no rows"
+adt object delete /sap/bc/adt/oo/classes/zcl_erpl_e2e_tick >/dev/null 2>&1 || true
+echo "   driver: queued with no SAP credentials, heartbeat ran it, $QROWS rows"
+
+# 8. Nothing may be left behind in the customer's system.
+# The trailing underscore matters: ZCL_ERPL_REV_CLIDRV is the permanent driver,
+# ZCL_ERPL_REV_CLI_<kind><nonce> are the throwaways that must never survive.
+LEFT="$(adt search 'ZCL_ERPL_REV_CLI_*' 2>/dev/null | grep -c 'ZCL_ERPL_REV_CLI_' || true)"
 [ "$LEFT" -eq 0 ] || fail "$LEFT temporary CLI class(es) leaked into SAP"
 echo "   no temporary classes left behind"
 

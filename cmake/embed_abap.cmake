@@ -23,6 +23,7 @@ set(ERPL_ABAP_ASSETS
     "zcl_erpl_rev_mkfm.abap|ZCL_ERPL_REV_MKFM|CLAS/OC||create the Z_DUCKDB_* RFC FMs"
     "zcl_erpl_rev_setup.abap|ZCL_ERPL_REV_SETUP|CLAS/OC||create the registered destination"
     "zcl_erpl_rev_diag.abap|ZCL_ERPL_REV_DIAG|CLAS/OC||round-trip probe (STFC_CONNECTION)"
+    "zcl_erpl_rev_clidrv.abap|ZCL_ERPL_REV_CLIDRV|CLAS/OC||CLI command driver (queue in DuckDB)"
     "z_erpl_rev_repl_worker.prog.abap|Z_ERPL_REV_REPL_WORKER|PROG/P||parallel-replication worker"
     "z_erpl_rev_replicate.prog.abap|Z_ERPL_REV_REPLICATE|PROG/P||replicate SAP table -> DuckDB"
     "z_erpl_rev_sql.prog.abap|Z_ERPL_REV_SQL|PROG/P||DuckDB SQL console"

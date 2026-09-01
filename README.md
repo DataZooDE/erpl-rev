@@ -161,9 +161,13 @@ Add `--print-abap` to any of them to see the ABAP instead of running it, and
 `--dry-run` to see the plan. Nothing writes to SAP or DuckDB without a terminal
 confirmation or an explicit `--yes`.
 
-> These commands deploy a short-lived class to `$TMP` to carry their parameters,
-> because an ADT classrun takes none. That needs **`S_DEVELOP`** — a stronger
-> authorisation than running the equivalent report in SE38.
+> Parameters reach SAP as *data*: the CLI writes the command into a DuckDB table
+> and the pre-deployed `ZCL_ERPL_REV_CLIDRV` executes it, so these commands need
+> **no SAP authorisation** and create nothing. `--queue-only` does not contact
+> SAP at all — the periodic `ERPL_REV_DELTA` job picks the command up.
+>
+> Where the driver is not deployed they fall back to generating a temporary
+> class, which does need `S_DEVELOP`. `erpl-rev doctor` reports which applies.
 
 ## Then set up the SAP side
 

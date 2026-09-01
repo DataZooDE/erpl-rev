@@ -24,6 +24,7 @@ bool ParseOption(const std::string &key, const std::function<std::string()> &tak
     else if (key == "--print-abap")     { o.print_abap = true; }
     else if (key == "--keep-generated") { o.keep_generated = true; }
     else if (key == "--quiet")          { o.quiet = true; }
+    else if (key == "--queue-only")     { o.queue_only = true; }
     else if (key == "--count")          { o.count = true; }
     else if (key == "--limit") {
         const std::string v = take();

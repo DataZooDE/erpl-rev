@@ -260,6 +260,21 @@ DuckDbBridge::DuckDbBridge(const std::string &path, const std::string &init_sql)
         "provisioned_ts TIMESTAMPTZ, seeded_ts TIMESTAMPTZ, last_run_ts TIMESTAMPTZ, error VARCHAR)");
     if (cdc->HasError())
         throw std::runtime_error("DuckDB cdc-state init failed: " + cdc->GetError());
+    // The CLI command queue. The CLI writes a row here and ABAP picks it up, so
+    // parameters reach SAP as *data* rather than as generated source -- which is
+    // what lets sync/replicate work for a user with no developer authorisation,
+    // and removes the ABAP-escaping surface entirely. See issue #85.
+    auto cmdq = con.Query(
+        "CREATE SEQUENCE IF NOT EXISTS _erpl_rev_cli_seq START 1;"
+        "CREATE TABLE IF NOT EXISTS _erpl_rev_cli_cmd ("
+        "cmd_id BIGINT PRIMARY KEY, created_ts TIMESTAMPTZ DEFAULT now(), "
+        "verb VARCHAR NOT NULL, params VARCHAR NOT NULL, "
+        "status VARCHAR DEFAULT 'PENDING', "
+        "claimed_ts TIMESTAMPTZ, finished_ts TIMESTAMPTZ, "
+        "result VARCHAR, error VARCHAR)");
+    if (cmdq->HasError())
+        throw std::runtime_error("DuckDB cli-queue init failed: " + cmdq->GetError());
+
     // Boot init: explicit init_sql (CLI/--init-file) wins; else env fallback. Runs
     // INSTALL/LOAD/CREATE SECRET/ATTACH so replication can publish to external
     // targets (parquet object stores, postgres, ducklake, bigquery, iceberg).

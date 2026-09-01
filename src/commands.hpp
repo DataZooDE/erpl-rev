@@ -7,6 +7,7 @@
 
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "cli_common.hpp"
@@ -29,6 +30,10 @@ struct Options : cli::ConnOptions {
     bool print_abap = false;
     bool keep_generated = false;
     bool quiet = false;
+    // Queue the command and return without contacting SAP at all. The periodic
+    // ERPL_REV_DELTA job drains the queue, so this path needs no SAP
+    // authorisation whatsoever -- not even the right to run a classrun.
+    bool queue_only = false;
 
     // Positional words after the verb, in order.
     std::vector<std::string> args;
@@ -40,6 +45,11 @@ bool ParseOption(const std::string &key, const std::function<std::string()> &tak
 void PrintHelp();
 
 // Exit codes: 0 verified success, 1 verified failure, 2 misuse, 3 unknown.
+// Build the JSON a queued command carries. Exposed for tests: these values are
+// user input, and they travel through a SQL literal and then an ABAP JSON
+// reader, so the escaping has to survive both.
+std::string BuildParams(const std::vector<std::pair<std::string, std::string>> &kv);
+
 int RunSql(Options o);
 int RunSync(Options o);
 int RunReplicate(Options o);
