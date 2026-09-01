@@ -257,6 +257,28 @@ Diagnosis Diagnose(const Options &o) {
                 "        running, and the gateway permits the registration. `erpl-rev setup`\n"
                 "        does the first; the handout covers the third.");
         }
+
+        // The probe also reports whether this user may create and activate a
+        // class. Worth its own line: without it `setup` fails partway through
+        // deploying, and `sync`/`replicate` fail on every call -- and the
+        // symptom is an object-create error that names an authorisation nobody
+        // was told they needed.
+        const std::string au = cli::LineStartingWith(r.output, "s_develop ");
+        d.develop_auth = DevelopAuthFromProbe(r.output);
+        if (!au.empty()) {
+            if (d.develop_auth == Status::Ok) {
+                add("sap.develop", "may create and activate ABAP (S_DEVELOP)", Status::Ok,
+                    au);
+            } else {
+                add("sap.develop", "may create and activate ABAP (S_DEVELOP)", Status::Fail,
+                    au,
+                    "setup deploys ABAP, and sync/replicate generate a temporary class,\n"
+                    "        so both need S_DEVELOP for OBJTYPE=CLAS (ACTVT 01 and 02).\n"
+                    "        A communications user normally has none. Either run setup as a\n"
+                    "        developer, or import the transport and use --print-abap to get\n"
+                    "        the ABAP to run from SE38. See the Basis handout.");
+            }
+        }
     } else {
         add("sap.destination", "destination ERPL_REV answers (round trip)", Status::Unknown,
             "skipped: probe class not deployed yet");
@@ -406,6 +428,14 @@ bool SetupClassSucceeded(const std::string &output, const std::string &program_i
     return true;
 }
 
+Status DevelopAuthFromProbe(const std::string &output) {
+    const std::string au = cli::LineStartingWith(output, "s_develop ");
+    if (au.empty()) return Status::Unknown;
+    const bool can_create = au.find("create=0") != std::string::npos;
+    const bool can_change = au.find("change=0") != std::string::npos;
+    return (can_create && can_change) ? Status::Ok : Status::Fail;
+}
+
 bool MkfmSucceeded(const std::string &output, const std::vector<std::string> &expected,
                    std::string &why) {
     // One `<NAME> tfdir subrc=0 fmode=R` line per module, read back from TFDIR
@@ -468,6 +498,29 @@ std::string RenderBasisHandout(const Diagnosis &d, const Options &o,
       << "- SU01: a user of type **Communications Data** (not Dialog).\n"
       << "- PFCG role with `S_RFC`: `ACTVT=16`, `RFC_TYPE=FUGR`, `RFC_NAME=ZERPL_REV`.\n"
       << "  That grants exactly the eight `Z_DUCKDB_*` modules and nothing else.\n\n"
+      << "This is the user the *running server* connects as. It is a different user\n"
+      << "from the one in section 4, and it deliberately needs no developer rights.\n\n"
+
+      << "## 4. The user that runs `erpl-rev setup` needs S_DEVELOP\n\n"
+      << "`setup` creates and activates ABAP objects over ADT, and `erpl-rev sync` /\n"
+      << "`erpl-rev replicate` generate a temporary class in `$TMP` to carry their\n"
+      << "parameters, because an ADT classrun takes none. All of that needs:\n\n"
+      << "```\n"
+      << "S_DEVELOP: OBJTYPE=CLAS, ACTVT=01 (create) and 02 (change)\n"
+      << "           plus PROG/INTF/TABL for the initial deploy\n"
+      << "```\n\n"
+      << "This is a **developer** authorisation and is normally absent on production.\n"
+      << "Two ways to live without it, both supported:\n\n"
+      << "- Import the ABAP as a **transport** instead of letting setup deploy it\n"
+      << "  (docs/INSTALL.md), then run only `erpl-rev doctor`, which never writes.\n"
+      << "- Use `--print-abap` on any command to get the exact ABAP and run it from\n"
+      << "  SE38/SE24 as a user who does have the rights.\n\n"
+      << "Current status for `" << o.user << "`: "
+      << (d.develop_auth == Status::Ok      ? "granted."
+          : d.develop_auth == Status::Fail  ? "**NOT granted** — setup cannot deploy as this user."
+                                            : "not determined (the probe class was not reachable).")
+      << "\n\n"
+
       << "## What setup already did\n\n";
     for (const auto &c : d.checks) {
         if (c.status == Status::Ok) s << "- ok: " << c.title << " — " << c.detail << "\n";
@@ -634,6 +687,18 @@ int RunSetup(Options o) {
     if (p.nothing_to_do) {
         std::cout << "Nothing to do.\n";
         return 0;
+    }
+    if (d.develop_auth == Status::Fail) {
+        // Better to stop here than to create four objects and fail on the fifth,
+        // leaving the system half-deployed and the user reading an ADT error
+        // that never mentions the word authorisation.
+        std::cout << "\nCannot deploy: " << o.user << " lacks S_DEVELOP for classes.\n"
+                     "  setup creates and activates ABAP objects, which needs\n"
+                     "  S_DEVELOP OBJTYPE=CLAS ACTVT=01 and 02.\n"
+                     "  Either run setup as a developer, import the transport instead\n"
+                     "  (docs/INSTALL.md), or use `erpl-rev setup --print-runbook` for the\n"
+                     "  handout to give whoever does have the rights.\n";
+        return 1;
     }
     if (!d.have_uvx || !d.adt_reachable) {
         std::cout << "Cannot deploy automatically (see the failures above).\n"

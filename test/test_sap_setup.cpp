@@ -289,3 +289,35 @@ TEST_CASE("MKFM lines are bound to module names", "[setup]") {
     CHECK_FALSE(MkfmSucceeded(out, FunctionModuleNames(), why));
     CHECK_THAT(why, ContainsSubstring("Z_DUCKDB_CLOSE"));   // names what is absent
 }
+
+// ---------------------------------------------------------------------------
+// S_DEVELOP. setup creates and activates ABAP, and sync/replicate generate a
+// temporary class, so both need a developer authorisation that a production
+// service user normally does not have. Getting this verdict wrong either
+// blocks a capable user or lets setup fail halfway through a deploy.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("the S_DEVELOP verdict is read from the probe", "[setup]") {
+    // subrc 0 from AUTHORITY-CHECK means granted.
+    CHECK(DevelopAuthFromProbe("s_develop create=0 change=0 user=DEVELOPER") == Status::Ok);
+
+    SECTION("create refused") {
+        CHECK(DevelopAuthFromProbe("s_develop create=4 change=0 user=SVC") == Status::Fail);
+    }
+    SECTION("change refused") {
+        CHECK(DevelopAuthFromProbe("s_develop create=0 change=4 user=SVC") == Status::Fail);
+    }
+    SECTION("both refused") {
+        CHECK(DevelopAuthFromProbe("s_develop create=4 change=4 user=SVC") == Status::Fail);
+    }
+    SECTION("an older probe that does not report it is Unknown, not Ok") {
+        // Silence must never read as permission: a probe deployed before this
+        // check existed says nothing, and guessing Ok would let setup start
+        // writing and fail partway.
+        CHECK(DevelopAuthFromProbe("subrc=0\nmsg=[]\necho=[hi]") == Status::Unknown);
+        CHECK(DevelopAuthFromProbe("") == Status::Unknown);
+    }
+    SECTION("the marker is only honoured at the start of a line") {
+        CHECK(DevelopAuthFromProbe("note: s_develop create=0 change=0") == Status::Unknown);
+    }
+}

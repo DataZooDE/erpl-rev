@@ -12,6 +12,13 @@ Two parts: (1) get the **ABAP objects** into the SAP system, (2) install the
 > uvx erpl-rev setup           # deploy, then prove a round trip before claiming success
 > ```
 >
+> **`setup` needs `S_DEVELOP`** (OBJTYPE=CLAS, ACTVT 01 and 02): it creates and
+> activates ABAP objects, and `sync`/`replicate` generate a temporary class to
+> carry their parameters. That is a developer authorisation and is normally
+> absent on production. `doctor` checks it and says so; if it is missing, import
+> the transport below instead and use `--print-abap` to get ABAP you can run from
+> SE38 as someone who has the rights.
+>
 > `setup` deploys the production ABAP objects over ADT, creates the function group,
 > the type-T destination and the eight `Z_DUCKDB_*` modules, and writes
 > `erpl-rev-basis-handout.md` with the two things a client genuinely cannot do — the

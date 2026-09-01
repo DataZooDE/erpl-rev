@@ -84,6 +84,10 @@ struct Diagnosis {
     bool destination_ok = false;
     bool gateway_reachable = false;
     bool stms_available = false;
+    // Can the ADT user create and activate a class? setup deploys ABAP, and the
+    // sync/replicate commands generate one, so both need S_DEVELOP. Unknown
+    // until the probe class is deployed and has been asked.
+    Status develop_auth = Status::Unknown;
 
     const Check *Find(const std::string &id) const;
     bool AnyFailed() const;
@@ -127,5 +131,9 @@ bool SetupClassSucceeded(const std::string &output, const std::string &program_i
                          const std::string &gwservice, std::string &why);
 bool MkfmSucceeded(const std::string &output, const std::vector<std::string> &expected,
                    std::string &why);
+
+// Read the S_DEVELOP verdict out of ZCL_ERPL_REV_DIAG's output. Unknown when
+// the probe said nothing about it -- an older probe, or one that never ran.
+Status DevelopAuthFromProbe(const std::string &output);
 
 } // namespace erpl_rev::setup

@@ -92,6 +92,19 @@ S_RFC: ACTVT=16, RFC_TYPE=FUGR, RFC_NAME=ZERPL_REV
   anyone who can read it can query the DuckDB — which is the same trust boundary
   as the DuckDB file itself.
 
+## 6a. Two different users, two different authorisations
+- The **RFC service user** the running server connects as needs only `S_RFC`
+  (`ACTVT=16`, `RFC_TYPE=FUGR`, `RFC_NAME=ZERPL_REV`) — the eight `Z_DUCKDB_*`
+  modules and nothing else. It needs **no** developer rights.
+- The user who runs **`erpl-rev setup`**, or the `sync`/`replicate` subcommands,
+  needs **`S_DEVELOP`** (`OBJTYPE=CLAS`, `ACTVT` 01 and 02, plus PROG/INTF/TABL
+  for the initial deploy), because those create and activate ABAP. This is a
+  developer authorisation; do not grant it to the service user to make the CLI
+  work. On a production system, import the transport and drive the reports from
+  SE38 instead — `--print-abap` prints exactly what to run.
+- `erpl-rev doctor` needs neither: it only reads, and it reports whether
+  `S_DEVELOP` is present so the gap is visible before anyone tries to deploy.
+
 ## 7. What erpl-rev does NOT do (assurances for Basis)
 - **Non-modifying**: ships only `Z*` objects in package `ZERPL`; modifies **no** SAP
   standard repository/customizing objects; no kernel/core changes.
