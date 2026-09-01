@@ -386,11 +386,18 @@ std::string StateField(const std::string &body, const std::string &key) {
 bool ReadServerState(ServerState &out) {
     const auto p = ServerStatePath();
     if (p.empty()) return false;
-    std::ifstream in(p);
-    if (!in) return false;
-    std::stringstream ss;
-    ss << in.rdbuf();
-    const std::string body = ss.str();
+
+    std::string body;
+    {
+        // Scoped so the handle is closed before the possible remove below:
+        // Windows refuses to delete a file that is still open, so leaving this
+        // stream in scope would leak a stale state file forever.
+        std::ifstream in(p);
+        if (!in) return false;
+        std::stringstream ss;
+        ss << in.rdbuf();
+        body = ss.str();
+    }
 
     out.db_path      = StateField(body, "db_path");
     out.quack_listen = StateField(body, "quack_listen");
