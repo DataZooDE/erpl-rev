@@ -12,6 +12,12 @@
 #include "rfc_handlers.hpp"
 #include "duckdb_bridge.hpp"
 #include "logging.hpp"
+#ifdef _WIN32
+#include <windows.h>    // GetCurrentProcessId
+#else
+#include <unistd.h>     // getpid
+#endif
+
 #include "cli_common.hpp"
 #include "commands.hpp"
 #include "json_util.hpp"

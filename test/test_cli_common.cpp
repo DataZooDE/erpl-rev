@@ -15,8 +15,12 @@
 #include <utility>
 #include <vector>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <process.h>    // _getpid
+#define ERPL_GETPID _getpid
+#else
 #include <unistd.h>
+#define ERPL_GETPID getpid
 #endif
 
 #include "cli_common.hpp"
@@ -68,7 +72,7 @@ class TempHome {
 public:
     TempHome() {
         dir_ = std::filesystem::temp_directory_path() /
-               ("erpl-rev-test-" + std::to_string(::getpid()) + "-" +
+               ("erpl-rev-test-" + std::to_string(ERPL_GETPID()) + "-" +
                 std::to_string(counter_++));
         std::filesystem::create_directories(dir_);
         env_.Set("XDG_CONFIG_HOME", dir_.string());
@@ -174,7 +178,7 @@ TEST_CASE("the server state file round-trips and hides its token", "[cli]") {
     in.quack_listen = "quack:localhost:9494";
     in.quack_token = "s3cr3t";
     in.version = "test";
-    in.pid = static_cast<long>(::getpid());   // alive: ourselves
+    in.pid = static_cast<long>(ERPL_GETPID());   // alive: ourselves
     REQUIRE(WriteServerState(in));
 
     ServerState out;
