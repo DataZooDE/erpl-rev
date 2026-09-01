@@ -14,7 +14,10 @@ permissions:
   contents: write      # create releases
 
 env:
-  DUCKDB_VERSION: "1.5.4"
+  # Must match CMakeLists.txt and the duckdb/ submodule tag: it is passed as
+  # DUCKDB_EXPLICIT_VERSION, so a mismatch both mislabels the engine and sends
+  # it looking for extensions built for a version it is not.
+  DUCKDB_VERSION: "1.5.5"
 
 jobs:
   posix:
@@ -241,7 +244,7 @@ jobs:
           }
           Write-Host "no RFC or ICU import; DuckDB is the only bundled library"
 
-      - name: Smoke test (self-extract, no external libs)
+      - name: Smoke test (no external libs)
         run: .\dist\erpl-rev-windows-amd64.exe --smoke
 
       - name: Package (zip)
@@ -261,9 +264,8 @@ jobs:
   # --- PyPI -------------------------------------------------------------------
   # `uvx erpl-rev` / `pip install erpl-rev`, the same way erpl-adt ships: each
   # platform's prebuilt binary is wrapped in a wheel with bin-to-wheel. What gets
-  # wrapped here is the SELF-EXTRACTING bundle, so the wheel carries DuckDB too
-  # and unpacks it to a per-version temp dir on first run -- there is still
-  # nothing else to install.
+  # wrapped here is the server binary itself: DuckDB is linked in, so there is
+  # no launcher, no payload to unpack and nothing else to install.
   # Deliberately NOT gated on a tag: building the wheels is the half of the PyPI
   # path that can fail for ordinary reasons (a renamed artefact, a missing
   # platform, a bin-to-wheel change), and a `workflow_dispatch` run rehearses it
