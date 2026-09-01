@@ -103,6 +103,12 @@ START-OF-SELECTION.
 
   DATA lt_run TYPE zcl_erpl_rev_delta=>tt_run.
 
+  " Drain anything the CLI queued before running the due targets. This is what
+  " lets `erpl-rev sync`/`replicate` work for a caller with no SAP
+  " authorisation at all: the CLI writes a row into a local DuckDB table and
+  " this job -- already running on a schedule -- picks it up. See issue #85.
+  PERFORM drain_cli.
+
   IF p_tgt IS NOT INITIAL.
     APPEND zcl_erpl_rev_delta=>run( p_tgt ) TO lt_run.
     PERFORM show USING lt_run.
@@ -122,6 +128,17 @@ START-OF-SELECTION.
     lt_run = zcl_erpl_rev_delta=>run_due( ).
     PERFORM show USING lt_run.
   ENDIF.
+
+*&---------------------------------------------------------------------*
+*&  Run whatever the CLI queued, and report it in the job log.
+*&---------------------------------------------------------------------*
+FORM drain_cli.
+  DATA(lt_cmd) = zcl_erpl_rev_clidrv=>drain( ).
+  LOOP AT lt_cmd INTO DATA(ls_cmd).
+    WRITE: / |cli { ls_cmd-cmd_id } { ls_cmd-verb } { ls_cmd-status } | &&
+             |{ ls_cmd-result }{ ls_cmd-error }|.
+  ENDLOOP.
+ENDFORM.
 
 *&---------------------------------------------------------------------*
 *&  Show one tick's results as a compact, coloured table.
