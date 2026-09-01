@@ -1,0 +1,418 @@
+// `erpl-rev sync` and `erpl-rev replicate` — the CLI counterparts of the
+// Z_ERPL_REV_DELTA and Z_ERPL_REV_REPLICATE reports.
+//
+// Reading job state is a local question and goes straight to DuckDB. Anything
+// that makes SAP *read source data* has to run in SAP, and the only ABAP entry
+// point erpl-adt offers is a parameterless class -- so those go through a
+// generated, deployed, deleted classrun.
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <thread>
+
+#include "abap_codegen.hpp"
+#include "abap_skeletons.hpp"
+#include "commands.hpp"
+#include "db_client.hpp"
+
+namespace erpl_rev::cmd {
+
+namespace {
+
+// Ask before changing anything, exactly as setup does. --non-interactive means
+// "do not prompt me", never "yes".
+int ConsentGate(const Options &o, const std::string &what) {
+    if (o.assume_yes) return 0;
+    if (cli::IsTty() && !o.non_interactive) {
+        if (cli::Confirm(what + "?", false)) return 0;
+        std::printf("Aborted; nothing was changed.\n");
+        return 1;
+    }
+    std::printf("Refusing to %s without confirmation: there is no terminal to ask\n"
+                "on. Re-run with --yes if that is what you meant, or with --dry-run\n"
+                "to see what would happen.\n", what.c_str());
+    return 2;
+}
+
+// Deploy, run, and read back a nonce-tagged result. `out` gets the raw console
+// output so a caller can show it when the parse finds nothing.
+int RunGenerated(const Options &o, const std::string &kind, const std::string &source,
+                 const std::string &nonce, std::string &out) {
+    if (o.print_abap) {
+        std::fputs(source.c_str(), stdout);
+        return 0;
+    }
+    // Same nonce as the render: the class name is baked into the source.
+    abapgen::TempClassrun cls(cli::ToAdtConn(o), kind, nonce, o.keep_generated);
+    const std::string err = cls.Deploy(source);
+    if (!err.empty()) {
+        std::fprintf(stderr, "erpl-rev: %s\n", err.c_str());
+        return 1;
+    }
+    const std::string rerr = cls.Run(out);
+    if (!rerr.empty()) {
+        std::fprintf(stderr, "erpl-rev: %s\n", rerr.c_str());
+        return 1;
+    }
+    if (abapgen::ResultLines(out, nonce).empty()) {
+        // Exit code 0 from erpl-adt proves nothing: a classrun answers HTTP 500
+        // with a body on a short dump, and that body can contain anything.
+        std::fprintf(stderr,
+                     "erpl-rev: the ABAP produced no result line for this run.\n%s\n",
+                     out.substr(0, 800).c_str());
+        return 1;
+    }
+    return 0;
+}
+
+bool HasFlag(const Options &o, const std::string &name) {
+    return std::find(o.args.begin(), o.args.end(), name) != o.args.end();
+}
+
+std::string Field(const Options &o, const std::string &name, const std::string &def = "") {
+    for (size_t i = 0; i + 1 < o.args.size(); i++)
+        if (o.args[i] == name) return o.args[i + 1];
+    return def;
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// sync ls / show — read-only, local
+// ---------------------------------------------------------------------------
+
+static int SyncList(Options &o) {
+    const auto ep = dbc::Detect(o.db_path, o.quack_url, o.quack_token);
+    if (!o.quiet) std::fprintf(stderr, "erpl-rev: %s\n", ep.why.c_str());
+    auto db = dbc::Db::Open(ep);
+    // `due` mirrors zcl_erpl_rev_delta=>due: micro:<s> -> s seconds, hourly ->
+    // 3600, nightly -> 86400, manual -> never.
+    const QueryResult r = db.Query(
+        "SELECT target, method, source_from, cadence, status, "
+        "       last_run_ts, rows_applied, "
+        "       CASE WHEN cadence = 'manual' THEN false "
+        "            WHEN last_run_ts IS NULL THEN true "
+        "            ELSE epoch(now() - last_run_ts) >= "
+        "                 CASE WHEN cadence LIKE 'micro:%' "
+        "                        THEN TRY_CAST(substr(cadence, 7) AS BIGINT) "
+        "                      WHEN cadence = 'hourly'  THEN 3600 "
+        "                      WHEN cadence = 'nightly' THEN 86400 "
+        "                      ELSE NULL END END AS due, "
+        "       last_error "
+        "FROM _erpl_rev_delta_state ORDER BY target",
+        o.limit < 0 ? 0 : o.limit);
+    std::fputs(render::Render(r, o.format).c_str(), stdout);
+    return 0;
+}
+
+static int SyncShow(Options &o, const std::string &target) {
+    const auto ep = dbc::Detect(o.db_path, o.quack_url, o.quack_token);
+    if (!o.quiet) std::fprintf(stderr, "erpl-rev: %s\n", ep.why.c_str());
+    auto db = dbc::Db::Open(ep);
+    const QueryResult s = db.Query(
+        "SELECT * FROM _erpl_rev_delta_state WHERE target = " + dbc::SqlLiteral(target));
+    if (s.rows.empty()) {
+        std::fprintf(stderr, "erpl-rev: no sync job named '%s'.\n", target.c_str());
+        return 1;
+    }
+    std::fputs(render::Render(s, o.format).c_str(), stdout);
+
+    const QueryResult h = db.Query(
+        "SELECT started_at, run_type, method, status, rows_applied, duration_ms, error_text "
+        "FROM erpl_rev_run_stats WHERE target = " + dbc::SqlLiteral(target) +
+        " ORDER BY started_at DESC LIMIT 10");
+    if (!h.rows.empty()) {
+        std::printf("\nrecent runs\n");
+        std::fputs(render::Render(h, o.format).c_str(), stdout);
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// sync create / run / schedule — SAP
+// ---------------------------------------------------------------------------
+
+static int SyncCreate(Options &o, const std::string &target) {
+    abapgen::SyncState st;
+    st.target      = target;
+    st.method      = Field(o, "--method");
+    st.source_from = Field(o, "--source");
+    st.keys        = Field(o, "--keys");
+    st.chg_col     = Field(o, "--chg-col");
+    st.wm_kind     = Field(o, "--wm-kind");
+    st.wm_value    = Field(o, "--wm-value");
+    st.cadence     = Field(o, "--cadence", "nightly");
+    st.extra       = Field(o, "--extra");
+    const std::string safety = Field(o, "--safety-secs");
+    if (!safety.empty()) st.safety_secs = std::atoll(safety.c_str());
+
+    if (st.method.empty() || st.source_from.empty() || st.keys.empty()) {
+        std::fprintf(stderr,
+                     "erpl-rev sync create: --method, --source and --keys are required.\n");
+        return 2;
+    }
+
+    const std::string nonce = abapgen::MakeNonce();
+    const std::string src = abapgen::RenderSyncRegister(st, nonce);
+    if (o.print_abap) { std::fputs(src.c_str(), stdout); return 0; }
+    if (o.dry_run) {
+        std::printf("Would register sync job '%s' (%s over %s).\n",
+                    st.target.c_str(), st.method.c_str(), st.source_from.c_str());
+        return 0;
+    }
+    if (const int rc = ConsentGate(o, "Register sync job '" + st.target + "' on " + o.host))
+        return rc;
+
+    std::string out;
+    if (const int rc = RunGenerated(o, "C", src, nonce, out)) return rc;
+
+    const std::string status = abapgen::ResultField(out, nonce, "status");
+    const std::string err = abapgen::ResultField(out, nonce, "error");
+    if (status != "ok") {
+        std::fprintf(stderr, "erpl-rev sync create: rejected by SAP: %s\n", err.c_str());
+        return 1;
+    }
+    std::printf("Registered '%s'.\n", st.target.c_str());
+    return 0;
+}
+
+static int SyncRun(Options &o, const std::string &target) {
+    const std::string nonce = abapgen::MakeNonce();
+    const std::string src = abapgen::RenderSyncRun(target, nonce);
+    if (o.print_abap) { std::fputs(src.c_str(), stdout); return 0; }
+    if (o.dry_run) {
+        std::printf("Would run %s.\n",
+                    target.empty() ? "every due sync job" : ("sync job '" + target + "'").c_str());
+        return 0;
+    }
+    if (const int rc = ConsentGate(o, target.empty()
+                                          ? "Run every due sync job on " + o.host
+                                          : "Run sync job '" + target + "' on " + o.host))
+        return rc;
+
+    std::string out;
+    if (const int rc = RunGenerated(o, "S", src, nonce, out)) return rc;
+
+    int failures = 0, ran = 0;
+    for (const auto &[k, v] : abapgen::ResultLines(out, nonce)) {
+        if (k != "run") continue;
+        ran++;
+        std::printf("  %s\n", v.c_str());
+        if (v.find(";error=") != std::string::npos &&
+            v.substr(v.rfind(";error=") + 7).size() > 0)
+            failures++;
+    }
+    if (ran == 0) std::printf("Nothing was due.\n");
+    return failures ? 1 : 0;
+}
+
+static int SyncSchedule(Options &o) {
+    const bool remove = HasFlag(o, "--remove");
+    const std::string every = Field(o, "--every");
+    if (!remove && every.empty()) {
+        std::fprintf(stderr, "erpl-rev sync schedule: --every <minutes> or --remove.\n");
+        return 2;
+    }
+    const long long minutes = every.empty() ? 1 : std::atoll(every.c_str());
+
+    const std::string nonce = abapgen::MakeNonce();
+    const std::string src = abapgen::RenderSchedule(minutes, remove, nonce);
+    if (o.print_abap) { std::fputs(src.c_str(), stdout); return 0; }
+    if (o.dry_run) {
+        std::printf("Would %s the periodic job ERPL_REV_DELTA%s.\n",
+                    remove ? "remove" : "install",
+                    remove ? "" : (" every " + std::to_string(minutes) + " min").c_str());
+        return 0;
+    }
+    if (const int rc = ConsentGate(o, std::string(remove ? "Remove" : "Install") +
+                                          " the periodic job on " + o.host))
+        return rc;
+
+    std::string out;
+    if (const int rc = RunGenerated(o, "J", src, nonce, out)) return rc;
+
+    const std::string msg = abapgen::ResultField(out, nonce, "msg");
+    if (msg.rfind("ERROR:", 0) == 0) {
+        std::fprintf(stderr, "erpl-rev sync schedule: %s\n", msg.c_str());
+        return 1;
+    }
+
+    // "Submitted" is not "scheduled": the work happens in a background job that
+    // can abort after this command has already returned. Ask SAP what actually
+    // exists before claiming anything.
+    std::printf("%s — verifying…\n", msg.c_str());
+    std::this_thread::sleep_for(std::chrono::seconds(12));
+
+    const std::string qn = abapgen::MakeNonce();
+    std::string qout;
+    if (const int rc = RunGenerated(o, "Q", abapgen::RenderJobCheck(qn), qn, qout))
+        return rc;
+    const long long jobs = std::atoll(abapgen::ResultField(qout, qn, "jobs").c_str());
+
+    if (remove && jobs == 0) { std::printf("Periodic job removed.\n"); return 0; }
+    if (!remove && jobs >= 1) {
+        std::printf("Periodic job ERPL_REV_DELTA is scheduled (every %lld min).\n", minutes);
+        return 0;
+    }
+    std::fprintf(stderr,
+        "erpl-rev sync schedule: the job was submitted but SAP still reports %lld\n"
+        "  periodic ERPL_REV_DELTA job(s) — the scheduling step did not take effect.\n"
+        "  Check SM37 for an aborted ERPLCLI_* job, or do it from the GUI:\n"
+        "  SE38 -> Z_ERPL_REV_DELTA -> %s.\n",
+        jobs, remove ? "p_unsch" : "p_sched + p_min");
+    return 1;
+}
+
+int RunSync(Options o) {
+    const auto cfg = cli::ReadConfig();
+    cli::ResolveConn(o, cfg, !o.non_interactive && cli::IsTty());
+
+    const std::string sub = o.args.empty() ? "" : o.args.front();
+    const std::string arg = o.args.size() > 1 && o.args[1].rfind("--", 0) != 0
+                                ? o.args[1] : std::string();
+    try {
+        if (sub == "ls")            return SyncList(o);
+        if (sub == "show")          return SyncShow(o, arg);
+        if (sub == "create")        return SyncCreate(o, arg);
+        if (sub == "run")           return SyncRun(o, arg);
+        if (sub == "run-due")       return SyncRun(o, "");
+        if (sub == "schedule")      return SyncSchedule(o);
+    } catch (const abapgen::UnsafeValue &e) {
+        std::fprintf(stderr, "erpl-rev: %s\n", e.what());
+        return 2;
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "erpl-rev: %s\n", e.what());
+        return 1;
+    }
+    std::fprintf(stderr,
+                 "erpl-rev sync: expected ls, show, create, rm, run, run-due or schedule.\n");
+    return 2;
+}
+
+// ---------------------------------------------------------------------------
+// replicate
+// ---------------------------------------------------------------------------
+
+int RunReplicate(Options o) {
+    const auto cfg = cli::ReadConfig();
+    cli::ResolveConn(o, cfg, !o.non_interactive && cli::IsTty());
+
+    abapgen::ReplicateParams p;
+    p.table       = Field(o, "--table");
+    p.target      = Field(o, "--target");
+    p.columns     = Field(o, "--columns");
+    p.where       = Field(o, "--where");
+    p.cds_params  = Field(o, "--cds-params");
+    p.init        = Field(o, "--init");
+    p.mode        = Field(o, "--mode", "UPSERT");
+    p.part_col    = Field(o, "--part-col");
+    p.dest        = Field(o, "--dest");
+    p.partition_by = Field(o, "--partition-by");
+    p.target_kind = Field(o, "--target-kind", "duckdb");
+    const std::string batch = Field(o, "--batch"), maxrows = Field(o, "--maxrows"),
+                      jobs = Field(o, "--jobs");
+    if (!batch.empty())   p.batch = std::atoll(batch.c_str());
+    if (!maxrows.empty()) p.maxrows = std::atoll(maxrows.c_str());
+    if (!jobs.empty())    { p.jobs = std::atoll(jobs.c_str()); p.parallel = p.jobs > 1; }
+    for (const auto &a : o.args) {
+        if (a == "--parallel")  p.parallel = true;
+        if (a == "--no-verify") p.verify = false;
+        if (a == "--no-truncate") p.truncate = false;
+    }
+    if (p.table.empty()) {
+        std::fprintf(stderr, "erpl-rev replicate: --table is required.\n");
+        return 2;
+    }
+    if (p.target.empty()) {
+        p.target = p.table;
+        for (char &c : p.target) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+
+    try {
+        const std::string nonce = abapgen::MakeNonce();
+        const std::string src = abapgen::RenderReplicate(p, nonce);
+        if (o.print_abap) { std::fputs(src.c_str(), stdout); return 0; }
+        if (o.dry_run) {
+            std::printf("Would load %s -> %s%s.\n", p.table.c_str(), p.target.c_str(),
+                        p.parallel ? " (parallel)" : "");
+            std::fputs(src.c_str(), stdout);
+            return 0;
+        }
+        if (const int rc = ConsentGate(o, "Load " + p.table + " into " + p.target +
+                                              " from " + o.host))
+            return rc;
+
+        std::string out;
+        if (const int rc = RunGenerated(o, "R", src, nonce, out)) return rc;
+
+        if (abapgen::ResultField(out, nonce, "status") != "submitted") {
+            std::fprintf(stderr, "erpl-rev replicate: %s\n",
+                         abapgen::ResultField(out, nonce, "error").c_str());
+            return 1;
+        }
+        const std::string job = abapgen::ResultField(out, nonce, "job");
+        std::printf("Submitted as SAP background job %s.\n", job.c_str());
+
+        if (HasFlag(o, "--detach")) {
+            std::printf("Watch it with: erpl-rev sql \"SELECT * FROM erpl_rev_run_stats "
+                        "WHERE target = '%s' ORDER BY started_at DESC LIMIT 5\"\n",
+                        p.target.c_str());
+            return 0;
+        }
+
+        // Poll DuckDB rather than holding an HTTP connection: the load can run
+        // for hours, and a dropped connection must not look like a failed load.
+        const std::string wait_s = Field(o, "--wait");
+        const long long wait = wait_s.empty() ? 3600 : std::atoll(wait_s.c_str());
+        const auto ep = dbc::Detect(o.db_path, o.quack_url, o.quack_token);
+        auto db = dbc::Db::Open(ep);
+        const auto t0 = std::chrono::steady_clock::now();
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                                     std::chrono::steady_clock::now() - t0).count();
+            long long rows = 0;
+            try {
+                const QueryResult c = db.Query(
+                    "SELECT count(*) AS n FROM " + dbc::SqlIdentifier(p.target));
+                if (!c.rows.empty()) {
+                    const auto pos = c.rows[0].find(':');
+                    if (pos != std::string::npos)
+                        rows = std::atoll(c.rows[0].substr(pos + 1).c_str());
+                }
+            } catch (...) {
+                // The target is created inside the run; "does not exist" is 0 rows.
+            }
+            const QueryResult st = db.Query(
+                "SELECT status, rows_applied, duration_ms, error_text "
+                "FROM erpl_rev_run_stats WHERE target = " + dbc::SqlLiteral(p.target) +
+                " ORDER BY started_at DESC LIMIT 1");
+            if (!st.rows.empty() && st.rows[0].find("\"status\"") != std::string::npos &&
+                elapsed > 2) {
+                std::fputs(render::Render(st, o.format).c_str(), stdout);
+                return st.rows[0].find("SUCCESS") != std::string::npos ? 0 : 1;
+            }
+            if (!o.quiet && cli::IsTty())
+                std::fprintf(stderr, "\r  %s: %lld rows (%llds) ", p.target.c_str(),
+                             rows, static_cast<long long>(elapsed));
+            if (elapsed >= wait) {
+                std::fprintf(stderr,
+                    "\nerpl-rev: job %s has not reported completion after %llds.\n"
+                    "  It may still be running -- SAP keeps working after this command\n"
+                    "  gives up. Watch it with:\n"
+                    "    erpl-rev sql \"SELECT * FROM erpl_rev_run_stats ORDER BY "
+                    "started_at DESC LIMIT 5\"\n",
+                    job.c_str(), wait);
+                return 3;   // unknown, deliberately not 1
+            }
+        }
+    } catch (const abapgen::UnsafeValue &e) {
+        std::fprintf(stderr, "erpl-rev: %s\n", e.what());
+        return 2;
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "erpl-rev: %s\n", e.what());
+        return 1;
+    }
+}
+
+} // namespace erpl_rev::cmd

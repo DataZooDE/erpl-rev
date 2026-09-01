@@ -41,5 +41,7 @@ void PrintHelp();
 
 // Exit codes: 0 verified success, 1 verified failure, 2 misuse, 3 unknown.
 int RunSql(Options o);
+int RunSync(Options o);
+int RunReplicate(Options o);
 
 } // namespace erpl_rev::cmd

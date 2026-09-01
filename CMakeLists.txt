@@ -271,6 +271,8 @@ add_executable(erpl_rev_server
   src/db_client.cpp
   src/table_render.cpp
   src/cmd_sql.cpp
+  src/cmd_sync.cpp
+  src/abap_skeletons.cpp
   src/cli_common.cpp
   src/sap_setup.cpp
   ${ERPL_ABAP_GENERATED}
@@ -329,6 +331,8 @@ if(TRUE)  # tests always build; DuckDB is in-tree
     src/db_client.cpp
     src/table_render.cpp
     src/cmd_sql.cpp
+    src/cmd_sync.cpp
+    src/abap_skeletons.cpp
     src/cli_common.cpp
     src/sap_setup.cpp
     src/adt.cpp

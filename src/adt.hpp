@@ -62,6 +62,10 @@ Result WriteSource(const Conn &c, const std::string &name, const std::string &fi
 // Run an IF_OO_ADT_CLASSRUN class and return its console output.
 Result RunClass(const Conn &c, const std::string &name);
 
+// Delete an object. Note this takes a URI -- /sap/bc/adt/oo/classes/<name> --
+// and not the --type/--name pair the create side uses.
+Result DeleteObject(const Conn &c, const std::string &uri);
+
 // True when a `source write --activate` actually succeeded. "Nothing to
 // activate" is what an UNCHANGED object returns and is success, not failure --
 // matching only "Activated" makes every re-run look broken, which teaches

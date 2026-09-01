@@ -161,6 +161,10 @@ Result RunClass(const Conn &c, const std::string &name) {
     return Run(c, {"object", "run", name});
 }
 
+Result DeleteObject(const Conn &c, const std::string &uri) {
+    return Run(c, {"object", "delete", uri});
+}
+
 bool ActivationSucceeded(const Result &r) {
     if (r.spawn_failed) return false;
     const std::string &o = r.output;

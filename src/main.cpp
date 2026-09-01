@@ -101,7 +101,12 @@ bool ListenIsLoopback(const std::string &listen) {
 // Parsed command-line options. *_set marks "seen on the command line" so the
 // resolver can apply CLI-over-env precedence without conflating an explicit
 // empty value with "unset".
-enum class Verb { Serve, Setup, Doctor, Sql };
+enum class Verb { Serve, Setup, Doctor, Sql, Sync, Replicate };
+
+// Verbs whose flags are parsed by the cmd module.
+inline bool IsCmdVerb(Verb v) {
+    return v == Verb::Sql || v == Verb::Sync || v == Verb::Replicate;
+}
 
 struct Cli {
     Verb verb = Verb::Serve;
@@ -189,9 +194,11 @@ Cli ParseArgs(int argc, char **argv) {
         else if (v == "setup")  { c.verb = Verb::Setup;  first = 2; }
         else if (v == "doctor") { c.verb = Verb::Doctor; first = 2; }
         else if (v == "sql")    { c.verb = Verb::Sql;    first = 2; }
+        else if (v == "sync")   { c.verb = Verb::Sync;   first = 2; }
+        else if (v == "replicate") { c.verb = Verb::Replicate; first = 2; }
         else {
             std::fprintf(stderr, "erpl-rev: unknown command '%s'\n"
-                                 "Commands: serve (default), setup, doctor, sql. "
+                                 "Commands: serve (default), setup, doctor, sql, sync, replicate. "
                                  "Try --help.\n",
                          v.c_str());
             c.bad_args = true;
@@ -243,15 +250,24 @@ Cli ParseArgs(int argc, char **argv) {
             c.smoke = true;
         } else if (key == "--no-telemetry") {
             c.no_telemetry = true;
-        } else if (c.verb == Verb::Sql && cmd::ParseOption(key, take_value, c.cmd)) {
-            // consumed by sql
+        } else if (IsCmdVerb(c.verb) && cmd::ParseOption(key, take_value, c.cmd)) {
+            // consumed by sql/sync/replicate
         } else if (setup::ParseOption(key, has_inval, take_value, c.setup)) {
             // consumed by setup/doctor
         } else if (a == "--") {
             // Everything after -- is a positional, however it is spelled.
             while (++i < argc) c.cmd.args.push_back(argv[i]);
-        } else if (c.verb == Verb::Sql && !a.empty() && a[0] != '-') {
+        } else if (IsCmdVerb(c.verb) && !a.empty() && a[0] != '-') {
             c.cmd.args.push_back(a);
+        } else if ((c.verb == Verb::Sync || c.verb == Verb::Replicate) &&
+                   a.rfind("--", 0) == 0) {
+            // sync and replicate mirror a five-tab SAP selection screen. Rather
+            // than redeclare thirty flags here, their words are collected and
+            // read by name in the command itself; an unrecognised one is
+            // reported there, where the valid set for that subcommand is known.
+            c.cmd.args.push_back(key);
+            if (has_inval) c.cmd.args.push_back(inval);
+            else if (i + 1 < argc && argv[i + 1][0] != '-') c.cmd.args.push_back(argv[++i]);
         } else {
             // Refuse rather than warn. A typo'd flag that is merely logged leaves
             // a server running with a configuration nobody asked for, and the
@@ -331,7 +347,9 @@ int main(int argc, char **argv) {
     // setup/doctor run and exit, like --smoke: they never start the server.
     if (cli.verb == Verb::Doctor) return setup::RunDoctor(cli.setup);
     if (cli.verb == Verb::Setup)  return setup::RunSetup(cli.setup);
-    if (cli.verb == Verb::Sql)    return cmd::RunSql(cli.cmd);
+    if (cli.verb == Verb::Sql)       return cmd::RunSql(cli.cmd);
+    if (cli.verb == Verb::Sync)      return cmd::RunSync(cli.cmd);
+    if (cli.verb == Verb::Replicate) return cmd::RunReplicate(cli.cmd);
 
     // Two surfaces, because this process almost never runs on a terminal. The
     // banner is for the operator who starts it by hand; the log line is for the
