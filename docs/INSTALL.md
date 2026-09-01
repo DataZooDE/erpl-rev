@@ -13,11 +13,14 @@ Two parts: (1) get the **ABAP objects** into the SAP system, (2) install the
 > ```
 >
 > **`setup` needs `S_DEVELOP`** (OBJTYPE=CLAS, ACTVT 01 and 02): it creates and
-> activates ABAP objects, and `sync`/`replicate` generate a temporary class to
-> carry their parameters. That is a developer authorisation and is normally
-> absent on production. `doctor` checks it and says so; if it is missing, import
-> the transport below instead and use `--print-abap` to get ABAP you can run from
-> SE38 as someone who has the rights.
+> activates ABAP objects. That is a developer authorisation and is normally
+> absent on production, so on production import the transport below instead.
+> `doctor` checks it and says so.
+>
+> The `sync` and `replicate` subcommands do **not** need it once setup (or the
+> transport) has deployed `ZCL_ERPL_REV_CLIDRV`: they pass their parameters as
+> data through a queue the driver reads. `--queue-only` goes further and does not
+> contact SAP at all.
 >
 > `setup` deploys the production ABAP objects over ADT, creates the function group,
 > the type-T destination and the eight `Z_DUCKDB_*` modules, and writes

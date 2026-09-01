@@ -18,6 +18,15 @@
 
 namespace erpl_rev::cmd {
 
+std::string BuildParams(const std::vector<std::pair<std::string, std::string>> &kv) {
+    std::string j = "{";
+    for (const auto &[k, v] : kv) {
+        if (j.size() > 1) j += ",";
+        j += json::QuoteString(k) + ":" + json::QuoteString(v);
+    }
+    return j + "}";
+}
+
 namespace {
 
 // Ask before changing anything, exactly as setup does. --non-interactive means
@@ -264,16 +273,11 @@ static int SyncCreate(Options &o, const std::string &target) {
     if (!o.print_abap && !o.dry_run && (o.queue_only || DriverAvailable(o))) {
         if (const int rc = ConsentGate(o, "Register sync job '" + st.target + "' on " + o.host))
             return rc;
-        std::string j = "{";
-        auto f = [&](const char *k, const std::string &v) {
-            if (!j.empty() && j.back() != '{') j += ",";
-            j += json::QuoteString(k) + ":" + json::QuoteString(v);
-        };
-        f("target", st.target); f("method", st.method); f("source_from", st.source_from);
-        f("keys", st.keys); f("chg_col", st.chg_col); f("wm_kind", st.wm_kind);
-        f("wm_value", st.wm_value); f("cadence", st.cadence); f("extra", st.extra);
-        f("safety_secs", std::to_string(st.safety_secs));
-        j += "}";
+        const std::string j = BuildParams({
+            {"target", st.target}, {"method", st.method}, {"source_from", st.source_from},
+            {"keys", st.keys}, {"chg_col", st.chg_col}, {"wm_kind", st.wm_kind},
+            {"wm_value", st.wm_value}, {"cadence", st.cadence}, {"extra", st.extra},
+            {"safety_secs", std::to_string(st.safety_secs)}});
         return RunViaDriver(o, "sync_register", j);
     }
     const std::string nonce = abapgen::MakeNonce();
@@ -307,7 +311,7 @@ static int SyncRun(Options &o, const std::string &target) {
                                               : "Run sync job '" + target + "' on " + o.host))
             return rc;
         return RunViaDriver(o, "sync_run",
-                            "{\"target\":" + json::QuoteString(target) + "}");
+                            BuildParams({{"target", target}}));
     }
     const std::string nonce = abapgen::MakeNonce();
     const std::string src = abapgen::RenderSyncRun(target, nonce);
@@ -351,8 +355,8 @@ static int SyncSchedule(Options &o) {
         if (const int rc = ConsentGate(o, std::string(remove ? "Remove" : "Install") +
                                               " the periodic job on " + o.host))
             return rc;
-        const std::string j = "{\"minutes\":" + json::QuoteString(std::to_string(minutes)) +
-                              ",\"remove\":" + json::QuoteString(remove ? "true" : "false") + "}";
+        const std::string j = BuildParams({{"minutes", std::to_string(minutes)},
+                                           {"remove", remove ? "true" : "false"}});
         return RunViaDriver(o, "schedule", j);
     }
     const std::string nonce = abapgen::MakeNonce();
@@ -475,17 +479,12 @@ int RunReplicate(Options o) {
             if (const int rc = ConsentGate(o, "Load " + p.table + " into " + p.target +
                                                   " from " + o.host))
                 return rc;
-            std::string j = "{";
-            auto f = [&](const char *k, const std::string &v) {
-                if (j.back() != '{') j += ",";
-                j += json::QuoteString(k) + ":" + json::QuoteString(v);
-            };
-            f("table", p.table); f("target", p.target); f("columns", p.columns);
-            f("where", p.where); f("cds_params", p.cds_params); f("init", p.init);
-            f("mode", p.mode); f("batch", std::to_string(p.batch));
-            f("maxrows", std::to_string(p.maxrows));
-            f("truncate", p.truncate ? "true" : "false");
-            j += "}";
+            const std::string j = BuildParams({
+                {"table", p.table}, {"target", p.target}, {"columns", p.columns},
+                {"where", p.where}, {"cds_params", p.cds_params}, {"init", p.init},
+                {"mode", p.mode}, {"batch", std::to_string(p.batch)},
+                {"maxrows", std::to_string(p.maxrows)},
+                {"truncate", p.truncate ? "true" : "false"}});
             // The driver runs replicate synchronously inside the classrun, which
             // is fine for the common case; --detach and the background-job path
             // remain available through the codegen route for very long loads.

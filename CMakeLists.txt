@@ -320,6 +320,7 @@ if(TRUE)  # tests always build; DuckDB is in-tree
     test/test_telemetry.cpp
     test/test_abap_codegen.cpp
     test/test_cli_common.cpp
+    test/test_cmd_queue.cpp
     test/test_table_render.cpp
     test/test_sap_setup.cpp
     test/bench_ingest.cpp
