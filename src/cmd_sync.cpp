@@ -131,6 +131,59 @@ std::string Field(const Options &o, const std::string &name, const std::string &
     return def;
 }
 
+// Is the pre-deployed driver available? Cheap and cached: one ADT search.
+bool DriverAvailable(const Options &o) {
+    static int cached = -1;
+    if (cached >= 0) return cached == 1;
+    auto r = adt::Run(cli::ToAdtConn(o), {"search", "ZCL_ERPL_REV_CLIDRV"});
+    cached = (r.ok() && r.output.find("ZCL_ERPL_REV_CLIDRV") != std::string::npos) ? 1 : 0;
+    return cached == 1;
+}
+
+// Queue a command, then get it executed: ask the driver to run now if we may,
+// otherwise leave it for the periodic heartbeat. Reports which happened,
+// because "queued, the job will pick it up within a minute" is a different
+// answer from "done" and should not be dressed up as one.
+int RunViaDriver(Options &o, const std::string &verb, const std::string &params) {
+    std::string why;
+    const long long id = QueueCommand(o, verb, params, why);
+    if (id == 0) {
+        std::fprintf(stderr, "erpl-rev: could not queue the command: %s\n", why.c_str());
+        return 1;
+    }
+
+    if (o.queue_only) {
+        // Deliberately no SAP call: this is the path for a caller with no SAP
+        // authorisation at all.
+        std::printf("Queued as command %lld. The periodic ERPL_REV_DELTA job will run it.\n"
+                    "  erpl-rev sql \"SELECT status, result, error FROM _erpl_rev_cli_cmd "
+                    "WHERE cmd_id = %lld\"\n", id, id);
+        return 3;   // queued; the outcome is not known yet
+    }
+
+    auto r = adt::RunClass(cli::ToAdtConn(o), "ZCL_ERPL_REV_CLIDRV");
+    if (!r.ok()) {
+        std::printf("Queued as command %lld. Could not run the driver directly\n"
+                    "  (%s),\n"
+                    "  so the periodic ERPL_REV_DELTA job will pick it up. Watch it with:\n"
+                    "    erpl-rev sql \"SELECT * FROM _erpl_rev_cli_cmd WHERE cmd_id = %lld\"\n",
+                    id, r.output.substr(0, 120).c_str(), id);
+        return 3;   // queued, outcome not yet known
+    }
+
+    std::string status, result, error;
+    if (!CommandResult(o, id, status, result, error)) {
+        std::fprintf(stderr, "erpl-rev: command %lld left no result row.\n", id);
+        return 1;
+    }
+    if (status != "DONE") {
+        std::fprintf(stderr, "erpl-rev: %s\n", error.empty() ? status.c_str() : error.c_str());
+        return 1;
+    }
+    std::printf("%s\n", result.c_str());
+    return 0;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -208,6 +261,21 @@ static int SyncCreate(Options &o, const std::string &target) {
         return 2;
     }
 
+    if (!o.print_abap && !o.dry_run && (o.queue_only || DriverAvailable(o))) {
+        if (const int rc = ConsentGate(o, "Register sync job '" + st.target + "' on " + o.host))
+            return rc;
+        std::string j = "{";
+        auto f = [&](const char *k, const std::string &v) {
+            if (!j.empty() && j.back() != '{') j += ",";
+            j += json::QuoteString(k) + ":" + json::QuoteString(v);
+        };
+        f("target", st.target); f("method", st.method); f("source_from", st.source_from);
+        f("keys", st.keys); f("chg_col", st.chg_col); f("wm_kind", st.wm_kind);
+        f("wm_value", st.wm_value); f("cadence", st.cadence); f("extra", st.extra);
+        f("safety_secs", std::to_string(st.safety_secs));
+        j += "}";
+        return RunViaDriver(o, "sync_register", j);
+    }
     const std::string nonce = abapgen::MakeNonce();
     const std::string src = abapgen::RenderSyncRegister(st, nonce);
     if (o.print_abap) { std::fputs(src.c_str(), stdout); return 0; }
@@ -232,52 +300,8 @@ static int SyncCreate(Options &o, const std::string &target) {
     return 0;
 }
 
-// Is the pre-deployed driver available? Cheap and cached: one ADT search.
-bool DriverAvailable(const Options &o) {
-    static int cached = -1;
-    if (cached >= 0) return cached == 1;
-    auto r = adt::Run(cli::ToAdtConn(o), {"search", "ZCL_ERPL_REV_CLIDRV"});
-    cached = (r.ok() && r.output.find("ZCL_ERPL_REV_CLIDRV") != std::string::npos) ? 1 : 0;
-    return cached == 1;
-}
-
-// Queue a command, then get it executed: ask the driver to run now if we may,
-// otherwise leave it for the periodic heartbeat. Reports which happened,
-// because "queued, the job will pick it up within a minute" is a different
-// answer from "done" and should not be dressed up as one.
-int RunViaDriver(Options &o, const std::string &verb, const std::string &params) {
-    std::string why;
-    const long long id = QueueCommand(o, verb, params, why);
-    if (id == 0) {
-        std::fprintf(stderr, "erpl-rev: could not queue the command: %s\n", why.c_str());
-        return 1;
-    }
-
-    auto r = adt::RunClass(cli::ToAdtConn(o), "ZCL_ERPL_REV_CLIDRV");
-    if (!r.ok()) {
-        std::printf("Queued as command %lld. Could not run the driver directly\n"
-                    "  (%s),\n"
-                    "  so the periodic ERPL_REV_DELTA job will pick it up. Watch it with:\n"
-                    "    erpl-rev sql \"SELECT * FROM _erpl_rev_cli_cmd WHERE cmd_id = %lld\"\n",
-                    id, r.output.substr(0, 120).c_str(), id);
-        return 3;   // queued, outcome not yet known
-    }
-
-    std::string status, result, error;
-    if (!CommandResult(o, id, status, result, error)) {
-        std::fprintf(stderr, "erpl-rev: command %lld left no result row.\n", id);
-        return 1;
-    }
-    if (status != "DONE") {
-        std::fprintf(stderr, "erpl-rev: %s\n", error.empty() ? status.c_str() : error.c_str());
-        return 1;
-    }
-    std::printf("%s\n", result.c_str());
-    return 0;
-}
-
 static int SyncRun(Options &o, const std::string &target) {
-    if (!o.print_abap && !o.dry_run && DriverAvailable(o)) {
+    if (!o.print_abap && !o.dry_run && (o.queue_only || DriverAvailable(o))) {
         if (const int rc = ConsentGate(o, target.empty()
                                               ? "Run every due sync job on " + o.host
                                               : "Run sync job '" + target + "' on " + o.host))
@@ -323,6 +347,14 @@ static int SyncSchedule(Options &o) {
     }
     const long long minutes = every.empty() ? 1 : std::atoll(every.c_str());
 
+    if (!o.print_abap && !o.dry_run && (o.queue_only || DriverAvailable(o))) {
+        if (const int rc = ConsentGate(o, std::string(remove ? "Remove" : "Install") +
+                                              " the periodic job on " + o.host))
+            return rc;
+        const std::string j = "{\"minutes\":" + json::QuoteString(std::to_string(minutes)) +
+                              ",\"remove\":" + json::QuoteString(remove ? "true" : "false") + "}";
+        return RunViaDriver(o, "schedule", j);
+    }
     const std::string nonce = abapgen::MakeNonce();
     const std::string src = abapgen::RenderSchedule(minutes, remove, nonce);
     if (o.print_abap) { std::fputs(src.c_str(), stdout); return 0; }
@@ -373,7 +405,9 @@ static int SyncSchedule(Options &o) {
 
 int RunSync(Options o) {
     const auto cfg = cli::ReadConfig();
-    cli::ResolveConn(o, cfg, !o.non_interactive && cli::IsTty());
+    // --queue-only never contacts SAP, so it must not prompt for a password to
+    // write a row into a local database.
+    cli::ResolveConn(o, cfg, !o.queue_only && !o.non_interactive && cli::IsTty());
 
     const std::string sub = o.args.empty() ? "" : o.args.front();
     const std::string arg = o.args.size() > 1 && o.args[1].rfind("--", 0) != 0
@@ -403,7 +437,7 @@ int RunSync(Options o) {
 
 int RunReplicate(Options o) {
     const auto cfg = cli::ReadConfig();
-    cli::ResolveConn(o, cfg, !o.non_interactive && cli::IsTty());
+    cli::ResolveConn(o, cfg, !o.queue_only && !o.non_interactive && cli::IsTty());
 
     abapgen::ReplicateParams p;
     p.table       = Field(o, "--table");
@@ -437,6 +471,26 @@ int RunReplicate(Options o) {
     }
 
     try {
+        if (!o.print_abap && !o.dry_run && (o.queue_only || DriverAvailable(o))) {
+            if (const int rc = ConsentGate(o, "Load " + p.table + " into " + p.target +
+                                                  " from " + o.host))
+                return rc;
+            std::string j = "{";
+            auto f = [&](const char *k, const std::string &v) {
+                if (j.back() != '{') j += ",";
+                j += json::QuoteString(k) + ":" + json::QuoteString(v);
+            };
+            f("table", p.table); f("target", p.target); f("columns", p.columns);
+            f("where", p.where); f("cds_params", p.cds_params); f("init", p.init);
+            f("mode", p.mode); f("batch", std::to_string(p.batch));
+            f("maxrows", std::to_string(p.maxrows));
+            f("truncate", p.truncate ? "true" : "false");
+            j += "}";
+            // The driver runs replicate synchronously inside the classrun, which
+            // is fine for the common case; --detach and the background-job path
+            // remain available through the codegen route for very long loads.
+            return RunViaDriver(o, "replicate", j);
+        }
         const std::string nonce = abapgen::MakeNonce();
         const std::string src = abapgen::RenderReplicate(p, nonce);
         if (o.print_abap) { std::fputs(src.c_str(), stdout); return 0; }

@@ -29,6 +29,10 @@ struct Options : cli::ConnOptions {
     bool print_abap = false;
     bool keep_generated = false;
     bool quiet = false;
+    // Queue the command and return without contacting SAP at all. The periodic
+    // ERPL_REV_DELTA job drains the queue, so this path needs no SAP
+    // authorisation whatsoever -- not even the right to run a classrun.
+    bool queue_only = false;
 
     // Positional words after the verb, in order.
     std::vector<std::string> args;
