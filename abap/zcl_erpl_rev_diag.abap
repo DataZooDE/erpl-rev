@@ -18,5 +18,26 @@ CLASS zcl_erpl_rev_diag IMPLEMENTATION.
     out->write( |msgid={ sy-msgid } msgno={ sy-msgno }| ).
     out->write( |v1=[{ sy-msgv1 }] v2=[{ sy-msgv2 }]| ).
     out->write( |echo=[{ lv_echo }] resp=[{ lv_resp }]| ).
+
+    " Can the calling user create and activate a class? `erpl-rev setup`
+    " deploys ABAP over ADT, and the CLI's sync/replicate commands generate a
+    " throwaway class to carry their parameters -- both need S_DEVELOP. A
+    " production RFC service user usually has none, and without this check the
+    " first sign of that is an opaque object-create failure mid-deploy.
+    " AUTHORITY-CHECK reads; it changes nothing, so doctor may run it.
+    AUTHORITY-CHECK OBJECT 'S_DEVELOP'
+      ID 'DEVCLASS' DUMMY
+      ID 'OBJTYPE'  FIELD 'CLAS'
+      ID 'OBJNAME'  DUMMY
+      ID 'P_GROUP'  DUMMY
+      ID 'ACTVT'    FIELD '01'.
+    DATA(lv_create) = sy-subrc.
+    AUTHORITY-CHECK OBJECT 'S_DEVELOP'
+      ID 'DEVCLASS' DUMMY
+      ID 'OBJTYPE'  FIELD 'CLAS'
+      ID 'OBJNAME'  DUMMY
+      ID 'P_GROUP'  DUMMY
+      ID 'ACTVT'    FIELD '02'.
+    out->write( |s_develop create={ lv_create } change={ sy-subrc } user={ sy-uname }| ).
   ENDMETHOD.
 ENDCLASS.

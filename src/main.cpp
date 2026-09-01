@@ -12,6 +12,15 @@
 #include "rfc_handlers.hpp"
 #include "duckdb_bridge.hpp"
 #include "logging.hpp"
+#ifdef _WIN32
+#include <windows.h>    // GetCurrentProcessId
+#else
+#include <unistd.h>     // getpid
+#endif
+
+#include "cli_common.hpp"
+#include "commands.hpp"
+#include "json_util.hpp"
 #include "sap_setup.hpp"
 #include "sap_uc.hpp"
 #include "erpl_rev_telemetry.hpp"
@@ -68,6 +77,27 @@ std::string Redact(std::string s, const std::string &secret) {
 }
 
 // quack only needs allow_other_hostname=true when binding beyond loopback.
+// quack_serve reports the token it generated in its result row; pull it out so
+// the state file can carry it. Returns empty if the shape is not what we expect,
+// in which case the CLI falls back to --quack-token / the environment.
+std::string TokenFromDetails(const std::string &details) {
+    try {
+        for (const auto &row : json::ParseRows(details))
+            for (const auto &c : row)
+                if (c.key.find("token") != std::string::npos && !c.value.empty())
+                    return c.value;
+    } catch (...) {}
+    return {};
+}
+
+long GetCurrentPid() {
+#ifdef _WIN32
+    return static_cast<long>(GetCurrentProcessId());
+#else
+    return static_cast<long>(getpid());
+#endif
+}
+
 bool ListenIsLoopback(const std::string &listen) {
     return listen.find("localhost") != std::string::npos ||
            listen.find("127.0.0.1") != std::string::npos ||
@@ -77,11 +107,17 @@ bool ListenIsLoopback(const std::string &listen) {
 // Parsed command-line options. *_set marks "seen on the command line" so the
 // resolver can apply CLI-over-env precedence without conflating an explicit
 // empty value with "unset".
-enum class Verb { Serve, Setup, Doctor };
+enum class Verb { Serve, Setup, Doctor, Sql, Sync, Replicate };
+
+// Verbs whose flags are parsed by the cmd module.
+inline bool IsCmdVerb(Verb v) {
+    return v == Verb::Sql || v == Verb::Sync || v == Verb::Replicate;
+}
 
 struct Cli {
     Verb verb = Verb::Serve;
     bool quack = false;
+    bool no_quack = false;
     std::string quack_listen;
     bool quack_listen_set = false;
     std::string quack_token;
@@ -97,6 +133,7 @@ struct Cli {
     bool no_telemetry = false;
     // setup / doctor
     setup::Options setup;
+    cmd::Options cmd;
     bool bad_args = false;      // an unknown flag; refuse to run rather than guess
 };
 
@@ -109,8 +146,11 @@ void PrintHelp() {
         "erpl-rev — ABAP RFC -> DuckDB bridge server\n\n"
         "Usage: erpl_rev_server [options]\n\n"
         "Options:\n"
-        "  --quack[=<listen>]       Also start the DuckDB quack network server\n"
-        "                           (default quack:localhost, port 9494).\n"
+        "  --quack[=<listen>]       DuckDB quack network server. ON BY DEFAULT on\n"
+        "                           loopback (quack:localhost, port 9494); the CLI\n"
+        "                           subcommands reach a running server through it.\n"
+        "  --no-quack               Do not start the network server. `erpl-rev sql`\n"
+        "                           and `sync` then need the server stopped.\n"
         "  --quack-listen <listen>  Set the quack bind URI (implies --quack); use\n"
         "                           quack:0.0.0.0:9494 to expose beyond loopback.\n"
         "  --quack-token <token>    Pin the quack client auth token (implies --quack);\n"
@@ -133,7 +173,7 @@ void PrintHelp() {
         "  ERPL_REV_GWHOST        SAP gateway host            (default localhost)\n"
         "  ERPL_REV_GWSERV        SAP gateway service         (default 3300)\n"
         "  ERPL_REV_REG_COUNT     parallel registrations      (default 5)\n"
-        "  ERPL_REV_QUACK         enable quack (truthy)       (default off)\n"
+        "  ERPL_REV_NO_QUACK      disable quack (truthy)      (default: quack on)\n"
         "  ERPL_REV_QUACK_LISTEN  quack bind URI              (default quack:localhost)\n"
         "  ERPL_REV_QUACK_TOKEN   pin quack auth token        (default random)\n"
         "  ERPL_REV_DB_PATH       DuckDB file (:memory: for in-mem) (default erpl-rev.duckdb)\n"
@@ -159,9 +199,13 @@ Cli ParseArgs(int argc, char **argv) {
         if (v == "serve") { c.verb = Verb::Serve; first = 2; }
         else if (v == "setup")  { c.verb = Verb::Setup;  first = 2; }
         else if (v == "doctor") { c.verb = Verb::Doctor; first = 2; }
+        else if (v == "sql")    { c.verb = Verb::Sql;    first = 2; }
+        else if (v == "sync")   { c.verb = Verb::Sync;   first = 2; }
+        else if (v == "replicate") { c.verb = Verb::Replicate; first = 2; }
         else {
             std::fprintf(stderr, "erpl-rev: unknown command '%s'\n"
-                                 "Commands: serve (default), setup, doctor. Try --help.\n",
+                                 "Commands: serve (default), setup, doctor, sql, sync, replicate. "
+                                 "Try --help.\n",
                          v.c_str());
             c.bad_args = true;
             return c;
@@ -191,6 +235,8 @@ Cli ParseArgs(int argc, char **argv) {
             c.quack = true;
             c.quack_listen = take_value();
             c.quack_listen_set = true;
+        } else if (key == "--no-quack") {
+            c.no_quack = true;
         } else if (key == "--quack-token") {
             c.quack = true;
             c.quack_token = take_value();
@@ -210,8 +256,24 @@ Cli ParseArgs(int argc, char **argv) {
             c.smoke = true;
         } else if (key == "--no-telemetry") {
             c.no_telemetry = true;
+        } else if (IsCmdVerb(c.verb) && cmd::ParseOption(key, take_value, c.cmd)) {
+            // consumed by sql/sync/replicate
         } else if (setup::ParseOption(key, has_inval, take_value, c.setup)) {
             // consumed by setup/doctor
+        } else if (a == "--") {
+            // Everything after -- is a positional, however it is spelled.
+            while (++i < argc) c.cmd.args.push_back(argv[i]);
+        } else if (IsCmdVerb(c.verb) && !a.empty() && a[0] != '-') {
+            c.cmd.args.push_back(a);
+        } else if ((c.verb == Verb::Sync || c.verb == Verb::Replicate) &&
+                   a.rfind("--", 0) == 0) {
+            // sync and replicate mirror a five-tab SAP selection screen. Rather
+            // than redeclare thirty flags here, their words are collected and
+            // read by name in the command itself; an unrecognised one is
+            // reported there, where the valid set for that subcommand is known.
+            c.cmd.args.push_back(key);
+            if (has_inval) c.cmd.args.push_back(inval);
+            else if (i + 1 < argc && argv[i + 1][0] != '-') c.cmd.args.push_back(argv[++i]);
         } else {
             // Refuse rather than warn. A typo'd flag that is merely logged leaves
             // a server running with a configuration nobody asked for, and the
@@ -286,11 +348,14 @@ int main(int argc, char **argv) {
 
     Cli cli = ParseArgs(argc, argv);
     if (cli.bad_args) return 2;
-    if (cli.help) { PrintHelp(); setup::PrintHelp(); return 0; }
+    if (cli.help) { PrintHelp(); setup::PrintHelp(); cmd::PrintHelp(); return 0; }
     if (cli.smoke) return RunSmoke();
     // setup/doctor run and exit, like --smoke: they never start the server.
     if (cli.verb == Verb::Doctor) return setup::RunDoctor(cli.setup);
     if (cli.verb == Verb::Setup)  return setup::RunSetup(cli.setup);
+    if (cli.verb == Verb::Sql)       return cmd::RunSql(cli.cmd);
+    if (cli.verb == Verb::Sync)      return cmd::RunSync(cli.cmd);
+    if (cli.verb == Verb::Replicate) return cmd::RunReplicate(cli.cmd);
 
     // Two surfaces, because this process almost never runs on a terminal. The
     // banner is for the operator who starts it by hand; the log line is for the
@@ -308,7 +373,14 @@ int main(int argc, char **argv) {
 
     // Config precedence: CLI flag > environment > default. Env stays the
     // 12factor baseline; flags are an override convenience.
-    const bool quack_enabled = cli.quack || EnvTruthy("ERPL_REV_QUACK");
+    // Quack is on by default, bound to loopback. The CLI subcommands reach a
+    // running server through it, so leaving it off by default would mean the
+    // documented `erpl-rev sql` does not work until the operator finds a flag.
+    // Exposing it beyond loopback still needs an explicit non-loopback
+    // --quack-listen, and a token is always required.
+    const bool quack_enabled =
+        !cli.no_quack && (cli.quack || EnvTruthy("ERPL_REV_QUACK") ||
+                          !EnvTruthy("ERPL_REV_NO_QUACK"));
     const std::string quack_listen =
         cli.quack_listen_set ? cli.quack_listen
                              : Env("ERPL_REV_QUACK_LISTEN", "quack:localhost");
@@ -418,6 +490,21 @@ int main(int argc, char **argv) {
                                  {"token_source", quack_token.empty() ? "generated"
                                                                        : "supplied (redacted)"},
                                  {"connect", Redact(details, quack_token)}});
+
+                // Record where we listen and with which token, so a CLI process
+                // can find us. Without this a generated token exists only in the
+                // line above, and `erpl-rev sql` against a server started with no
+                // arguments would have nothing to authenticate with.
+                cli::ServerState st;
+                st.db_path = db_path;
+                st.quack_listen = quack_listen;
+                st.quack_token = quack_token.empty() ? TokenFromDetails(details)
+                                                     : quack_token;
+                st.version = ERPL_REV_VERSION;
+                st.pid = static_cast<long>(GetCurrentPid());
+                if (!cli::WriteServerState(st))
+                    log::get().Warn("quack", "could not write the server state file",
+                                    {{"path", cli::ServerStatePath().string()}});
             } catch (const std::exception &e) {
                 log::get().Error("quack", "failed to start (continuing without it)",
                                  {{"listen", quack_listen}, {"error", e.what()}});
@@ -428,6 +515,7 @@ int main(int argc, char **argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
         log::get().Info("server", "shutting down");
+        cli::RemoveServerState();
         if (quack_running) {
             try { StopQuackServer(quack_listen); }
             catch (const std::exception &e) {

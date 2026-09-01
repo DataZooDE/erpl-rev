@@ -1,6 +1,7 @@
 #include "adt.hpp"
 
 #include <array>
+#include <vector>
 #include <cstdio>
 #include <cstdlib>
 
@@ -96,10 +97,60 @@ Result RunCapture(const std::vector<std::string> &argv) {
     return r;
 }
 
+// How to invoke erpl-adt on this machine.
+//
+// `uvx erpl-adt` is the normal answer and needs no setup: uv downloads the
+// tool from PyPI on first use. But erpl-rev also ships as a standalone binary
+// and in Docker, where uv may be absent, and the old code simply assumed it --
+// which meant every SAP-touching command failed with "command not found"
+// wearing a costume.
+//
+// Resolved once and cached: an explicit override, then a plain erpl-adt on
+// PATH (the pip/Homebrew/Docker install), then uvx.
+static std::vector<std::string> g_launcher;
+static bool g_launcher_resolved = false;
+static std::string g_launcher_override;
+
+void SetToolPath(const std::string &path) {
+    g_launcher_override = path;
+    g_launcher_resolved = false;
+}
+
+const std::vector<std::string> &Launcher() {
+    if (g_launcher_resolved) return g_launcher;
+    g_launcher_resolved = true;
+
+    auto works = [](const std::vector<std::string> &argv) {
+        auto probe = argv;
+        probe.push_back("--version");
+        return RunCapture(probe).ok();
+    };
+
+    if (!g_launcher_override.empty() && works({g_launcher_override})) {
+        g_launcher = {g_launcher_override};
+    } else if (works({"erpl-adt"})) {
+        g_launcher = {"erpl-adt"};
+    } else {
+        // Last, because it is the slowest: uvx re-resolves the environment on
+        // every call even when the wheel is already cached.
+        g_launcher = {"uvx", "erpl-adt"};
+    }
+    return g_launcher;
+}
+
+std::string ToolHint() {
+    return "erpl-adt is required for the SAP side. Install it with one of:\n"
+           "    uv tool install erpl-adt     (or have `uv` on PATH; uvx fetches it)\n"
+           "    pip install erpl-adt\n"
+           "  or point at an existing binary with --adt-path.";
+}
+
 bool ToolAvailable() { return !ToolVersion().empty(); }
 
 std::string ToolVersion() {
-    auto r = RunCapture({"uvx", "erpl-adt", "--version"});
+    auto argv = Launcher();
+    argv.push_back("--version");
+    auto r = RunCapture(argv);
     if (!r.ok()) return "";
     // Trim to the first line; the version banner may be followed by other output.
     auto nl = r.output.find('\n');
@@ -109,17 +160,18 @@ std::string ToolVersion() {
 }
 
 Result Run(const Conn &c, const std::vector<std::string> &args) {
-    std::vector<std::string> argv{
-        "uvx", "erpl-adt",
-        "--host", c.host,
-        "--port", c.port,
-        "--user", c.user,
-        "--client", c.client,
-        // --password-env, never --password: an argument is visible in the
-        // process list to every user on the machine.
-        "--password-env", "ERPL_REV_SAP_PASSWORD",
-        "--timeout", std::to_string(c.timeout_s),
-    };
+    std::vector<std::string> argv = Launcher();
+    for (const std::string &a : {std::string("--host"), c.host,
+                                 std::string("--port"), c.port,
+                                 std::string("--user"), c.user,
+                                 std::string("--client"), c.client,
+                                 // --password-env, never --password: an argument
+                                 // is visible in the process list to every user
+                                 // on the machine.
+                                 std::string("--password-env"),
+                                 std::string("ERPL_REV_SAP_PASSWORD"),
+                                 std::string("--timeout"), std::to_string(c.timeout_s)})
+        argv.push_back(a);
     argv.insert(argv.end(), args.begin(), args.end());
 
     // Pass the password through the environment for the child only.
@@ -159,6 +211,10 @@ Result WriteSource(const Conn &c, const std::string &name, const std::string &fi
 
 Result RunClass(const Conn &c, const std::string &name) {
     return Run(c, {"object", "run", name});
+}
+
+Result DeleteObject(const Conn &c, const std::string &uri) {
+    return Run(c, {"object", "delete", uri});
 }
 
 bool ActivationSucceeded(const Result &r) {

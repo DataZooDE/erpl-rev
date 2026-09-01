@@ -41,6 +41,17 @@ struct Result {
 Result RunCapture(const std::vector<std::string> &argv);
 
 // True if `uvx` can be found and can run erpl-adt.
+// Override the erpl-adt executable (--adt-path). Call before first use;
+// resolution is cached.
+void SetToolPath(const std::string &path);
+
+// How erpl-adt will be invoked: an override, `erpl-adt` on PATH, or
+// `uvx erpl-adt`. Resolved once, on demand.
+const std::vector<std::string> &Launcher();
+
+// Install advice, for when the tool cannot be found at all.
+std::string ToolHint();
+
 bool ToolAvailable();
 // The erpl-adt version string, or empty if unavailable.
 std::string ToolVersion();
@@ -61,6 +72,10 @@ Result WriteSource(const Conn &c, const std::string &name, const std::string &fi
 
 // Run an IF_OO_ADT_CLASSRUN class and return its console output.
 Result RunClass(const Conn &c, const std::string &name);
+
+// Delete an object. Note this takes a URI -- /sap/bc/adt/oo/classes/<name> --
+// and not the --type/--name pair the create side uses.
+Result DeleteObject(const Conn &c, const std::string &uri);
 
 // True when a `source write --activate` actually succeeded. "Nothing to
 // activate" is what an UNCHANGED object returns and is success, not failure --

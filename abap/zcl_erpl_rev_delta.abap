@@ -588,8 +588,12 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       INTO TABLE @DATA(lt_old).
     LOOP AT lt_old INTO DATA(ls_old).
       CALL FUNCTION 'BP_JOB_DELETE'
+        " commitmode, not commit_flag: BP_JOB_DELETE has no COMMIT_FLAG, and
+        " passing one dumps with CALL_FUNCTION_PARM_UNKNOWN. This loop only runs
+        " when a previous job exists, so the first-ever schedule worked and every
+        " re-schedule and unschedule after it aborted.
         EXPORTING jobcount = ls_old-jobcount jobname = ls_old-jobname
-                  forcedmode = abap_true commit_flag = abap_true
+                  forcedmode = abap_true commitmode = abap_true
         EXCEPTIONS OTHERS = 0.
     ENDLOOP.
     DATA(lv_removed) = lines( lt_old ).

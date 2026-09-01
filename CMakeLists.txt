@@ -267,6 +267,13 @@ add_executable(erpl_rev_server
   src/sxml_binary.cpp
   src/payload.cpp
   src/adt.cpp
+  src/abap_codegen.cpp
+  src/db_client.cpp
+  src/table_render.cpp
+  src/cmd_sql.cpp
+  src/cmd_sync.cpp
+  src/abap_skeletons.cpp
+  src/cli_common.cpp
   src/sap_setup.cpp
   ${ERPL_ABAP_GENERATED}
   src/logging.cpp
@@ -311,6 +318,9 @@ if(TRUE)  # tests always build; DuckDB is in-tree
     test/test_sxml_binary.cpp
     test/test_payload.cpp
     test/test_telemetry.cpp
+    test/test_abap_codegen.cpp
+    test/test_cli_common.cpp
+    test/test_table_render.cpp
     test/test_sap_setup.cpp
     test/bench_ingest.cpp
     src/duckdb_bridge.cpp
@@ -319,6 +329,13 @@ if(TRUE)  # tests always build; DuckDB is in-tree
     src/sxml_binary.cpp
     src/payload.cpp
     src/erpl_rev_telemetry.cpp
+    src/abap_codegen.cpp
+    src/db_client.cpp
+    src/table_render.cpp
+    src/cmd_sql.cpp
+    src/cmd_sync.cpp
+    src/abap_skeletons.cpp
+    src/cli_common.cpp
     src/sap_setup.cpp
     src/adt.cpp
     ${ERPL_ABAP_GENERATED})

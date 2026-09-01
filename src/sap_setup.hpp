@@ -24,6 +24,8 @@
 #pragma once
 
 #include <functional>
+
+#include "cli_common.hpp"
 #include <string>
 #include <vector>
 
@@ -32,21 +34,15 @@ namespace erpl_rev::setup {
 // Resolved from flags > environment > config file > prompt. The *_set flags
 // record "came from the command line" so the resolver can apply that precedence
 // without confusing an explicit empty value with an absent one.
-struct Options {
-    std::string host, port, client, user, password;
+struct Options : cli::ConnOptions {
     std::string package;      // "$TMP" or e.g. ZERPL_CORE; empty = decide by diagnosis
     std::string program_id;   // gateway PROGRAM_ID, default ERPL_REV
     std::string gwhost, gwserv;
-    bool host_set = false, port_set = false, client_set = false, user_set = false;
-    bool password_set = false, package_set = false, program_set = false;
+    bool package_set = false, program_set = false;
     bool gwhost_set = false, gwserv_set = false;
 
-    bool dry_run = false;
-    bool non_interactive = false;
     bool print_runbook = false;
-    bool json = false;
     bool save_password = false;
-    bool assume_yes = false;
 };
 
 // Consume one option if it belongs to setup/doctor. Returns false if the flag is
@@ -67,7 +63,9 @@ int RunSetup(Options o);
 // can be exercised without an SAP system.
 // ---------------------------------------------------------------------------
 
-enum class Status { Ok, Warn, Fail, Unknown };
+// The check model is setup's, but the status vocabulary is shared with every
+// other command that prints a report line.
+using Status = cli::Status;
 
 struct Check {
     std::string id;      // stable identifier, e.g. "sap.adt"
@@ -86,6 +84,10 @@ struct Diagnosis {
     bool destination_ok = false;
     bool gateway_reachable = false;
     bool stms_available = false;
+    // Can the ADT user create and activate a class? setup deploys ABAP, and the
+    // sync/replicate commands generate one, so both need S_DEVELOP. Unknown
+    // until the probe class is deployed and has been asked.
+    Status develop_auth = Status::Unknown;
 
     const Check *Find(const std::string &id) const;
     bool AnyFailed() const;
@@ -129,5 +131,9 @@ bool SetupClassSucceeded(const std::string &output, const std::string &program_i
                          const std::string &gwservice, std::string &why);
 bool MkfmSucceeded(const std::string &output, const std::vector<std::string> &expected,
                    std::string &why);
+
+// Read the S_DEVELOP verdict out of ZCL_ERPL_REV_DIAG's output. Unknown when
+// the probe said nothing about it -- an older probe, or one that never ran.
+Status DevelopAuthFromProbe(const std::string &output);
 
 } // namespace erpl_rev::setup
