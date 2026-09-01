@@ -170,6 +170,84 @@ run ZCL_ERPL_REV_BWTEST abap/zcl_erpl_rev_bwtest.abap
 echo "$OUT" | grep -q 'BW RESULT pass=5 fail=0' || fail "bw test ($OUT)"
 echo "   bw OK (ADBC read -> DuckDB: view + parameterized SQLScript table function, parity, parquet)"
 
+# ---------------------------------------------------------------------------
+echo "== CLI E2E (operate the server from the shell) =="
+# The commands that replace the SAP GUI reports. The server started above is
+# still running with quack on the default loopback listener, so the CLI should
+# find it through the runtime state file with no flags at all.
+CLI=./build/erpl_rev_server
+adt() { uvx erpl-adt "${ADT[@]}" "$@"; }
+STATE="${XDG_RUNTIME_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}}/erpl-rev/server.json"
+
+[ -f "$STATE" ] || fail "no server state file at $STATE"
+if [ "$(stat -c %a "$STATE" 2>/dev/null || stat -f %Lp "$STATE")" != "600" ]; then
+  fail "server state file is not 0600 -- it holds the quack token"
+fi
+
+# 1. Zero-config: no flags, finds the running server.
+OUT="$($CLI sql "SELECT 42 AS answer" 2>&1)" || fail "sql failed: $OUT"
+grep -q "using the running server" <<<"$OUT" || fail "sql did not use quack: $OUT"
+grep -q "42" <<<"$OUT" || fail "sql returned no answer: $OUT"
+
+# 2. Formats.
+[ "$($CLI sql "SELECT 1 AS n" --format csv 2>/dev/null)" = "n
+1" ] || fail "csv output wrong"
+$CLI sql "SELECT 1 AS n" --format json 2>/dev/null | grep -q '"rows":\[{"n":1}\]' \
+  || fail "json output wrong"
+
+# 3. --print-abap contacts nothing and produces activatable ABAP. This is the
+#    only compile check the generated skeletons ever get.
+GEN="/tmp/erpl_cli_gen_$$.abap"
+$CLI replicate --table T000 --target t000_cli --print-abap > "$GEN" 2>/dev/null \
+  || fail "--print-abap failed"
+grep -q "SUBMIT z_erpl_rev_replicate" "$GEN" || fail "generated ABAP has no SUBMIT"
+# Deploy it under a stable name purely to prove it compiles.
+adt object create --type CLAS/OC --name ZCL_ERPL_CLI_SYNTAX --package '$TMP' \
+     --description 'erpl-rev CLI syntax probe' >/dev/null 2>&1 || true
+sed -e 's/ZCL_ERPL_REV_CLI_R[0-9a-f]*/ZCL_ERPL_CLI_SYNTAX/g' "$GEN" > "$GEN.named"
+adt source write ZCL_ERPL_CLI_SYNTAX --file "$GEN.named" --activate 2>&1 \
+  | grep -qE "Activated|Nothing to activate" \
+  || fail "the generated replicate ABAP does not compile"
+adt object delete /sap/bc/adt/oo/classes/zcl_erpl_cli_syntax >/dev/null 2>&1 || true
+rm -f "$GEN" "$GEN.named"
+echo "   generated ABAP compiles"
+
+# 4. Injection: each payload must become a literal, never a statement.
+for BAD in "MANDT = '000' OR '1'='1'" "x' ). DELETE FROM t000. \"" 'a` ). zcl_evil=>go( ). `'; do
+  P="$($CLI replicate --table T000 --where "$BAD" --print-abap 2>&1)" \
+    || fail "print-abap refused a legitimate payload: $BAD"
+  grep -q "DELETE FROM" <<<"$(grep -v p_where <<<"$P")" \
+    && fail "payload escaped its literal: $BAD"
+done
+# A newline cannot be escaped into an ABAP literal, so it must be refused.
+$CLI replicate --table T000 --where "$(printf 'a\nENDMETHOD.')" --print-abap >/dev/null 2>&1
+[ $? -eq 2 ] || fail "a newline in --where was not refused with exit 2"
+echo "   injection payloads render as literals; a newline is refused"
+
+# 5. A real load, submitted as a background job and verified from run stats.
+$CLI replicate --table T000 --target t000_cli --yes --wait 180 --quiet >/dev/null 2>&1 \
+  || fail "replicate did not report success"
+CNT="$($CLI sql "SELECT count(*) AS n FROM t000_cli" --format csv --quiet 2>/dev/null | tail -1)"
+[ "${CNT:-0}" -gt 0 ] || fail "replicate produced no rows"
+echo "   replicate -> $CNT rows via a background job"
+
+# 6. sync: register through ABAP, list from DuckDB.
+$CLI sync create t000_cli --method SNAPSHOT --source T000 --keys MANDT \
+     --cadence nightly --yes >/dev/null 2>&1 || fail "sync create failed"
+$CLI sync ls --quiet 2>/dev/null | grep -q t000_cli || fail "sync ls does not show the job"
+# The granularity gate lives in ABAP; the CLI must not be able to bypass it.
+if $CLI sync create t000_bad --method WATERMARK --source T000 --keys MANDT \
+        --chg-col X --wm-kind DATE --cadence micro:30 --yes >/dev/null 2>&1; then
+  fail "the ABAP granularity gate was bypassed"
+fi
+$CLI sync run t000_cli --yes >/dev/null 2>&1 || fail "sync run failed"
+echo "   sync create/ls/run, and the granularity gate still applies"
+
+# 7. Nothing may be left behind in the customer's system.
+LEFT="$(adt search 'ZCL_ERPL_REV_CLI*' 2>/dev/null | grep -c ZCL_ERPL_REV_CLI || true)"
+[ "$LEFT" -eq 0 ] || fail "$LEFT temporary CLI class(es) leaked into SAP"
+echo "   no temporary classes left behind"
+
 kill "$SRV" 2>/dev/null; sleep 1
 rm -f "$E2E_DB" "$E2E_DB".wal
 if [ "$RFC_BACKEND" = proto ]; then

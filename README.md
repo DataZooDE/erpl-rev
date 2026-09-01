@@ -138,7 +138,34 @@ uvx erpl-rev --smoke         # prove the RFC backend and DuckDB both load
 or `pip install erpl-rev` if you would rather have it on `PATH`. Wheels are
 published for Linux x86-64, macOS arm64 and Windows x64.
 
-### Then set up the SAP side
+#### Then operate it from the shell
+
+Everything the SAP GUI reports do is also a command, so a headless server is a
+first-class place to work from:
+
+```bash
+uvx erpl-rev sql "SELECT count(*) FROM mara"      # the Z_ERPL_REV_SQL console
+uvx erpl-rev replicate --table MARA --target mara # the Z_ERPL_REV_REPLICATE report
+uvx erpl-rev sync ls                              # registered delta jobs
+uvx erpl-rev sync run mara                        # one delta cycle
+uvx erpl-rev sync schedule --every 5              # the periodic background job
+```
+
+`sql` and `sync ls|show` read the live DuckDB directly — over the server's quack
+listener when one is running, or the file when it is not, and they always print
+which. Anything that needs SAP to *read source data* submits the same report the
+GUI submits as a background job, so a load that takes hours is not bounded by an
+HTTP timeout.
+
+Add `--print-abap` to any of them to see the ABAP instead of running it, and
+`--dry-run` to see the plan. Nothing writes to SAP or DuckDB without a terminal
+confirmation or an explicit `--yes`.
+
+> These commands deploy a short-lived class to `$TMP` to carry their parameters,
+> because an ADT classrun takes none. That needs **`S_DEVELOP`** — a stronger
+> authorisation than running the equivalent report in SE38.
+
+## Then set up the SAP side
 
 Getting the binary was always easy; getting SAP ready used to be an afternoon
 across four documents — a type-T destination, a function group, eight

@@ -41,6 +41,17 @@ struct Result {
 Result RunCapture(const std::vector<std::string> &argv);
 
 // True if `uvx` can be found and can run erpl-adt.
+// Override the erpl-adt executable (--adt-path). Call before first use;
+// resolution is cached.
+void SetToolPath(const std::string &path);
+
+// How erpl-adt will be invoked: an override, `erpl-adt` on PATH, or
+// `uvx erpl-adt`. Resolved once, on demand.
+const std::vector<std::string> &Launcher();
+
+// Install advice, for when the tool cannot be found at all.
+std::string ToolHint();
+
 bool ToolAvailable();
 // The erpl-adt version string, or empty if unavailable.
 std::string ToolVersion();

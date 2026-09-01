@@ -75,8 +75,22 @@ S_RFC: ACTVT=16, RFC_TYPE=FUGR, RFC_NAME=ZERPL_REV
 - Credentials for external publish targets (Postgres/DuckLake/object store) go in
   the server's **`--init-file`** (CREATE SECRET / ATTACH), never on the RFC wire,
   never in ABAP. Restrict that file to the service account (`chmod 600`).
-- The DuckDB file + quack token: keep the quack listener on loopback unless needed;
-  pin a token (`--quack-token`) and treat it as a secret.
+- **The quack network listener is ON by default**, bound to loopback
+  (`quack:localhost:9494`) and always token-protected. It is what the
+  `erpl-rev sql` / `sync` subcommands use to reach a running server, so turning
+  it off means those commands only work while the server is stopped.
+  - `--no-quack` (or `ERPL_REV_NO_QUACK=1`) disables it entirely.
+  - Exposing it beyond loopback requires an explicit non-loopback
+    `--quack-listen`; only then is `allow_other_hostname` passed.
+  - Pin the token with `--quack-token` and treat it as a secret. When quack
+    generates one, it is written to the runtime state file below rather than
+    only logged.
+- **The runtime state file** (`$XDG_RUNTIME_DIR/erpl-rev/server.json`, mode
+  `0600`) records the listen URI, the quack token and the pid so a CLI process
+  on the same host can find the server. It holds a secret: it is written
+  atomically, never world-readable, and removed at shutdown. On a shared host,
+  anyone who can read it can query the DuckDB — which is the same trust boundary
+  as the DuckDB file itself.
 
 ## 7. What erpl-rev does NOT do (assurances for Basis)
 - **Non-modifying**: ships only `Z*` objects in package `ZERPL`; modifies **no** SAP

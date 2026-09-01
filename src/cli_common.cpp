@@ -263,6 +263,7 @@ bool ParseConnOption(const std::string &key,
     else if (key == "--sap-client") { o.client = take(); o.client_set = true; }
     else if (key == "--sap-user")   { o.user = take();   o.user_set = true; }
     else if (key == "--timeout")    { o.timeout_s = std::atoi(take().c_str()); }
+    else if (key == "--adt-path")   { o.adt_path = take(); adt::SetToolPath(o.adt_path); }
     else if (key == "--dry-run")         { o.dry_run = true; }
     else if (key == "--non-interactive") { o.non_interactive = true; }
     else if (key == "--json")            { o.json = true; }

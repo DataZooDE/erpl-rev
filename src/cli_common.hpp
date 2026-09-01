@@ -86,6 +86,7 @@ struct ConnOptions {
     bool assume_yes = false;
     bool json = false;        // legacy alias for --format json
     int timeout_s = 600;      // erpl-adt --timeout; its own default of 120 truncates real work
+    std::string adt_path;     // --adt-path: an explicit erpl-adt executable
 };
 
 // Consume one connection/behaviour flag. Returns false if the key is none of
