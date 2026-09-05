@@ -101,6 +101,9 @@ CLASS zcl_erpl_rev_deltadrv DEFINITION PUBLIC FINAL CREATE PUBLIC.
     "! padding in the generated predicate are wrong.
     CLASS-METHODS seed_datetimes.
 
+    "! Touch every ZDELTA_ALL row, maintaining all strategy columns at once.
+    CLASS-METHODS touch_all.
+
 ENDCLASS.
 
 CLASS zcl_erpl_rev_deltadrv IMPLEMENTATION.
@@ -327,6 +330,14 @@ CLASS zcl_erpl_rev_deltadrv IMPLEMENTATION.
     COMMIT WORK AND WAIT.
   ENDMETHOD.
 
+
+  METHOD touch_all.
+    GET TIME STAMP FIELD DATA(lv_ts).
+    UPDATE zdelta_all SET chg_tstamp = @lv_ts, chg_dats = @sy-datum,
+                          chg_date2 = @sy-datum, chg_time = @sy-uzeit,
+                          chg_counter = chg_counter + 1.
+    COMMIT WORK AND WAIT.
+  ENDMETHOD.
 
   METHOD seed_dates.
     DELETE FROM zdelta_d.

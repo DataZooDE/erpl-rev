@@ -92,7 +92,7 @@ std::string StageName(const std::string &target, long long run_id) {
 }
 
 BeginResult Begin(duckdb::Connection &con, const std::string &target, LoadType load_type,
-                  int64_t read_start_epoch) {
+                  int64_t read_start_epoch, const std::string &sap_now) {
     const State st = LoadState(con, target);
 
     BeginResult out;
@@ -110,7 +110,26 @@ BeginResult Begin(duckdb::Connection &con, const std::string &target, LoadType l
     spec.wm_value = out.plan.apply_floor ? st.wm_value : std::string();
     spec.safety_secs = st.safety_secs;
     spec.safety_units = st.safety_units;
-    out.bounds = wm::ComputeBounds(spec, read_start_epoch);
+    // A DATS or TIMS column is wall-clock in SAP's timezone. The server's own
+    // clock is the wrong ruler for it, so ABAP passes its own and the bounds are
+    // computed against that. For the UTC-based timestamp kinds the server clock
+    // is right and is used as-is.
+    int64_t read_start = read_start_epoch;
+    int64_t skew = 0;
+    const bool sap_clock = spec.kind == wm::WmKind::Date || spec.kind == wm::WmKind::Datetime;
+    if (sap_now.size() >= 14) {
+        try {
+            const int64_t sap_epoch = wm::ParseNumts(sap_now);
+            // How far the server's clock is ahead of SAP's wall clock. For a
+            // DATS/TIMS column that difference is what converts a wall-clock
+            // value into a real instant.
+            skew = read_start_epoch - sap_epoch;
+            if (sap_clock) read_start = sap_epoch;
+        } catch (...) {
+            // Unparseable: fall back rather than fail the cycle.
+        }
+    }
+    out.bounds = wm::ComputeBounds(spec, read_start);
 
     // Allocate the run id NOW, so everything the cycle writes can carry it. It
     // used to exist only as a sequence default on the stats table, consumed when
@@ -137,10 +156,10 @@ BeginResult Begin(duckdb::Connection &con, const std::string &target, LoadType l
          // later ceiling would advance the watermark past rows this cycle never
          // read. It is the plan for the cycle, decided once.
          "INSERT INTO _erpl_rev_run_stats (run_id, target, source, run_type, method, status, "
-         "load_type, wm_from, wm_to) VALUES (" + std::to_string(out.run_id) + "," + Lit(target) +
+         "load_type, wm_from, wm_to, clock_skew_secs) VALUES (" + std::to_string(out.run_id) + "," + Lit(target) +
              "," + Lit(st.source_from) + ",'DELTA'," + Lit(st.method) + ",'RUNNING'," +
              Lit(LoadTypeCode(load_type)) + "," + Lit(st.wm_value) + "," +
-             Lit(out.bounds.next_watermark) + ")",
+             Lit(out.bounds.next_watermark) + "," + std::to_string(skew) + ")",
          "open stats row");
 
     Exec(con,
@@ -307,10 +326,14 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
             if (!log_exists) {
                 Exec(con, "CREATE TABLE " + log + " AS SELECT * FROM " + target + " LIMIT 0",
                      "create change log");
+                // _commit_ts is when the SOURCE says the row changed; _applied_at
+                // is when erpl-rev wrote it. Two columns, not one: the difference
+                // between them IS the replication latency, and a single column
+                // filled from whichever clock was nearest measures nothing.
                 for (const auto &c : {std::string("_seq BIGINT"), std::string("_op VARCHAR"),
                                       std::string("_run_id BIGINT"),
-                                      std::string("_changed_at TIMESTAMPTZ"),
-                                      std::string("_commit_ts TIMESTAMPTZ")})
+                                      std::string("_commit_ts TIMESTAMPTZ"),
+                                      std::string("_applied_at TIMESTAMPTZ")})
                     Exec(con, "ALTER TABLE " + log + " ADD COLUMN " + c, "log column");
                 Exec(con, "CREATE SEQUENCE IF NOT EXISTS " + log + "_seq START 1", "log sequence");
             }
@@ -330,12 +353,76 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
                 if (i) left_on += " AND ";
                 left_on += "t." + keys[i] + " = s." + keys[i];
             }
+            // The source's change time, parsed from the change column. SAP writes
+            // timestamps as YYYYMMDDHHMMSS(.fffffff), which is not a format any
+            // database parses by accident. NULL when the method has no such
+            // value -- a snapshot row genuinely has no source timestamp, and
+            // inventing one would make every latency percentile a fiction.
+            // Timezone is not a detail here: it is the difference between a
+            // latency figure and a two-hour lie.
+            //
+            // NUMTS/TIMESTAMPL come from ABAP's GET TIME STAMP, which is UTC by
+            // definition, so they are read AT TIME ZONE 'UTC'. DATS and TIMS are
+            // local wall-clock and are read as local. Getting this wrong is not
+            // subtle once you look -- every percentile shifts by exactly the
+            // offset -- but it is invisible if you only ever check that a number
+            // came out.
+            const auto skew_s = Scalar(con, "SELECT coalesce(clock_skew_secs,0) "
+                                            "FROM _erpl_rev_run_stats WHERE run_id=" +
+                                                std::to_string(run_id));
+            const long long skew = skew_s.empty() ? 0 : std::stoll(skew_s);
+            const std::string skew_add =
+                skew == 0 ? "" : " + INTERVAL '" + std::to_string(skew) + "' SECOND";
+
+            std::string commit_ts = "NULL";
+            const auto col = Lower(st.chg_col);
+            if (!st.chg_col.empty() &&
+                (st.wm_kind == "NUMTS" || st.wm_kind == "TIMESTAMPL" || st.wm_kind.empty())) {
+                commit_ts = "(try_strptime(substr(CAST(s." + col + " AS VARCHAR), 1, 14), "
+                            "'%Y%m%d%H%M%S') AT TIME ZONE 'UTC')";
+            } else if (!st.chg_col.empty() && st.wm_kind == "DATETIME" && !st.time_col.empty()) {
+                // The pair, composed back into one value. Reading only the date
+                // half would parse to midnight and report every change as up to
+                // a day stale.
+                //
+                // strftime, not CAST: the staging table holds these as DuckDB
+                // DATE and TIME, whose text form is '2026-09-05' and '20:31:39'.
+                // Concatenating those gives something no SAP format string
+                // parses, and the failure is silent -- try_strptime returns NULL
+                // and the latency simply has no samples, which reads as "the
+                // feature is off" rather than "the parse is wrong".
+                // strftime handles the DATE half; it does NOT accept a bare
+                // TIME, so the time half is formatted by stripping the colons
+                // out of its text form. Both halves land as SAP writes them --
+                // YYYYMMDD and HHMMSS -- which is what the parse expects.
+                // ...plus the recorded SAP-to-server offset, which is what turns
+                // a wall-clock value into an instant comparable with now().
+                // AT TIME ZONE 'UTC', then the recorded offset. A parsed
+                // wall-clock value is a naive TIMESTAMP, and letting it cast into
+                // a TIMESTAMPTZ column picks up the SERVER's session zone -- which
+                // is how a two-hour error appears in a latency figure without
+                // anything looking wrong. Anchoring to UTC and adding the measured
+                // SAP-to-server offset makes it independent of where either
+                // machine happens to be.
+                commit_ts = "((try_strptime(strftime(s." + col + ", '%Y%m%d') || "
+                            "replace(substr(CAST(s." + Lower(st.time_col) +
+                            " AS VARCHAR), 1, 8), ':', ''), '%Y%m%d%H%M%S') "
+                            "AT TIME ZONE 'UTC')" + skew_add + ")";
+            } else if (!st.chg_col.empty() && st.wm_kind == "DATE") {
+                commit_ts = "((try_strptime(strftime(s." + col + ", '%Y%m%d'), '%Y%m%d') "
+                            "AT TIME ZONE 'UTC')" + skew_add + ")";
+            }
+            // A counter watermark has no clock at all, so _commit_ts stays NULL
+            // and latency is genuinely unmeasurable for it. Reported as "no
+            // samples" rather than as zero.
+
             auto r = con.Query(
                 "INSERT INTO " + log + " (" + collist +
-                ", _seq, _op, _run_id, _changed_at, _commit_ts) SELECT " + sellist +
+                ", _seq, _op, _run_id, _commit_ts, _applied_at) SELECT " + sellist +
                 ", nextval('" + log + "_seq'), CASE WHEN t." + keys[0] +
                 " IS NULL THEN 'I' ELSE 'U' END, " + std::to_string(run_id) +
-                ", now(), now() FROM " + stage + " s LEFT JOIN " + target + " t ON " + left_on);
+                ", " + commit_ts + ", now() FROM " + stage + " s LEFT JOIN " + target +
+                " t ON " + left_on);
             if (r->HasError())
                 throw std::runtime_error("cycle: change-log append failed: " + r->GetError());
             res.logged = res.ins + res.upd;

@@ -53,10 +53,16 @@ TEST_CASE("CDC dialect: HANA delete-only plan", "[cdc][dialect]") {
                 R"(SELECT "MANDT","CARRID","CONNID","FLDATE","_OP","_SEQ" )"
                 R"(FROM "ZCDC_SFLIGHT_LOG" WHERE "_SEQ" > %POS% ORDER BY "_SEQ")");
         REQUIRE(p.prune_sql == R"(DELETE FROM "ZCDC_SFLIGHT_LOG" WHERE "_SEQ" <= %CONF%)");
-        // read_from excludes _TS and casts _SEQ to INTEGER for the ABAP ADBC reader.
+        // read_from casts _SEQ to INTEGER and _TS to text for the ABAP ADBC
+        // reader, which chokes on HANA's native BIGINT and TIMESTAMP host types.
+        // _TS is carried, not dropped: it is when the change COMMITTED in SAP, so
+        // it is the only thing that makes trigger-tier latency measurable rather
+        // than merely estimated from cycle durations.
         REQUIRE(p.read_from ==
                 R"((SELECT "MANDT","CARRID","CONNID","FLDATE","_OP",)"
-                R"(CAST("_SEQ" AS INTEGER) AS "_SEQ" FROM "ZCDC_SFLIGHT_LOG") AS LOGREAD)");
+                R"(CAST("_SEQ" AS INTEGER) AS "_SEQ",)"
+                R"(TO_VARCHAR("_TS", 'YYYYMMDDHH24MISS') AS "_TS" )"
+                R"(FROM "ZCDC_SFLIGHT_LOG") AS LOGREAD)");
     }
     SECTION("teardown drops exactly what provision created") {
         REQUIRE(p.teardown_ddl.size() == 3);

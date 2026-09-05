@@ -103,6 +103,13 @@ const std::vector<Migration> &Migrations() {
     // v5 -- the streaming daemon's singleton row. One row, ever: a second daemon
     // claiming it is how a duplicate start is detected and turned into
     // "attach and report" rather than two daemons running the same targets.
+    // v6 -- the SAP-to-server clock offset, recorded per run.
+    //
+    // A DATS/TIMS change value is wall-clock in SAP's timezone, which the server
+    // cannot know. It CAN know the difference: BEGIN_CYCLE is told SAP's clock
+    // and compares it with its own. Storing that per run turns a wall-clock
+    // value into a real instant without a timezone database and without
+    // assuming the two machines agree.
     {5, "daemon: singleton row and tick budget", {
         "CREATE TABLE IF NOT EXISTS _erpl_rev_daemon ("
         "id INTEGER PRIMARY KEY DEFAULT 1, instance_id VARCHAR, heartbeat_ts TIMESTAMPTZ, "
@@ -111,6 +118,17 @@ const std::vector<Migration> &Migrations() {
         "stop BOOLEAN DEFAULT false, ticks BIGINT DEFAULT 0, started_ts TIMESTAMPTZ)",
         "INSERT INTO _erpl_rev_daemon (id) SELECT 1 "
         "WHERE NOT EXISTS (SELECT 1 FROM _erpl_rev_daemon WHERE id=1)",
+    }},
+
+    // v6 -- the SAP-to-server clock offset, recorded per run.
+    //
+    // A DATS/TIMS change value is wall-clock in SAP's timezone, which the server
+    // cannot know. It CAN know the DIFFERENCE: BEGIN_CYCLE is told SAP's clock
+    // and compares it with its own. Storing that per run turns a wall-clock
+    // value into a real instant without a timezone database and without assuming
+    // the two machines agree -- which, measured on A4H, they did not.
+    {6, "run stats: SAP-to-server clock offset", {
+        "SELECT 1",
     }},
 
     };
@@ -166,6 +184,8 @@ void ApplyColumnAdds(duckdb::Connection &con, int version) {
         AddColumnIfMissing(con, rs, "portion_count", "INTEGER");
         AddColumnIfMissing(con, rs, "validation_status", "VARCHAR");
         AddColumnIfMissing(con, rs, "lag_ms", "BIGINT");
+    } else if (version == 6) {
+        AddColumnIfMissing(con, "_erpl_rev_run_stats", "clock_skew_secs", "BIGINT DEFAULT 0");
     }
 }
 

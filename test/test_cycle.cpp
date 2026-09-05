@@ -184,6 +184,18 @@ TEST_CASE("cycle: the change log records one row per applied change", "[cycle][l
     CHECK(Scalar(con, "SELECT _op FROM " + log + " WHERE id=2") == "U");
     CHECK(Scalar(con, "SELECT _op FROM " + log + " WHERE id=3") == "I");
     CHECK(Scalar(con, "SELECT _run_id FROM " + log + " WHERE id=3") == std::to_string(b.run_id));
+    // The two timestamps that make latency measurable after the fact: when the
+    // source says it changed, and when we wrote it.
+    // Compared against the same parse rather than a literal string: the column is
+    // TIMESTAMPTZ, so its rendering depends on the session timezone and asserting
+    // on the text would pass or fail by where the machine is.
+    // A NUMTS change column comes from ABAP's GET TIME STAMP, which is UTC, so
+    // it is read as UTC rather than as local wall-clock. Getting that wrong
+    // shifts every latency percentile by the machine's offset -- which is
+    // exactly what the first stress run showed, as a flat +7204s.
+    CHECK(Scalar(con, "SELECT _commit_ts = (try_strptime('20260905110500','%Y%m%d%H%M%S') "
+                      "AT TIME ZONE 'UTC') FROM " + log + " WHERE id=3") == "true");
+    CHECK_FALSE(Scalar(con, "SELECT _applied_at FROM " + log + " WHERE id=3").empty());
     // Monotonic within the transaction that wrote them.
     CHECK(Scalar(con, "SELECT count(DISTINCT _seq) FROM " + log) == "2");
 }

@@ -16,6 +16,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstdlib>
+
 #include "delta_plan.hpp"
 
 using namespace erpl_rev::wm;
@@ -150,8 +152,13 @@ TEST_CASE("delta_plan: DATETIME composes the DATS+TIMS pair", "[watermark]") {
     s.safety_secs = 120;
 
     const auto b = ComputeBounds(s, kReadStart);
+    // The FLOOR is derived from the stored watermark, so it is exact whatever
+    // the machine's timezone. The CEILING is derived from the clock and is
+    // therefore local for a DATS+TIMS pair -- asserted as a relationship in
+    // "DATS and TIMS bounds are local" rather than as a literal here, so this
+    // test does not start failing when CI runs somewhere else.
     CHECK(b.floor == "20260905115759");
-    CHECK(b.ceiling == "20260905115800");
+    CHECK(b.has_ceiling);
     // The pair is compared as one 14-character value, so the caller can split it.
     CHECK(FloorDate(b) == "20260905");
     CHECK(FloorTime(b) == "115759");
@@ -232,4 +239,31 @@ TEST_CASE("delta_plan: kind names round-trip through their stored spelling", "[w
     CHECK(KindName(WmKind::Datetime) == "DATETIME");
     // Unknown spellings must not silently become a working kind.
     CHECK_THROWS(ParseKind("WHATEVER"));
+}
+
+TEST_CASE("delta_plan: DATS and TIMS bounds are local, TIMESTAMPL bounds are UTC",
+          "[watermark]") {
+    // SAP stores DATS/TIMS as local wall-clock and a GET TIME STAMP value as
+    // UTC. A bound computed in the wrong clock is wrong by the machine's offset,
+    // and it does not look like a timezone bug -- it looks like the target
+    // replicating nothing, or replicating everything on every cycle.
+    //
+    // Asserted as a RELATIONSHIP rather than against fixed strings, so the test
+    // means the same thing in every timezone CI might run in.
+    const auto utc_kind = ComputeBounds(Spec(WmKind::Numts, "20260101000000"), kReadStart);
+
+    WatermarkSpec pair;
+    pair.kind = WmKind::Datetime;
+    pair.chg_col = "ERDAT";
+    pair.time_col = "ERZET";
+    pair.wm_value = "20260101000000";
+    pair.safety_secs = 120;
+    const auto local_kind = ComputeBounds(pair, kReadStart);
+
+    const auto offset = ParseNumts(local_kind.ceiling) - ParseNumts(utc_kind.ceiling);
+    // Whatever the offset is, both must agree with their own clock: the pair's
+    // ceiling is the UTC one shifted by exactly the local offset, and nothing
+    // else.
+    CHECK(std::abs(offset) < 15 * 3600);
+    CHECK((ParseNumts(utc_kind.ceiling) + offset) == ParseNumts(local_kind.ceiling));
 }

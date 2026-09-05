@@ -36,8 +36,15 @@ dep() {  # dep <adt-type> <NAME> <file> <desc> [<source-type>]
     local t="$1" n="$2" f="$3" d="$4" st="${5:-}"
     if [ ! -f "$AB/$f" ]; then echo "  MISS $n ($f)"; rc=1; return 1; fi
     adt object create --type "$t" --name "$n" --package '$TMP' --description "$d" >/dev/null 2>&1
-    local args=(source write "$n" --file "$AB/$f" --activate)
-    [ -n "$st" ] && args=(source write "$n" --type "$st" --file "$AB/$f" --activate)
+    # SAP's DDL parser rejects comments inside a table body, so a .ddl file keeps
+    # its explanation as a leading `*` block and it is stripped on the way in.
+    # Losing that prose to satisfy a parser would be the wrong trade.
+    local src="$AB/$f"
+    if [ "${f##*.}" = "ddl" ] && head -1 "$src" | grep -q '^\*'; then
+        src="$(mktemp)"; sed '/^\*/d' "$AB/$f" > "$src"
+    fi
+    local args=(source write "$n" --file "$src" --activate)
+    [ -n "$st" ] && args=(source write "$n" --type "$st" --file "$src" --activate)
     # "Nothing to activate" is what an UNCHANGED object returns -- success, not
     # failure. Matching only "Activated" made every re-run report the whole
     # catalogue as broken, which trains you to ignore the warnings.
@@ -51,6 +58,8 @@ dep() {  # dep <adt-type> <NAME> <file> <desc> [<source-type>]
 }
 cls()  { dep CLAS/OC "$1" "$2" "$3"; }
 prog() { dep PROG/P "$1" "$2" "$3"; }
+# SAP's DDL parser rejects comments inside a table body, so the repo copies keep
+# their explanation as a leading `*` block and it is stripped on the way in.
 tabl() { dep TABL/DT "$1" "$2" "$3" TABL; }
 intf() { dep INTF/OI "$1" "$2" "$3" INTF; }
 ddls() { dep DDLS/DF "$1" "$2" "$3" DDLS; }
@@ -59,6 +68,8 @@ echo "== DDIC fixtures =="
 tabl ZWIDE_BSEG zwide_bseg.ddl "wide BSEG repro (erpl-rev)"
 tabl ZDELTA_WM  zdelta_wm.ddl  "delta watermark test table (erpl-rev)"
 tabl ZDELTA_D   zdelta_d.ddl   "DATE watermark test table (complete-day rule)"
+tabl ZDELTA_ALL zdelta_all.ddl "one column per replication strategy (BSEG-shaped)"
+tabl ZDELTA_AUDIT zdelta_audit.ddl "change-generator audit (the loss/latency oracle)"
 tabl ZDELTA_DT  zdelta_dt.ddl  "DATS+TIMS watermark test table (pair comparison)"
 
 echo "== interfaces (before util -- replicate's signature references it) =="

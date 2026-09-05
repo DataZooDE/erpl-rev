@@ -209,17 +209,28 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       rv_error = |granularity gate: wm_kind=DATE cannot use cadence { is_state-cadence }|.
       RETURN.
     ENDIF.
+    " Every column of the state row is written here. A field added to ty_state but
+    " forgotten in this statement is not a compile error and not a runtime error:
+    " it simply arrives at the server as empty, and the feature that needed it
+    " does nothing. time_col was exactly that -- a DATETIME target registered
+    " cleanly, replicated its first batch, and then silently stopped, because the
+    " server was comparing a pair whose time half it had never been told about.
     DATA(lv_sql) =
       |INSERT INTO _erpl_rev_delta_state | &&
-      |(target,method,source_from,keys,chg_col,wm_kind,wm_value,safety_secs,cadence,extra,status) VALUES (| &&
+      |(target,method,source_from,keys,chg_col,time_col,wm_kind,wm_value,| &&
+      |safety_secs,safety_units,cadence,extra,status) VALUES (| &&
       |'{ q( is_state-target ) }','{ q( is_state-method ) }','{ q( is_state-source_from ) }',| &&
-      |'{ q( is_state-keys ) }','{ q( is_state-chg_col ) }','{ q( is_state-wm_kind ) }',| &&
+      |'{ q( is_state-keys ) }','{ q( is_state-chg_col ) }',| &&
+      |{ COND string( WHEN is_state-time_col IS INITIAL THEN 'NULL' ELSE |'{ q( is_state-time_col ) }'| ) },| &&
+      |'{ q( is_state-wm_kind ) }',| &&
       |{ COND string( WHEN is_state-wm_value IS INITIAL THEN 'NULL' ELSE |'{ q( is_state-wm_value ) }'| ) },| &&
-      |{ is_state-safety_secs },'{ q( is_state-cadence ) }',| &&
+      |{ is_state-safety_secs },{ is_state-safety_units },'{ q( is_state-cadence ) }',| &&
       |{ COND string( WHEN is_state-extra IS INITIAL THEN 'NULL' ELSE |'{ q( is_state-extra ) }'| ) },'IDLE') | &&
       |ON CONFLICT (target) DO UPDATE SET method=excluded.method, source_from=excluded.source_from, | &&
-      |keys=excluded.keys, chg_col=excluded.chg_col, wm_kind=excluded.wm_kind, wm_value=excluded.wm_value, | &&
-      |safety_secs=excluded.safety_secs, cadence=excluded.cadence, extra=excluded.extra|.
+      |keys=excluded.keys, chg_col=excluded.chg_col, time_col=excluded.time_col, | &&
+      |wm_kind=excluded.wm_kind, wm_value=excluded.wm_value, | &&
+      |safety_secs=excluded.safety_secs, safety_units=excluded.safety_units, | &&
+      |cadence=excluded.cadence, extra=excluded.extra|.
     DATA(ls) = zcl_erpl_rev_util=>query( lv_sql ).
     rv_error = ls-error.
   ENDMETHOD.
@@ -227,8 +238,10 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
   METHOD state.
     DATA(ls) = zcl_erpl_rev_util=>query(
       |SELECT target, method, source_from, keys, coalesce(chg_col,'') AS chg_col, | &&
+      |coalesce(time_col,'') AS time_col, | &&
       |coalesce(wm_kind,'') AS wm_kind, coalesce(wm_value,'') AS wm_value, | &&
-      |coalesce(safety_secs,0) AS safety_secs, coalesce(cadence,'manual') AS cadence, | &&
+      |coalesce(safety_secs,0) AS safety_secs, | &&
+      |coalesce(safety_units,0) AS safety_units, coalesce(cadence,'manual') AS cadence, | &&
       |coalesce(extra,'') AS extra, coalesce(status,'IDLE') AS status | &&
       |FROM _erpl_rev_delta_state WHERE target='{ q( iv_target ) }'| ).
     IF ls-error IS NOT INITIAL OR ls-row_count = 0. RETURN. ENDIF.
@@ -343,7 +356,15 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
     " advancing to the maximum would put it below the next floor permanently.
     DATA(lv_plan) = plan_json( iv_action = 'BEGIN_CYCLE'
                                iv_target = is_state-target
-                               iv_params = |\{"load_type":"{ iv_load_type }"\}| ).
+                               " SAP's own clock travels with the request. A DATS
+                               " or TIMS column is wall-clock in THIS system's
+                               " timezone, and the server has no way to know what
+                               " that is -- on A4H it is UTC while the server sat
+                               " at UTC+2, which showed up not as a timezone
+                               " complaint but as a DATETIME target that
+                               " replicated once and then went quiet.
+                               iv_params = |\{"load_type":"{ iv_load_type }",| &&
+                                           |"sap_now":"{ sy-datum }{ sy-uzeit }"\}| ).
     IF lv_plan IS INITIAL.
       rs-error = 'BEGIN_CYCLE returned nothing'.
       RETURN.
@@ -368,17 +389,20 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
     IF lv_plan CS '"read_rows":true'.
       DATA lv_where TYPE string.
 
-      IF lv_tcol IS NOT INITIAL.
+      IF lv_tcol IS NOT INITIAL AND lv_floor IS NOT INITIAL.
         " A DATS + TIMS pair, compared as one value. The parentheses matter: the
         " same-day case has to bind tighter than the later-day case, or every row
         " after the floor's time-of-day is selected on every later day.
+        "
+        " The substring is taken INSIDE this guard, not before it. On an initial
+        " load there is no floor at all, and offsetting into an empty string is a
+        " short dump rather than an empty predicate.
         DATA(lv_fd) = lv_floor(8).
-        DATA(lv_ft) = COND string( WHEN strlen( lv_floor ) >= 14 THEN lv_floor+8(6) ELSE '000000' ).
-        IF lv_floor IS NOT INITIAL.
-          lv_where = |( { lv_chg } > '{ lv_fd }' OR | &&
-                     |( { lv_chg } = '{ lv_fd }' AND { lv_tcol } > '{ lv_ft }' ) )|.
-        ENDIF.
-      ELSEIF lv_floor IS NOT INITIAL.
+        DATA(lv_ft) = COND string( WHEN strlen( lv_floor ) >= 14 THEN lv_floor+8(6)
+                                   ELSE '000000' ).
+        lv_where = |( { lv_chg } > '{ lv_fd }' OR | &&
+                   |( { lv_chg } = '{ lv_fd }' AND { lv_tcol } > '{ lv_ft }' ) )|.
+      ELSEIF lv_tcol IS INITIAL AND lv_floor IS NOT INITIAL.
         lv_where = |{ lv_chg } > '{ lv_floor }'|.
       ENDIF.
 

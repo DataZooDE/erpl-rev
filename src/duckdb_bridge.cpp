@@ -1158,12 +1158,57 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
                   " FROM " + upsert_src + " c";
     }
 
+    // The change log, if this target has one. Written inside the SAME transaction
+    // as the apply -- a log that records changes the target never received is
+    // worse than no log. _commit_ts comes from the trigger's own timestamp, so
+    // the trigger tier's latency is measurable exactly like the watermark tier's.
+    std::string log_sql;
+    {
+        auto le = con.Query("SELECT count(*) FROM _erpl_rev_delta_state "
+                            "WHERE target='" + target + "' AND coalesce(log_enabled,false)");
+        const bool want_log = !le->HasError() && le->RowCount() > 0 &&
+                              le->GetValue(0, 0).GetValue<int64_t>() > 0;
+        if (want_log) {
+            const std::string logtab = "_erpl_rev_log_" + LowerName(target);
+            auto ex = con.Query("SELECT count(*) FROM duckdb_tables() WHERE table_name='" +
+                                logtab + "'");
+            const bool exists = !ex->HasError() && ex->RowCount() > 0 &&
+                                ex->GetValue(0, 0).GetValue<int64_t>() > 0;
+            if (exists) {
+                std::string cl, sl;
+                for (size_t i = 0; i < dcols.size(); ++i) {
+                    if (i) { cl += ","; sl += ","; }
+                    cl += dcols[i];
+                    sl += cast_to("c." + dcols[i], dtypes[i]);
+                }
+                if (!cl.empty()) {
+                    const std::string src = keys_mode ? upsert_src : net_iu;
+                    log_sql = "INSERT INTO " + logtab + " (" + cl +
+                              ", _seq, _op, _run_id, _commit_ts, _applied_at) SELECT " + sl +
+                              ", nextval('" + logtab + "_seq'), c.\"_OP\", 0, "
+                              "try_strptime(c.\"_TS\", '%Y%m%d%H%M%S'), now() FROM " +
+                              src + " c";
+                }
+            }
+        }
+    }
+
     Exec(con, "BEGIN");
     try {
         Exec(con, del_sql);
         // del_iu removes every net-I/U key first; ins_sql then puts back only the
         // ones the re-read actually found. A key that vanished in between is
         // therefore deleted by construction, which is exactly what it should be.
+        if (!log_sql.empty()) {
+            auto lr = con.Query(log_sql);
+            // Best-effort: a log the shadow batch cannot satisfy (a column the
+            // re-read did not bring back) must not fail the apply itself.
+            // Best-effort by design, and silent rather than logged: duckdb_bridge
+            // deliberately has no logging dependency, and a failed append must
+            // not fail the apply. It shows up as a change log that stops growing,
+            // which the stress harness asserts on directly.
+            (void)lr->HasError();
+        }
         if (!del_iu_sql.empty()) { Exec(con, del_iu_sql); Exec(con, ins_sql); }
         else if (keys_mode) {
             // No data columns in common with the images (a keys-only re-read):

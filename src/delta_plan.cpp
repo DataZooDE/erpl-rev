@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <ctime>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace erpl_rev {
@@ -11,9 +12,9 @@ namespace {
 
 constexpr int64_t kDay = 86400;
 
-// Civil <-> epoch on UTC only. SAP change columns carry local wall-clock values,
-// but every value here is compared against another value from the SAME column,
-// so the arithmetic only has to be self-consistent -- never localised.
+
+// Civil <-> epoch on UTC only. Every value here is compared against another
+// value from the SAME column, so the arithmetic only has to be self-consistent.
 int64_t CivilToEpoch(int y, int mo, int d, int h, int mi, int s) {
     // Howard Hinnant's days_from_civil.
     y -= mo <= 2;
@@ -161,6 +162,7 @@ Bounds ComputeBounds(const WatermarkSpec &spec, int64_t read_start_epoch) {
             // Complete days only. as_of_date is captured ONCE per cycle by the
             // caller passing read_start, so a retry after midnight cannot make
             // the rule mean something different halfway through.
+            //
             b.as_of_date = FormatDats(read_start_epoch);
             // Any non-zero window has to round UP to a whole day, or it vanishes
             // against a day-granular column.

@@ -95,11 +95,19 @@ CdcPlan HanaDialect::Plan(const CdcSpec &spec) const {
     sel += Quote(p.op_col) + "," + Quote(p.seq_col);
     p.read_sql = "SELECT " + sel + " FROM " + Quote(p.log_table) +
                  " WHERE " + Quote(p.seq_col) + " > %POS% ORDER BY " + Quote(p.seq_col);
-    // read_from: the keys + op + seq (cast to INTEGER), no _TS — the ABAP ADBC reader
-    // binds these cleanly where it chokes on HANA TIMESTAMP / BIGINT host types.
+    // read_from: the keys + op + seq (cast to INTEGER), plus the trigger's commit
+    // timestamp as TEXT. The ABAP ADBC reader binds these cleanly where it chokes
+    // on HANA TIMESTAMP / BIGINT host types -- hence the casts rather than the
+    // native columns.
+    //
+    // _TS is what makes trigger replication measurable: it is the moment the
+    // change committed in SAP, so the difference between it and the apply time is
+    // the real end-to-end latency. Without it the trigger tier could only ever
+    // report how long a cycle took, not how stale the data was.
     std::string rcols;
     for (const auto &k : p.log_cols) rcols += Quote(k) + ",";
     rcols += Quote(p.op_col) + ",CAST(" + Quote(p.seq_col) + " AS INTEGER) AS " + Quote(p.seq_col);
+    rcols += ",TO_VARCHAR(\"_TS\", 'YYYYMMDDHH24MISS') AS \"_TS\"";
     p.read_from = "(SELECT " + rcols + " FROM " + Quote(p.log_table) + ") AS LOGREAD";
     p.prune_sql = "DELETE FROM " + Quote(p.log_table) +
                   " WHERE " + Quote(p.seq_col) + " <= %CONF%";

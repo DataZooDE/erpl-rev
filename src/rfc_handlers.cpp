@@ -568,7 +568,8 @@ extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE,
             const auto lt = ParseLoadType(JsonField(params, "load_type").empty()
                                               ? "D" : JsonField(params, "load_type"));
             const auto b = cycle::Begin(con, target, lt,
-                                        static_cast<int64_t>(std::time(nullptr)));
+                                        static_cast<int64_t>(std::time(nullptr)),
+                                        JsonField(params, "sap_now"));
             plan = std::string("{") +
                    "\"run_id\":" + std::to_string(b.run_id) + "," +
                    "\"stage\":" + json::QuoteString(b.stage_table) + "," +

@@ -54,8 +54,17 @@ struct CommitResult {
     std::string new_watermark;
 };
 
+// `sap_now` is SAP's own clock as YYYYMMDDHHMMSS, and it is not optional
+// decoration: a DATS/TIMS column is wall-clock in the SAP SYSTEM's timezone,
+// which the server cannot know and must not guess. Measured on A4H the two
+// differed by two hours, and the symptom was not "wrong timezone" -- it was a
+// DATETIME target that replicated its first batch and then silently stopped,
+// because every subsequent floor sat in the future.
+//
+// Empty falls back to the server clock, which is correct for the UTC-based
+// TIMESTAMPL kinds and is the best available answer for the rest.
 BeginResult Begin(duckdb::Connection &con, const std::string &target, LoadType load_type,
-                  int64_t read_start_epoch);
+                  int64_t read_start_epoch, const std::string &sap_now = "");
 
 CommitResult Commit(duckdb::Connection &con, const std::string &target, long long run_id,
                     const CommitCounts &counts);
