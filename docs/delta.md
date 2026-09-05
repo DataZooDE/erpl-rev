@@ -52,15 +52,32 @@ zcl_erpl_rev_delta=>register( VALUE #(
   source_from = 'MARA'                          " SAP entity to read / re-read
   keys        = 'MANDT,MATNR'                   " merge / anti-join key (DuckDB column names)
   chg_col     = 'CHANGED_AT'                    " watermark column (WATERMARK/INSERT_ONLY)
-  wm_kind     = 'NUMTS'                          " NUMTS | DATETIME | CHANGENR | INT | DATE
+  wm_kind     = 'NUMTS'                          " NUMTS | TIMESTAMPL | DATETIME | DATE | INT
+  time_col    = ''                              " DATETIME only: the TIMS half of the pair
   wm_value    = '20260101000000'                " last high-water (text); blank = first cycle reads all
-  safety_secs = 120                             " safety-interval overlap (absorbed by the idempotent merge)
+  safety_secs = 120                             " seconds of overlap, clock-based kinds
+  safety_units = 0                              " values of overlap, counter kinds (INT)
   cadence     = 'micro:120'                      " micro:<sec> | hourly | nightly | manual
   extra       = '{"objectclas":"MATERIAL"}' ) ).  " CHANGEDOC/INSERT_ONLY driver class
 ```
 
 > **Granularity gate:** registering `cadence='micro:*'` with `wm_kind='DATE'`
 > (a date-only column can't be sub-hourly) is rejected.
+
+> **`CHANGENR` is not a watermark kind.** The change number comes from a buffered
+> number range and is not monotonic in commit order, so an overlap counted in
+> change numbers bounds nothing. Registering it is refused, naming `CHANGEDOC` --
+> which positions on `UDATE`+`UTIME` -- as the alternative.
+
+### What each kind means
+
+| `wm_kind` | Column | Ceiling | Overlap |
+|---|---|---|---|
+| `NUMTS` | `YYYYMMDDHHMMSS` | read start − `safety_secs` | `safety_secs` seconds |
+| `TIMESTAMPL` | `…HHMMSS.fffffff` | as above, fraction preserved | `safety_secs` seconds |
+| `DATETIME` | a `DATS` + a `TIMS` column | as above, compared as one 14-char value | `safety_secs` seconds |
+| `DATE` | `DATS` | **yesterday** — today is never read | whole days, ≥ 1 when `safety_secs` > 0 |
+| `INT` | a monotonic counter | max of the staged rows − `safety_units` | `safety_units` values |
 
 Seed the target with an initial full load first (`zcl_erpl_rev_util=>replicate`),
 then register; a WATERMARK/CHANGEDOC/INSERT_ONLY target is self-creating with its PK
@@ -109,10 +126,11 @@ Install/remove the job from the report (or `Z_ERPL_REV_REPLICATE`'s Delta tab):
 - Programmatically: `zcl_erpl_rev_delta=>schedule( iv_minutes = 1 )` /
   `schedule( iv_remove = abap_true )` (uses `JOB_OPEN`/`JOB_SUBMIT`/`JOB_CLOSE`).
 
-A background-job period is **≥ 1 minute**. For genuine **sub-minute** micro-batch, use
-the report's `p_loop` (a job that ticks every `p_secs` via `WAIT`, holding a work
-process) or an external trigger. For most cases a 1-minute job is plenty — the
-`safety_secs` overlap + idempotent merge absorb the lag.
+A background-job period is **≥ 1 minute**. For genuine **sub-minute** replication run
+**`Z_ERPL_REV_DAEMON`**: one background job that ticks every `p_secs`, asks the server
+what is due and runs it. It is a singleton (a second start reports the running instance
+and exits), and the periodic `Z_ERPL_REV_DELTA` job re-submits it if its heartbeat goes
+stale, so it survives a system restart. For most cases a 1-minute job is plenty.
 
 ### One screen: load + register + schedule
 
@@ -129,16 +147,59 @@ background job that drives it. So "every 30 minutes" sets both; no separate numb
 
 ## Correctness contract
 
-Every cycle is **idempotent** (key-based merge / set-based snapshot diff) and
-re-runnable. A `safety_secs` overlap on the read guarantees no lost rows
-(at-least-once); the idempotent merge absorbs the re-delivered overlap. State is
-advanced in the server (one connection-local transaction per apply), so a failed
-cast or any error rolls the whole package back. A per-target **lease** prevents two
-cycles from overlapping (`status='RUNNING'` + a fresh `lease_ts`; a stale lease is
-reclaimed). There is no cross-system 2-phase commit.
+Every cycle reads a half-open window `(floor, ceiling]` of the change column. Both
+ends carry weight:
+
+- The **floor** is the stored watermark pulled *back* by the safety window, so rows
+  that committed late are re-read. The merge is keyed, so re-delivery is free — it
+  shows up as `rows_read` > `rows_applied` in the run statistics and nothing else.
+- The **ceiling** is a value the cycle is confident everything below has committed
+  by: the cycle's read start, minus the safety window. **The watermark advances to
+  the ceiling, never to the maximum of the rows that happened to be delivered.**
+
+That second point is the whole guarantee. Subtracting the safety window from the
+floor alone is *not* sufficient: if a cycle reads for longer than the window, a row
+committing during the read below the delivered maximum is skipped, and once the
+watermark reaches that maximum it is below the next floor forever. Advancing to the
+read-start ceiling instead is what makes the overlap actually bound the loss.
+
+The contract this buys is **at-least-once with a bounded lag**: no row is lost
+provided its commit is visible to a read starting more than `safety_secs` after the
+value it carries. That is a real assumption, and `safety_secs` is the dial for it —
+raise it on a system where transactions stay open a long time.
+
+The apply is atomic: merge, change-log append and watermark advance happen in **one
+transaction**, and `wm_value` moves only inside it, after the merge. A cycle that
+dies at any earlier point therefore leaves the watermark where it was, so the read
+is simply replayed and the orphaned staging table is free to discard.
+
+A cycle is fenced by `active_run_id`, not by the lease. A healthy cycle can block
+for longer than any lease TTL (the ingest pipe waits up to an hour), so the lease is
+advisory; the commit compare-and-swaps on the run id and refuses if the target was
+reclaimed in the meantime. There is no cross-system 2-phase commit.
 
 `CHANGENR` is buffered and **not strictly monotonic** in commit order, so CDHDR-driven
-methods watermark on `UDATE`+`UTIME` with a safety lag — never a bare `CHANGENR > wm`.
+methods watermark on `UDATE`+`UTIME` with the same safety offset applied — never a bare
+`CHANGENR > wm`.
+
+### Load types
+
+Every run is one of four, selectable with `sync run --load-type`:
+
+| Code | Meaning | Watermark |
+|---|---|---|
+| `D` | delta (default) | advances to the ceiling |
+| `F` | full reload — a data **repair** | **untouched**: a repair fixes data, it does not re-seed the delta |
+| `I` | init without data: adopt a position, transfer nothing | seeded from the source |
+| `L` | init + full load | advances to the ceiling |
+
+`I` is for a target already populated from somewhere else — a restore, a migration,
+a parquet drop.
+
+> **Upgrade note.** Before this, `safety_secs` was stored, exposed on the CLI and on
+> the Delta tab, and read by nothing: the read was `chg_col > wm` with no overlap at
+> all. Existing targets will now re-deliver more rows on their first cycles. That is
+> harmless — the merge is idempotent — and visible as `rows_read` > `rows_applied`.
 
 ## Demo & inspection (SAP GUI)
 
