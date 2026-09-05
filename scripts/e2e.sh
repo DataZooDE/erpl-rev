@@ -154,6 +154,42 @@ else
   ps -p "$SRV" >/dev/null || { cat /tmp/erpl_e2e_srv.log; fail "server died"; }
 fi
 
+
+# --- suite runner ------------------------------------------------------------
+# Every ABAP suite is one line in the table below: NAME|CLASS|file|marker|tag.
+# Selection is by environment, not by flags, because this script deliberately
+# refuses unknown flags:
+#
+#   ERPL_REV_E2E_ONLY='delta|cdc'   run only suites whose NAME or tag matches
+#   ERPL_REV_E2E_SKIP='soak|perf'   skip suites whose NAME or tag matches
+#
+# The marker convention is `<NAME> RESULT pass=<n> fail=0`. The assertion is
+# ALWAYS fail=0 plus an optional minimum pass count -- never an exact count.
+# Eight suites used to assert exact totals, so every added assertion inside a
+# suite meant hand-bumping a number here; those are the most rubber-stamped
+# lines in the file and the first to be "fixed" by making them match.
+ONLY="${ERPL_REV_E2E_ONLY:-}"
+SKIP="${ERPL_REV_E2E_SKIP:-@soak|@perf}"
+
+suite() {  # NAME CLASS file marker-prefix min-pass tag description
+  local name="$1" cls="$2" file="$3" marker="$4" minpass="${5:-1}" tag="${6:-}" desc="${7:-}"
+  if [ -n "$ONLY" ] && ! printf '%s %s' "$name" "$tag" | grep -qiE "$ONLY"; then return 0; fi
+  if [ -n "$SKIP" ] &&   printf '%s %s' "$name" "$tag" | grep -qiE "$SKIP";  then
+    echo "== $name (skipped) =="; return 0
+  fi
+  echo "== $name =="
+  [ -n "$desc" ] && echo "   $desc"
+  run "$cls" "$file"
+  echo "$OUT" | grep -qE "$marker RESULT pass=[0-9]+ fail=0" \
+    || fail "$name ($OUT)"
+  local got
+  got=$(echo "$OUT" | grep -oE "$marker RESULT pass=[0-9]+" | grep -oE '[0-9]+$' | head -1)
+  if [ -n "$got" ] && [ "$got" -lt "$minpass" ]; then
+    fail "$name ran only $got assertions, expected at least $minpass"
+  fi
+  echo "   $name OK ($got assertions)"
+}
+
 run() {  # cls file -> $OUT (cleaned). Uses ABSOLUTE --file path.
   local cls="$1" file="$HERE/$2"
   uvx erpl-adt "${ADT[@]}" object create --type CLAS/OC --name "$cls" \
@@ -178,93 +214,48 @@ echo "$OUT" | grep -q 'affected=' || fail "ingest affected"
 on_server test -f /tmp/erpl_rev_sap_export.parquet || fail "parquet not written"
 echo "   ingest OK (parquet written, upsert verified)"
 
-echo "== Console E2E (arbitrary SQL -> arbitrary result column names) =="
-# Realistic console queries: count(*), unaliased arith/func/CASE, >30-char
-# expression name, colliding sanitized names, NULL, mixed types, unicode.
-# Catches the class of bug where DuckDB column names (count_star(), (1 + 2), ...)
-# are invalid ABAP component names and crash the RTTS structure build.
-run ZCL_ERPL_REV_CONSOLETEST abap/zcl_erpl_rev_consoletest.abap
-echo "$OUT" | grep -q 'CONSOLE RESULT pass=9 fail=0' || fail "console test ($OUT)"
-echo "   console OK (9/9 realistic queries, no dump)"
+suite console ZCL_ERPL_REV_CONSOLETEST abap/zcl_erpl_rev_consoletest.abap CONSOLE 9 "" \
+  "arbitrary SQL to arbitrary result column names, without a dump"
 
-echo "== SLT-like replication E2E (field selection + source filter) =="
-# Projection keeps only the chosen columns (keys auto-retained), the filter is
-# applied at the SAP source (only matching rows transferred), UPSERT dedups on
-# re-run, and a bad column / bad WHERE returns a clean error instead of a dump.
-run ZCL_ERPL_REV_SLTTEST abap/zcl_erpl_rev_slttest.abap
-echo "$OUT" | grep -q 'SLT RESULT pass=37 fail=0' || fail "slt test ($OUT)"
-echo "   slt OK (37/37: projection, source filter, key-retention, error-safety, value-help, display)"
 
-echo "== Data-identity E2E (replicated == SAP source, every cell) =="
-# Exhaustively compares the replicated DuckDB target against the SAP source:
-# SFLIGHT every row x every column (direct), ZWIDE_BSEG 3000 rows x 390 cols
-# (per-row md5), REPOSRC 200 rows x 34 cols (large multi-chunk RSTR DATA + blank
-# DATS), plus a negative control proving the compare detects a change.
-run ZCL_ERPL_REV_DIFFTEST abap/zcl_erpl_rev_difftest.abap
-echo "$OUT" | grep -q 'DIFF RESULT pass=4 fail=0' || fail "diff test ($OUT)"
-echo "   diff OK (SFLIGHT 94x14 + ZWIDE 3000x390 + REPOSRC 200x34 identical; corruption detected)"
+suite slt ZCL_ERPL_REV_SLTTEST abap/zcl_erpl_rev_slttest.abap SLT 37 "" \
+  "projection, source filter, key retention, error safety"
 
-echo "== Delta (incremental) E2E (watermark / snapshot / change-doc / insert-only / orchestration) =="
-# Proves delta against REAL SAP transactions: a direct Open SQL change to ZDELTA_WM
-# (watermark merge + idempotent re-run), a physical DELETE reflected only via the
-# snapshot anti-join, a real BAPI_MATERIAL_SAVEDATA (MM02) writing genuine CDHDR/CDPOS
-# picked up by the change-doc re-read + the insert-only 2-step, and the orchestration
-# lease/granularity-gate/due-catch-up. Needs the delta classes + ZDELTA_WM + the new
-# Z_DUCKDB_SNAPSHOT_MERGE FM deployed (scripts/deploy-abap.sh).
-run ZCL_ERPL_REV_DELTATEST abap/zcl_erpl_rev_deltatest.abap
-echo "$OUT" | grep -qE 'DELTA RESULT pass=[0-9]+ fail=0' || fail "delta test ($OUT)"
-echo "   delta OK (watermark+idempotent, snapshot delete, real material change-doc/insert-only, orchestration)"
+
+suite diff ZCL_ERPL_REV_DIFFTEST abap/zcl_erpl_rev_difftest.abap DIFF 4 "" \
+  "every replicated cell equals the SAP source; corruption is detected"
+
+
+suite delta ZCL_ERPL_REV_DELTATEST abap/zcl_erpl_rev_deltatest.abap DELTA 1 "" \
+  "watermark, snapshot delete, real change documents, orchestration"
+
 
 # Trigger-CDC (opt-in physical-delete tier, ADR-0004): provisions REAL HANA triggers
 # on the source via the server-generated DDL, physically deletes rows, and proves one
 # CDC cycle reflects the deletes in the DuckDB target; idempotent re-run; teardown
 # leaves no orphan objects. Needs ZCL_ERPL_REV_CDC[TEST] + the CDC FMs (mkfm).
-echo "== Trigger-CDC E2E (real HANA triggers, physical deletes) =="
-run ZCL_ERPL_REV_CDCTEST abap/zcl_erpl_rev_cdctest.abap
-echo "$OUT" | grep -qE 'CDC RESULT pass=[0-9]+ fail=0' || fail "cdc test ($OUT)"
-echo "   trigger-CDC OK (provision real triggers, capture physical deletes, idempotent, teardown)"
+suite cdc ZCL_ERPL_REV_CDCTEST abap/zcl_erpl_rev_cdctest.abap CDC 1 "" \
+  "real HANA triggers capture physical deletes; teardown leaves nothing"
 
-echo "== Partitioned full-load E2E (coordinator heap + workers + deferred PK) =="
-# Two workers append DISJOINT key ranges into one heap (iv_create=false,
-# iv_build_pk=false); the coordinator builds the PRIMARY KEY once. Proves the merge
-# + deferred-PK contract behind parallel background-job replication.
-run ZCL_ERPL_REV_PARTEST abap/zcl_erpl_rev_partest.abap
-echo "$OUT" | grep -q 'PARTITION RESULT pass=9 fail=0' || fail "partition test ($OUT)"
-echo "   partition OK (2 disjoint workers -> one heap, PK built once, count parity;"
-echo "                 auto partition-col pick + auto job-count recommend)"
 
-echo "== Report parallel-branch E2E (Z_ERPL_REV_REPLICATE, real background jobs) =="
-# SUBMITs the end-user report with the parallel checkbox set; the report auto-picks
-# the partition column (BELNR) and runs 4 background worker jobs into one target,
-# building the PK once. Needs the report + worker PROGs deployed (deploy-abap.sh)
-# and >=1 free batch WP. Reads the report's list from memory and asserts parity.
-run ZCL_ERPL_REV_REPLRUN abap/zcl_erpl_rev_replrun.abap
-echo "$OUT" | grep -q 'REPLRUN RESULT pass=6 fail=0' || fail "report parallel test ($OUT)"
-echo "   report parallel OK (auto BELNR partition, 4 jobs, verify + parity, worker job-log progress)"
+suite partition ZCL_ERPL_REV_PARTEST abap/zcl_erpl_rev_partest.abap PARTITION 9 "" \
+  "disjoint workers into one heap, PK built once"
 
-echo "== External-target E2E (stage-then-publish: parquet / dataset / attached catalog) =="
-# Replicate a SAP slice into a local DuckDB holding table, then publish it via one
-# DuckDB statement to: a parquet file, a partitioned parquet dataset, and a table in
-# an ATTACHed catalog (a 2nd DuckDB file = the same SQL path as postgres/ducklake/
-# bigquery/iceberg). Plus the end-user report (Z_ERPL_REV_REPLICATE) writing parquet.
-run ZCL_ERPL_REV_PUBTEST abap/zcl_erpl_rev_pubtest.abap
-echo "$OUT" | grep -q 'PUBTEST RESULT pass=6 fail=0' || fail "publish test ($OUT)"
-echo "   publish OK (parquet file + dataset, attached-catalog full+append, report->parquet)"
 
-echo "== CDS view source E2E (DDIF resolves CDS; NODE filtered, keys auto-detected) =="
-# Replicate a CDS view entity (ZERPL_C_FLIGHTS over SFLIGHT) through the normal path:
-# describe + auto keys + count/value parity + CDS->parquet + WITH PARAMETERS + F4.
-# Needs the DDLS fixtures (one-time, see deploy-abap.sh).
-run ZCL_ERPL_REV_CDSTEST abap/zcl_erpl_rev_cdstest.abap
-echo "$OUT" | grep -q 'CDS RESULT pass=8 fail=0' || fail "cds test ($OUT)"
-echo "   cds OK (describe/NODE-filter, auto keys, count+value parity, parquet, params, F4, is_cds)"
+suite replrun ZCL_ERPL_REV_REPLRUN abap/zcl_erpl_rev_replrun.abap REPLRUN 6 "" \
+  "the end-user report's parallel branch, with real background jobs"
 
-echo "== BW/native (ADBC) source E2E (HANA-view stand-in for a calc view) =="
-# replicate_native reads via ADBC native SQL; a HANA VIEW created in-test stands in
-# for a _SYS_BIC calc view (no BW on this box). Count + value parity + native->parquet.
-run ZCL_ERPL_REV_BWTEST abap/zcl_erpl_rev_bwtest.abap
-echo "$OUT" | grep -q 'BW RESULT pass=5 fail=0' || fail "bw test ($OUT)"
-echo "   bw OK (ADBC read -> DuckDB: view + parameterized SQLScript table function, parity, parquet)"
+
+suite publish ZCL_ERPL_REV_PUBTEST abap/zcl_erpl_rev_pubtest.abap PUBTEST 6 "" \
+  "parquet file and dataset, attached catalog full and append"
+
+
+suite cds ZCL_ERPL_REV_CDSTEST abap/zcl_erpl_rev_cdstest.abap CDS 8 "" \
+  "CDS view entity as a source: keys, parity, parameters"
+
+
+suite bw ZCL_ERPL_REV_BWTEST abap/zcl_erpl_rev_bwtest.abap BW 5 "" \
+  "replicate_native over ADBC: a HANA view stands in for a calc view"
 
 # ---------------------------------------------------------------------------
 echo "== CLI E2E (operate the server from the shell) =="
