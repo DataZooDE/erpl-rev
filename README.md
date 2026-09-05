@@ -224,7 +224,7 @@ as `erpl`). Download it from the SAP Software Center, or copy it from an `erpl`
 checkout. DuckDB is fetched as an official prebuilt:
 ```bash
 cp -a /path/to/nwrfcsdk ./nwrfcsdk     # provides nwrfcsdk/linux/{include,lib}
-make duckdb-dist                       # fetch prebuilt libduckdb 1.5.4 into vendor/
+make duckdb-dist                       # fetch prebuilt libduckdb 1.5.5 into vendor/
 ```
 
 ### 2. Build & test
@@ -248,7 +248,7 @@ just `./erpl-rev-linux-amd64` with the `ERPL_REV_*` env below; the bundle
 self-extracts and sets its own loader path. The `LD_LIBRARY_PATH` line is **only**
 for the from-source `build/erpl_rev_server`, whose libs live elsewhere in the tree:
 ```bash
-export LD_LIBRARY_PATH=$PWD/nwrfcsdk/linux/lib:$PWD/vendor/duckdb-1.5.4
+export LD_LIBRARY_PATH=$PWD/nwrfcsdk/linux/lib:$PWD/vendor/duckdb-1.5.5
 ERPL_REV_GWHOST=<gateway-host> ERPL_REV_GWSERV=sapgw00 \
 ERPL_REV_DB_PATH=erpl-rev.duckdb \
   ./build/erpl_rev_server            # add --quack for the network server
@@ -359,7 +359,7 @@ ABAP ──CALL FUNCTION 'Z_DUCKDB_QUERY'/'Z_DUCKDB_INGEST' DESTINATION 'ERPL_RE
 A registered RFC server (`RfcCreateServer`/`RfcLaunchServer`) hosts a handful of
 function modules whose payloads are **JSON / binary-sXML over scalar `STRING`
 params** — schema-generic, so no custom DDIC structures. It links the official
-prebuilt **DuckDB 1.5.4** (`libduckdb.so`, parquet+json+quack built in); our code
+prebuilt **DuckDB 1.5.5** (`libduckdb.so`, parquet+json+quack built in); our code
 plus libstdc++/libgcc are static, leaving only `libduckdb.so` and the SAP `.so`
 trio dynamic.
 
@@ -371,10 +371,12 @@ CLI flags override env (**flag > env > default**); `--help` prints the full surf
 
 | Concern | Flag | Env var | Default |
 |---|---|---|---|
-| Gateway PROGRAM_ID | — | `ERPL_REV_PROGRAM_ID` | `ERPL_REV` |
-| Gateway host / service | — | `ERPL_REV_GWHOST` / `ERPL_REV_GWSERV` | `localhost` / `3300` |
+| Gateway PROGRAM_ID | `--program-id` | `ERPL_REV_PROGRAM_ID` | `ERPL_REV` |
+| Gateway host / service | `--gwhost` / `--gwserv` | `ERPL_REV_GWHOST` / `ERPL_REV_GWSERV` | `localhost` / `3300` |
 | Parallel registrations | — | `ERPL_REV_REG_COUNT` | `5` |
-| Enable quack | `--quack[=<listen>]` | `ERPL_REV_QUACK` | off |
+| Reach the gateway through a tunnel | `--tunnel-secret <name>` | `ERPL_REV_TUNNEL_SECRET` | — (off; see [docs/tunnel.md](docs/tunnel.md)) |
+| Tunnel far end / near end | `--tunnel-target` / `--tunnel-local-port` | `ERPL_REV_TUNNEL_TARGET` / `ERPL_REV_TUNNEL_LOCAL_PORT` | the gateway / a free loopback port |
+| Disable quack | `--no-quack` | `ERPL_REV_NO_QUACK` | quack is **on**, bound to loopback |
 | Quack bind / token | `--quack-listen` / `--quack-token` | `ERPL_REV_QUACK_LISTEN` / `ERPL_REV_QUACK_TOKEN` | `quack:localhost` (port 9494) / random |
 | DuckDB file | `--db <path>` | `ERPL_REV_DB_PATH` | `erpl-rev.duckdb` (`:memory:` for in-mem) |
 | Boot init SQL | `--init-sql` / `--init-file` | `ERPL_REV_DUCKDB_INIT` | — (ATTACH/secrets for external/cloud targets) |
@@ -433,6 +435,7 @@ drop the request silently with zero impact. Details: [`docs/telemetry.md`](docs/
 - [`docs/INSTALL.md`](docs/INSTALL.md) — SAP transport import + server install + upgrade/uninstall
 - [`docs/enable-rfc-registration.md`](docs/enable-rfc-registration.md) — gateway registration / `reginfo`
 - [`docs/security.md`](docs/security.md) — Basis hardening, RFC user, SNC, ACLs
+- [`docs/tunnel.md`](docs/tunnel.md) — optional: reaching the gateway when this host has no route to it
 - [`docs/sql-console.md`](docs/sql-console.md) — the in-GUI DuckDB SQL console
 - [`docs/telemetry.md`](docs/telemetry.md) — what's collected, where, and the three opt-outs
 - [`docs/docker.md`](docs/docker.md) — running the container image from ghcr.io

@@ -121,6 +121,23 @@ public:
     // Stop a quack server previously started on `listen` (CALL quack_stop(...)).
     void StopQuack(const std::string &listen);
 
+    // Open an optional erpl-tunnel forward for the SAP gateway leg: INSTALL/LOAD
+    // erpl_tunnel from the DuckDB community repository (signed, over HTTPS), then
+    // run `import_sql` (see tunnel::ImportSql). The secret it names is the
+    // operator's, defined in --init-file with erpl-tunnel's own CREATE SECRET, so
+    // no credential passes through here.
+    //
+    // Throws with an actionable message rather than a DuckDB one when the
+    // extension cannot be loaded -- the common cause is that no community build
+    // exists for the exact DuckDB version this binary embeds, and "IO Error" does
+    // not lead anyone to that.
+    void StartTunnel(const std::string &import_sql);
+
+    // The tunnels() row whose local_port matches, as a JSON object, or "" when
+    // no such forward exists. Used to prove the forward came up before the RFC
+    // registration is attempted, and to report liveness afterwards.
+    std::string TunnelInfo(const std::string &local_port);
+
     // Ingest JSON rows into `target`:
     //  - Insert: append all rows.
     //  - Upsert: INSERT ... ON CONFLICT (key_cols) DO UPDATE (target needs a

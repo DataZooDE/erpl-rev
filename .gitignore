@@ -15,3 +15,6 @@ dev_rfc.log
 # self-extracting bundle output
 /dist/
 .codex-delegate/
+
+# agent-crew run artifacts (multi-agent review transcripts)
+.crew/

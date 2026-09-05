@@ -40,6 +40,12 @@ struct Options : cli::ConnOptions {
     std::string gwhost, gwserv;
     bool package_set = false, program_set = false;
     bool gwhost_set = false, gwserv_set = false;
+    // Name of the erpl-tunnel secret the SERVER reaches the gateway through,
+    // if any. Empty is the normal case. doctor cannot probe such a gateway --
+    // the forward lives in the server process, not this one -- so this exists
+    // to stop it claiming it can.
+    std::string tunnel_secret;
+    bool tunnel_secret_set = false;
 
     bool print_runbook = false;
     bool save_password = false;
@@ -83,6 +89,11 @@ struct Diagnosis {
     bool probe_present = false;   // ZCL_ERPL_REV_DIAG, the round-trip probe
     bool destination_ok = false;
     bool gateway_reachable = false;
+    // True when reachability could not be established either way, because the
+    // gateway is reached through a tunnel this process does not hold. Distinct
+    // from `not reachable`: it must not produce a remedy telling the operator
+    // to go and look at firewalls.
+    bool gateway_unknown = false;
     bool stms_available = false;
     // Can the ADT user create and activate a class? setup deploys ABAP, and the
     // sync/replicate commands generate one, so both need S_DEVELOP. Unknown

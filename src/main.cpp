@@ -23,6 +23,7 @@
 #include "json_util.hpp"
 #include "sap_setup.hpp"
 #include "sap_uc.hpp"
+#include "tunnel.hpp"
 #include "erpl_rev_telemetry.hpp"
 
 #include <cctype>
@@ -128,6 +129,23 @@ struct Cli {
     bool init_sql_set = false;
     std::string init_file;
     bool init_file_set = false;
+    // Gateway coordinates. These were environment-only on `serve` while
+    // setup/doctor had flags for them, which was already an odd split; the
+    // optional tunnel makes it a real problem, because the gateway address has to
+    // stay sayable independently of where the RFC layer actually dials.
+    std::string gwhost;
+    bool gwhost_set = false;
+    std::string gwserv;
+    bool gwserv_set = false;
+    std::string program_id;
+    bool program_id_set = false;
+    // Optional erpl-tunnel forward. Empty secret => no tunnel, and every line of
+    // the startup path below behaves exactly as it did before it existed.
+    std::string tunnel_secret;
+    bool tunnel_secret_set = false;
+    std::string tunnel_target;
+    bool tunnel_target_set = false;
+    int tunnel_local_port = 0;      // 0 => pick a free loopback port
     bool help = false;
     bool smoke = false;
     bool no_telemetry = false;
@@ -163,6 +181,24 @@ void PrintHelp() {
         "                           postgres/ducklake/bigquery/iceberg targets.\n"
         "  --init-file <path>       Read boot SQL from a file (for multi-line ATTACH/\n"
         "                           secret scripts). Overrides --init-sql.\n"
+        "  --gwhost <host>          SAP gateway host (default localhost).\n"
+        "  --gwserv <service>       SAP gateway service/port (default 3300).\n"
+        "  --program-id <id>        Gateway PROGRAM_ID (default ERPL_REV).\n"
+        "\nOptional tunnel — only needed when this host has no route to the gateway:\n"
+        "  --tunnel-secret <name>   Reach the gateway through an erpl-tunnel forward.\n"
+        "                           <name> is a secret YOU define in --init-file with\n"
+        "                           erpl-tunnel's own SQL, e.g.\n"
+        "                             CREATE SECRET sap (TYPE tunnel, backend 'tailscale',\n"
+        "                                                auth_key '…', state_dir '…');\n"
+        "                           erpl-rev installs the extension, opens the forward\n"
+        "                           and dials it — --gwhost/--gwserv keep naming the\n"
+        "                           REAL gateway everywhere (logs, doctor, reginfo).\n"
+        "                           Omit this and nothing tunnel-related runs at all.\n"
+        "  --tunnel-target <h:port> Forward somewhere other than --gwhost:--gwserv.\n"
+        "                           Numeric port (erpl-tunnel forwards TCP, so 3300,\n"
+        "                           not sapgw00).\n"
+        "  --tunnel-local-port <n>  Pin the near end. Default: a free loopback port,\n"
+        "                           chosen at boot so nothing has to be kept in sync.\n\n"
         "  --smoke                  Self-check: load + call the bundled RFC backend\n"
         "                           and DuckDB, print their versions, exit 0.\n"
         "                           Needs no SAP gateway (used by the CI smoke test).\n"
@@ -173,6 +209,10 @@ void PrintHelp() {
         "  ERPL_REV_GWHOST        SAP gateway host            (default localhost)\n"
         "  ERPL_REV_GWSERV        SAP gateway service         (default 3300)\n"
         "  ERPL_REV_REG_COUNT     parallel registrations      (default 5)\n"
+        "  ERPL_REV_TUNNEL_SECRET erpl-tunnel secret to reach the gateway through\n"
+        "                         (default: none -- no tunnel, dial the gateway)\n"
+        "  ERPL_REV_TUNNEL_TARGET tunnel far end host:port  (default: the gateway)\n"
+        "  ERPL_REV_TUNNEL_LOCAL_PORT  tunnel near end     (default: a free port)\n"
         "  ERPL_REV_NO_QUACK      disable quack (truthy)      (default: quack on)\n"
         "  ERPL_REV_QUACK_LISTEN  quack bind URI              (default quack:localhost)\n"
         "  ERPL_REV_QUACK_TOKEN   pin quack auth token        (default random)\n"
@@ -244,6 +284,33 @@ Cli ParseArgs(int argc, char **argv) {
         } else if (key == "--db" || key == "--db-path") {
             c.db_path = take_value();
             c.db_set = true;
+        // Serve-only: setup/doctor have their own --gwhost/--gwserv/--program-id,
+        // parsed further down by setup::ParseOption into a different struct.
+        // Without the verb guard these branches would swallow them first and
+        // silently break both verbs.
+        } else if (c.verb == Verb::Serve && key == "--gwhost") {
+            c.gwhost = take_value();
+            c.gwhost_set = true;
+        } else if (c.verb == Verb::Serve && key == "--gwserv") {
+            c.gwserv = take_value();
+            c.gwserv_set = true;
+        } else if (c.verb == Verb::Serve && key == "--program-id") {
+            c.program_id = take_value();
+            c.program_id_set = true;
+        } else if (c.verb == Verb::Serve && key == "--tunnel-secret") {
+            c.tunnel_secret = take_value();
+            c.tunnel_secret_set = true;
+        } else if (c.verb == Verb::Serve && key == "--tunnel-target") {
+            c.tunnel_target = take_value();
+            c.tunnel_target_set = true;
+        } else if (c.verb == Verb::Serve && key == "--tunnel-local-port") {
+            const std::string v = take_value();
+            try { c.tunnel_local_port = std::stoi(v); }
+            catch (...) {
+                std::fprintf(stderr, "erpl-rev: --tunnel-local-port wants a number, got '%s'.\n",
+                             v.c_str());
+                c.bad_args = true;
+            }
         } else if (key == "--init-sql") {
             c.init_sql = take_value();
             c.init_sql_set = true;
@@ -368,9 +435,36 @@ int main(int argc, char **argv) {
     std::signal(SIGINT, OnSigInt);
     std::signal(SIGTERM, OnSigInt);
 
-    const std::string program_id = Env("ERPL_REV_PROGRAM_ID", "ERPL_REV");
-    const std::string gwhost     = Env("ERPL_REV_GWHOST", "localhost");
-    const std::string gwserv     = Env("ERPL_REV_GWSERV", "3300");
+    const std::string program_id =
+        cli.program_id_set ? cli.program_id : Env("ERPL_REV_PROGRAM_ID", "ERPL_REV");
+    const std::string gwhost =
+        cli.gwhost_set ? cli.gwhost : Env("ERPL_REV_GWHOST", "localhost");
+    const std::string gwserv =
+        cli.gwserv_set ? cli.gwserv : Env("ERPL_REV_GWSERV", "3300");
+
+    // Optional gateway tunnel. Everything below is a no-op unless a secret is
+    // named: Resolve() then reports the gateway itself as the dial target, which
+    // is what RfcCreateServer has always been given.
+    const std::string tunnel_secret =
+        cli.tunnel_secret_set ? cli.tunnel_secret : Env("ERPL_REV_TUNNEL_SECRET", "");
+    const std::string tunnel_target =
+        cli.tunnel_target_set ? cli.tunnel_target : Env("ERPL_REV_TUNNEL_TARGET", "");
+    int tunnel_local_port = cli.tunnel_local_port;
+    if (tunnel_local_port == 0 && !tunnel_secret.empty()) {
+        try { tunnel_local_port = std::stoi(Env("ERPL_REV_TUNNEL_LOCAL_PORT", "0")); }
+        catch (...) { tunnel_local_port = 0; }
+        if (tunnel_local_port == 0) tunnel_local_port = cli::FreeLoopbackPort();
+    }
+    tunnel::Plan tunnel_plan;
+    {
+        std::string terr;
+        if (!tunnel::Resolve(tunnel_secret, tunnel_target, gwhost, gwserv,
+                             tunnel_local_port, tunnel_plan, terr)) {
+            log::get().Error("tunnel", "cannot configure the gateway tunnel",
+                             {{"reason", terr}});
+            return 2;
+        }
+    }
 
     // Config precedence: CLI flag > environment > default. Env stays the
     // 12factor baseline; flags are an override convenience.
@@ -437,9 +531,33 @@ int main(int argc, char **argv) {
     try {
         InstallHandlers(db_path, init_sql);
 
+        // Bring the forward up BEFORE registering. Five registrations onto a
+        // local port nothing forwards would come back as CM_ALLOCATE_FAILURE_RETRY
+        // and send the operator to look at the gateway, so a tunnel that does not
+        // come up has to stop the boot here, while the cause is still nameable.
+        if (tunnel_plan.enabled) {
+            StartTunnelForward(tunnel::ImportSql(tunnel_plan));
+            const std::string info = TunnelForwardInfo(tunnel_plan.dial_port);
+            if (info.empty())
+                throw std::runtime_error(
+                    "the erpl-tunnel forward to " + tunnel_plan.gwhost + ":" +
+                    tunnel_plan.gwserv + " did not come up (secret '" +
+                    tunnel_plan.secret + "'); tunnels() reports no forward on local port " +
+                    tunnel_plan.dial_port);
+            log::get().Info("tunnel", "gateway forward up",
+                            {{"secret", tunnel_plan.secret},
+                             {"gateway", tunnel_plan.gwhost + ":" + tunnel_plan.gwserv},
+                             {"via", tunnel_plan.dial_host + ":" + tunnel_plan.dial_port},
+                             {"tunnel", info}});
+        }
+
         auto uprog = std2uc(program_id);
-        auto ugwh  = std2uc(gwhost);
-        auto ugws  = std2uc(gwserv);
+        // The RFC layer dials the near end of the forward when one is configured,
+        // and the gateway itself otherwise. gwhost/gwserv keep their meaning for
+        // every human-facing consumer -- see the log line below, doctor, and the
+        // reginfo handout -- which is the whole reason the two are separate.
+        auto ugwh  = std2uc(tunnel_plan.dial_host);
+        auto ugws  = std2uc(tunnel_plan.dial_port);
         // Register SEVERAL parallel connections at the gateway. With a single
         // registration (REG_COUNT=1) a second or concurrent CALL FUNCTION finds
         // the lone connection busy and fails with CM_ALLOCATE_FAILURE_RETRY
@@ -466,8 +584,15 @@ int main(int argc, char **argv) {
             throw_rfc("RfcLaunchServer", info);
         }
 
+        // gwhost/gwserv, not the dial target: this line is what an operator reads
+        // to confirm which SAP system they are attached to.
         log::get().Info("server", "listening (Ctrl-C to stop)",
-                        {{"program_id", program_id}, {"gwhost", gwhost}, {"gwserv", gwserv}});
+                        {{"program_id", program_id},
+                         {"gwhost", tunnel_plan.gwhost},
+                         {"gwserv", tunnel_plan.gwserv},
+                         {"via", tunnel_plan.enabled
+                                     ? "tunnel " + tunnel_plan.secret
+                                     : std::string("direct")}});
 
         // Bounded counts/kinds only — never gateway host/service or db path.
         int reg_count_n = 5;

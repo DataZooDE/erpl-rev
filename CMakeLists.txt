@@ -274,6 +274,7 @@ add_executable(erpl_rev_server
   src/cmd_sync.cpp
   src/abap_skeletons.cpp
   src/cli_common.cpp
+  src/tunnel.cpp
   src/sap_setup.cpp
   ${ERPL_ABAP_GENERATED}
   src/logging.cpp
@@ -323,6 +324,7 @@ if(TRUE)  # tests always build; DuckDB is in-tree
     test/test_cmd_queue.cpp
     test/test_table_render.cpp
     test/test_sap_setup.cpp
+    test/test_tunnel.cpp
     test/bench_ingest.cpp
     src/duckdb_bridge.cpp
     src/cdc_dialect.cpp
@@ -337,6 +339,7 @@ if(TRUE)  # tests always build; DuckDB is in-tree
     src/cmd_sync.cpp
     src/abap_skeletons.cpp
     src/cli_common.cpp
+    src/tunnel.cpp
     src/sap_setup.cpp
     src/adt.cpp
     ${ERPL_ABAP_GENERATED})

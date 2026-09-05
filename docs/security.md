@@ -47,6 +47,38 @@ If the server runs on a different host than the gateway, protect the channel wit
 - Gateway: `snc/enable=1`, and require SNC for the registration.
 - Same-host loopback only → SNC optional but still recommended.
 
+> **Known gap, stated plainly.** erpl-rev does not configure SNC itself — the RFC
+> connection parameters it passes are `program_id`, `gwhost`, `gwserv` and
+> `reg_count`, with no SNC pass-through. Setting the variables above therefore
+> means configuring the NW RFC SDK out of band (`sapnwrfc.ini` / its own
+> environment), and `doctor` cannot confirm it took effect. **Until that is
+> implemented, an off-box deployment carries SAP business data in cleartext
+> unless something else encrypts the leg.**
+>
+> An optional [tunnel](tunnel.md) (`--tunnel-secret`) is one such something: a
+> WireGuard mesh or SSH forward encrypts the pipe. It is **not** a substitute for
+> SNC — the mesh protects the channel, SNC proves the identity at each end — and
+> it must not be presented to a Basis team as one.
+
+### What runs on the server host
+The §7 assurances below are about the SAP system, and all of them hold. They say
+nothing about this machine, so for completeness:
+
+| Component | Provenance | Outbound |
+|---|---|---|
+| `erpl_rev_server` | this project; single static binary, DuckDB linked in | the SAP gateway; PostHog telemetry unless opted out |
+| `quack` extension | DuckDB signed extension repository, over HTTPS | none (it listens) |
+| `erpl_tunnel` extension — **only with `--tunnel-secret`** | DuckDB **community** repository, signed, over HTTPS | its control plane (self-hostable), DERP relay, UDP 41641/STUN with 443 fallback |
+| `httpfs` / `motherduck` / catalog extensions — only if your init SQL loads them | DuckDB signed extension repositories | your object store / warehouse |
+
+Nothing here needs `allow_unsigned_extensions`, and erpl-rev never enables it.
+
+A mesh control plane is **new audit surface**: enrollment, key minting and ACL
+edits appear in none of SMGW, `gw/logging` or UCON, and whoever administers the
+tailnet can grant reachability to the gateway. Put it under the same change
+control as the gateway itself, prefer a self-hosted control plane, and ship its
+logs where the SAP logs go.
+
 ## 4. RFC user — least privilege
 Create a dedicated **Communications**-type user (no dialog logon) for the FM calls
 and give it only the delivered role:

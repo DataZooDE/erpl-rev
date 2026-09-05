@@ -49,6 +49,8 @@ void Resolve(Options &o, bool allow_prompt) {
     // gwhost defaults to the already-resolved host, so it must come after it.
     o.gwhost     = cli::Pick(cfg, o.gwhost, o.gwhost_set, "ERPL_REV_GWHOST", "gwhost", o.host);
     o.gwserv     = cli::Pick(cfg, o.gwserv, o.gwserv_set, "ERPL_REV_GWSERV", "gwserv", "3300");
+    o.tunnel_secret = cli::Pick(cfg, o.tunnel_secret, o.tunnel_secret_set,
+                                "ERPL_REV_TUNNEL_SECRET", "tunnel_secret", "");
 }
 
 // Having typed a host, a client and a user once, nobody wants to type them
@@ -77,6 +79,10 @@ void OfferToSave(const Options &o) {
     cfg["gwhost"] = o.gwhost;
     cfg["gwserv"] = o.gwserv;
     cfg["program_id"] = o.program_id;
+    // Persist the tunnel secret NAME (never a credential -- the secret itself
+    // lives in the server's --init-file) so a later `doctor` knows not to claim
+    // it probed a gateway it cannot reach from here.
+    if (!o.tunnel_secret.empty()) cfg["tunnel_secret"] = o.tunnel_secret;
     if (!o.package.empty()) cfg["package"] = o.package;
     // Consent to store a password is given per run, not inherited from whatever
     // is already in the file: without this, one --save-password keeps the secret
@@ -122,6 +128,7 @@ bool ParseOption(const std::string &key, bool, const std::function<std::string()
     else if (key == "--program-id") { o.program_id = take(); o.program_set = true; }
     else if (key == "--gwhost")     { o.gwhost = take();     o.gwhost_set = true; }
     else if (key == "--gwserv")     { o.gwserv = take();     o.gwserv_set = true; }
+    else if (key == "--tunnel-secret") { o.tunnel_secret = take(); o.tunnel_secret_set = true; }
     else if (key == "--print-runbook")  { o.print_runbook = true; }
     else if (key == "--save-password")  { o.save_password = true; }
     else return false;
@@ -149,6 +156,10 @@ void PrintHelp() {
         "  --program-id <id>        Gateway PROGRAM_ID (default ERPL_REV)\n"
         "  --gwhost <h>             Gateway host (default: the SAP host)\n"
         "  --gwserv <p>             Gateway service/port (default 3300)\n"
+        "  --tunnel-secret <name>   The erpl-tunnel secret the SERVER reaches the gateway\n"
+        "                           through, if any. doctor then reports gateway\n"
+        "                           reachability as unknown instead of probing a local\n"
+        "                           forward it does not hold and calling that success.\n"
         "  --dry-run                Show the change set and stop. Writes nothing.\n"
         "  --non-interactive        Never prompt; fail instead. For CI. This is not\n"
         "                           consent to change the system -- add --yes for that.\n"
@@ -286,13 +297,32 @@ Diagnosis Diagnose(const Options &o) {
 
     // 5. Can this machine even reach the gateway? Checked from here, because
     //    that is where the server will register from.
-    d.gateway_reachable = cli::TcpReachable(o.gwhost, o.gwserv);
-    add("gateway.reachable", "gateway reachable from this machine",
-        d.gateway_reachable ? Status::Ok : Status::Fail,
-        o.gwhost + ":" + o.gwserv,
-        d.gateway_reachable ? "" :
-        "Nothing can register until this host can open a TCP connection to the\n"
-        "        gateway. Check the host/port (--gwhost/--gwserv), firewalls and routing.");
+    if (!o.tunnel_secret.empty()) {
+        // The forward lives inside the SERVER's DuckDB, not in this CLI process,
+        // so there is nothing here to probe through. Probing anyway would connect
+        // to the server's local end -- bound whether or not the far side is alive
+        // -- and report a healthy gateway on the strength of a socket that proves
+        // nothing. An honest Unknown beats a false Ok; this is the same stance
+        // gateway.reginfo takes below for a thing it cannot read.
+        d.gateway_unknown = true;
+        add("gateway.reachable", "gateway reachable from the server",
+            Status::Unknown,
+            o.gwhost + ":" + o.gwserv + " through tunnel '" + o.tunnel_secret + "'",
+            "Reached through an erpl-tunnel forward held by the server process, not\n"
+            "        by this one, so it cannot be probed from here -- an actual\n"
+            "        registration proves it. Check the server's boot log for\n"
+            "        \"tunnel: gateway forward up\".");
+    } else {
+        d.gateway_reachable = cli::TcpReachable(o.gwhost, o.gwserv);
+        add("gateway.reachable", "gateway reachable from this machine",
+            d.gateway_reachable ? Status::Ok : Status::Fail,
+            o.gwhost + ":" + o.gwserv,
+            d.gateway_reachable ? "" :
+            "Nothing can register until this host can open a TCP connection to the\n"
+            "        gateway. Check the host/port (--gwhost/--gwserv), firewalls and routing.\n"
+            "        If this host has no route to the gateway at all, the server can reach\n"
+            "        it through a tunnel instead -- see --tunnel-secret.");
+    }
 
     // The reginfo allow-list cannot be read remotely -- it is a file on the SAP
     // host. Say so plainly rather than leaving a silent gap in the report.
@@ -339,7 +369,10 @@ Plan MakePlan(const Diagnosis &d, const Options &o) {
             "$TMP is a local, non-transportable package and some systems reap it. "
             "Fine to evaluate with; use --package ZERPL_CORE for anything lasting.");
     }
-    if (!d.gateway_reachable) {
+    // Only when reachability was actually tested and failed. Under a tunnel it
+    // was not tested at all, and telling the operator to fix a route this host
+    // does not need would send them after the wrong thing.
+    if (!d.gateway_reachable && !d.gateway_unknown) {
         p.manual_steps.push_back(
             "Make the gateway reachable from this host (" + o.gwhost + ":" + o.gwserv +
             ") -- nothing can register until then.");

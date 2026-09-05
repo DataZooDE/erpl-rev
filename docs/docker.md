@@ -76,7 +76,7 @@ gateway — handy as a post-pull sanity check:
 
 ```bash
 docker run --rm ghcr.io/datazoode/erpl-rev:latest --smoke
-# -> erpl-rev smoke ok: SAP NW RFC SDK 750 ...; DuckDB {"v":"v1.5.4"}
+# -> erpl-rev smoke ok: SAP NW RFC SDK 750 ...; DuckDB {"v":"v1.5.5"}
 ```
 
 ## Notes

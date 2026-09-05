@@ -52,6 +52,14 @@ std::string LineStartingWith(const std::string &output, const std::string &prefi
 // most expensive failure to debug after the fact.
 bool TcpReachable(const std::string &host, const std::string &port);
 
+// A loopback TCP port nothing is listening on, or 0 if one cannot be found.
+// Used to pick the near end of an optional tunnel forward so the operator never
+// has to keep a port number in step with anything. Inherently a hint rather than
+// a reservation -- the port is released before the caller binds it -- which is
+// fine here because the only racer would be another process on the same host,
+// and the forward fails loudly at boot if it loses.
+int FreeLoopbackPort();
+
 // How the outside world sees this machine; "<this-host>" if it cannot be told.
 std::string LocalHostname();
 
