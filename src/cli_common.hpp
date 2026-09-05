@@ -75,6 +75,12 @@ std::filesystem::path ConfigPath();
 ConfigMap ReadConfig();
 bool WriteConfig(const ConfigMap &kv);
 
+// Write `body` to `p` at mode 0600, atomically. The obvious version --
+// truncate, write, chmod -- leaves a window in which a file holding a secret
+// is world-readable, and a truncated file if the process dies mid-write.
+// Exposed because `setup` scaffolds an init-file that may carry a tunnel key.
+bool WriteSecretFile(const std::filesystem::path &p, const std::string &body);
+
 // ---------------------------------------------------------------------------
 // Connection options, shared by every command that can reach SAP.
 //

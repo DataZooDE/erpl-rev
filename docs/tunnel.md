@@ -47,7 +47,47 @@ inferring it, and pin the ACL to that. If the server is in a cloud VPC this is
 usually an improvement — behind NAT or an autoscaling SNAT range there was no
 stable address to pin in the first place.
 
-## Setup
+## The easy path: let `setup` do it
+
+When `erpl-rev setup` finds the gateway unreachable and no tunnel configured, it
+stops and offers the choice rather than reporting the failure and moving on:
+
+```
+This machine cannot reach the gateway at sapgw.internal:3300.
+Two ways forward:
+
+  1. A route. Ask for outbound TCP from this host to that one host and
+     port. Usually the cheapest fix, and it needs nothing from erpl-rev.
+  2. A tunnel. The server reaches the gateway through an erpl-tunnel
+     forward (Tailscale, NetBird or SSH). Also encrypts the leg, which
+     matters here: erpl-rev cannot configure SNC yet, so an off-box
+     deployment is otherwise cleartext.
+
+Set up a tunnel now? [y/N]:
+```
+
+Say yes and it asks for the backend, a name for the secret, the node name and
+where to keep the node identity, then reads the auth key **without echoing it**.
+It writes the `CREATE SECRET` block to `<config dir>/init.sql` at mode 0600 —
+appending, so any `ATTACH` statements or warehouse secrets already in that file
+survive — and prints the exact command to start the server:
+
+```
+  Wrote /home/you/.config/erpl-rev/init.sql (mode 0600).
+  Start the server with:
+
+    erpl-rev serve --gwhost sapgw.internal --gwserv 3300 \
+         --tunnel-secret sap_gateway --init-file /home/you/.config/erpl-rev/init.sql
+```
+
+Leave the key blank if you do not have it yet: the file is written with a marked
+`PASTE-YOUR-KEY-HERE` placeholder and a `TODO`, rather than an empty literal that
+would parse and then fail to authenticate at boot.
+
+`--non-interactive` never prompts — it prints the same two options and tells you
+to re-run with `--tunnel-secret`.
+
+## Doing it by hand
 
 **1. Define the secret.** This is erpl-tunnel's own SQL and its own credential;
 erpl-rev never sees the key. Put it in the boot init file, mode 0600:
@@ -110,7 +150,7 @@ erpl-rev doctor --gwhost sapgw.internal --gwserv 3300 --tunnel-secret sap
 An honest unknown, not a false pass. `erpl-rev setup` persists the secret's *name*
 (never the credential) so later runs remember.
 
-## Why not just write it by hand
+## Why not just set ERPL_REV_GWHOST=127.0.0.1
 
 You can do all of this with `--init-sql` and `ERPL_REV_GWHOST=127.0.0.1`, and it
 works — but the configuration then says the SAP gateway is on loopback, and

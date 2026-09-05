@@ -130,3 +130,97 @@ TEST_CASE("an out-of-range local port is refused", "[tunnel]") {
     CHECK_FALSE(tunnel::Resolve("sap", "", "sapgw.corp", "3300", 0, p, err));
     CHECK_FALSE(tunnel::Resolve("sap", "", "sapgw.corp", "3300", 70000, p, err));
 }
+
+// ---------------------------------------------------------------------------
+// Scaffolding for `erpl-rev setup`
+//
+// The generated block is erpl-tunnel's own SQL. Generating it rather than asking
+// the operator to copy it out of a doc is the point: a mistyped backend option
+// produces a secret that parses and then fails at boot, which is a long way from
+// where the mistake was made.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("backend names round-trip, and nothing else is accepted", "[tunnel]") {
+    tunnel::Backend b;
+    REQUIRE(tunnel::ParseBackend("tailscale", b));
+    CHECK(std::string(tunnel::BackendName(b)) == "tailscale");
+    REQUIRE(tunnel::ParseBackend("netbird", b));
+    CHECK(std::string(tunnel::BackendName(b)) == "netbird");
+    REQUIRE(tunnel::ParseBackend("ssh", b));
+    CHECK(std::string(tunnel::BackendName(b)) == "ssh");
+    CHECK_FALSE(tunnel::ParseBackend("wireguard", b));
+    CHECK_FALSE(tunnel::ParseBackend("", b));
+    CHECK_FALSE(tunnel::ParseBackend("Tailscale", b));   // exact, not fuzzy
+}
+
+TEST_CASE("the scaffolded secret loads the extension and names the right key", "[tunnel]") {
+    tunnel::SecretSpec s;
+    s.backend = tunnel::Backend::Tailscale;
+    s.secret = "sap_gateway";
+    s.key = "tskey-auth-abc";
+    s.hostname = "ingest01";
+    s.state_dir = "/var/lib/erpl/mesh";
+    const std::string sql = tunnel::RenderSecretSql(s);
+
+    // CREATE SECRET (TYPE tunnel) is only recognised once the extension is loaded,
+    // so the block has to carry the INSTALL/LOAD itself.
+    CHECK_THAT(sql, ContainsSubstring("INSTALL erpl_tunnel FROM community"));
+    CHECK_THAT(sql, ContainsSubstring("LOAD erpl_tunnel"));
+    CHECK_THAT(sql, ContainsSubstring("CREATE OR REPLACE SECRET sap_gateway"));
+    CHECK_THAT(sql, ContainsSubstring("backend 'tailscale'"));
+    CHECK_THAT(sql, ContainsSubstring("auth_key 'tskey-auth-abc'"));
+    CHECK_THAT(sql, ContainsSubstring("state_dir '/var/lib/erpl/mesh'"));
+    // NetBird's key has a different name; using Tailscale's would fail at boot.
+    CHECK_THAT(sql, !ContainsSubstring("setup_key"));
+}
+
+TEST_CASE("netbird gets setup_key, not auth_key", "[tunnel]") {
+    tunnel::SecretSpec s;
+    s.backend = tunnel::Backend::NetBird;
+    s.secret = "nb";
+    s.key = "A2C8-E62B";
+    const std::string sql = tunnel::RenderSecretSql(s);
+    CHECK_THAT(sql, ContainsSubstring("backend 'netbird'"));
+    CHECK_THAT(sql, ContainsSubstring("setup_key 'A2C8-E62B'"));
+    CHECK_THAT(sql, !ContainsSubstring("auth_key"));
+}
+
+TEST_CASE("the ssh block carries the host-key warning", "[tunnel]") {
+    tunnel::SecretSpec s;
+    s.backend = tunnel::Backend::Ssh;
+    s.secret = "bastion";
+    s.hostname = "jump.corp";
+    s.ssh_user = "svc";
+    s.ssh_port = "2222";
+    s.key = "hunter2";
+    const std::string sql = tunnel::RenderSecretSql(s);
+    CHECK_THAT(sql, ContainsSubstring("TYPE ssh_tunnel"));
+    CHECK_THAT(sql, ContainsSubstring("host 'jump.corp'"));
+    CHECK_THAT(sql, ContainsSubstring("port 2222"));
+    CHECK_THAT(sql, ContainsSubstring("user 'svc'"));
+    // erpl-tunnel's own docs say the SSH backend does not pin host keys. Anyone
+    // reading the generated file should learn that from the file.
+    CHECK_THAT(sql, ContainsSubstring("does not pin"));
+}
+
+TEST_CASE("a missing key renders a marked placeholder, not an empty literal", "[tunnel]") {
+    // '' would parse and then fail to authenticate at boot, a long way from here.
+    tunnel::SecretSpec s;
+    s.backend = tunnel::Backend::Tailscale;
+    s.secret = "sap";
+    const std::string sql = tunnel::RenderSecretSql(s);
+    CHECK_THAT(sql, ContainsSubstring("PASTE-YOUR-KEY-HERE"));
+    CHECK_THAT(sql, ContainsSubstring("TODO"));
+    CHECK_THAT(sql, !ContainsSubstring("auth_key ''"));
+}
+
+TEST_CASE("a quote in a scaffolded value cannot break out of its literal", "[tunnel]") {
+    tunnel::SecretSpec s;
+    s.backend = tunnel::Backend::Tailscale;
+    s.secret = "sap";
+    s.key = "ab'cd";
+    s.hostname = "o'hare";
+    const std::string sql = tunnel::RenderSecretSql(s);
+    CHECK_THAT(sql, ContainsSubstring("'ab''cd'"));
+    CHECK_THAT(sql, ContainsSubstring("'o''hare'"));
+}

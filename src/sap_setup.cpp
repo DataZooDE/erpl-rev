@@ -8,6 +8,7 @@
 #include "abap_assets.hpp"
 #include "adt.hpp"
 #include "cli_common.hpp"
+#include "tunnel.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -495,6 +496,108 @@ bool MkfmSucceeded(const std::string &output, const std::vector<std::string> &ex
     return true;
 }
 
+// Where setup scaffolds boot SQL, next to the config file it already writes.
+std::filesystem::path InitFilePath() {
+    const auto cfg = cli::ConfigPath();
+    return cfg.empty() ? std::filesystem::path() : cfg.parent_path() / "init.sql";
+}
+
+// The gateway is unreachable from here and no tunnel is configured. That is a
+// fork in the road, not a failure to report and move past: either someone opens
+// a route, or the server reaches the gateway through a tunnel. Setup is the only
+// place that knows the diagnosis, so it is the right place to ask.
+//
+// Returns true when a tunnel was scaffolded (and o.tunnel_secret set), so the
+// caller can re-render the handout knowing reginfo's HOST= is now the exit node.
+bool OfferTunnel(Options &o, bool interactive) {
+    std::cout
+        << "\nThis machine cannot reach the gateway at " << o.gwhost << ":" << o.gwserv
+        << ".\n"
+           "Two ways forward:\n\n"
+           "  1. A route. Ask for outbound TCP from this host to that one host and\n"
+           "     port. Usually the cheapest fix, and it needs nothing from erpl-rev.\n"
+           "  2. A tunnel. The server reaches the gateway through an erpl-tunnel\n"
+           "     forward (Tailscale, NetBird or SSH). Also encrypts the leg, which\n"
+           "     matters here: erpl-rev cannot configure SNC yet, so an off-box\n"
+           "     deployment is otherwise cleartext. See docs/tunnel.md.\n\n";
+
+    if (!interactive) {
+        std::cout << "  Re-run with --tunnel-secret <name> to have setup scaffold option 2.\n\n";
+        return false;
+    }
+    if (!cli::Confirm("Set up a tunnel now?", false)) {
+        std::cout << "  Fine -- fix the route and re-run `erpl-rev doctor`.\n\n";
+        return false;
+    }
+
+    // Mesh first, deliberately: erpl-tunnel's own security guide says the SSH
+    // backend does not pin the server's host key, so a bastion is MITM-able while
+    // presenting as encrypted. Offering it first would recommend the weakest one.
+    const std::string backend_in = cli::Prompt(
+        "  Backend — tailscale, netbird or ssh (mesh backends authenticate peers by\n"
+        "  key; the SSH backend does not pin host keys)", "tailscale");
+    tunnel::Backend backend;
+    if (!tunnel::ParseBackend(backend_in, backend)) {
+        std::cout << "  '" << backend_in << "' is not one of tailscale, netbird, ssh."
+                     " Skipping.\n\n";
+        return false;
+    }
+
+    tunnel::SecretSpec spec;
+    spec.backend = backend;
+    spec.secret = cli::Prompt("  Name for the secret", "sap_gateway");
+    if (backend == tunnel::Backend::Ssh) {
+        spec.hostname = cli::Prompt("  SSH bastion host", "");
+        spec.ssh_user = cli::Prompt("  SSH user", "");
+        spec.ssh_port = cli::Prompt("  SSH port", "22");
+    } else {
+        spec.hostname = cli::Prompt("  Node name for this server on the mesh",
+                                    cli::LocalHostname());
+        spec.state_dir = cli::Prompt("  Where to persist the node identity",
+                                     "/var/lib/erpl/mesh");
+    }
+    // Never a flag, never echoed -- the same rule the SAP password follows. Empty
+    // is allowed and renders a marked placeholder, which is the honest outcome
+    // when the operator does not have the key to hand yet.
+    spec.key = cli::PromptSecret(
+        backend == tunnel::Backend::Ssh    ? "  SSH password (blank to fill in later)"
+        : backend == tunnel::Backend::NetBird ? "  NetBird setup key (blank to fill in later)"
+                                              : "  Tailscale auth key (blank to fill in later)");
+
+    const auto path = InitFilePath();
+    if (path.empty()) {
+        std::cout << "  Cannot work out where to write the init file. Skipping.\n\n";
+        return false;
+    }
+    // Append rather than overwrite: --init-file is also where ATTACH statements
+    // and warehouse secrets live, and silently discarding those would be a much
+    // worse bug than anything this feature fixes.
+    std::string body;
+    {
+        std::ifstream in(path);
+        if (in) body.assign(std::istreambuf_iterator<char>(in), {});
+        if (!body.empty() && body.back() != '\n') body += "\n";
+        if (!body.empty()) body += "\n";
+    }
+    body += tunnel::RenderSecretSql(spec);
+
+    if (!cli::WriteSecretFile(path, body)) {
+        std::cout << "  Could not write " << path.string() << ". Skipping.\n\n";
+        return false;
+    }
+    o.tunnel_secret = spec.secret;
+
+    std::cout << "\n  Wrote " << path.string() << " (mode 0600"
+              << (spec.key.empty() ? ", with a placeholder key to fill in" : "") << ").\n"
+              << "  Start the server with:\n\n"
+              << "    erpl-rev serve --gwhost " << o.gwhost << " --gwserv " << o.gwserv
+              << " \\\n         --tunnel-secret " << spec.secret
+              << " --init-file " << path.string() << "\n\n"
+              << "  The gateway keeps its name everywhere: --gwhost is the real gateway,\n"
+              << "  and erpl-rev handles the forward and the local port itself.\n\n";
+    return true;
+}
+
 std::string RenderBasisHandout(const Diagnosis &d, const Options &o,
                                const std::string &server_host) {
     std::ostringstream s;
@@ -705,6 +808,11 @@ int RunSetup(Options o) {
     std::cout << "Diagnosing " << o.host << ":" << o.port << " (client " << o.client << ")…\n";
     Diagnosis d = Diagnose(o);
     PrintReport(d);
+
+    // Asked before the plan is printed, because the answer changes the reginfo
+    // line in the handout the plan hands over.
+    if (!d.gateway_reachable && !d.gateway_unknown && o.tunnel_secret.empty())
+        OfferTunnel(o, interactive);
 
     const Plan p = MakePlan(d, o);
 

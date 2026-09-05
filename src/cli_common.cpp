@@ -201,6 +201,8 @@ std::string Trim(std::string s) {
     return s;
 }
 
+} // namespace
+
 // Write `body` to `p` so that it is never briefly world-readable and never
 // left half-written. The obvious version -- truncate, write, chmod -- has a
 // window in which a file holding a secret is readable by anyone, and leaves a
@@ -232,8 +234,6 @@ bool WriteSecretFile(const std::filesystem::path &p, const std::string &body) {
     return out.good();
 #endif
 }
-
-} // namespace
 
 std::filesystem::path ConfigPath() {
 #ifdef _WIN32

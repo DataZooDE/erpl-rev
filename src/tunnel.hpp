@@ -73,4 +73,39 @@ bool Resolve(const std::string &secret, const std::string &target,
 // input and has no business terminating a literal.
 std::string ImportSql(const Plan &p);
 
+// ---------------------------------------------------------------------------
+// Scaffolding, for `erpl-rev setup`
+// ---------------------------------------------------------------------------
+
+// The three backends erpl-tunnel offers, in the order setup should present them:
+// a mesh first, because the SSH backend does not pin the server's host key
+// (erpl-tunnel's own docs/guides/security.md says so), which makes a bastion
+// MITM-able while looking encrypted. The intuitive ordering is the wrong one.
+enum class Backend { Tailscale, NetBird, Ssh };
+
+// Parse a backend name; false when it is not one of the three.
+bool ParseBackend(const std::string &name, Backend &out);
+const char *BackendName(Backend b);
+
+// What the operator needs to hand over for each backend. `key` is the auth key /
+// setup key / SSH password, and never appears anywhere but the generated file.
+struct SecretSpec {
+    Backend backend = Backend::Tailscale;
+    std::string secret;      // the name erpl-rev will pass to --tunnel-secret
+    std::string key;         // auth_key / setup_key / password; may be empty
+    std::string hostname;    // mesh node name, or the SSH host
+    std::string ssh_user;    // SSH only
+    std::string ssh_port;    // SSH only, default 22
+    std::string state_dir;   // mesh only; where the node identity persists
+};
+
+// Render the CREATE SECRET block for --init-file. This is erpl-tunnel's own SQL,
+// generated rather than copied out of a doc, so a typo in a backend option cannot
+// silently produce a secret that fails only at boot.
+//
+// An empty `key` renders a clearly-marked placeholder rather than an empty
+// literal: a secret that parses but cannot authenticate is worse than one that
+// obviously needs filling in.
+std::string RenderSecretSql(const SecretSpec &s);
+
 } // namespace erpl_rev::tunnel
