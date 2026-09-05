@@ -92,6 +92,11 @@ srv_kill() {
 }
 fail() { echo "E2E FAIL: $*" >&2; srv_kill; exit 1; }
 
+# Static gates first: they need no SAP, no build and no credentials, so a
+# violation should cost a second rather than a full e2e run.
+echo "== compliance (static) =="
+"$HERE/scripts/compliance-scan.sh" || fail "compliance scan"
+
 echo "== build =="
 if [ -n "$REMOTE" ]; then
   # Nothing here can build or test the other platform's binary; that is CI's job

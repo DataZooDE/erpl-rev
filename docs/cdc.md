@@ -41,7 +41,7 @@ and streams the rows, and (c) runs the opaque prune.
 
 | Mode | Triggers | Log payload | Use when |
 |------|----------|-------------|----------|
-| **DELETE_ONLY** (default) | `AFTER DELETE` only | keys | inserts/updates already come from the watermark tier — the trigger only closes the physical-delete gap (the Fivetran pattern; minimal write-path overhead) |
+| **DELETE_ONLY** (default) | `AFTER DELETE` only | keys | inserts/updates already come from the watermark tier — the trigger only closes the physical-delete gap, for minimal write-path overhead |
 | **FULL_IUD** | `AFTER INSERT`/`UPDATE`/`DELETE` | full row image | the source has no usable change column at all — the log carries the row so the server upserts I/U and deletes D, entirely server-side |
 
 ## Using it
@@ -107,5 +107,6 @@ the idempotent merge absorbs. The state machine guards transitions
   rows, and proves one CDC cycle reflects them in the DuckDB target; idempotent re-run;
   `run_due` heartbeat; teardown leaves no orphan objects. Prints `CDC RESULT pass=N fail=0`.
 
-See ADR-0004 in the design study for the rationale and the industry corroboration
-(Theobald Table CDC, Fivetran delete-only triggers, SLT/CDS-CDC key-only logging).
+See ADR-0004 in the design study for the rationale, and for how the three
+established approaches compare: table-level trigger CDC, delete-only triggers
+alongside a watermark tier, and SLT/CDS-CDC key-only logging.
