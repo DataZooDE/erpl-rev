@@ -17,7 +17,12 @@ namespace erpl_rev {
 
 enum class CdcMode {
     DeleteOnly,  // AFTER DELETE only — inserts/updates come from the watermark tier
-    FullIud,     // AFTER INSERT/UPDATE/DELETE — for sources without a usable change column
+    KeysIud,     // AFTER INSERT/UPDATE/DELETE, logging keys only — the cycle re-reads
+                 // the source for the row image. The default: cheaper on the write
+                 // path of a wide hot table than logging a full image per change.
+    ImageIud,    // AFTER INSERT/UPDATE/DELETE, logging the whole row — for sources
+                 // that cannot be re-read cheaply. Stored as FULL_IUD before the
+                 // rename; that spelling is still accepted on read, forever.
 };
 
 // What to provision. `keys` are the FULL target key columns (including the client,
@@ -26,8 +31,8 @@ enum class CdcMode {
 struct CdcSpec {
     std::string source;               // SAP source table, e.g. "SFLIGHT"
     std::vector<std::string> keys;    // key columns, in order
-    // All columns to log for FULL_IUD (so inserts/updates carry the row image the
-    // server upserts). Empty / DELETE_ONLY logs keys only (deletes need just the key).
+    // All columns to log for IMAGE_IUD (so inserts/updates carry the row image the
+    // server upserts). DELETE_ONLY and KEYS_IUD log keys only.
     std::vector<std::string> columns;
     CdcMode mode = CdcMode::DeleteOnly;
     std::string log_table;            // override; default ZCDC_<source>_LOG
@@ -54,7 +59,7 @@ struct CdcPlan {
     std::string seq_col = "_SEQ";
     std::vector<std::string> key_cols;        // merge/match key columns (== spec.keys)
     std::vector<std::string> log_cols;        // columns written to the log (keys, or
-                                              // all columns for FULL_IUD full-row)
+                                              // all columns for IMAGE_IUD full-row)
 };
 
 class CdcDialect {

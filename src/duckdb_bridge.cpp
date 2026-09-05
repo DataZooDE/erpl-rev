@@ -1,5 +1,7 @@
 #include "duckdb_bridge.hpp"
 #include "control_schema.hpp"
+
+#include <set>
 #include "payload.hpp"
 #include "json_util.hpp"
 #include "sxml_binary.hpp"
@@ -938,7 +940,8 @@ void DuckDbBridge::CdcAdvancePosition(const std::string &target, long long posit
 }
 
 CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::string &staging,
-                                      const std::vector<std::string> &keys) {
+                                      const std::vector<std::string> &keys,
+                                      const std::string &images) {
     CdcState st = CdcGet(target);
     if (!st.exists) throw std::runtime_error("CDC: no registration for " + target);
     CdcApplyResult res;
@@ -1014,12 +1017,57 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
     const std::string net_del = "(SELECT * FROM " + coalesced + " c WHERE lower(c.\"_op\")='d')";
     const std::string net_iu  = "(SELECT * FROM " + coalesced + " c WHERE lower(c.\"_op\") IN ('i','u'))";
 
-    // Data columns to upsert = target columns also present in staging (so delete-only
-    // staging, which carries only keys, yields a keys-only upsert == DO NOTHING).
+    // KEYS_IUD: the shadow log carries keys only and the row values come from a
+    // second staging table the cycle filled by re-reading the source. The log is
+    // still the only authority on WHICH keys changed and what the net op was --
+    // the images are only a source of values.
+    const bool keys_mode = !images.empty();
+    std::set<std::string> iset;
+    if (keys_mode) {
+        auto icols = con.Query("SELECT * FROM " + images + " LIMIT 0");
+        if (icols->HasError())
+            throw std::runtime_error("CDC: images describe failed: " + icols->GetError());
+        for (duckdb::idx_t c = 0; c < icols->ColumnCount(); c++)
+            iset.insert(LowerName(icols->names[c]));
+    }
+    auto in_images = [&](const std::string &n) { return iset.count(n) > 0; };
+
+    // Data columns to upsert = target columns also present in the value source
+    // (so delete-only staging, which carries only keys, yields a keys-only
+    // upsert == DO NOTHING).
     std::vector<std::string> dcols, dtypes;
     for (duckdb::idx_t c = 0; c < tcols->ColumnCount(); c++) {
         std::string n = LowerName(tcols->names[c]);
-        if (in_staging(n)) { dcols.push_back(n); dtypes.push_back(tcols->types[c].ToString()); }
+        const bool present = keys_mode ? in_images(n) : in_staging(n);
+        if (present) { dcols.push_back(n); dtypes.push_back(tcols->types[c].ToString()); }
+    }
+
+    // The rows to write, in KEYS mode: the images INNER JOINed to the net-I/U key
+    // set. The join is what stops a key whose net op turned out to be a delete
+    // from being resurrected because the re-read happened to catch it alive.
+    std::string upsert_src = net_iu;
+    if (keys_mode) {
+        std::string on;
+        for (size_t i = 0; i < kl.size(); i++) {
+            if (i) on += " AND ";
+            on += "img." + kl[i] + " = " + cast_to("n." + kl[i], type_of(kl[i]));
+        }
+        upsert_src = "(SELECT img.* FROM " + images + " img JOIN " + net_iu + " n ON " + on + ")";
+    }
+
+    // ...and the mirror race: a key the log says was inserted or updated, which
+    // the re-read could not find because it was deleted in between. Leaving the
+    // old row in place would strand a stale row forever -- nothing will change
+    // that key again, so no later cycle would revisit it. It is a delete.
+    std::string vanished;
+    if (keys_mode) {
+        std::string on;
+        for (size_t i = 0; i < kl.size(); i++) {
+            if (i) on += " AND ";
+            on += "img." + kl[i] + " = " + cast_to("c." + kl[i], type_of(kl[i]));
+        }
+        vanished = "(SELECT c.* FROM " + net_iu + " c WHERE NOT EXISTS ("
+                   "SELECT 1 FROM " + images + " img WHERE " + on + "))";
     }
 
     // Counts (pre-apply, key-only anti-joins): del = net-deletes present in target;
@@ -1038,6 +1086,26 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
         res.del = cr->GetValue(0, 0).GetValue<int64_t>();
         res.ins = cr->GetValue(1, 0).GetValue<int64_t>();
         res.upd = cr->GetValue(2, 0).GetValue<int64_t>();
+
+        if (keys_mode) {
+            // Re-count against the images: a net-I/U key the re-read could not
+            // find is applied as a delete, so it must be reported as one rather
+            // than as an insert or update that silently did nothing.
+            const std::string dj = key_join("t", "c");
+            auto kr = con.Query(
+                "SELECT "
+                "(SELECT count(*) FROM " + vanished + " c WHERE EXISTS (SELECT 1 FROM " + target +
+                  " t WHERE " + dj + ")) AS gone,"
+                "(SELECT count(*) FROM " + upsert_src + " c WHERE NOT EXISTS (SELECT 1 FROM " +
+                  target + " t WHERE " + key_join("t", "c") + ")) AS ins,"
+                "(SELECT count(*) FROM " + upsert_src + " c WHERE EXISTS (SELECT 1 FROM " +
+                  target + " t WHERE " + key_join("t", "c") + ")) AS upd");
+            if (kr->HasError())
+                throw std::runtime_error("CDC: keys-mode count failed: " + kr->GetError());
+            res.del += kr->GetValue(0, 0).GetValue<int64_t>();
+            res.ins = kr->GetValue(1, 0).GetValue<int64_t>();
+            res.upd = kr->GetValue(2, 0).GetValue<int64_t>();
+        }
     }
 
     // Atomic apply: delete net-deletes, upsert net-I/U, advance position + mark ACTIVE,
@@ -1062,16 +1130,26 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
         del_iu_sql = "DELETE FROM " + target + " t WHERE EXISTS (SELECT 1 FROM " + net_iu +
                      " c WHERE " + key_join("t", "c") + ")";
         ins_sql = "INSERT INTO " + target + " (" + collist + ") SELECT " + sellist +
-                  " FROM " + net_iu + " c";
+                  " FROM " + upsert_src + " c";
     }
 
     Exec(con, "BEGIN");
     try {
         Exec(con, del_sql);
+        // del_iu removes every net-I/U key first; ins_sql then puts back only the
+        // ones the re-read actually found. A key that vanished in between is
+        // therefore deleted by construction, which is exactly what it should be.
         if (!del_iu_sql.empty()) { Exec(con, del_iu_sql); Exec(con, ins_sql); }
+        else if (keys_mode) {
+            // No data columns in common with the images (a keys-only re-read):
+            // still honour the vanished keys.
+            Exec(con, "DELETE FROM " + target + " t WHERE EXISTS (SELECT 1 FROM " + vanished +
+                      " c WHERE " + key_join("t", "c") + ")");
+        }
         Exec(con, "UPDATE _erpl_rev_cdc SET position=" + std::to_string(max_seq) +
                   ", last_run_ts=now(), status='ACTIVE' WHERE target=" + SqlLit(target));
         Exec(con, "DROP TABLE " + staging);
+        if (keys_mode) Exec(con, "DROP TABLE IF EXISTS " + images);
         Exec(con, "COMMIT");
     } catch (...) {
         Exec(con, "ROLLBACK");

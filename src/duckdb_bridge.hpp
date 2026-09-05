@@ -61,7 +61,7 @@ struct CdcState {
     std::string source;
     std::string keys;        // comma list
     std::string platform;    // HANA
-    std::string mode;        // DELETE_ONLY | FULL_IUD
+    std::string mode;        // DELETE_ONLY | KEYS_IUD | IMAGE_IUD (FULL_IUD on read)
     std::string log_table;
     std::string status;      // PROVISIONED | SEEDED | ACTIVE | DISABLED
     long long position = 0;  // last consumed log sequence
@@ -202,8 +202,13 @@ public:
     // sequence, drop the staging table, and mark the run ACTIVE — all in one
     // transaction (an error rolls everything back and leaves the position untouched).
     // Returns the I/U/D counts and the prune bound. `keys` are the target key cols.
+    // `images` (optional) is a second staging table holding the re-read row
+    // images for a KEYS_IUD cycle, whose shadow log carries keys only. When it
+    // is empty the row values come from the log itself, which is the IMAGE_IUD
+    // path and is unchanged.
     CdcApplyResult CdcApply(const std::string &target, const std::string &staging,
-                            const std::vector<std::string> &keys);
+                            const std::vector<std::string> &keys,
+                            const std::string &images = "");
 
     // --- Streaming cursors (fixed-memory paging for large results) ----------
     // OpenCursor starts a streaming query on its OWN DuckDB connection (DuckDB

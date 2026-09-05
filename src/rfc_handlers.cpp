@@ -100,7 +100,14 @@ std::string UpperOf(std::string s) {
     return s;
 }
 CdcMode CdcModeOf(const std::string &m) {
-    return UpperOf(m) == "FULL_IUD" ? CdcMode::FullIud : CdcMode::DeleteOnly;
+    const auto u = UpperOf(m);
+    // FULL_IUD is the pre-rename spelling. It stays accepted permanently: it is a
+    // stored value on every system provisioned before the rename, and a mode the
+    // dialect does not recognise would silently fall back to DELETE_ONLY -- i.e.
+    // stop capturing inserts and updates.
+    if (u == "IMAGE_IUD" || u == "FULL_IUD") return CdcMode::ImageIud;
+    if (u == "KEYS_IUD") return CdcMode::KeysIud;
+    return CdcMode::DeleteOnly;
 }
 // A JSON array of plain (escaped, quoted) strings.
 std::string JsonStrArray(const std::vector<std::string> &v) {
@@ -351,10 +358,10 @@ extern "C" RFC_RC SAP_API ZCdcPlanImpl(RFC_CONNECTION_HANDLE,
         spec.source = src;
         spec.keys = SplitCsv(ks);
         spec.mode = CdcModeOf(md);
-        // FULL_IUD logs the full row image: take the column set from the (seeded)
+        // IMAGE_IUD logs the full row image: take the column set from the (seeded)
         // DuckDB target and upper-case it to the SAP/HANA column names the triggers
         // reference (replicate lower-cases on the way in).
-        if (spec.mode == CdcMode::FullIud) {
+        if (spec.mode == CdcMode::ImageIud) {
             QueryResult tc = g_bridge->Query("SELECT * FROM " + target + " LIMIT 0");
             for (auto &c : tc.columns) spec.columns.push_back(UpperOf(c.name));
         }
