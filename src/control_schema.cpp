@@ -100,6 +100,19 @@ const std::vector<Migration> &Migrations() {
         "SELECT 1",
     }},
 
+    // v5 -- the streaming daemon's singleton row. One row, ever: a second daemon
+    // claiming it is how a duplicate start is detected and turned into
+    // "attach and report" rather than two daemons running the same targets.
+    {5, "daemon: singleton row and tick budget", {
+        "CREATE TABLE IF NOT EXISTS _erpl_rev_daemon ("
+        "id INTEGER PRIMARY KEY DEFAULT 1, instance_id VARCHAR, heartbeat_ts TIMESTAMPTZ, "
+        "tick_secs INTEGER DEFAULT 2, max_workers INTEGER DEFAULT 2, "
+        "full_load_share DOUBLE DEFAULT 0.5, status VARCHAR DEFAULT 'STOPPED', "
+        "stop BOOLEAN DEFAULT false, ticks BIGINT DEFAULT 0, started_ts TIMESTAMPTZ)",
+        "INSERT INTO _erpl_rev_daemon (id) SELECT 1 "
+        "WHERE NOT EXISTS (SELECT 1 FROM _erpl_rev_daemon WHERE id=1)",
+    }},
+
     };
     // clang-format on
     return kMigrations;

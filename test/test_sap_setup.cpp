@@ -223,10 +223,12 @@ TEST_CASE("ZCL_ERPL_REV_SETUP failures are not mistaken for success", "[setup]")
 
 TEST_CASE("MKFM is judged by TFDIR, not by the insert return code", "[setup]") {
     std::string out;
+    // Driven by the contract rather than a fourth copy of the name list, so
+    // adding an FM does not silently leave this test asserting the old set.
+    const auto names = FunctionModuleNames();
+    const auto total = std::to_string(names.size());
     // subrc=3 is "already exists" -- a perfectly good outcome on a re-run.
-    for (const char *n : {"Z_DUCKDB_QUERY", "Z_DUCKDB_INGEST", "Z_DUCKDB_SNAPSHOT_MERGE",
-                          "Z_DUCKDB_CDC_PLAN", "Z_DUCKDB_CDC_APPLY", "Z_DUCKDB_OPEN",
-                          "Z_DUCKDB_FETCH", "Z_DUCKDB_CLOSE"}) {
+    for (const auto &n : names) {
         out += std::string(n) + " insert subrc=3 [FL/050] already exists\n";
         out += std::string(n) + " tfdir subrc=0 fmode=R\n";
     }
@@ -239,7 +241,7 @@ TEST_CASE("MKFM is judged by TFDIR, not by the insert return code", "[setup]") {
         const auto p = broken.find("Z_DUCKDB_CLOSE tfdir subrc=0 fmode=R");
         broken.replace(p, 36, "Z_DUCKDB_CLOSE tfdir subrc=0 fmode= ");
         CHECK_FALSE(MkfmSucceeded(broken, FunctionModuleNames(), why));
-        CHECK_THAT(why, ContainsSubstring("7 of 8"));
+        CHECK_THAT(why, ContainsSubstring(std::to_string(names.size() - 1) + " of " + total));
     }
     SECTION("invalid_function_pool: nothing was created, class still exited 0") {
         CHECK_FALSE(MkfmSucceeded("Z_DUCKDB_QUERY insert subrc=4 invalid_function_pool\n",

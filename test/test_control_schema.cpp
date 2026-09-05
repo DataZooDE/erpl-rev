@@ -130,6 +130,20 @@ TEST_CASE("control_schema: v3 rewrites the stored FULL_IUD mode value", "[schema
         CHECK(HasColumn(con, "_erpl_rev_cdc", c));
 }
 
+TEST_CASE("control_schema: v5 creates exactly one daemon row", "[schema]") {
+    // The singleton is what makes a second daemon start "attach and report"
+    // rather than two daemons running the same targets against each other.
+    const auto path = UnpackV1Fixture("v5");
+    duckdb::DuckDB db(path);
+    duckdb::Connection con(db);
+    schema::Migrate(con, "test");
+    CHECK(Scalar(con, "SELECT count(*) FROM _erpl_rev_daemon") == "1");
+    CHECK(Scalar(con, "SELECT status FROM _erpl_rev_daemon") == "STOPPED");
+    // Re-running must not add a second one.
+    schema::Migrate(con, "test");
+    CHECK(Scalar(con, "SELECT count(*) FROM _erpl_rev_daemon") == "1");
+}
+
 TEST_CASE("control_schema: migrating twice is a no-op", "[schema]") {
     const auto path = UnpackV1Fixture("idem");
     duckdb::DuckDB db(path);

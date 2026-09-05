@@ -121,7 +121,8 @@ CLASS zcl_erpl_rev_mkfm IMPLEMENTATION.
 
         make( out  = out
               name = 'Z_DUCKDB_CDC_APPLY'
-              imps = VALUE #( ( `IV_TARGET` ) ( `IV_STAGING` ) ( `IV_KEYS` ) )
+              imps = VALUE #( ( `IV_TARGET` ) ( `IV_STAGING` ) ( `IV_KEYS` )
+                              ( `IV_IMAGES` ) )
               exps = VALUE #( ( `EV_INS` ) ( `EV_UPD` ) ( `EV_DEL` )
                               ( `EV_PRUNE` ) ( `EV_APPLIED` ) ( `EV_ERROR` ) )
               txt  = 'erpl-rev: CDC apply staged log batch' ).
@@ -145,6 +146,14 @@ CLASS zcl_erpl_rev_mkfm IMPLEMENTATION.
               imps = VALUE #( ( `IV_HANDLE` ) )
               exps = VALUE #( ( `EV_ERROR` ) )
               txt  = 'erpl-rev: close streaming cursor' ).
+
+        " The planning surface. Three generic importing parameters: every future
+        " action is a key inside IV_PARAMS, so this signature is written once.
+        make( out  = out
+              name = 'Z_DUCKDB_PLAN'
+              imps = VALUE #( ( `IV_ACTION` ) ( `IV_TARGET` ) ( `IV_PARAMS` ) )
+              exps = VALUE #( ( `EV_PLAN` ) ( `EV_ERROR` ) )
+              txt  = 'erpl-rev: server-side planning (cycle, tick, split, ...)' ).
       CATCH cx_root INTO DATA(lx).
         out->write( |EXCEPTION: { lx->get_text( ) }| ).
     ENDTRY.

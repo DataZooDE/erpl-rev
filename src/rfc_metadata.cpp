@@ -73,6 +73,7 @@ ERPL_DESC(BuildCdcApplyDesc,      "Z_DUCKDB_CDC_APPLY")
 ERPL_DESC(BuildOpenDesc,          "Z_DUCKDB_OPEN")
 ERPL_DESC(BuildFetchDesc,         "Z_DUCKDB_FETCH")
 ERPL_DESC(BuildCloseDesc,         "Z_DUCKDB_CLOSE")
+ERPL_DESC(BuildPlanDesc,          "Z_DUCKDB_PLAN")
 
 #undef ERPL_DESC
 

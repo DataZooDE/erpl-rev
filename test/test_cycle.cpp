@@ -291,3 +291,12 @@ TEST_CASE("cycle: a repair run does not move the watermark", "[cycle]") {
     CHECK(Scalar(con, "SELECT count(*) FROM zdelta_wm") == "3");        // data repaired
     CHECK(Scalar(con, "SELECT wm_value FROM _erpl_rev_delta_state") == "20260905100000");
 }
+
+TEST_CASE("cycle: the stage name is collision-safe across target names", "[cycle]") {
+    // Stage and log names are derived from a customer-chosen target name. Two
+    // targets sharing one stage would have them merging into each other's data.
+    CHECK(cycle::StageName("MY-TAB", 1) != cycle::StageName("MY_TAB", 1));
+    CHECK(cycle::ChangeLogName("MY-TAB") != cycle::ChangeLogName("MY_TAB"));
+    // ...but a run id still separates two runs of the same target.
+    CHECK(cycle::StageName("T", 1) != cycle::StageName("T", 2));
+}

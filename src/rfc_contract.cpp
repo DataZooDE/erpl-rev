@@ -42,9 +42,12 @@ const std::vector<RfcFm> &RfcContract() {
          {Imp("IV_TARGET"), Imp("IV_SOURCE"), Imp("IV_KEYS"), Imp("IV_MODE"),
           Imp("IV_PLATFORM"), Imp("IV_ACTION"), Exp("EV_PLAN"), Exp("EV_ERROR")}},
 
+        // IV_IMAGES: the second staging table a KEYS_IUD cycle fills by re-reading
+        // the source. Optional, so an ABAP caller generated before it existed
+        // still binds.
         {"Z_DUCKDB_CDC_APPLY",
-         {Imp("IV_TARGET"), Imp("IV_STAGING"), Imp("IV_KEYS"), Exp("EV_INS"), Exp("EV_UPD"),
-          Exp("EV_DEL"), Exp("EV_PRUNE"), Exp("EV_APPLIED"), Exp("EV_ERROR")}},
+         {Imp("IV_TARGET"), Imp("IV_STAGING"), Imp("IV_KEYS"), Imp("IV_IMAGES"), Exp("EV_INS"),
+          Exp("EV_UPD"), Exp("EV_DEL"), Exp("EV_PRUNE"), Exp("EV_APPLIED"), Exp("EV_ERROR")}},
 
         {"Z_DUCKDB_OPEN",
          {Imp("IV_SQL"), Exp("EV_HANDLE"), Exp("EV_COLUMNS"), Exp("EV_ERROR")}},
@@ -54,6 +57,16 @@ const std::vector<RfcFm> &RfcContract() {
           Exp("EV_DONE"), Exp("EV_ERROR")}},
 
         {"Z_DUCKDB_CLOSE", {Imp("IV_HANDLE"), Exp("EV_ERROR")}},
+
+        // The planning surface. Three generic IN parameters on purpose: every
+        // future action is a key inside IV_PARAMS, so this descriptor is written
+        // once and never touched again -- which is what a hand-maintained
+        // descriptor, mirrored by an ABAP generator, needs to be.
+        //
+        // Actions: BEGIN_CYCLE, CYCLE_COMMIT, TICK, SPLIT, VALIDATE, DRIFT,
+        // RETAIN, SUBS, CDC_PROBE, CDC_STATUS.
+        {"Z_DUCKDB_PLAN",
+         {Imp("IV_ACTION"), Imp("IV_TARGET"), Imp("IV_PARAMS"), Exp("EV_PLAN"), Exp("EV_ERROR")}},
     };
     return kContract;
 }

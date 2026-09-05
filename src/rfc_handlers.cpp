@@ -1,4 +1,7 @@
 #include "rfc_handlers.hpp"
+#include "cycle.hpp"
+#include "load_type.hpp"
+#include "tick_planner.hpp"
 #include "rfc_metadata.hpp"
 #include "sap_uc.hpp"
 #include "duckdb_bridge.hpp"
@@ -130,6 +133,9 @@ std::string ColumnsToJson(const std::vector<QueryColumn> &cols) {
 
 } // namespace
 
+extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE, RFC_FUNCTION_HANDLE,
+                                    RFC_ERROR_INFO *);
+
 void InstallHandlers(const std::string &db_path, const std::string &init_sql) {
     g_bridge = std::make_unique<DuckDbBridge>(db_path, init_sql);   // empty path => in-memory
 
@@ -152,11 +158,13 @@ void InstallHandlers(const std::string &db_path, const std::string &init_sql) {
         throw_rfc("RfcInstallServerFunction(Z_DUCKDB_CDC_PLAN)", info);
     if (RfcInstallServerFunction(nullptr, BuildCdcApplyDesc(), ZCdcApplyImpl, &info) != RFC_OK)
         throw_rfc("RfcInstallServerFunction(Z_DUCKDB_CDC_APPLY)", info);
+    if (RfcInstallServerFunction(nullptr, BuildPlanDesc(), ZPlanImpl, &info) != RFC_OK)
+        throw_rfc("RfcInstallServerFunction(Z_DUCKDB_PLAN)", info);
 
     log::get().Debug("rfc", "handlers installed",
                      {{"functions", "STFC_CONNECTION,Z_DUCKDB_QUERY,Z_DUCKDB_INGEST,"
                                     "Z_DUCKDB_SNAPSHOT_MERGE,Z_DUCKDB_CDC_PLAN,Z_DUCKDB_CDC_APPLY,"
-                                    "Z_DUCKDB_OPEN,Z_DUCKDB_FETCH,Z_DUCKDB_CLOSE", true},
+                                    "Z_DUCKDB_OPEN,Z_DUCKDB_FETCH,Z_DUCKDB_CLOSE,Z_DUCKDB_PLAN", true},
                       {"db", db_path.empty() ? ":memory:" : db_path}});
 }
 
@@ -409,9 +417,13 @@ extern "C" RFC_RC SAP_API ZCdcApplyImpl(RFC_CONNECTION_HANDLE,
         std::string target  = GetString(funcHandle, "IV_TARGET");
         std::string staging = GetString(funcHandle, "IV_STAGING");
         std::string keys    = GetString(funcHandle, "IV_KEYS");
+        // Empty unless this is a KEYS_IUD cycle, whose shadow log carries keys
+        // only and whose row values come from a re-read of the source.
+        std::string images  = GetString(funcHandle, "IV_IMAGES");
         log::get().Info("rfc", "Z_DUCKDB_CDC_APPLY",
-                        {{"target", target}, {"staging", staging}, {"keys", keys}});
-        CdcApplyResult r = g_bridge->CdcApply(target, staging, SplitCsv(keys));
+                        {{"target", target}, {"staging", staging}, {"keys", keys},
+                         {"images", images}});
+        CdcApplyResult r = g_bridge->CdcApply(target, staging, SplitCsv(keys), images);
         SetString(funcHandle, "EV_INS",     std::to_string(r.ins));
         SetString(funcHandle, "EV_UPD",     std::to_string(r.upd));
         SetString(funcHandle, "EV_DEL",     std::to_string(r.del));
@@ -424,6 +436,177 @@ extern "C" RFC_RC SAP_API ZCdcApplyImpl(RFC_CONNECTION_HANDLE,
     } catch (const std::exception &e) {
         _tc.fail("cdc_error");
         log::get().Error("rfc", "Z_DUCKDB_CDC_APPLY failed", {{"error", e.what()}});
+        SetString(funcHandle, "EV_ERROR", e.what());
+    }
+    return RFC_OK;
+}
+
+
+
+// A scalar out of a flat JSON object. IV_PARAMS is written by our own ABAP, so
+// this only has to handle what we send: quoted strings and bare numbers. It is
+// deliberately not a general parser -- the JSON here is an internal wire format,
+// not user input.
+std::string JsonField(const std::string &json, const std::string &key) {
+    const std::string needle = "\"" + key + "\"";
+    auto at = json.find(needle);
+    if (at == std::string::npos) return {};
+    at = json.find(':', at + needle.size());
+    if (at == std::string::npos) return {};
+    ++at;
+    while (at < json.size() && std::isspace(static_cast<unsigned char>(json[at]))) ++at;
+    if (at >= json.size()) return {};
+    if (json[at] == '"') {
+        std::string out;
+        for (++at; at < json.size() && json[at] != '"'; ++at) {
+            if (json[at] == '\\' && at + 1 < json.size()) ++at;
+            out += json[at];
+        }
+        return out;
+    }
+    std::string out;
+    while (at < json.size() && json[at] != ',' && json[at] != '}' &&
+           !std::isspace(static_cast<unsigned char>(json[at])))
+        out += json[at++];
+    return out;
+}
+
+// The tick plan, as JSON. Reads the three control tables the planner needs and
+// hands the pure function its rows, so the daemon and the batch tick get the
+// same answer from the same code.
+std::string PlanTickJson(duckdb::Connection &con) {
+    std::vector<plan::TargetRow> targets;
+    auto tr = con.Query(
+        "SELECT target, method, cadence, status, coalesce(load_type_default,'D'), "
+        "coalesce(epoch(last_run_ts),0), coalesce(epoch(lease_ts),0), "
+        "coalesce(epoch(parked_until),0), coalesce(fail_count,0), "
+        "coalesce(max_cycle_secs,3600), coalesce(rows_applied,0) "
+        "FROM _erpl_rev_delta_state");
+    if (tr->HasError()) throw std::runtime_error("plan: state read failed: " + tr->GetError());
+    for (size_t i = 0; i < tr->RowCount(); ++i) {
+        plan::TargetRow t;
+        t.target = tr->GetValue(0, i).ToString();
+        t.method = tr->GetValue(1, i).ToString();
+        t.cadence = tr->GetValue(2, i).ToString();
+        t.status = tr->GetValue(3, i).ToString();
+        t.load_type_default = tr->GetValue(4, i).ToString();
+        t.last_run_epoch = tr->GetValue(5, i).GetValue<double>();
+        t.lease_epoch = tr->GetValue(6, i).GetValue<double>();
+        t.parked_until_epoch = tr->GetValue(7, i).GetValue<double>();
+        t.fail_count = static_cast<int>(tr->GetValue(8, i).GetValue<int64_t>());
+        t.max_cycle_secs = static_cast<int>(tr->GetValue(9, i).GetValue<int64_t>());
+        t.last_rows = tr->GetValue(10, i).GetValue<int64_t>();
+        targets.push_back(t);
+    }
+
+    std::vector<plan::CdcRow> cdc;
+    auto cr = con.Query("SELECT target, status, coalesce(shadow_rows,0) FROM _erpl_rev_cdc");
+    if (!cr->HasError())
+        for (size_t i = 0; i < cr->RowCount(); ++i) {
+            plan::CdcRow c;
+            c.target = cr->GetValue(0, i).ToString();
+            c.status = cr->GetValue(1, i).ToString();
+            c.shadow_rows = cr->GetValue(2, i).GetValue<int64_t>();
+            cdc.push_back(c);
+        }
+
+    plan::DaemonRow d;
+    auto dr = con.Query("SELECT coalesce(tick_secs,2), coalesce(max_workers,2), "
+                        "coalesce(full_load_share,0.5), coalesce(stop,false) "
+                        "FROM _erpl_rev_daemon LIMIT 1");
+    if (!dr->HasError() && dr->RowCount() > 0) {
+        d.tick_secs = static_cast<int>(dr->GetValue(0, 0).GetValue<int64_t>());
+        d.max_workers = static_cast<int>(dr->GetValue(1, 0).GetValue<int64_t>());
+        d.full_load_share = dr->GetValue(2, 0).GetValue<double>();
+        d.stop = dr->GetValue(3, 0).GetValue<bool>();
+    }
+
+    const auto p = plan::PlanTick(targets, cdc, d, static_cast<double>(std::time(nullptr)));
+    std::string out = "{\"stop\":" + std::string(p.stop ? "true" : "false") +
+                      ",\"sleep_secs\":" + std::to_string(p.sleep_secs) + ",\"cycles\":[";
+    for (size_t i = 0; i < p.cycles.size(); ++i) {
+        if (i) out += ",";
+        out += "{\"target\":" + json::QuoteString(p.cycles[i].target) +
+               ",\"method\":" + json::QuoteString(p.cycles[i].method) +
+               ",\"load_type\":" + json::QuoteString(p.cycles[i].load_type) +
+               ",\"worker\":" + (p.cycles[i].worker ? "true" : "false") + "}";
+    }
+    return out + "]}";
+}
+
+// --- Planning ---------------------------------------------------------------
+// One FM, many actions, because the alternative is a new stub (and a new upgrade
+// event on every installed system) per decision the server needs to make.
+// Everything travels as JSON in IV_PARAMS / EV_PLAN, so the signature never
+// changes again.
+//
+// BEGIN_CYCLE and CYCLE_COMMIT are the cycle contract: the server decides the
+// read bounds and owns the commit, ABAP reads and stages. Note the reply carries
+// VALUES -- a floor, a ceiling, a column name -- never SQL text, so the driver's
+// "parameters are only ever read as values" posture holds here too.
+extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE,
+                                    RFC_FUNCTION_HANDLE funcHandle,
+                                    RFC_ERROR_INFO *) {
+    RfcCallScope _tc("plan");
+    try {
+        const std::string action = UpperOf(GetString(funcHandle, "IV_ACTION"));
+        const std::string target = GetString(funcHandle, "IV_TARGET");
+        const std::string params = GetString(funcHandle, "IV_PARAMS");
+        log::get().Info("rfc", "Z_DUCKDB_PLAN",
+                        {{"action", action}, {"target", target}});
+
+        auto con = g_bridge->Connect();
+        std::string plan;
+
+        if (action == "BEGIN_CYCLE") {
+            const auto lt = ParseLoadType(JsonField(params, "load_type").empty()
+                                              ? "D" : JsonField(params, "load_type"));
+            const auto b = cycle::Begin(con, target, lt,
+                                        static_cast<int64_t>(std::time(nullptr)));
+            plan = std::string("{") +
+                   "\"run_id\":" + std::to_string(b.run_id) + "," +
+                   "\"stage\":" + json::QuoteString(b.stage_table) + "," +
+                   "\"source_from\":" + json::QuoteString(b.source_from) + "," +
+                   "\"keys\":" + json::QuoteString(b.keys) + "," +
+                   "\"chg_col\":" + json::QuoteString(b.chg_col) + "," +
+                   "\"time_col\":" + json::QuoteString(b.time_col) + "," +
+                   "\"has_floor\":" + (b.bounds.has_floor ? "true" : "false") + "," +
+                   "\"floor\":" + json::QuoteString(b.bounds.floor) + "," +
+                   "\"has_ceiling\":" + (b.bounds.has_ceiling ? "true" : "false") + "," +
+                   "\"ceiling\":" + json::QuoteString(b.bounds.ceiling) + "," +
+                   "\"as_of_date\":" + json::QuoteString(b.bounds.as_of_date) + "," +
+                   "\"read_rows\":" + (b.plan.read_rows ? "true" : "false") + "," +
+                   "\"truncate\":" + (b.plan.truncate_target ? "true" : "false") +
+                   "}";
+        } else if (action == "CYCLE_COMMIT") {
+            cycle::CommitCounts c;
+            const auto rr = JsonField(params, "rows_read");
+            if (!rr.empty()) c.rows_read = std::atoll(rr.c_str());
+            const auto r = cycle::Commit(con, target,
+                                         std::atoll(JsonField(params, "run_id").c_str()), c);
+            plan = std::string("{") +
+                   "\"ins\":" + std::to_string(r.ins) + "," +
+                   "\"upd\":" + std::to_string(r.upd) + "," +
+                   "\"del\":" + std::to_string(r.del) + "," +
+                   "\"logged\":" + std::to_string(r.logged) + "," +
+                   "\"wm\":" + json::QuoteString(r.new_watermark) +
+                   "}";
+        } else if (action == "TICK") {
+            plan = PlanTickJson(con);
+        } else {
+            throw std::runtime_error(
+                "unknown plan action '" + action +
+                "'. Known: BEGIN_CYCLE, CYCLE_COMMIT, TICK.");
+        }
+
+        SetString(funcHandle, "EV_PLAN", plan);
+        SetString(funcHandle, "EV_ERROR", "");
+    } catch (const std::exception &e) {
+        // Never let an exception cross the RFC boundary: ABAP gets a clean
+        // EV_ERROR, which is the convention every other handler follows.
+        _tc.fail("plan_error");
+        log::get().Error("rfc", "Z_DUCKDB_PLAN failed", {{"error", e.what()}});
+        SetString(funcHandle, "EV_PLAN", "");
         SetString(funcHandle, "EV_ERROR", e.what());
     }
     return RFC_OK;
