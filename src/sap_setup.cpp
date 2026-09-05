@@ -512,12 +512,29 @@ std::string RenderBasisHandout(const Diagnosis &d, const Options &o,
       << "Add to the `reginfo` file (SMGW → Goto → Expert Functions → External Security,\n"
       << "or the file named by the `gw/reg_info` profile parameter):\n\n"
       << "```\n"
-      << "P TP=" << o.program_id << " HOST=" << server_host
+      << "P TP=" << o.program_id << " HOST="
+      // Under a tunnel the gateway sees the address the forward egresses from --
+      // the exit node -- not this machine. Printing a gethostname() value as if it
+      // were authoritative would generate a line that refuses the registration,
+      // and the usual "fix" for that is the wildcard the deny line exists to
+      // prevent. Say where the real value comes from instead.
+      << (o.tunnel_secret.empty() ? server_host : std::string("<see below>"))
       << " ACCESS=" << o.gwhost << " CANCEL=" << o.gwhost << "\n"
       << "D TP=*\n"
       << "```\n\n"
-      << "`TP` is the PROGRAM_ID exactly, no wildcards. `HOST` is the machine erpl-rev\n"
-      << "runs on. Keep the trailing deny line, or the allow-list permits everything.\n\n"
+      << "`TP` is the PROGRAM_ID exactly, no wildcards. Keep the trailing deny line,\n"
+      << "or the allow-list permits everything.\n\n"
+      << (o.tunnel_secret.empty()
+              ? "`HOST` is the machine erpl-rev runs on.\n\n"
+              : "`HOST` **cannot be filled in from here.** This server reaches the gateway\n"
+                "through a tunnel (`" + o.tunnel_secret + "`), so the gateway sees the address\n"
+                "the forward egresses from -- an exit node or bastion -- not the erpl-rev\n"
+                "host. Take the value from the registration attempt in SMGW (Goto → Logged\n"
+                "On Clients / the gateway trace) rather than inferring it, and pin the ACL\n"
+                "to that one address. Do not widen it to a wildcard.\n\n"
+                "The tunnel itself is outside SAP: it lives in the erpl-rev process and\n"
+                "changes nothing in the `ZERPL` package, the RFC user's role, or the\n"
+                "destination.\n\n")
       << "**Reloading reginfo needs no restart**: SMGW → Goto → Expert Functions →\n"
       << "External Security → Reread.\n\n"
       << "## 2. Profile parameters — only if registration is still refused\n\n"
