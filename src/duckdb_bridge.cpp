@@ -939,6 +939,8 @@ void DuckDbBridge::CdcAdvancePosition(const std::string &target, long long posit
               " WHERE target=" + SqlLit(target));
 }
 
+duckdb::Connection DuckDbBridge::Connect() { return duckdb::Connection(*db_); }
+
 CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::string &staging,
                                       const std::vector<std::string> &keys,
                                       const std::string &images) {

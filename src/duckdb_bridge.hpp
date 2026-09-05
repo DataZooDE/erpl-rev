@@ -221,6 +221,12 @@ public:
     CursorPage FetchCursor(const std::string &handle, long long page_rows);
     void       CloseCursor(const std::string &handle);
 
+    // A fresh connection on the shared store. Used by the cycle-commit path,
+    // which is deliberately a free function over a connection rather than more
+    // methods here: it keeps that logic drivable from a bare in-memory DuckDB in
+    // tests, with no bridge and no RFC.
+    duckdb::Connection Connect();
+
 private:
     // Each public operation opens its own duckdb::Connection on db_ (DuckDB allows
     // many concurrent connections on one database), so calls are thread-safe
