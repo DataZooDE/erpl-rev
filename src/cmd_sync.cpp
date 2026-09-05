@@ -57,6 +57,18 @@ std::string UnknownFlag(const std::vector<std::string> &args, const std::string 
     static const Spec kSyncRun[] = {
         {"--load-type", true},
     };
+    static const Spec kSyncSetWm[]  = { {"--wm-value", true} };
+    static const Spec kSyncPreview[] = { {"--rows", true} };
+    static const Spec kDaemon[]     = { {"--tick", true}, {"--workers", true} };
+    static const Spec kSub[]        = { {"--target", true}, {"--sink", true},
+                                        {"--dedup-keys", true} };
+    static const Spec kMass[]       = { {"--split", true}, {"--limit-rows", true},
+                                        {"--limit-mb", true}, {"--time-unit", true},
+                                        {"--part-col", true}, {"--restart", true},
+                                        {"--jobs", true}, {"--server-group", true} };
+    static const Spec kCdc[]        = { {"--target", true}, {"--all", false},
+                                        {"--mode", true}, {"--reconcile", false} };
+    static const Spec kRetain[]     = { {"--target", true}, {"--window-days", true} };
 
     const Spec *known = nullptr;
     size_t count = 0;
@@ -65,6 +77,13 @@ std::string UnknownFlag(const std::vector<std::string> &args, const std::string 
     else if (sub == "sync schedule")  { known = kSyncSchedule; count = std::size(kSyncSchedule); }
     else if (sub == "sync run" || sub == "sync run-due")
                                       { known = kSyncRun;      count = std::size(kSyncRun); }
+    else if (sub == "sync set-wm")    { known = kSyncSetWm;    count = std::size(kSyncSetWm); }
+    else if (sub == "sync preview")   { known = kSyncPreview;  count = std::size(kSyncPreview); }
+    else if (sub.rfind("daemon", 0) == 0)  { known = kDaemon;  count = std::size(kDaemon); }
+    else if (sub.rfind("sub", 0) == 0)     { known = kSub;     count = std::size(kSub); }
+    else if (sub.rfind("mass", 0) == 0)    { known = kMass;    count = std::size(kMass); }
+    else if (sub.rfind("cdc", 0) == 0)     { known = kCdc;     count = std::size(kCdc); }
+    else if (sub.rfind("retain", 0) == 0)  { known = kRetain;  count = std::size(kRetain); }
     // ls / show read no flags of their own; count stays 0, so any `--word` at
     // all is unknown -- which is the right answer for them.
 
