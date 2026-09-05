@@ -296,29 +296,46 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
     Exec(con, "BEGIN", "begin");
     try {
         if (want_log) {
-            Exec(con, "CREATE TABLE IF NOT EXISTS " + log + " AS SELECT * FROM " + target +
-                          " LIMIT 0", "create change log");
-            for (const auto &c : {std::string("_seq BIGINT"), std::string("_op VARCHAR"),
-                                  std::string("_run_id BIGINT"),
-                                  std::string("_changed_at TIMESTAMPTZ"),
-                                  std::string("_commit_ts TIMESTAMPTZ")}) {
-                const auto col = c.substr(0, c.find(' '));
-                const auto have = Scalar(con, "SELECT count(*) FROM duckdb_columns() "
-                                              "WHERE table_name=" + Lit(log) +
-                                                  " AND column_name=" + Lit(col));
-                if (have == "0") Exec(con, "ALTER TABLE " + log + " ADD COLUMN " + c, "log column");
+            // Provision the log ONCE, not on every commit. This block used to run
+            // its CREATE, five duckdb_columns() probes and a CREATE SEQUENCE every
+            // cycle: a flat ~40ms whatever the row count, which on a 1000-row
+            // cycle was six times the cost of the work itself. Measured by
+            // bench_cycle before anyone had to notice it in production.
+            const bool log_exists =
+                Scalar(con, "SELECT count(*) FROM duckdb_tables() WHERE table_name=" + Lit(log))
+                == "1";
+            if (!log_exists) {
+                Exec(con, "CREATE TABLE " + log + " AS SELECT * FROM " + target + " LIMIT 0",
+                     "create change log");
+                for (const auto &c : {std::string("_seq BIGINT"), std::string("_op VARCHAR"),
+                                      std::string("_run_id BIGINT"),
+                                      std::string("_changed_at TIMESTAMPTZ"),
+                                      std::string("_commit_ts TIMESTAMPTZ")})
+                    Exec(con, "ALTER TABLE " + log + " ADD COLUMN " + c, "log column");
+                Exec(con, "CREATE SEQUENCE IF NOT EXISTS " + log + "_seq START 1", "log sequence");
             }
-            Exec(con, "CREATE SEQUENCE IF NOT EXISTS " + log + "_seq START 1", "log sequence");
 
             // Derived before the merge: 'U' if the key is already in the target,
             // 'I' otherwise. That is the engine's verdict about what it is about
             // to do, not the source's claim about what happened.
+            // LEFT JOIN, not a correlated EXISTS. Both express "was this key
+            // already in the target", but DuckDB plans the subquery as a full
+            // scan of the target while the join uses its index: measured at 30ms
+            // vs 3ms for a TEN-row batch against a 1M-row target, because the
+            // cost of the scan tracks the TARGET size, not the change set. On a
+            // streaming tick that is the difference between the log costing more
+            // than the cycle and costing almost nothing.
+            std::string left_on;
+            for (size_t i = 0; i < keys.size(); ++i) {
+                if (i) left_on += " AND ";
+                left_on += "t." + keys[i] + " = s." + keys[i];
+            }
             auto r = con.Query(
                 "INSERT INTO " + log + " (" + collist +
                 ", _seq, _op, _run_id, _changed_at, _commit_ts) SELECT " + sellist +
-                ", nextval('" + log + "_seq'), CASE WHEN EXISTS (SELECT 1 FROM " + target +
-                " t WHERE " + key_join + ") THEN 'U' ELSE 'I' END, " + std::to_string(run_id) +
-                ", now(), now() FROM " + stage + " s");
+                ", nextval('" + log + "_seq'), CASE WHEN t." + keys[0] +
+                " IS NULL THEN 'I' ELSE 'U' END, " + std::to_string(run_id) +
+                ", now(), now() FROM " + stage + " s LEFT JOIN " + target + " t ON " + left_on);
             if (r->HasError())
                 throw std::runtime_error("cycle: change-log append failed: " + r->GetError());
             res.logged = res.ins + res.upd;

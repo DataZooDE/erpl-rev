@@ -371,7 +371,8 @@ if(TRUE)  # tests always build; DuckDB is in-tree
     test/test_table_render.cpp
     test/test_sap_setup.cpp
     test/test_tunnel.cpp
-    test/bench_ingest.cpp)
+    test/bench_ingest.cpp
+    test/bench_cycle.cpp)
   target_compile_definitions(erpl_rev_tests PRIVATE
     ERPL_REV_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
     ERPL_REV_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures"
