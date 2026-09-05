@@ -269,6 +269,7 @@ add_library(erpl_rev_core OBJECT
   src/control_schema.cpp
   src/delta_plan.cpp
   src/load_type.cpp
+  src/rfc_contract.cpp
   src/cdc_dialect.cpp
   src/json_util.cpp
   src/sxml_binary.cpp
@@ -338,6 +339,7 @@ if(TRUE)  # tests always build; DuckDB is in-tree
     test/test_control_schema.cpp
     test/test_delta_plan.cpp
     test/test_load_type.cpp
+    test/test_rfc_contract.cpp
     test/test_sxml_binary.cpp
     test/test_payload.cpp
     test/test_telemetry.cpp
@@ -350,7 +352,8 @@ if(TRUE)  # tests always build; DuckDB is in-tree
     test/bench_ingest.cpp)
   target_compile_definitions(erpl_rev_tests PRIVATE
     ERPL_REV_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
-    ERPL_REV_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures")
+    ERPL_REV_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures"
+    ERPL_REV_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
   target_link_libraries(erpl_rev_tests PRIVATE
     erpl_rev_core ${DUCKDB_LIB} Threads::Threads Catch2::Catch2WithMain
     posthog_telemetry datazoo_banner OpenSSL::Crypto ZLIB::ZLIB)
