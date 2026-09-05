@@ -47,35 +47,11 @@ CLASS zcl_erpl_rev_difftest IMPLEMENTATION.
   ENDMETHOD.
 
   METHOD sap_cell.
-    FIELD-SYMBOLS <v> TYPE any.
-    ASSIGN iv_val TO <v>.
-    CASE is_field-datatype.
-      WHEN 'DATS'.
-        DATA(d) = CONV string( <v> ).
-        rv = COND #( WHEN d = '00000000' OR d IS INITIAL THEN ``
-                     ELSE |{ d(4) }-{ d+4(2) }-{ d+6(2) }| ).
-      WHEN 'TIMS'.
-        DATA(t) = CONV string( <v> ).
-        IF t IS INITIAL. t = '000000'. ENDIF.
-        rv = |{ t(2) }:{ t+2(2) }:{ t+4(2) }|.
-      WHEN 'INT1' OR 'INT2' OR 'INT4' OR 'INT8'
-           OR 'DEC' OR 'CURR' OR 'QUAN'.
-        DATA n TYPE string.
-        n = <v>.
-        CONDENSE n NO-GAPS.
-        rv = n.
-      WHEN 'RAW' OR 'LRAW' OR 'RSTR'.
-        rv = |{ <v> }|.                       " xstring -> uppercase hex, whole
-        " Compared byte for byte, trailing zeros included. Both sides used to
-        " trim '(00)+$' because the pipeline dropped them; trimming
-        " "symmetrically" sounds harmless and is not. ZWIDE_BSEG's
-        " blob0001..blob0004 are all-zero RAW(16) on every row, so both sides
-        " reduced to empty and a column replicated as an EMPTY BLOB compared
-        " equal to sixteen zero bytes -- 3000 rows x 390 columns of it.
-      WHEN OTHERS.                             " CHAR/CLNT/NUMC/CUKY/UNIT/LANG/...
-        rv = CONV string( <v> ).
-        REPLACE PCRE '\s+$' IN rv WITH ``.     " right-trim (CHAR blank-pad)
-    ENDCASE.
+    " Delegates: the implementation moved to zcl_erpl_rev_util, because data
+    " validation is a shipped feature now and its SAP-side half has to be a
+    " delivered object. Keeping a copy here would give the test and the feature
+    " two canonicalisations that can disagree -- which would defeat both.
+    rv = zcl_erpl_rev_util=>fingerprint_cell( is_field = is_field iv_val = iv_val ).
   ENDMETHOD.
 
   METHOD md5.

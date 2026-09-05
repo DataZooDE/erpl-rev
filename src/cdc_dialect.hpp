@@ -55,6 +55,9 @@ struct CdcPlan {
     // every column binds in the ABAP ADBC layer (which rejects HANA TIMESTAMP/BIGINT).
     std::string read_from;
     std::string prune_sql;
+    // KEYS_IUD only: the query returning the net insert/update keys the cycle has
+    // to re-read from the source. Empty for the other modes.
+    std::string netkeys_sql;
     std::string op_col = "_OP";
     std::string seq_col = "_SEQ";
     std::vector<std::string> key_cols;        // merge/match key columns (== spec.keys)

@@ -210,3 +210,28 @@ TEST_CASE("cdc_dialect: the three modes differ only where they should", "[cdc][k
     CHECK(pk.trigger_names.size() == pi.trigger_names.size());
     CHECK(pk.log_cols != pi.log_cols);
 }
+
+TEST_CASE("cdc_dialect: KEYS_IUD emits the net-key query, other modes do not",
+          "[cdc][keys]") {
+    // Coalescing to a net op per key belongs on the server: the ABAP executor
+    // should never have to reason about what a batch of interleaved changes
+    // means, and a key whose net op is a delete must not be re-read at all.
+    HanaDialect d;
+    CdcSpec s;
+    s.source = "SFLIGHT";
+    s.keys = {"MANDT", "CARRID"};
+    s.columns = {"MANDT", "CARRID", "PRICE"};
+
+    s.mode = CdcMode::KeysIud;
+    const auto k = d.Plan(s);
+    REQUIRE_FALSE(k.netkeys_sql.empty());
+    CHECK(k.netkeys_sql.find("row_number()") != std::string::npos);
+    CHECK(k.netkeys_sql.find("mandt,carrid") != std::string::npos);
+    // Only net inserts and updates -- a net delete has nothing to re-read.
+    CHECK(k.netkeys_sql.find("('i','u')") != std::string::npos);
+
+    s.mode = CdcMode::ImageIud;
+    CHECK(d.Plan(s).netkeys_sql.empty());
+    s.mode = CdcMode::DeleteOnly;
+    CHECK(d.Plan(s).netkeys_sql.empty());
+}

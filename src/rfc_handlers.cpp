@@ -1,5 +1,6 @@
 #include "rfc_handlers.hpp"
 #include "cycle.hpp"
+#include "drift.hpp"
 #include "load_type.hpp"
 #include "tick_planner.hpp"
 #include "rfc_metadata.hpp"
@@ -395,6 +396,11 @@ extern "C" RFC_RC SAP_API ZCdcPlanImpl(RFC_CONNECTION_HANDLE,
         js += ",\"read_sql\":"       + json::QuoteString(read);
         js += ",\"read_from\":"      + json::QuoteString(plan.read_from);
         js += ",\"prune_sql\":"      + json::QuoteString(plan.prune_sql);
+        // The executor needs these to run a KEYS_IUD cycle: which mode it is in,
+        // what to re-read from, and which keys need re-reading.
+        js += ",\"mode\":"           + json::QuoteString(md);
+        js += ",\"source\":"         + json::QuoteString(src);
+        js += ",\"netkeys_sql\":"    + json::QuoteString(plan.netkeys_sql);
         js += "}";
         SetString(funcHandle, "EV_PLAN", js);
         SetString(funcHandle, "EV_ERROR", "");
@@ -591,6 +597,73 @@ extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE,
                    "\"logged\":" + std::to_string(r.logged) + "," +
                    "\"wm\":" + json::QuoteString(r.new_watermark) +
                    "}";
+        } else if (action == "DRIFT") {
+            // The DDIC field list arrives as JSON on the first package of a
+            // replication, so this costs no round trip of its own.
+            drift::Schema ddic;
+            {
+                size_t at = 0;
+                while ((at = params.find("{", at)) != std::string::npos) {
+                    const auto end = params.find("}", at);
+                    if (end == std::string::npos) break;
+                    const auto obj = params.substr(at, end - at + 1);
+                    drift::Field f;
+                    f.name = JsonField(obj, "name");
+                    f.datatype = JsonField(obj, "datatype");
+                    const auto len = JsonField(obj, "length");
+                    const auto dec = JsonField(obj, "decimals");
+                    if (!len.empty()) f.length = std::atoi(len.c_str());
+                    if (!dec.empty()) f.decimals = std::atoi(dec.c_str());
+                    if (!f.name.empty()) ddic.push_back(f);
+                    at = end + 1;
+                }
+            }
+
+            drift::Schema have;
+            {
+                auto r = con.Query("SELECT column_name, data_type FROM duckdb_columns() "
+                                   "WHERE lower(table_name)=lower('" + target + "')");
+                if (!r->HasError())
+                    for (size_t i = 0; i < r->RowCount(); ++i) {
+                        drift::Field f;
+                        f.name = r->GetValue(0, i).ToString();
+                        // The target's DuckDB type is compared through the same
+                        // mapping the DDIC side uses, so a difference means a real
+                        // difference and not a spelling one.
+                        f.datatype = r->GetValue(1, i).ToString();
+                        have.push_back(f);
+                    }
+            }
+
+            // A target that does not exist yet is not drift -- it is a first load.
+            if (have.empty()) {
+                plan = "{\"blocked\":false,\"new_target\":true}";
+            } else {
+                // Compare on names only when the target was built from these very
+                // fields: DuckDB reports its own type names, so a type-level diff
+                // here would flag every column on every run.
+                drift::Schema ddic_names, have_names;
+                for (const auto &f : ddic) ddic_names.push_back({f.name, "", 0, 0});
+                for (const auto &f : have) have_names.push_back({f.name, "", 0, 0});
+                const auto d = drift::Diff(ddic_names, have_names);
+
+                std::string alters;
+                for (const auto &f : d.added) {
+                    for (const auto &orig : ddic)
+                        if (orig.name == f.name) {
+                            auto r = con.Query("ALTER TABLE " + target + " ADD COLUMN " +
+                                               f.name + " " + drift::DuckType(orig));
+                            if (!r->HasError()) alters += (alters.empty() ? "" : ",") +
+                                                          json::QuoteString(f.name);
+                        }
+                }
+                if (d.blocked)
+                    con.Query("UPDATE _erpl_rev_delta_state SET status='BLOCKED' "
+                              "WHERE target='" + target + "'");
+                plan = std::string("{\"blocked\":") + (d.blocked ? "true" : "false") +
+                       ",\"added\":[" + alters + "]" +
+                       ",\"detail\":" + json::QuoteString(drift::Explain(d)) + "}";
+            }
         } else if (action == "TICK") {
             plan = PlanTickJson(con);
         } else {

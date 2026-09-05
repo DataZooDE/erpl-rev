@@ -15,6 +15,12 @@ namespace {
 using erpl_rev::sqlname::Token;
 using erpl_rev::sqlname::Upper;
 
+std::string Lower(const std::string &v) {
+    std::string r = v;
+    for (char &c : r) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return r;
+}
+
 std::string Quote(const std::string &id) { return erpl_rev::sqlname::QuoteIdent(id); }
 
 // Build the INSERT-into-log that a trigger body runs, capturing the logged columns
@@ -103,6 +109,23 @@ CdcPlan HanaDialect::Plan(const CdcSpec &spec) const {
         p.teardown_ddl.push_back("DROP TRIGGER " + Quote(t));
     p.teardown_ddl.push_back("DROP TABLE " + Quote(p.log_table));
     p.teardown_ddl.push_back("DROP SEQUENCE " + Quote(p.seq_name));
+
+    // The net insert/update keys a KEYS_IUD cycle must re-read. Coalescing to one
+    // op per key happens HERE and not in ABAP, so the executor never has to
+    // reason about what a batch of interleaved changes means -- and so a key
+    // whose net op turned out to be a delete is not re-read at all.
+    if (spec.mode == CdcMode::KeysIud) {
+        std::string keycsv;
+        for (size_t i = 0; i < spec.keys.size(); ++i) {
+            if (i) keycsv += ",";
+            keycsv += Lower(spec.keys[i]);
+        }
+        p.netkeys_sql =
+            "SELECT " + keycsv + " FROM (SELECT * FROM " + p.log_table + "__cdclog"
+            " QUALIFY row_number() OVER (PARTITION BY " + keycsv +
+            " ORDER BY \"" + p.seq_col + "\" DESC)=1) WHERE lower(\"" + p.op_col +
+            "\") IN ('i','u')";
+    }
 
     return p;
 }

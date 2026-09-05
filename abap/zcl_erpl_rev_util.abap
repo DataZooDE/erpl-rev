@@ -319,7 +319,105 @@ CLASS zcl_erpl_rev_util DEFINITION PUBLIC FINAL CREATE PUBLIC.
                 iv_chunk     TYPE i DEFAULT 500
       RETURNING VALUE(rv)    TYPE string.
 
+    "! One unit of a mass run: a predicate the worker applies, and its number.
+    TYPES: BEGIN OF ty_portion,
+             portion_no TYPE i,
+             predicate  TYPE string,
+           END OF ty_portion.
+    TYPES tt_portion TYPE STANDARD TABLE OF ty_portion WITH DEFAULT KEY.
+
+    "! Run a mass load from an explicit portion list.
+    "!
+    "! Extracted from replicate_parallel so the streaming daemon and mass
+    "! execution share ONE dispatcher: two would mean two keep-alive
+    "! implementations, and the second one would be the one nobody tested.
+    "! replicate_parallel keeps its signature and builds today's min/max portion
+    "! list, then delegates here.
+    "!
+    "! iv_recreate guards the DROP. replicate_parallel could always drop its
+    "! target because every caller pointed it at a staging table; once the
+    "! portion list is an input and the coordinator picks the target, that DROP
+    "! is one mistake away from wiping a customer's replicated table. A restart
+    "! passes abap_false, because the portions that already finished are in there.
+    CLASS-METHODS replicate_portions
+      IMPORTING iv_tab        TYPE csequence
+                iv_target     TYPE csequence
+                it_portions   TYPE tt_portion
+                iv_run_id     TYPE i DEFAULT 0
+                iv_recreate   TYPE abap_bool DEFAULT abap_true
+                iv_columns    TYPE csequence OPTIONAL
+                iv_init       TYPE csequence OPTIONAL
+                iv_batch      TYPE i DEFAULT 0
+                iv_params     TYPE csequence OPTIONAL
+                iv_max_attempts TYPE i DEFAULT 3
+                ii_progress   TYPE REF TO zif_erpl_rev_progress OPTIONAL
+      RETURNING VALUE(rs)     TYPE ty_result.
+
+    "! One SAP-side cell as canonical comparison text.
+    "!
+    "! Delivered, not test-only: data validation is a product feature, and its
+    "! two halves are hand-coupled -- this and the DuckDB-side expression must
+    "! produce the same text for the same value. Reimplementing this in C++ would
+    "! be a second copy of the DDIC knowledge below that can silently disagree
+    "! with the one that ships, so only the SQL half moved to the server.
+    CLASS-METHODS fingerprint_cell
+      IMPORTING is_field  TYPE ty_field
+                iv_val    TYPE any
+      RETURNING VALUE(rv) TYPE string.
+
+    "! The DDIC field list as JSON, for the structure watchdog.
+    "!
+    "! describe_table already computes exactly this for every replication, so the
+    "! list rides along on the first package instead of costing a second round
+    "! trip -- and there is no second implementation of "what does this table
+    "! look like" to drift from the first.
+    CLASS-METHODS fields_json
+      IMPORTING it_fields TYPE tt_field
+      RETURNING VALUE(rv) TYPE string.
+
+    "! Resolve a fiscal-year variant into date ranges.
+    "!
+    "! The variant lives in SAP (T009/T009B), so this cannot move to the server.
+    "! It returns DATA -- the resolved period ranges -- and the server then cuts
+    "! portions from them with the same code path it uses for a plain time split.
+    "! ABAP never decides where a boundary goes.
+    CLASS-METHODS fiscal_periods
+      IMPORTING iv_variant TYPE csequence
+                iv_from_year TYPE numc4
+                iv_to_year   TYPE numc4
+      RETURNING VALUE(rv)  TYPE string.
+
   PRIVATE SECTION.
+    TYPES: BEGIN OF ty_portion_state,
+             portion_no TYPE i,
+             predicate  TYPE string,
+             job_name   TYPE tbtcjob-jobname,
+             job_count  TYPE tbtcjob-jobcount,
+             attempts   TYPE i,
+             done       TYPE abap_bool,
+             failed     TYPE abap_bool,
+           END OF ty_portion_state.
+
+    "! Submit one portion as a background job. Bumps the attempt count, so a
+    "! portion that keeps aborting eventually stops being retried.
+    CLASS-METHODS dispatch_portion
+      IMPORTING iv_tab     TYPE csequence
+                iv_target  TYPE csequence
+                iv_prefix  TYPE string
+                iv_columns TYPE csequence OPTIONAL
+                iv_init    TYPE csequence OPTIONAL
+                iv_batch   TYPE i DEFAULT 0
+                iv_params  TYPE csequence OPTIONAL
+      CHANGING  cs_state   TYPE ty_portion_state
+      RETURNING VALUE(rv_ok) TYPE abap_bool.
+
+    "! Record a portion's status in DuckDB, so a restart knows what finished.
+    CLASS-METHODS mark_portion
+      IMPORTING iv_run_id  TYPE i
+                iv_portion TYPE i
+                iv_status  TYPE string
+                iv_job     TYPE csequence.
+
     "! Build an empty typed standard table from a columns JSON ([{name,type}]).
     CLASS-METHODS build_table
       IMPORTING iv_columns    TYPE string
@@ -775,6 +873,31 @@ CLASS zcl_erpl_rev_util IMPLEMENTATION.
       RETURN.
     ENDIF.
 
+    " Structure watchdog. describe_table has just computed the DDIC field list --
+    " which IS the watchdog's input -- so it rides to the server here rather than
+    " costing a round trip of its own, and there is no second implementation of
+    " "what does this table look like" to drift from this one.
+    "
+    " The server diffs it against the target and the last snapshot: a new column
+    " is added automatically, a removed or retyped one blocks the target, because
+    " neither can be resolved without deciding what happens to already-replicated
+    " data. Best-effort: a drift check that fails must not stop a replication that
+    " would otherwise have worked.
+    TRY.
+        DATA lv_drift TYPE string.
+        CALL FUNCTION 'Z_DUCKDB_PLAN' DESTINATION c_dest
+          EXPORTING iv_action = 'DRIFT'
+                    iv_target = CONV string( iv_target )
+                    iv_params = fields_json( ls_desc-fields )
+          IMPORTING ev_plan   = lv_drift
+          EXCEPTIONS OTHERS   = 1.
+        IF lv_drift CS '"blocked":true'.
+          rs-error = |schema drift: { lv_drift }|.
+          RETURN.
+        ENDIF.
+      CATCH cx_root ##NO_HANDLER.
+    ENDTRY.
+
     " Dynamic internal table holding ONLY the selected columns (keys always kept,
     " in DDIC order), so projection flows straight through to BXML and the DDL.
     DATA(lo_full) = CAST cl_abap_structdescr(
@@ -1076,6 +1199,11 @@ CLASS zcl_erpl_rev_util IMPLEMENTATION.
   ENDMETHOD.
 
   METHOD replicate_parallel.
+    " Kept exactly as it was for callers: numeric-key ranges over the partition
+    " column. What changed is that it no longer runs the jobs itself -- it builds
+    " a portion list and hands it to replicate_portions, so the daemon and mass
+    " execution go through the same dispatcher and there is only one keep-alive
+    " implementation to get right.
     DATA(ld) = describe_table( iv_tab = iv_tab iv_target = iv_target iv_columns = iv_columns ).
     IF ld-error IS NOT INITIAL.  rs-error = ld-error. RETURN. ENDIF.
     IF ld-keys IS INITIAL.       rs-error = 'parallel load needs a keyed table'. RETURN. ENDIF.
@@ -1085,10 +1213,6 @@ CLASS zcl_erpl_rev_util IMPLEMENTATION.
     DATA lv_len TYPE i.
     LOOP AT ld-fields INTO DATA(lf) WHERE name = lv_pc. lv_len = lf-length. ENDLOOP.
     IF lv_len = 0. rs-error = |partition column { lv_pc } not found|. RETURN. ENDIF.
-
-    " coordinator: (re)create the heap target (no PRIMARY KEY)
-    DATA(lc) = query( |DROP TABLE IF EXISTS { iv_target }; { ld-ddl_nopk }| ).
-    IF lc-error IS NOT INITIAL. rs-error = lc-error. RETURN. ENDIF.
 
     " min/max of the partition column at the SAP source (honoring iv_where + any
     " CDS parameters via the same dynamic FROM token the workers use).
@@ -1107,6 +1231,7 @@ CLASS zcl_erpl_rev_util IMPLEMENTATION.
         ENDIF.
       CATCH cx_root INTO DATA(lx_mm). rs-error = |min/max failed: { lx_mm->get_text( ) }|. RETURN.
     ENDTRY.
+
     " the column must be DIGIT-VALUED (NUMC, or a CHAR/DATS key of digits like a
     " document number) so its values range-partition numerically. A non-numeric
     " column (e.g. an alphabetic CHAR key) errors cleanly instead of dumping on the
@@ -1126,11 +1251,9 @@ CLASS zcl_erpl_rev_util IMPLEMENTATION.
     lv_step = lv_span / iv_jobs.
     IF lv_step < 1. lv_step = 1. ENDIF.
 
-    GET TIME STAMP FIELD DATA(lv_t0).
-    DATA(lv_pfx) = |ERPLR{ sy-uzeit }|.
-    DATA lv_started TYPE i.
+    DATA lt_portions TYPE tt_portion.
     DO iv_jobs TIMES.
-      DATA(lv_i)  = sy-index.
+      DATA(lv_i) = sy-index.
       DATA lv_lo TYPE p LENGTH 16.
       DATA lv_hi TYPE p LENGTH 16.
       lv_lo = lv_min + ( lv_i - 1 ) * lv_step.
@@ -1140,85 +1263,21 @@ CLASS zcl_erpl_rev_util IMPLEMENTATION.
       DATA(lv_his) = condense( |{ lv_hi }| ).
       DATA(lv_range) = |{ lv_pc } BETWEEN '{ lv_los WIDTH = lv_len ALIGN = RIGHT PAD = '0' }'| &&
                        | AND '{ lv_his WIDTH = lv_len ALIGN = RIGHT PAD = '0' }'|.
-      DATA(lv_where) = COND string( WHEN iv_where IS NOT INITIAL
-                                    THEN |( { iv_where } ) AND ( { lv_range } )| ELSE lv_range ).
-      DATA lv_jn TYPE tbtcjob-jobname.
-      DATA lv_jc TYPE tbtcjob-jobcount.
-      lv_jn = |{ lv_pfx }_{ lv_i }|.
-      CALL FUNCTION 'JOB_OPEN' EXPORTING jobname = lv_jn IMPORTING jobcount = lv_jc
-        EXCEPTIONS OTHERS = 1.
-      IF sy-subrc <> 0. rs-error = 'JOB_OPEN failed'. RETURN. ENDIF.
-      SUBMIT z_erpl_rev_repl_worker
-        WITH p_tab = iv_tab WITH p_tgt = iv_target WITH p_where = lv_where
-        WITH p_cols = iv_columns WITH p_init = iv_init WITH p_batch = iv_batch
-        WITH p_parm = iv_params
-        VIA JOB lv_jn NUMBER lv_jc AND RETURN.
-      CALL FUNCTION 'JOB_CLOSE' EXPORTING jobcount = lv_jc jobname = lv_jn strtimmed = abap_true
-        EXCEPTIONS OTHERS = 1.
-      lv_started = lv_started + 1.
+      APPEND VALUE #( portion_no = lv_i
+                      predicate  = COND string( WHEN iv_where IS NOT INITIAL
+                                                THEN |( { iv_where } ) AND ( { lv_range } )|
+                                                ELSE lv_range ) ) TO lt_portions.
     ENDDO.
-    IF ii_progress IS BOUND.
-      ii_progress->note( iv_text = |submitted { lv_started } background job(s) on { lv_pc }; waiting...|
-                         iv_done = 0 iv_total = lv_started ).
-    ENDIF.
 
-    " wait for all workers (active = scheduled/released/ready/running). The dialog
-    " BLOCKS here, so emit a status line each second (rows loaded climb live) —
-    " otherwise the screen looks frozen and users re-trigger the load.
-    DATA(lv_like) = |{ lv_pfx }_%|.
-    DATA lv_active TYPE i.
-    DO 3600 TIMES.
-      SELECT COUNT(*) FROM tbtco INTO @lv_active
-        WHERE jobname LIKE @lv_like AND status IN ( 'P', 'S', 'Y', 'R' ).
-      IF lv_active = 0. EXIT. ENDIF.
-      IF ii_progress IS BOUND.
-        DATA(lv_done) = lv_started - lv_active.
-        DATA(lqc) = query( |SELECT count(*) AS c FROM { iv_target }| ).
-        FIND PCRE '"c":(\d+)' IN lqc-rows SUBMATCHES DATA(lv_loaded).
-        ii_progress->note(
-          iv_text  = |parallel load: { lv_done }/{ lv_started } jobs done, { lv_loaded } rows loaded|
-          iv_done  = lv_done iv_total = lv_started ).
-      ENDIF.
-      WAIT UP TO 1 SECONDS.
-    ENDDO.
-    " If the loop fell through with workers still active, the wait timed out — report
-    " it (with the prefix so the operator can find the jobs in SM37) rather than
-    " silently building the PK over a partial load.
-    IF lv_active > 0.
-      rs-error = |timeout: { lv_active } of { lv_started } worker job(s) still running | &&
-                 |after the wait window (jobs { lv_pfx }_*); check SM37|.
-      RETURN.
-    ENDIF.
-    DATA lv_abend TYPE i.
-    SELECT COUNT(*) FROM tbtco INTO @lv_abend
-      WHERE jobname LIKE @lv_like AND status = 'A'.
-    IF lv_abend > 0. rs-error = |{ lv_abend } of { lv_started } worker job(s) aborted|. ENDIF.
-
-    " coordinator: build the PRIMARY KEY once over the merged data
-    IF rs-error IS INITIAL.
-      IF ii_progress IS BOUND.
-        ii_progress->note( iv_text = |all { lv_started } jobs done; building primary key ({ ld-keys })...| ).
-      ENDIF.
-      DATA(lpk) = query( |ALTER TABLE { iv_target } ADD PRIMARY KEY ({ ld-keys });| ).
-      IF lpk-error IS NOT INITIAL. rs-error = |add primary key: { lpk-error }|. ENDIF.
-    ENDIF.
-
-    GET TIME STAMP FIELD DATA(lv_t1).
-    rs-seconds = cl_abap_tstmp=>subtract( tstmp1 = lv_t1 tstmp2 = lv_t0 ).
-    DATA(qc) = query( |SELECT count(*) AS c FROM { iv_target }| ).
-    FIND PCRE '"c":(\d+)' IN qc-rows SUBMATCHES DATA(lv_cs).
-    IF sy-subrc = 0. rs-rows_affected = CONV i( lv_cs ). ENDIF.
-
-    " Dashboard stats: one FULL run row for the whole parallel load (jobs = N). The
-    " workers pass iv_record=false, so this is the single row for the run.
-    IF iv_record = abap_true.
-      record_run( iv_target = iv_target iv_source = iv_tab
-        iv_run_type = 'FULL' iv_method = 'FULL'
-        iv_status = COND #( WHEN rs-error IS INITIAL THEN 'SUCCESS' ELSE 'ERROR' )
-        iv_ms = CONV i( rs-seconds * 1000 )
-        iv_read = rs-rows_affected iv_ins = rs-rows_affected
-        iv_jobs = iv_jobs iv_error = rs-error ).
-    ENDIF.
+    rs = replicate_portions( iv_tab      = iv_tab
+                             iv_target   = iv_target
+                             it_portions = lt_portions
+                             iv_recreate = abap_true
+                             iv_columns  = iv_columns
+                             iv_init     = iv_init
+                             iv_batch    = iv_batch
+                             iv_params   = iv_params
+                             ii_progress = ii_progress ).
   ENDMETHOD.
 
   METHOD pick_partition_col.
@@ -1598,6 +1657,245 @@ CLASS zcl_erpl_rev_util IMPLEMENTATION.
     CALL FUNCTION 'Z_DUCKDB_CLOSE' DESTINATION c_dest
       EXPORTING iv_handle = lv_handle IMPORTING ev_error = lv_err
       EXCEPTIONS OTHERS = 0.
+  ENDMETHOD.
+
+
+  METHOD replicate_portions.
+    IF it_portions IS INITIAL.
+      rs-error = 'no portions to run'.
+      RETURN.
+    ENDIF.
+
+    DATA(ld) = describe_table( iv_tab = iv_tab iv_target = iv_target iv_columns = iv_columns ).
+    IF ld-error IS NOT INITIAL. rs-error = ld-error. RETURN. ENDIF.
+
+    " Create the heap target WITHOUT a primary key: the workers append disjoint
+    " ranges concurrently, and the PK is built once at the end. iv_recreate is
+    " false on a restart, where the finished portions' rows must survive.
+    IF iv_recreate = abap_true.
+      DATA(lc) = query( |DROP TABLE IF EXISTS { iv_target }; { ld-ddl_nopk }| ).
+      IF lc-error IS NOT INITIAL. rs-error = lc-error. RETURN. ENDIF.
+    ENDIF.
+
+    DATA(lv_pfx) = |ERPLR{ sy-uzeit }|.
+    DATA lt_state TYPE HASHED TABLE OF ty_portion_state WITH UNIQUE KEY portion_no.
+    LOOP AT it_portions INTO DATA(ls_p).
+      INSERT VALUE ty_portion_state( portion_no = ls_p-portion_no
+                                     predicate  = ls_p-predicate
+                                     attempts   = 0 ) INTO TABLE lt_state.
+    ENDLOOP.
+
+    " --- dispatch ------------------------------------------------------------
+    DATA(lv_started) = 0.
+    LOOP AT lt_state ASSIGNING FIELD-SYMBOL(<st>).
+      IF dispatch_portion( EXPORTING iv_tab = iv_tab iv_target = iv_target
+                                     iv_prefix = lv_pfx iv_columns = iv_columns
+                                     iv_init = iv_init iv_batch = iv_batch
+                                     iv_params = iv_params
+                           CHANGING  cs_state = <st> ) = abap_false.
+        rs-error = |JOB_OPEN failed for portion { <st>-portion_no }|.
+        RETURN.
+      ENDIF.
+      lv_started = lv_started + 1.
+      mark_portion( iv_run_id = iv_run_id iv_portion = <st>-portion_no
+                    iv_status = 'RUNNING' iv_job = <st>-job_name ).
+    ENDLOOP.
+
+    IF ii_progress IS BOUND.
+      ii_progress->note( iv_text = |submitted { lv_started } portion job(s); waiting...|
+                         iv_done = 0 iv_total = lv_started ).
+    ENDIF.
+
+    " --- wait, with keep-alive ----------------------------------------------
+    " The poll that already existed, plus the part that was missing: a job that
+    " ABENDED leaves its portion unfinished, and without re-dispatching it the
+    " run waits for a worker that is never coming back.
+    DATA lv_open TYPE i.
+    DO 3600 TIMES.
+      lv_open = 0.
+      LOOP AT lt_state ASSIGNING <st> WHERE done = abap_false.
+        DATA lv_status TYPE tbtco-status.
+        SELECT SINGLE status FROM tbtco INTO @lv_status
+          WHERE jobname = @<st>-job_name AND jobcount = @<st>-job_count.
+
+        CASE lv_status.
+          WHEN 'F'.                      " finished
+            <st>-done = abap_true.
+            mark_portion( iv_run_id = iv_run_id iv_portion = <st>-portion_no
+                          iv_status = 'DONE' iv_job = <st>-job_name ).
+          WHEN 'A'.                      " aborted
+            IF <st>-attempts >= iv_max_attempts.
+              " A portion that keeps dying would otherwise hold a slot forever
+              " and the run would neither finish nor fail.
+              <st>-done   = abap_true.
+              <st>-failed = abap_true.
+              mark_portion( iv_run_id = iv_run_id iv_portion = <st>-portion_no
+                            iv_status = 'FAILED' iv_job = <st>-job_name ).
+            ELSE.
+              dispatch_portion( EXPORTING iv_tab = iv_tab iv_target = iv_target
+                                          iv_prefix = lv_pfx iv_columns = iv_columns
+                                          iv_init = iv_init iv_batch = iv_batch
+                                          iv_params = iv_params
+                                CHANGING  cs_state = <st> ).
+              lv_open = lv_open + 1.
+            ENDIF.
+          WHEN OTHERS.                   " P/S/Y/R, or not readable yet
+            " Not readable is treated as ALIVE on purpose: re-dispatching a
+            " portion whose job status we merely failed to read would run it
+            " twice, into a heap with no primary key to dedup it.
+            lv_open = lv_open + 1.
+        ENDCASE.
+      ENDLOOP.
+
+      IF lv_open = 0. EXIT. ENDIF.
+      IF ii_progress IS BOUND.
+        DATA(lv_done) = lv_started - lv_open.
+        DATA(lqc) = query( |SELECT count(*) AS c FROM { iv_target }| ).
+        FIND PCRE '"c":(\d+)' IN lqc-rows SUBMATCHES DATA(lv_loaded).
+        ii_progress->note(
+          iv_text = |mass load: { lv_done }/{ lv_started } portions done, { lv_loaded } rows|
+          iv_done = lv_done iv_total = lv_started ).
+      ENDIF.
+      WAIT UP TO 1 SECONDS.
+    ENDDO.
+
+    IF lv_open > 0.
+      rs-error = |timeout: { lv_open } portion(s) still running (jobs { lv_pfx }_*); check SM37|.
+      RETURN.
+    ENDIF.
+
+    " --- did every portion succeed? -----------------------------------------
+    " "Finished" is not "complete". Building the primary key over a run with a
+    " failed portion would declare success on top of missing rows.
+    DATA(lv_failed) = 0.
+    LOOP AT lt_state ASSIGNING <st> WHERE failed = abap_true.
+      lv_failed = lv_failed + 1.
+    ENDLOOP.
+    IF lv_failed > 0.
+      rs-error = |{ lv_failed } of { lv_started } portion(s) failed after { iv_max_attempts } | &&
+                 |attempt(s); the target is INCOMPLETE. Re-run with --restart { iv_run_id } | &&
+                 |to retry only those portions|.
+      RETURN.
+    ENDIF.
+
+    " --- build the key once --------------------------------------------------
+    IF ld-keys IS NOT INITIAL.
+      DATA(lp) = query( |ALTER TABLE { iv_target } ADD PRIMARY KEY ({ ld-keys })| ).
+      IF lp-error IS NOT INITIAL. rs-error = lp-error. RETURN. ENDIF.
+    ENDIF.
+
+    DATA(lq) = query( |SELECT count(*) AS c FROM { iv_target }| ).
+    FIND PCRE '"c":(\d+)' IN lq-rows SUBMATCHES DATA(lv_c).
+    rs-rows_affected = lv_c.
+  ENDMETHOD.
+
+  METHOD dispatch_portion.
+    DATA lv_jn TYPE tbtcjob-jobname.
+    DATA lv_jc TYPE tbtcjob-jobcount.
+    lv_jn = |{ iv_prefix }_{ cs_state-portion_no }|.
+    CALL FUNCTION 'JOB_OPEN' EXPORTING jobname = lv_jn IMPORTING jobcount = lv_jc
+      EXCEPTIONS OTHERS = 1.
+    IF sy-subrc <> 0. rv_ok = abap_false. RETURN. ENDIF.
+
+    SUBMIT z_erpl_rev_repl_worker
+      WITH p_tab = iv_tab WITH p_tgt = iv_target WITH p_where = cs_state-predicate
+      WITH p_cols = iv_columns WITH p_init = iv_init WITH p_batch = iv_batch
+      WITH p_parm = iv_params
+      VIA JOB lv_jn NUMBER lv_jc AND RETURN.
+
+    CALL FUNCTION 'JOB_CLOSE' EXPORTING jobcount = lv_jc jobname = lv_jn strtimmed = abap_true
+      EXCEPTIONS OTHERS = 1.
+
+    cs_state-job_name  = lv_jn.
+    cs_state-job_count = lv_jc.
+    cs_state-attempts  = cs_state-attempts + 1.
+    rv_ok = abap_true.
+  ENDMETHOD.
+
+  METHOD mark_portion.
+    " Portion status lives in DuckDB with the rest of the replication state, so a
+    " restart can see which portions finished even after the coordinator died.
+    IF iv_run_id = 0. RETURN. ENDIF.
+    query( |UPDATE _erpl_rev_portion SET status='{ iv_status }', | &&
+           |worker_job='{ iv_job }' | &&
+           |WHERE run_id={ iv_run_id } AND portion_no={ iv_portion }| ).
+  ENDMETHOD.
+
+
+  METHOD fingerprint_cell.
+    FIELD-SYMBOLS <v> TYPE any.
+    ASSIGN iv_val TO <v>.
+    CASE is_field-datatype.
+      WHEN 'DATS'.
+        DATA(d) = CONV string( <v> ).
+        rv = COND #( WHEN d = '00000000' OR d IS INITIAL THEN ``
+                     ELSE |{ d(4) }-{ d+4(2) }-{ d+6(2) }| ).
+      WHEN 'TIMS'.
+        DATA(t) = CONV string( <v> ).
+        IF t IS INITIAL. t = '000000'. ENDIF.
+        rv = |{ t(2) }:{ t+2(2) }:{ t+4(2) }|.
+      WHEN 'INT1' OR 'INT2' OR 'INT4' OR 'INT8'
+           OR 'DEC' OR 'CURR' OR 'QUAN'.
+        DATA n TYPE string.
+        n = <v>.
+        CONDENSE n NO-GAPS.
+        rv = n.
+      WHEN 'RAW' OR 'LRAW' OR 'RSTR'.
+        rv = |{ <v> }|.                       " xstring -> uppercase hex, whole
+        " Byte for byte, trailing zeros included. Both sides once trimmed
+        " '(00)+$' because the pipeline dropped them; trimming "symmetrically"
+        " sounds harmless and is not. ZWIDE_BSEG's blob0001..blob0004 are
+        " all-zero RAW(16) on every row, so both sides reduced to empty and a
+        " column replicated as an EMPTY BLOB compared equal to sixteen zero
+        " bytes -- across 3000 rows x 390 columns.
+      WHEN OTHERS.                             " CHAR/CLNT/NUMC/CUKY/UNIT/LANG/...
+        rv = CONV string( <v> ).
+        REPLACE PCRE '\s+$' IN rv WITH ``.    " right-trim (CHAR is blank-padded)
+    ENDCASE.
+  ENDMETHOD.
+
+  METHOD fields_json.
+    DATA lt TYPE string_table.
+    LOOP AT it_fields INTO DATA(lf).
+      APPEND |\{"name":"{ lf-name }","datatype":"{ lf-datatype }",| &&
+             |"length":{ lf-length },"decimals":{ lf-decimals }\}| TO lt.
+    ENDLOOP.
+    rv = |[{ concat_lines_of( table = lt sep = `,` ) }]|.
+  ENDMETHOD.
+
+  METHOD fiscal_periods.
+    " T009B holds the period end date per fiscal year and period for a variant,
+    " including the shifted and 4-4-5 calendars that make this impossible to
+    " compute outside SAP. The ranges come back as data; the server cuts the
+    " portions.
+    DATA lt TYPE string_table.
+    DATA lv_var TYPE t009b-periv.
+    lv_var = iv_variant.
+
+    SELECT bdatj, poper, bumon, butag FROM t009b
+      INTO TABLE @DATA(lt_p)
+      WHERE periv = @lv_var
+        AND bdatj >= @iv_from_year
+        AND bdatj <= @iv_to_year
+      ORDER BY bdatj, poper.
+    IF sy-subrc <> 0.
+      rv = |[]|.
+      RETURN.
+    ENDIF.
+
+    " Each row gives the period's END; the start is the day after the previous
+    " period's end. The first period of a year starts where the previous year's
+    " last period ended, which is why the rows are read in order and carried.
+    DATA lv_prev TYPE d.
+    LOOP AT lt_p INTO DATA(ls_p).
+      DATA lv_end TYPE d.
+      lv_end = |{ ls_p-bdatj }{ ls_p-bumon }{ ls_p-butag }|.
+      DATA(lv_start) = COND d( WHEN lv_prev IS INITIAL THEN lv_end ELSE lv_prev + 1 ).
+      APPEND |\{"gjahr":"{ ls_p-bdatj }","poper":"{ ls_p-poper }",| &&
+             |"from":"{ lv_start }","to":"{ lv_end }"\}| TO lt.
+      lv_prev = lv_end.
+    ENDLOOP.
+    rv = |[{ concat_lines_of( table = lt sep = `,` ) }]|.
   ENDMETHOD.
 
 ENDCLASS.

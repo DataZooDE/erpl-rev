@@ -46,6 +46,18 @@ CLASS zcl_erpl_rev_cdc DEFINITION PUBLIC FINAL CREATE PUBLIC.
       RETURNING VALUE(rt_targets) TYPE string_table.
 
   PRIVATE SECTION.
+    "! Rebuild key tuples from the server's net-key JSON, in key order.
+    CLASS-METHODS net_key_rows
+      IMPORTING iv_json     TYPE string
+                it_key_cols TYPE string_table
+      EXPORTING et_rows     TYPE zcl_erpl_rev_util=>tt_keyrows.
+
+    "! DDIC datatype per key column, so numeric keys are not quoted.
+    CLASS-METHODS key_types
+      IMPORTING iv_source   TYPE csequence
+                it_key_cols TYPE string_table
+      EXPORTING et_types    TYPE string_table.
+
     CONSTANTS c_dest TYPE rfcdest VALUE 'ERPL_REV'.
 
     TYPES: BEGIN OF ty_plan,
@@ -128,6 +140,7 @@ CLASS zcl_erpl_rev_cdc IMPLEMENTATION.
       EXPORTING iv_target  = iv_target
                 iv_staging = iv_staging
                 iv_keys    = iv_keys
+                iv_images  = iv_images
       IMPORTING ev_ins     = lv_ins
                 ev_upd     = lv_upd
                 ev_del     = lv_del
@@ -209,7 +222,54 @@ CLASS zcl_erpl_rev_cdc IMPLEMENTATION.
     IF lr-error IS NOT INITIAL. rs-error = lr-error. RETURN. ENDIF.
 
     DATA(lv_keys) = concat_lines_of( table = ls-key_cols sep = `,` ).
-    rs = apply( iv_target = iv_target iv_staging = lv_stg iv_keys = lv_keys ).
+
+    " KEYS_IUD: the shadow log carries key + op + sequence only, so the row VALUES
+    " have to be re-read from the source. That is the whole point of the mode --
+    " the trigger a customer's transactions pay for stays small, instead of writing
+    " a full row image on every change to a wide hot table.
+    "
+    " The server decides WHICH keys need re-reading (netkeys_sql coalesces the
+    " batch to a net op per key and returns only the net inserts and updates); ABAP
+    " re-reads them and stages the images. Deletes are NOT re-read: the row is
+    " gone, and the log is the only remaining evidence it existed.
+    DATA lv_img TYPE string.
+    IF ls-mode = 'KEYS_IUD' AND ls-netkeys_sql IS NOT INITIAL.
+      DATA(lk) = zcl_erpl_rev_util=>query( ls-netkeys_sql ).
+      IF lk-error IS NOT INITIAL. rs-error = lk-error. RETURN. ENDIF.
+
+      IF lk-row_count > 0.
+        lv_img = |{ iv_target }__cdcimg|.
+
+        " Rebuild the key tuples from the server's answer, then let the shared
+        " predicate builder turn them into a WHERE -- the same one the
+        " change-document re-read uses, so a composite key works and a large key
+        " set is chunked rather than exceeding the parser.
+        DATA lt_rows TYPE zcl_erpl_rev_util=>tt_keyrows.
+        net_key_rows( EXPORTING iv_json = lk-rows it_key_cols = ls-key_cols
+                      IMPORTING et_rows = lt_rows ).
+
+        DATA lt_types TYPE string_table.
+        key_types( EXPORTING iv_source = ls-source it_key_cols = ls-key_cols
+                   IMPORTING et_types = lt_types ).
+
+        DATA(lv_where) = zcl_erpl_rev_util=>key_in_predicate(
+          it_key_cols  = ls-key_cols
+          it_key_types = lt_types
+          it_rows      = lt_rows ).
+
+        DATA(li) = zcl_erpl_rev_util=>replicate(
+          iv_tab      = ls-source
+          iv_target   = lv_img
+          iv_mode     = 'INSERT'
+          iv_truncate = abap_true
+          iv_where    = lv_where
+          iv_record   = abap_false ).
+        IF li-error IS NOT INITIAL. rs-error = li-error. RETURN. ENDIF.
+      ENDIF.
+    ENDIF.
+
+    rs = apply( iv_target = iv_target iv_staging = lv_stg iv_keys = lv_keys
+                iv_images = lv_img ).
     IF rs-error IS NOT INITIAL. RETURN. ENDIF.
 
     " Prune the SAP log up to the server-confirmed position (watermark-driven, never
@@ -248,6 +308,47 @@ CLASS zcl_erpl_rev_cdc IMPLEMENTATION.
 
   METHOD to_int.
     IF iv CO ` 0123456789-`. rv = CONV i( iv ). ENDIF.
+  ENDMETHOD.
+
+
+  METHOD net_key_rows.
+    " The server returns the net insert/update keys as JSON rows. Turn them back
+    " into key tuples in KEY ORDER, which is what the predicate builder expects --
+    " the order is what makes a composite tuple line up with its columns.
+    CLEAR et_rows.
+    DATA lt_generic TYPE STANDARD TABLE OF string WITH EMPTY KEY.
+    SPLIT iv_json AT '},' INTO TABLE lt_generic.
+    LOOP AT lt_generic INTO DATA(lv_obj).
+      DATA lt_tuple TYPE string_table.
+      CLEAR lt_tuple.
+      LOOP AT it_key_cols INTO DATA(lv_col).
+        DATA(lv_lc) = to_lower( lv_col ).
+        DATA lv_val TYPE string.
+        CLEAR lv_val.
+        FIND PCRE |"{ lv_lc }"\\s*:\\s*"?([^",}}]*)"?| IN lv_obj SUBMATCHES lv_val.
+        APPEND lv_val TO lt_tuple.
+      ENDLOOP.
+      " Skip a fragment that yielded nothing: a trailing separator, not a key.
+      IF line_exists( lt_tuple[ table_line = `` ] ) AND lines( lt_tuple ) = 1.
+        CONTINUE.
+      ENDIF.
+      APPEND lt_tuple TO et_rows.
+    ENDLOOP.
+  ENDMETHOD.
+
+  METHOD key_types.
+    " DDIC types for the key columns, so a numeric key is written unquoted. A
+    " quoted numeric compares as text and matches nothing -- silently.
+    CLEAR et_types.
+    DATA(ld) = zcl_erpl_rev_util=>describe_table( iv_tab = iv_source ).
+    LOOP AT it_key_cols INTO DATA(lv_col).
+      DATA(lv_up) = to_upper( lv_col ).
+      DATA(lv_ty) = `CHAR`.
+      LOOP AT ld-fields INTO DATA(lf) WHERE name = lv_up.
+        lv_ty = lf-datatype.
+      ENDLOOP.
+      APPEND lv_ty TO et_types.
+    ENDLOOP.
   ENDMETHOD.
 
 ENDCLASS.
