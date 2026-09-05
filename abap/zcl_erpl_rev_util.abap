@@ -66,12 +66,24 @@ CLASS zcl_erpl_rev_util DEFINITION PUBLIC FINAL CREATE PUBLIC.
     " partitioned load -- stays the same.
     " Default OFF, on measurement rather than principle. The ratio is real --
     " a 50,000-row x 420-column package compresses 180,522,994 -> 3,768,726 bytes,
-    " 47.9x -- but over LOOPBACK the bytes were never the bottleneck, and paying
-    " ~2.5 s of compression CPU per 100k rows on the work process (the contended
-    " resource in a partitioned load) costs more than the transfer it saves:
-    " 6 alternating pairs, full-width 100k-row serial load, median 16 s off
-    " against 18.5 s on. Switch it on where the WIRE is the constraint -- a real
-    " network between SAP and the server -- and measure there before trusting it.
+    " 47.9x -- but the bytes have to be worth more than the CPU that saves them,
+    " and that depends entirely on the link. Full-width 100k-row serial load,
+    " six alternating pairs each, medians (erpl-rev#68, #86):
+    "
+    "   SAP and server on ONE host   12 s off / 16 s on   gzip costs 4 s
+    "   separate hosts, ~1 Gbit LAN  13 s off / 14 s on   gzip costs 1 s
+    "
+    " So a real network does make the payload cost something -- about 3 s per
+    " 100k full-width rows at gigabit -- but not enough to overtake the ~4 s of
+    " compression CPU, paid on the work process, the contended resource in a
+    " partitioned load. Compression wins once transfer costs more than it does,
+    " which is roughly BELOW 500-600 Mbit/s.
+    "
+    " Switch it on for a SLOW LINK -- a WAN, a VPN, SAP and the server in
+    " different datacentres. "A real network" is not the threshold: a gigabit
+    " LAN is a real network and compression still loses 8% on it. Below the
+    " crossover is extrapolated from those two medians, not measured; if the
+    " margin matters to you, measure your own link before trusting it.
     CLASS-DATA gv_gzip     TYPE abap_bool VALUE abap_false.
     CLASS-DATA gv_gzip_min TYPE i VALUE 262144.
 
