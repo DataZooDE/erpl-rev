@@ -117,3 +117,57 @@ TEST_CASE("a bare scalar is read the way cmd_id arrives", "[queue]") {
     CHECK(AbapJstr(R"({"cmd_id":42,"verb":"replicate"})", "verb") == "replicate");
     CHECK(AbapJstr(R"({"result":null})", "result").empty());
 }
+
+// ---------------------------------------------------------------------------
+// Unknown subcommand flags
+//
+// main() collects sync's and replicate's flags without knowing them, so an
+// unrecognised one used to reach the command and be read by nobody. That is not
+// a cosmetic gap: `replicate --queue-only` on a build predating that flag ran
+// happily and took the generated-ABAP path instead of the queue, with no
+// complaint anywhere. A flag that silently does nothing looks like it worked.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("replicate accepts the flags it reads", "[args]") {
+    CHECK(cmd::UnknownFlag({"--table", "T000", "--target", "t000", "--where",
+                            "MANDT = '000'", "--parallel", "--jobs", "4"},
+                           "replicate")
+              .empty());
+}
+
+TEST_CASE("replicate refuses a flag it does not read", "[args]") {
+    CHECK(cmd::UnknownFlag({"--tabel", "T000"}, "replicate") == "--tabel");
+    // A flag from a newer build, run against an older one -- the shape of the
+    // original bug. (`--queue-only` is consumed by ParseOption today, so it
+    // never reaches these words; a caller from the future is the general case.)
+    CHECK(cmd::UnknownFlag({"--table", "T000", "--from-the-future"}, "replicate")
+          == "--from-the-future");
+    // A sync flag is not a replicate flag, however valid it is elsewhere.
+    CHECK(cmd::UnknownFlag({"--table", "T000", "--cadence", "nightly"}, "replicate")
+          == "--cadence");
+}
+
+TEST_CASE("a flag's value is never mistaken for a flag", "[args]") {
+    // main() splits --where=--x into two words. The second is a value, not a flag.
+    CHECK(cmd::UnknownFlag({"--where", "--x"}, "replicate").empty());
+    // ... but the word after a boolean flag still has to be checked.
+    CHECK(cmd::UnknownFlag({"--parallel", "--nope"}, "replicate") == "--nope");
+}
+
+TEST_CASE("positionals are not flags", "[args]") {
+    CHECK(cmd::UnknownFlag({"create", "t000", "--method", "SNAPSHOT", "--source",
+                            "T000", "--keys", "MANDT"},
+                           "sync create")
+              .empty());
+}
+
+TEST_CASE("each sync subcommand has its own flag set", "[args]") {
+    CHECK(cmd::UnknownFlag({"schedule", "--every", "5"}, "sync schedule").empty());
+    CHECK(cmd::UnknownFlag({"schedule", "--remove"}, "sync schedule").empty());
+    // create's flags do not travel to schedule, nor schedule's to create.
+    CHECK(cmd::UnknownFlag({"schedule", "--keys", "MANDT"}, "sync schedule") == "--keys");
+    CHECK(cmd::UnknownFlag({"create", "t", "--every", "5"}, "sync create") == "--every");
+    // ls / show / run read no flags of their own.
+    CHECK(cmd::UnknownFlag({"ls", "--every", "5"}, "sync ls") == "--every");
+    CHECK(cmd::UnknownFlag({"ls"}, "sync ls").empty());
+}

@@ -50,6 +50,16 @@ void PrintHelp();
 // reader, so the escaping has to survive both.
 std::string BuildParams(const std::vector<std::pair<std::string, std::string>> &kv);
 
+// The first `--word` in `args` that subcommand `sub` never reads, or "" when
+// every one of them is recognised. `sub` is the command as typed: "replicate",
+// "sync create", "sync schedule", ...
+//
+// main() collects these words without knowing them -- sync and replicate mirror
+// a many-tab SAP selection screen, and redeclaring thirty flags there would
+// duplicate the whole surface -- so the check has to live with the command that
+// does know them. Exposed for tests.
+std::string UnknownFlag(const std::vector<std::string> &args, const std::string &sub);
+
 int RunSql(Options o);
 int RunSync(Options o);
 int RunReplicate(Options o);

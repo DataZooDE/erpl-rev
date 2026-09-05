@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <iterator>
 #include <thread>
 
 #include "abap_codegen.hpp"
@@ -25,6 +26,48 @@ std::string BuildParams(const std::vector<std::pair<std::string, std::string>> &
         j += json::QuoteString(k) + ":" + json::QuoteString(v);
     }
     return j + "}";
+}
+
+std::string UnknownFlag(const std::vector<std::string> &args, const std::string &sub) {
+    // name, takes_value. A value-taking flag's value is the next word, and a
+    // value may itself look like a flag (`--where=--x`), so it is skipped
+    // rather than examined.
+    struct Spec { const char *name; bool takes_value; };
+    static const Spec kReplicate[] = {
+        {"--table", true},        {"--target", true},     {"--columns", true},
+        {"--where", true},        {"--cds-params", true}, {"--init", true},
+        {"--mode", true},         {"--part-col", true},   {"--dest", true},
+        {"--partition-by", true}, {"--target-kind", true}, {"--batch", true},
+        {"--maxrows", true},      {"--jobs", true},       {"--wait", true},
+        {"--parallel", false},    {"--no-verify", false}, {"--no-truncate", false},
+        {"--detach", false},
+    };
+    static const Spec kSyncCreate[] = {
+        {"--method", true},   {"--source", true},  {"--keys", true},
+        {"--chg-col", true},  {"--wm-kind", true}, {"--wm-value", true},
+        {"--cadence", true},  {"--extra", true},   {"--safety-secs", true},
+    };
+    static const Spec kSyncSchedule[] = {
+        {"--every", true}, {"--remove", false},
+    };
+
+    const Spec *known = nullptr;
+    size_t count = 0;
+    if (sub == "replicate")           { known = kReplicate;    count = std::size(kReplicate); }
+    else if (sub == "sync create")    { known = kSyncCreate;   count = std::size(kSyncCreate); }
+    else if (sub == "sync schedule")  { known = kSyncSchedule; count = std::size(kSyncSchedule); }
+    // ls / show / run / run-due read no flags of their own; count stays 0, so
+    // any `--word` at all is unknown -- which is the right answer for them.
+
+    for (size_t i = 0; i < args.size(); i++) {
+        if (args[i].rfind("--", 0) != 0) continue;   // a positional, e.g. the target
+        const Spec *hit = nullptr;
+        for (size_t k = 0; k < count; k++)
+            if (args[i] == known[k].name) { hit = &known[k]; break; }
+        if (!hit) return args[i];
+        if (hit->takes_value) i++;
+    }
+    return {};
 }
 
 namespace {
@@ -138,6 +181,19 @@ std::string Field(const Options &o, const std::string &name, const std::string &
     for (size_t i = 0; i + 1 < o.args.size(); i++)
         if (o.args[i] == name) return o.args[i + 1];
     return def;
+}
+
+// Reject a `--flag` this subcommand does not read, rather than ignore it.
+// Ignoring is worse than it sounds: a flag that silently does nothing looks
+// like it worked. `replicate --queue-only` on a build predating that flag
+// printed no complaint and quietly took the generated-ABAP path instead --
+// the command appeared to run, against a different code path than asked for.
+int RefuseUnknownFlags(const Options &o, const std::string &sub) {
+    const std::string bad = UnknownFlag(o.args, sub);
+    if (bad.empty()) return 0;
+    std::fprintf(stderr, "erpl-rev %s: unknown option '%s'. Try --help.\n",
+                 sub.c_str(), bad.c_str());
+    return 2;
 }
 
 // Is the pre-deployed driver available? Cheap and cached: one ADT search.
@@ -408,14 +464,18 @@ static int SyncSchedule(Options &o) {
 }
 
 int RunSync(Options o) {
+    const std::string sub = o.args.empty() ? "" : o.args.front();
+    const std::string arg = o.args.size() > 1 && o.args[1].rfind("--", 0) != 0
+                                ? o.args[1] : std::string();
+    // Before anything that prompts or contacts SAP: a typo'd flag should cost
+    // the user an error message, not a password prompt and a wrong job.
+    if (const int rc = RefuseUnknownFlags(o, "sync " + sub)) return rc;
+
     const auto cfg = cli::ReadConfig();
     // --queue-only never contacts SAP, so it must not prompt for a password to
     // write a row into a local database.
     cli::ResolveConn(o, cfg, !o.queue_only && !o.non_interactive && cli::IsTty());
 
-    const std::string sub = o.args.empty() ? "" : o.args.front();
-    const std::string arg = o.args.size() > 1 && o.args[1].rfind("--", 0) != 0
-                                ? o.args[1] : std::string();
     try {
         if (sub == "ls")            return SyncList(o);
         if (sub == "show")          return SyncShow(o, arg);
@@ -440,6 +500,10 @@ int RunSync(Options o) {
 // ---------------------------------------------------------------------------
 
 int RunReplicate(Options o) {
+    // Before anything that prompts or contacts SAP: a typo'd flag should cost
+    // the user an error message, not a password prompt and a wrong load.
+    if (const int rc = RefuseUnknownFlags(o, "replicate")) return rc;
+
     const auto cfg = cli::ReadConfig();
     cli::ResolveConn(o, cfg, !o.queue_only && !o.non_interactive && cli::IsTty());
 
