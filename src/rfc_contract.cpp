@@ -45,6 +45,11 @@ const std::vector<RfcFm> &RfcContract() {
         // IV_IMAGES: the second staging table a KEYS_IUD cycle fills by re-reading
         // the source. Optional, so an ABAP caller generated before it existed
         // still binds.
+        //
+        // Changing an EXISTING function module's interface only works because
+        // mkfm deletes and recreates it first -- RS_FUNCTIONMODULE_INSERT alone
+        // reports "already exists" and changes nothing, so the parameter never
+        // arrives and the caller fails at runtime.
         {"Z_DUCKDB_CDC_APPLY",
          {Imp("IV_TARGET"), Imp("IV_STAGING"), Imp("IV_KEYS"), Imp("IV_IMAGES"), Exp("EV_INS"),
           Exp("EV_UPD"), Exp("EV_DEL"), Exp("EV_PRUNE"), Exp("EV_APPLIED"), Exp("EV_ERROR")}},
@@ -64,7 +69,12 @@ const std::vector<RfcFm> &RfcContract() {
         // descriptor, mirrored by an ABAP generator, needs to be.
         //
         // Actions: BEGIN_CYCLE, CYCLE_COMMIT, TICK, SPLIT, VALIDATE, DRIFT,
-        // RETAIN, SUBS, CDC_PROBE, CDC_STATUS.
+        // RETAIN, SUBS, CDC_PROBE, CDC_STATUS, CDC_APPLY.
+        //
+        // CDC_APPLY lives here rather than as a new parameter on
+        // Z_DUCKDB_CDC_APPLY because an existing FM's interface cannot be
+        // extended in place -- see the note on that entry. This is what the
+        // generic IV_PARAMS shape is FOR.
         {"Z_DUCKDB_PLAN",
          {Imp("IV_ACTION"), Imp("IV_TARGET"), Imp("IV_PARAMS"), Exp("EV_PLAN"), Exp("EV_ERROR")}},
     };

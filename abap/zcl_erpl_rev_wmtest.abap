@@ -116,7 +116,7 @@ CLASS zcl_erpl_rev_wmtest IMPLEMENTATION.
 
     ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM zdelta_d | &&
                              |WHERE changed_on = '{ sy-datum }'| ) = 0 )
-        what = "today's rows are not read"
+        what = `rows dated today are not read`
         detail = |{ sy-datum }| ).
     ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM zdelta_d | &&
                              |WHERE changed_on < '{ sy-datum }'| ) > 0 )

@@ -239,7 +239,7 @@ CLASS zcl_erpl_rev_util DEFINITION PUBLIC FINAL CREATE PUBLIC.
     "! does the federation. This is the "stage-then-publish" sink: replication keeps
     "! all its speed/typing on a local table, then this materializes the result
     "! anywhere DuckDB can write. iv_kind:
-    "!   PARQUET - COPY (SELECT * FROM src) TO '<dest>' (FORMAT parquet[, PARTITION_BY..]).
+    "!   PARQUET - COPY (SELECT * FROM src) TO the destination path (FORMAT parquet[, PARTITION_BY..]).
     "!             dest = a file (single) or a directory (partitioned dataset).
     "!   TABLE   - a table in an ATTACHed catalog (ducklake / postgres / bigquery /
     "!             iceberg / another duckdb), dest = catalog.schema.table. FULL =
@@ -295,7 +295,7 @@ CLASS zcl_erpl_rev_util DEFINITION PUBLIC FINAL CREATE PUBLIC.
                 iv_page       TYPE i DEFAULT 8192
       RETURNING VALUE(rs)     TYPE ty_stream.
 
-    "! One key tuple, values in key order.
+    " One key tuple, values in key order.
     TYPES ty_keyrow  TYPE string_table.
     TYPES tt_keyrows TYPE STANDARD TABLE OF ty_keyrow WITH DEFAULT KEY.
 
@@ -319,7 +319,7 @@ CLASS zcl_erpl_rev_util DEFINITION PUBLIC FINAL CREATE PUBLIC.
                 iv_chunk     TYPE i DEFAULT 500
       RETURNING VALUE(rv)    TYPE string.
 
-    "! One unit of a mass run: a predicate the worker applies, and its number.
+    " One unit of a mass run: a predicate the worker applies, and its number.
     TYPES: BEGIN OF ty_portion,
              portion_no TYPE i,
              predicate  TYPE string,
@@ -351,7 +351,7 @@ CLASS zcl_erpl_rev_util DEFINITION PUBLIC FINAL CREATE PUBLIC.
                 iv_params     TYPE csequence OPTIONAL
                 iv_max_attempts TYPE i DEFAULT 3
                 ii_progress   TYPE REF TO zif_erpl_rev_progress OPTIONAL
-      RETURNING VALUE(rs)     TYPE ty_result.
+      RETURNING VALUE(rs)     TYPE ty_repl.
 
     "! One SAP-side cell as canonical comparison text.
     "!

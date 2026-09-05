@@ -52,6 +52,38 @@ CLASS zcl_erpl_rev_mkfm IMPLEMENTATION.
     lv_name = name.
     lv_area = 'ZERPL_REV'.
     lv_text = txt.
+    " Adding a parameter to an EXISTING function module is the case that matters
+    " on an upgrade, and RS_FUNCTIONMODULE_INSERT cannot do it: it returns
+    " "already exists" and changes nothing, so a new importing parameter silently
+    " never arrives and the caller fails at runtime with "field is unknown".
+    "
+    " So: compare the live interface against the one we are about to generate,
+    " and when they differ, delete and recreate. These are generated stubs whose
+    " bodies are a single call into the server, so recreating one loses nothing.
+    SELECT COUNT(*) FROM fupararef
+      WHERE funcname = @lv_name AND paramtype IN ( 'I', 'E' )
+      INTO @DATA(lv_live_params).
+    DATA(lv_want_params) = lines( lt_imp ) + lines( lt_exp ).
+
+    IF lv_live_params > 0 AND lv_live_params <> lv_want_params.
+      out->write( |{ name } interface changed ({ lv_live_params } -> { lv_want_params } | &&
+                  |parameters); recreating| ).
+      " FUNCTION_DELETE, not RS_FUNCTIONMODULE_DELETE: the latter simply does not
+      " exist on this release, and calling it aborts the whole generation run
+      " with CX_SY_DYN_CALL_ILLEGAL_FUNC -- which is how this was found.
+      CALL FUNCTION 'FUNCTION_DELETE'
+        EXPORTING
+          funcname                 = lv_name
+          suppress_success_message = 'X'
+        EXCEPTIONS
+          error_message            = 1
+          OTHERS                   = 2.
+      IF sy-subrc <> 0.
+        out->write( |{ name } could not be deleted (subrc={ sy-subrc }); | &&
+                    |the new parameter will NOT be present| ).
+      ENDIF.
+    ENDIF.
+
     CALL FUNCTION 'RS_FUNCTIONMODULE_INSERT'
       EXPORTING
         funcname                = lv_name

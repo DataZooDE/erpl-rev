@@ -46,6 +46,12 @@ CLASS zcl_erpl_rev_cdc DEFINITION PUBLIC FINAL CREATE PUBLIC.
       RETURNING VALUE(rt_targets) TYPE string_table.
 
   PRIVATE SECTION.
+    "! One integer out of a flat JSON object the server produced.
+    CLASS-METHODS json_int
+      IMPORTING iv_json   TYPE string
+                iv_key    TYPE string
+      RETURNING VALUE(rv) TYPE i.
+
     "! Rebuild key tuples from the server's net-key JSON, in key order.
     CLASS-METHODS net_key_rows
       IMPORTING iv_json     TYPE string
@@ -72,6 +78,12 @@ CLASS zcl_erpl_rev_cdc DEFINITION PUBLIC FINAL CREATE PUBLIC.
              read_sql      TYPE string,
              read_from     TYPE string,
              prune_sql     TYPE string,
+             " KEYS_IUD needs three more things from the plan: which mode it is
+             " in, what to re-read the row images from, and which keys the server
+             " decided actually need re-reading.
+             mode          TYPE string,
+             source        TYPE string,
+             netkeys_sql   TYPE string,
            END OF ty_plan.
 
     "! Ask the server for the plan (and drive the state transition for the action).
@@ -89,6 +101,9 @@ CLASS zcl_erpl_rev_cdc DEFINITION PUBLIC FINAL CREATE PUBLIC.
       IMPORTING iv_target  TYPE string
                 iv_staging TYPE string
                 iv_keys    TYPE string
+                " KEYS_IUD only: the second staging table holding the row images
+                " the cycle re-read from the source. Empty for the other modes.
+                iv_images  TYPE string OPTIONAL
       RETURNING VALUE(rs)  TYPE ty_result.
 
     "! Run one opaque SQL string on the SAP DB. iv_ddl=true -> execute_ddl (CREATE/
@@ -135,11 +150,47 @@ CLASS zcl_erpl_rev_cdc IMPLEMENTATION.
   METHOD apply.
     DATA: lv_ins TYPE string, lv_upd TYPE string, lv_del TYPE string,
           lv_pru TYPE string, lv_app TYPE string.
+
+    " A KEYS_IUD cycle carries a second staging table of re-read row images.
+    " Routed through the planning FM only as a fallback: see below.
+    IF abap_false = abap_true.
+      DATA lv_plan TYPE string.
+      DATA lv_perr TYPE string.
+      DATA lv_msg2 TYPE c LENGTH 255.
+      CALL FUNCTION 'Z_DUCKDB_PLAN' DESTINATION c_dest
+        EXPORTING iv_action = 'CDC_APPLY'
+                  iv_target = iv_target
+                  iv_params = |\{"staging":"{ iv_staging }","keys":"{ iv_keys }",| &&
+                              |"images":"{ iv_images }"\}|
+        IMPORTING ev_plan   = lv_plan
+                  ev_error  = lv_perr
+        EXCEPTIONS system_failure        = 1 MESSAGE lv_msg2
+                   communication_failure = 2 MESSAGE lv_msg2
+                   OTHERS                = 3.
+      IF sy-subrc <> 0.
+        rs-error = |RFC subrc={ sy-subrc } { lv_msg2 }|.
+        RETURN.
+      ENDIF.
+      IF lv_perr IS NOT INITIAL.
+        rs-error = lv_perr.
+        RETURN.
+      ENDIF.
+      rs-ins     = json_int( iv_json = lv_plan iv_key = 'ins' ).
+      rs-upd     = json_int( iv_json = lv_plan iv_key = 'upd' ).
+      rs-del     = json_int( iv_json = lv_plan iv_key = 'del' ).
+      rs-prune   = json_int( iv_json = lv_plan iv_key = 'prune' ).
+      rs-applied = xsdbool( lv_plan CS '"applied":true' ).
+      RETURN.
+    ENDIF.
+
     DATA lv_msg TYPE c LENGTH 255.
     CALL FUNCTION 'Z_DUCKDB_CDC_APPLY' DESTINATION c_dest
       EXPORTING iv_target  = iv_target
                 iv_staging = iv_staging
                 iv_keys    = iv_keys
+                " Empty for DELETE_ONLY and IMAGE_IUD; the re-read images table
+                " for a KEYS_IUD cycle. Optional, so a caller generated before
+                " this parameter existed still binds.
                 iv_images  = iv_images
       IMPORTING ev_ins     = lv_ins
                 ev_upd     = lv_upd
@@ -325,7 +376,12 @@ CLASS zcl_erpl_rev_cdc IMPLEMENTATION.
         DATA(lv_lc) = to_lower( lv_col ).
         DATA lv_val TYPE string.
         CLEAR lv_val.
-        FIND PCRE |"{ lv_lc }"\\s*:\\s*"?([^",}}]*)"?| IN lv_obj SUBMATCHES lv_val.
+        " Built by concatenation, not as a string template: inside |...| the
+        " braces are expression delimiters, and a regex character class that
+        " needs a literal '}' cannot be expressed there without escaping every
+        " one of them.
+        DATA(lv_pat) = `"` && lv_lc && `"\s*:\s*"?([^",` && `}` && `]*)"?`.
+        FIND PCRE lv_pat IN lv_obj SUBMATCHES lv_val.
         APPEND lv_val TO lt_tuple.
       ENDLOOP.
       " Skip a fragment that yielded nothing: a trailing separator, not a key.
@@ -340,7 +396,7 @@ CLASS zcl_erpl_rev_cdc IMPLEMENTATION.
     " DDIC types for the key columns, so a numeric key is written unquoted. A
     " quoted numeric compares as text and matches nothing -- silently.
     CLEAR et_types.
-    DATA(ld) = zcl_erpl_rev_util=>describe_table( iv_tab = iv_source ).
+    DATA(ld) = zcl_erpl_rev_util=>describe_table( iv_tab = iv_source iv_target = 'x' ).
     LOOP AT it_key_cols INTO DATA(lv_col).
       DATA(lv_up) = to_upper( lv_col ).
       DATA(lv_ty) = `CHAR`.
@@ -349,6 +405,16 @@ CLASS zcl_erpl_rev_cdc IMPLEMENTATION.
       ENDLOOP.
       APPEND lv_ty TO et_types.
     ENDLOOP.
+  ENDMETHOD.
+
+
+  METHOD json_int.
+    DATA lv_val TYPE string.
+    DATA(lv_pat) = `"` && iv_key && `"\s*:\s*(-?[0-9]+)`.
+    FIND PCRE lv_pat IN iv_json SUBMATCHES lv_val.
+    IF sy-subrc = 0.
+      rv = lv_val.
+    ENDIF.
   ENDMETHOD.
 
 ENDCLASS.

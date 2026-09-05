@@ -597,6 +597,23 @@ extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE,
                    "\"logged\":" + std::to_string(r.logged) + "," +
                    "\"wm\":" + json::QuoteString(r.new_watermark) +
                    "}";
+        } else if (action == "CDC_APPLY") {
+            // The KEYS_IUD apply. It is an action rather than a parameter on
+            // Z_DUCKDB_CDC_APPLY because that FM's interface cannot be extended
+            // on a live system: the metadata updates, the generated include does
+            // not, and the caller fails to compile against a parameter the
+            // catalogue says exists.
+            const auto staging = JsonField(params, "staging");
+            const auto keys    = JsonField(params, "keys");
+            const auto images  = JsonField(params, "images");
+            CdcApplyResult r = g_bridge->CdcApply(target, staging, SplitCsv(keys), images);
+            plan = std::string("{") +
+                   "\"ins\":" + std::to_string(r.ins) + "," +
+                   "\"upd\":" + std::to_string(r.upd) + "," +
+                   "\"del\":" + std::to_string(r.del) + "," +
+                   "\"prune\":" + std::to_string(r.prune_bound) + "," +
+                   "\"applied\":" + (r.applied ? "true" : "false") +
+                   "}";
         } else if (action == "DRIFT") {
             // The DDIC field list arrives as JSON on the first package of a
             // replication, so this costs no round trip of its own.
@@ -669,7 +686,7 @@ extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE,
         } else {
             throw std::runtime_error(
                 "unknown plan action '" + action +
-                "'. Known: BEGIN_CYCLE, CYCLE_COMMIT, TICK.");
+                "'. Known: BEGIN_CYCLE, CYCLE_COMMIT, TICK, CDC_APPLY, DRIFT.");
         }
 
         SetString(funcHandle, "EV_PLAN", plan);
