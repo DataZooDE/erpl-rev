@@ -266,6 +266,7 @@ endif()
 # headers), logging (only the server and rfc_handlers use it) and main.
 add_library(erpl_rev_core OBJECT
   src/duckdb_bridge.cpp
+  src/control_schema.cpp
   src/cdc_dialect.cpp
   src/json_util.cpp
   src/sxml_binary.cpp
@@ -284,7 +285,8 @@ add_library(erpl_rev_core OBJECT
   ${ERPL_ABAP_GENERATED})
 target_include_directories(erpl_rev_core PUBLIC src "${DUCKDB_INCLUDE}")
 target_compile_definitions(erpl_rev_core PUBLIC
-  ERPL_REV_DUCKDB_VERSION="${DUCKDB_VERSION}")
+  ERPL_REV_DUCKDB_VERSION="${DUCKDB_VERSION}"
+  ERPL_REV_VERSION="${ERPL_REV_VERSION}")
 # Linked for their INTERFACE include directories: an OBJECT library does not
 # inherit a consumer's link interface, so these have to be named here or the
 # telemetry/banner headers are not on the include path.
@@ -311,8 +313,6 @@ add_executable(erpl_rev_server
 set_target_properties(erpl_rev_server PROPERTIES ENABLE_EXPORTS TRUE)
 
 target_include_directories(erpl_rev_server PRIVATE "${RFC_INCLUDE}")
-target_compile_definitions(erpl_rev_server PRIVATE
-  ERPL_REV_VERSION="${ERPL_REV_VERSION}")
 target_link_libraries(erpl_rev_server PRIVATE
   erpl_rev_core ${SAP_LIBS} ${DUCKDB_LIB} Threads::Threads ${CMAKE_DL_LIBS}
   posthog_telemetry datazoo_banner OpenSSL::Crypto ZLIB::ZLIB)
@@ -333,6 +333,7 @@ if(TRUE)  # tests always build; DuckDB is in-tree
     test/test_duckdb_bridge.cpp
     test/test_cdc_dialect.cpp
     test/test_sql_name.cpp
+    test/test_control_schema.cpp
     test/test_sxml_binary.cpp
     test/test_payload.cpp
     test/test_telemetry.cpp
@@ -344,7 +345,8 @@ if(TRUE)  # tests always build; DuckDB is in-tree
     test/test_tunnel.cpp
     test/bench_ingest.cpp)
   target_compile_definitions(erpl_rev_tests PRIVATE
-    ERPL_REV_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+    ERPL_REV_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
+    ERPL_REV_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures")
   target_link_libraries(erpl_rev_tests PRIVATE
     erpl_rev_core ${DUCKDB_LIB} Threads::Threads Catch2::Catch2WithMain
     posthog_telemetry datazoo_banner OpenSSL::Crypto ZLIB::ZLIB)

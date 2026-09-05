@@ -349,7 +349,8 @@ CLASS zcl_erpl_rev_util DEFINITION PUBLIC FINAL CREATE PUBLIC.
           mv_rows    TYPE i,           " rows confirmed ingested by completed tasks
           mv_err     TYPE string,      " first error from any task
           mv_seq     TYPE i,
-          mv_depth   TYPE i VALUE 2.   " max ingests in flight
+          mv_depth   TYPE i VALUE 2,   " max ingests in flight
+          mv_wait    TYPE i VALUE 3600. " seconds a throttle/drain wait may take
     "! Dispatch one package for ingestion (async if possible, else synchronous),
     "! throttling to mv_depth in-flight tasks.
     METHODS pipe_send
@@ -605,7 +606,7 @@ CLASS zcl_erpl_rev_util IMPLEMENTATION.
     " Throttle so at most mv_depth ingests are in flight (WAIT runs the aRFC
     " end-of-task callbacks, which decrement mv_pending).
     IF mv_pending >= mv_depth.
-      WAIT UNTIL mv_pending < mv_depth UP TO 3600 SECONDS.
+      WAIT UNTIL mv_pending < mv_depth UP TO mv_wait SECONDS.
     ENDIF.
     mv_seq = mv_seq + 1.
     DATA(lv_task) = |EREV{ mv_seq }|.
@@ -644,7 +645,19 @@ CLASS zcl_erpl_rev_util IMPLEMENTATION.
 
   METHOD pipe_drain.
     IF mv_pending > 0.
-      WAIT UNTIL mv_pending <= 0 UP TO 3600 SECONDS.
+      WAIT UNTIL mv_pending <= 0 UP TO mv_wait SECONDS.
+    ENDIF.
+    " A WAIT that expires returns normally, so without this check a drain that
+    " timed out is indistinguishable from one that completed -- and the caller
+    " reports a short row count as success. replicate_parallel already gets the
+    " equivalent right for its job wait (it re-checks lv_active afterwards).
+    " Today that is a wrong count; once a cycle stages and the server merges the
+    " stage, a package still in flight lands AFTER the merge and is discarded by
+    " the next cycle -- a lost row.
+    IF mv_pending > 0.
+      IF mv_err IS INITIAL.
+        mv_err = |ingest drain timed out after { mv_wait }s, { mv_pending } package(s) in flight|.
+      ENDIF.
     ENDIF.
   ENDMETHOD.
 

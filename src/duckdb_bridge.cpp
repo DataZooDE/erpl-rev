@@ -1,4 +1,5 @@
 #include "duckdb_bridge.hpp"
+#include "control_schema.hpp"
 #include "payload.hpp"
 #include "json_util.hpp"
 #include "sxml_binary.hpp"
@@ -207,40 +208,17 @@ DuckDbBridge::DuckDbBridge(const std::string &path, const std::string &init_sql)
     // skips this); a later remote query auto-loads it anyway.
     if (!con.Query("LOAD httpfs")->HasError())
         con.Query("SET GLOBAL httpfs_connection_caching=true");
-    // Delta registry + runtime state — created once, always (independent of the
-    // optional boot init_sql). Both the per-target config and the watermark/lease
-    // state for incremental extraction live here; ABAP reads/writes it through
-    // Z_DUCKDB_QUERY, so there is no new SAP-side state table. (HLD §4.1.)
-    auto d = con.Query(
-        "CREATE TABLE IF NOT EXISTS _erpl_rev_delta_state ("
-        "target VARCHAR PRIMARY KEY, method VARCHAR NOT NULL, source_from VARCHAR NOT NULL, "
-        "keys VARCHAR NOT NULL, chg_col VARCHAR, wm_kind VARCHAR, wm_value VARCHAR, "
-        "safety_secs INTEGER DEFAULT 120, cadence VARCHAR DEFAULT 'nightly', extra VARCHAR, "
-        // TIMESTAMPTZ (not naive TIMESTAMP): now() is tz-aware, so storing it in a
-        // naive column and later doing epoch(now()) - epoch(col) yields a spurious
-        // local-UTC offset. Matching types keeps cadence/lease arithmetic correct.
-        "last_run_ts TIMESTAMPTZ, rows_applied BIGINT, status VARCHAR DEFAULT 'IDLE', "
-        "lease_ts TIMESTAMPTZ, last_error VARCHAR)");
-    if (d->HasError())
-        throw std::runtime_error("DuckDB delta-state init failed: " + d->GetError());
-    // Replication run statistics — one durable row per full or incremental run,
-    // written by the ABAP apply path (zcl_erpl_rev_util=>record_run via Z_DUCKDB_QUERY),
-    // with enough dimensions/measures to build a replication dashboard straight from
-    // DuckDB (see docs/stats.md). run_id from a sequence; ts defaults to the server
-    // clock (now()) so it agrees with the delta-state clock. The erpl_rev_run_stats
-    // view adds derived rows_applied / rows_per_sec / started_at / is_success.
-    auto seq = con.Query("CREATE SEQUENCE IF NOT EXISTS _erpl_rev_run_seq START 1");
-    if (seq->HasError())
-        throw std::runtime_error("DuckDB run-seq init failed: " + seq->GetError());
-    auto rstat = con.Query(
-        "CREATE TABLE IF NOT EXISTS _erpl_rev_run_stats ("
-        "run_id BIGINT PRIMARY KEY DEFAULT nextval('_erpl_rev_run_seq'), "
-        "ts TIMESTAMPTZ DEFAULT now(), "
-        "target VARCHAR, source VARCHAR, run_type VARCHAR, method VARCHAR, status VARCHAR, "
-        "duration_ms BIGINT, rows_read BIGINT, rows_ins BIGINT, rows_upd BIGINT, rows_del BIGINT, "
-        "wm_from VARCHAR, wm_to VARCHAR, jobs INTEGER, error_text VARCHAR)");
-    if (rstat->HasError())
-        throw std::runtime_error("DuckDB run-stats init failed: " + rstat->GetError());
+    // Control schema: every table erpl-rev owns is created and evolved from the
+    // one ordered migration list in control_schema.cpp, so a DuckDB file from an
+    // older binary is migrated in place at boot rather than diverging. v1 of that
+    // list is exactly the DDL that used to be inline here.
+    //
+    // Only the server migrates: the CLI reaches DuckDB over quack while the
+    // server holds the file lock, so it must never run this.
+    schema::Migrate(con, ERPL_REV_VERSION);
+
+    // The run-stats view is CREATE OR REPLACE on every open rather than a
+    // migration, so a view fix reaches existing files without a version bump.
     auto rview = con.Query(
         "CREATE OR REPLACE VIEW erpl_rev_run_stats AS SELECT "
         "run_id, ts AS finished_at, "
@@ -255,32 +233,6 @@ DuckDbBridge::DuckDbBridge(const std::string &path, const std::string &init_sql)
         "FROM _erpl_rev_run_stats");
     if (rview->HasError())
         throw std::runtime_error("DuckDB run-stats view init failed: " + rview->GetError());
-    // Trigger-CDC state machine (opt-in physical-delete tier, ADR-0004 / epic #17).
-    // One row per CDC target: config + provisioning status + log position. Guarded
-    // transitions live in the CDC* methods; the table itself is plain DuckDB so the
-    // state survives a server restart.
-    auto cdc = con.Query(
-        "CREATE TABLE IF NOT EXISTS _erpl_rev_cdc ("
-        "target VARCHAR PRIMARY KEY, source VARCHAR NOT NULL, keys VARCHAR NOT NULL, "
-        "platform VARCHAR DEFAULT 'HANA', mode VARCHAR DEFAULT 'DELETE_ONLY', "
-        "status VARCHAR DEFAULT 'PROVISIONED', log_table VARCHAR, position BIGINT DEFAULT 0, "
-        "provisioned_ts TIMESTAMPTZ, seeded_ts TIMESTAMPTZ, last_run_ts TIMESTAMPTZ, error VARCHAR)");
-    if (cdc->HasError())
-        throw std::runtime_error("DuckDB cdc-state init failed: " + cdc->GetError());
-    // The CLI command queue. The CLI writes a row here and ABAP picks it up, so
-    // parameters reach SAP as *data* rather than as generated source -- which is
-    // what lets sync/replicate work for a user with no developer authorisation,
-    // and removes the ABAP-escaping surface entirely. See issue #85.
-    auto cmdq = con.Query(
-        "CREATE SEQUENCE IF NOT EXISTS _erpl_rev_cli_seq START 1;"
-        "CREATE TABLE IF NOT EXISTS _erpl_rev_cli_cmd ("
-        "cmd_id BIGINT PRIMARY KEY, created_ts TIMESTAMPTZ DEFAULT now(), "
-        "verb VARCHAR NOT NULL, params VARCHAR NOT NULL, "
-        "status VARCHAR DEFAULT 'PENDING', "
-        "claimed_ts TIMESTAMPTZ, finished_ts TIMESTAMPTZ, "
-        "result VARCHAR, error VARCHAR)");
-    if (cmdq->HasError())
-        throw std::runtime_error("DuckDB cli-queue init failed: " + cmdq->GetError());
 
     // Boot init: explicit init_sql (CLI/--init-file) wins; else env fallback. Runs
     // INSTALL/LOAD/CREATE SECRET/ATTACH so replication can publish to external
