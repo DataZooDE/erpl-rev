@@ -270,6 +270,7 @@ add_library(erpl_rev_core OBJECT
   src/delta_plan.cpp
   src/load_type.cpp
   src/rfc_contract.cpp
+  src/tick_planner.cpp
   src/cdc_dialect.cpp
   src/json_util.cpp
   src/sxml_binary.cpp
@@ -341,6 +342,7 @@ if(TRUE)  # tests always build; DuckDB is in-tree
     test/test_load_type.cpp
     test/test_rfc_contract.cpp
     test/test_cdc_apply_keys.cpp
+    test/test_tick_planner.cpp
     test/test_sxml_binary.cpp
     test/test_payload.cpp
     test/test_telemetry.cpp
