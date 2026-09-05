@@ -68,7 +68,7 @@ GENERATOR := $(shell command -v ninja >/dev/null 2>&1 && echo Ninja || echo "Uni
 
 DIST ?= dist
 
-.PHONY: all build configure test run run-mem run-no-quack e2e duckdb-dist submodules start-sap clean bundle
+.PHONY: all build configure test ctest run run-mem run-no-quack e2e duckdb-dist submodules start-sap clean bundle
 
 all: build
 
@@ -121,8 +121,18 @@ endif
 build: configure
 	cmake --build $(BUILD_DIR)
 
+# TEST_SPEC passes a Catch2 spec straight through, so a single case or tag can
+# be run without remembering the binary's path:
+#   make test TEST_SPEC='[watermark]'
+TEST_SPEC ?=
 test: build
-	$(RUN_ENV) ./$(BUILD_DIR)/erpl_rev_tests
+	$(RUN_ENV) ./$(BUILD_DIR)/erpl_rev_tests $(TEST_SPEC)
+
+# The same suite through ctest, which is how CI selects a subset by name:
+#   make ctest CTEST_ARGS='-R watermark'
+CTEST_ARGS ?=
+ctest: build
+	cd $(BUILD_DIR) && $(RUN_ENV) ctest --output-on-failure $(CTEST_ARGS)
 
 # Run the RFC server WITH the quack network server enabled. Override the bind
 # address with QUACK_LISTEN (default loopback; use quack:0.0.0.0:9494 to expose).

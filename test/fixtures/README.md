@@ -18,3 +18,9 @@ target already links.
 **This file cannot be regenerated once the constructor writes a version table.** It was produced by
 the pre-change binary and checked in first, deliberately — a hand-synthesised copy made later from
 v2+ code would not test the migration it claims to. Do not "refresh" it.
+
+## Test naming convention
+
+`ctest -R <area>` matches Catch2 **case names**, not tags, so every new case is
+named `area: what it proves` (e.g. `sqlname: Token keeps ...`). Tags stay for
+`./erpl_rev_tests "[sqlname]"`; the prefix is what makes CI able to run a subset.

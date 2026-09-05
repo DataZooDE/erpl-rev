@@ -1,4 +1,5 @@
 #include "cdc_dialect.hpp"
+#include "sql_name.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -8,23 +9,13 @@ namespace erpl_rev {
 
 namespace {
 
-std::string Upper(const std::string &s) {
-    std::string r = s;
-    std::transform(r.begin(), r.end(), r.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-    return r;
-}
+// Name and quoting rules live in sql_name.hpp: the ZCDC_* token rule is shared
+// with the per-target change log, and having two copies over two namespaces of
+// customer-supplied names is exactly the bug that is hard to fix later.
+using erpl_rev::sqlname::Token;
+using erpl_rev::sqlname::Upper;
 
-// A safe, in-namespace object-name token from a source name: uppercase, and any
-// char that isn't A-Z/0-9 becomes '_' (so /BIC/FOO -> _BIC_FOO).
-std::string NameToken(const std::string &s) {
-    std::string r = Upper(s);
-    for (char &c : r)
-        if (!std::isalnum(static_cast<unsigned char>(c))) c = '_';
-    return r;
-}
-
-std::string Quote(const std::string &id) { return "\"" + id + "\""; }
+std::string Quote(const std::string &id) { return erpl_rev::sqlname::QuoteIdent(id); }
 
 // Build the INSERT-into-log that a trigger body runs, capturing the logged columns
 // (keys, or the full row image for FULL_IUD) plus the op flag, the next sequence
@@ -54,7 +45,7 @@ CdcPlan HanaDialect::Plan(const CdcSpec &spec) const {
     if (spec.source.empty()) throw std::runtime_error("CDC: empty source table");
     if (spec.keys.empty()) throw std::runtime_error("CDC: no key columns for " + spec.source);
 
-    const std::string tok = NameToken(spec.source);
+    const std::string tok = Token(spec.source);
     CdcPlan p;
     p.key_cols = spec.keys;
     // FULL_IUD logs the full row image (so inserts/updates can be upserted server-side);
