@@ -107,6 +107,35 @@ CdcPlan HanaDialect::Plan(const CdcSpec &spec) const {
     return p;
 }
 
+// HANA's own catalogue views. Restricted to the ZCDC_ namespace and the current
+// schema, so the probe cannot see -- let alone report -- customer objects.
+std::string HanaDialect::ProbeTablesSql() const {
+    return "SELECT TABLE_NAME FROM SYS.TABLES WHERE SCHEMA_NAME = CURRENT_SCHEMA "
+           "AND TABLE_NAME LIKE 'ZCDC/_%' ESCAPE '/'";
+}
+
+std::string HanaDialect::ProbeSequencesSql() const {
+    return "SELECT SEQUENCE_NAME FROM SYS.SEQUENCES WHERE SCHEMA_NAME = CURRENT_SCHEMA "
+           "AND SEQUENCE_NAME LIKE 'ZCDC/_%' ESCAPE '/'";
+}
+
+std::string HanaDialect::ProbeTriggersSql() const {
+    // IS_VALID matters as much as existence: an invalid trigger is present in the
+    // catalogue and fires nothing, which looks healthy and captures nothing.
+    return "SELECT TRIGGER_NAME, IS_VALID FROM SYS.TRIGGERS WHERE SCHEMA_NAME = CURRENT_SCHEMA "
+           "AND TRIGGER_NAME LIKE 'ZCDC/_%' ESCAPE '/'";
+}
+
+std::string AnyDbDialect::ProbeTablesSql() const {
+    throw std::runtime_error("CDC: only SAP HANA is supported in this release");
+}
+std::string AnyDbDialect::ProbeSequencesSql() const {
+    throw std::runtime_error("CDC: only SAP HANA is supported in this release");
+}
+std::string AnyDbDialect::ProbeTriggersSql() const {
+    throw std::runtime_error("CDC: only SAP HANA is supported in this release");
+}
+
 CdcPlan AnyDbDialect::Plan(const CdcSpec &) const {
     throw std::runtime_error(
         "CDC: platform 'ANYDB' is not supported in v1 (only HANA); see ADR-0004 roadmap");

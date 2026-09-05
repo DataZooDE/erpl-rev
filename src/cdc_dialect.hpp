@@ -67,19 +67,37 @@ public:
     virtual ~CdcDialect() = default;
     virtual CdcPlan Plan(const CdcSpec &spec) const = 0;
     virtual std::string Name() const = 0;
+
+    // Catalogue probe: what the DATABASE says exists, as opposed to what the
+    // registry believes. Three result sets -- tables, sequences, triggers with
+    // their enabled flag -- which the status derivation compares against the
+    // expected object list. Without this a trigger dropped out of band (system
+    // copy, transport, DBA) is invisible until rows go missing.
+    virtual std::string ProbeTablesSql() const = 0;
+    virtual std::string ProbeSequencesSql() const = 0;
+    virtual std::string ProbeTriggersSql() const = 0;
 };
 
 class HanaDialect : public CdcDialect {
 public:
     CdcPlan Plan(const CdcSpec &spec) const override;
     std::string Name() const override { return "HANA"; }
+    std::string ProbeTablesSql() const override;
+    std::string ProbeSequencesSql() const override;
+    std::string ProbeTriggersSql() const override;
 };
 
 // AnyDB (Oracle/DB2/MSSQL/ASE): not implemented in v1 — Plan() throws.
+// Not implemented: erpl-rev targets HANA-based ECC and S/4. The seam is kept
+// deliberately -- it costs nothing and is what makes "HANA only" a scope choice
+// rather than something baked into the design.
 class AnyDbDialect : public CdcDialect {
 public:
     CdcPlan Plan(const CdcSpec &spec) const override;
     std::string Name() const override { return "ANYDB"; }
+    std::string ProbeTablesSql() const override;
+    std::string ProbeSequencesSql() const override;
+    std::string ProbeTriggersSql() const override;
 };
 
 // platform: "HANA" (default) or anything else -> AnyDbDialect (which refuses).
