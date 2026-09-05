@@ -58,6 +58,8 @@ ddls() { dep DDLS/DF "$1" "$2" "$3" DDLS; }
 echo "== DDIC fixtures =="
 tabl ZWIDE_BSEG zwide_bseg.ddl "wide BSEG repro (erpl-rev)"
 tabl ZDELTA_WM  zdelta_wm.ddl  "delta watermark test table (erpl-rev)"
+tabl ZDELTA_D   zdelta_d.ddl   "DATE watermark test table (complete-day rule)"
+tabl ZDELTA_DT  zdelta_dt.ddl  "DATS+TIMS watermark test table (pair comparison)"
 
 echo "== interfaces (before util -- replicate's signature references it) =="
 intf ZIF_ERPL_REV_PROGRESS zif_erpl_rev_progress.intf.abap "replicate progress callback"
@@ -99,6 +101,8 @@ prog Z_ERPL_REV_DELTA         z_erpl_rev_delta.prog.abap         "delta orchestr
 prog Z_ERPL_REV_DAEMON        z_erpl_rev_daemon.prog.abap        "streaming daemon (second-scale)"
 prog Z_ERPL_REV_DELTA_SFLIGHT z_erpl_rev_delta_sflight.prog.abap "SFLIGHT delta demo"
 cls  ZCL_ERPL_REV_REPLRUN     zcl_erpl_rev_replrun.abap          "report parallel-branch E2E"
+cls  ZCL_ERPL_REV_WMTEST      zcl_erpl_rev_wmtest.abap           "watermark correctness E2E"
+cls  ZCL_ERPL_REV_FOOTPRINT   zcl_erpl_rev_footprint.abap        "delivered-object inventory"
 
 # RS_FUNCTIONMODULE_INSERT fails with invalid_function_pool unless the group already
 # exists, and nothing else creates it -- so on a fresh container every FM is silently

@@ -23,9 +23,11 @@ CLASS zcl_erpl_rev_delta DEFINITION PUBLIC FINAL CREATE PUBLIC.
              source_from TYPE string,
              keys        TYPE string,
              chg_col     TYPE string,
-             wm_kind     TYPE string,   " NUMTS | DATETIME | CHANGENR | INT | DATE
+             wm_kind     TYPE string,   " NUMTS | TIMESTAMPL | DATETIME | DATE | INT
+             time_col    TYPE string,   " DATETIME only: the TIMS half of the pair
              wm_value    TYPE string,
-             safety_secs TYPE i,
+             safety_secs TYPE i,        " overlap in seconds, clock-based kinds
+             safety_units TYPE i,       " overlap in values, counter kinds (INT)
              cadence     TYPE string,   " micro:<sec> | hourly | nightly | manual
              extra       TYPE string,   " JSON, e.g. {"objectclas":"MATERIAL"}
              status      TYPE string,
@@ -76,9 +78,15 @@ CLASS zcl_erpl_rev_delta DEFINITION PUBLIC FINAL CREATE PUBLIC.
 
     "! Run ONE delta cycle for a target: lease -> dispatch by method -> commit ->
     "! release. rs-skipped=X when the lease is held by another cycle.
+    "! One cycle. iv_load_type selects which of the four a run is:
+    "!   D delta (default) - the bounded window
+    "!   F full reload, watermark untouched - a data repair, not a re-seed
+    "!   I init without data - adopt a position, transfer nothing
+    "!   L init + full load
     CLASS-METHODS run
-      IMPORTING iv_target TYPE csequence
-      RETURNING VALUE(rs) TYPE ty_run.
+      IMPORTING iv_target    TYPE csequence
+                iv_load_type TYPE csequence DEFAULT 'D'
+      RETURNING VALUE(rs)    TYPE ty_run.
 
     "! Targets currently DUE (cadence elapsed since last_run_ts, lease free).
     "! cadence='manual' is never due. Used by the Z_ERPL_REV_DELTA job loop.

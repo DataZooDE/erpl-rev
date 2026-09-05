@@ -250,6 +250,9 @@ suite publish ZCL_ERPL_REV_PUBTEST abap/zcl_erpl_rev_pubtest.abap PUBTEST 6 "" \
   "parquet file and dataset, attached catalog full and append"
 
 
+suite watermark ZCL_ERPL_REV_WMTEST abap/zcl_erpl_rev_wmtest.abap WM 8 "" \
+  "the corrections: a late commit below the observed max is delivered, DATE never reads today, a DATS+TIMS pair survives midnight, load types I and F"
+
 suite cds ZCL_ERPL_REV_CDSTEST abap/zcl_erpl_rev_cdstest.abap CDS 8 "" \
   "CDS view entity as a source: keys, parity, parameters"
 
@@ -421,5 +424,8 @@ if [ "$RFC_BACKEND" = proto ] && [ -z "$REMOTE" ]; then
     echo "   RFC backend linked statically; no RFC shared object at all"
   fi
 fi
+
+suite footprint ZCL_ERPL_REV_FOOTPRINT abap/zcl_erpl_rev_footprint.abap FOOTPRINT 14 "" \
+  "the delivered package contains exactly the documented objects, and nothing else"
 
 echo "== E2E PASSED =="
