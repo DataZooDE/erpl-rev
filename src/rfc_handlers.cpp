@@ -169,6 +169,16 @@ void StopQuackServer(const std::string &listen) {
     g_bridge->StopQuack(listen);
 }
 
+void StartTunnelForward(const std::string &import_sql) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    g_bridge->StartTunnel(import_sql);
+}
+
+std::string TunnelForwardInfo(const std::string &local_port) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    return g_bridge->TunnelInfo(local_port);
+}
+
 } // namespace erpl_rev
 
 using namespace erpl_rev;

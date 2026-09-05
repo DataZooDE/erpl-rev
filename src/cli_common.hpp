@@ -52,6 +52,14 @@ std::string LineStartingWith(const std::string &output, const std::string &prefi
 // most expensive failure to debug after the fact.
 bool TcpReachable(const std::string &host, const std::string &port);
 
+// A loopback TCP port nothing is listening on, or 0 if one cannot be found.
+// Used to pick the near end of an optional tunnel forward so the operator never
+// has to keep a port number in step with anything. Inherently a hint rather than
+// a reservation -- the port is released before the caller binds it -- which is
+// fine here because the only racer would be another process on the same host,
+// and the forward fails loudly at boot if it loses.
+int FreeLoopbackPort();
+
 // How the outside world sees this machine; "<this-host>" if it cannot be told.
 std::string LocalHostname();
 
@@ -66,6 +74,12 @@ using ConfigMap = std::map<std::string, std::string>;
 std::filesystem::path ConfigPath();
 ConfigMap ReadConfig();
 bool WriteConfig(const ConfigMap &kv);
+
+// Write `body` to `p` at mode 0600, atomically. The obvious version --
+// truncate, write, chmod -- leaves a window in which a file holding a secret
+// is world-readable, and a truncated file if the process dies mid-write.
+// Exposed because `setup` scaffolds an init-file that may carry a tunnel key.
+bool WriteSecretFile(const std::filesystem::path &p, const std::string &body);
 
 // ---------------------------------------------------------------------------
 // Connection options, shared by every command that can reach SAP.

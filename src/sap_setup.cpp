@@ -8,6 +8,7 @@
 #include "abap_assets.hpp"
 #include "adt.hpp"
 #include "cli_common.hpp"
+#include "tunnel.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -49,6 +50,8 @@ void Resolve(Options &o, bool allow_prompt) {
     // gwhost defaults to the already-resolved host, so it must come after it.
     o.gwhost     = cli::Pick(cfg, o.gwhost, o.gwhost_set, "ERPL_REV_GWHOST", "gwhost", o.host);
     o.gwserv     = cli::Pick(cfg, o.gwserv, o.gwserv_set, "ERPL_REV_GWSERV", "gwserv", "3300");
+    o.tunnel_secret = cli::Pick(cfg, o.tunnel_secret, o.tunnel_secret_set,
+                                "ERPL_REV_TUNNEL_SECRET", "tunnel_secret", "");
 }
 
 // Having typed a host, a client and a user once, nobody wants to type them
@@ -77,6 +80,10 @@ void OfferToSave(const Options &o) {
     cfg["gwhost"] = o.gwhost;
     cfg["gwserv"] = o.gwserv;
     cfg["program_id"] = o.program_id;
+    // Persist the tunnel secret NAME (never a credential -- the secret itself
+    // lives in the server's --init-file) so a later `doctor` knows not to claim
+    // it probed a gateway it cannot reach from here.
+    if (!o.tunnel_secret.empty()) cfg["tunnel_secret"] = o.tunnel_secret;
     if (!o.package.empty()) cfg["package"] = o.package;
     // Consent to store a password is given per run, not inherited from whatever
     // is already in the file: without this, one --save-password keeps the secret
@@ -122,6 +129,7 @@ bool ParseOption(const std::string &key, bool, const std::function<std::string()
     else if (key == "--program-id") { o.program_id = take(); o.program_set = true; }
     else if (key == "--gwhost")     { o.gwhost = take();     o.gwhost_set = true; }
     else if (key == "--gwserv")     { o.gwserv = take();     o.gwserv_set = true; }
+    else if (key == "--tunnel-secret") { o.tunnel_secret = take(); o.tunnel_secret_set = true; }
     else if (key == "--print-runbook")  { o.print_runbook = true; }
     else if (key == "--save-password")  { o.save_password = true; }
     else return false;
@@ -149,6 +157,10 @@ void PrintHelp() {
         "  --program-id <id>        Gateway PROGRAM_ID (default ERPL_REV)\n"
         "  --gwhost <h>             Gateway host (default: the SAP host)\n"
         "  --gwserv <p>             Gateway service/port (default 3300)\n"
+        "  --tunnel-secret <name>   The erpl-tunnel secret the SERVER reaches the gateway\n"
+        "                           through, if any. doctor then reports gateway\n"
+        "                           reachability as unknown instead of probing a local\n"
+        "                           forward it does not hold and calling that success.\n"
         "  --dry-run                Show the change set and stop. Writes nothing.\n"
         "  --non-interactive        Never prompt; fail instead. For CI. This is not\n"
         "                           consent to change the system -- add --yes for that.\n"
@@ -286,13 +298,32 @@ Diagnosis Diagnose(const Options &o) {
 
     // 5. Can this machine even reach the gateway? Checked from here, because
     //    that is where the server will register from.
-    d.gateway_reachable = cli::TcpReachable(o.gwhost, o.gwserv);
-    add("gateway.reachable", "gateway reachable from this machine",
-        d.gateway_reachable ? Status::Ok : Status::Fail,
-        o.gwhost + ":" + o.gwserv,
-        d.gateway_reachable ? "" :
-        "Nothing can register until this host can open a TCP connection to the\n"
-        "        gateway. Check the host/port (--gwhost/--gwserv), firewalls and routing.");
+    if (!o.tunnel_secret.empty()) {
+        // The forward lives inside the SERVER's DuckDB, not in this CLI process,
+        // so there is nothing here to probe through. Probing anyway would connect
+        // to the server's local end -- bound whether or not the far side is alive
+        // -- and report a healthy gateway on the strength of a socket that proves
+        // nothing. An honest Unknown beats a false Ok; this is the same stance
+        // gateway.reginfo takes below for a thing it cannot read.
+        d.gateway_unknown = true;
+        add("gateway.reachable", "gateway reachable from the server",
+            Status::Unknown,
+            o.gwhost + ":" + o.gwserv + " through tunnel '" + o.tunnel_secret + "'",
+            "Reached through an erpl-tunnel forward held by the server process, not\n"
+            "        by this one, so it cannot be probed from here -- an actual\n"
+            "        registration proves it. Check the server's boot log for\n"
+            "        \"tunnel: gateway forward up\".");
+    } else {
+        d.gateway_reachable = cli::TcpReachable(o.gwhost, o.gwserv);
+        add("gateway.reachable", "gateway reachable from this machine",
+            d.gateway_reachable ? Status::Ok : Status::Fail,
+            o.gwhost + ":" + o.gwserv,
+            d.gateway_reachable ? "" :
+            "Nothing can register until this host can open a TCP connection to the\n"
+            "        gateway. Check the host/port (--gwhost/--gwserv), firewalls and routing.\n"
+            "        If this host has no route to the gateway at all, the server can reach\n"
+            "        it through a tunnel instead -- see --tunnel-secret.");
+    }
 
     // The reginfo allow-list cannot be read remotely -- it is a file on the SAP
     // host. Say so plainly rather than leaving a silent gap in the report.
@@ -339,7 +370,10 @@ Plan MakePlan(const Diagnosis &d, const Options &o) {
             "$TMP is a local, non-transportable package and some systems reap it. "
             "Fine to evaluate with; use --package ZERPL_CORE for anything lasting.");
     }
-    if (!d.gateway_reachable) {
+    // Only when reachability was actually tested and failed. Under a tunnel it
+    // was not tested at all, and telling the operator to fix a route this host
+    // does not need would send them after the wrong thing.
+    if (!d.gateway_reachable && !d.gateway_unknown) {
         p.manual_steps.push_back(
             "Make the gateway reachable from this host (" + o.gwhost + ":" + o.gwserv +
             ") -- nothing can register until then.");
@@ -462,6 +496,108 @@ bool MkfmSucceeded(const std::string &output, const std::vector<std::string> &ex
     return true;
 }
 
+// Where setup scaffolds boot SQL, next to the config file it already writes.
+std::filesystem::path InitFilePath() {
+    const auto cfg = cli::ConfigPath();
+    return cfg.empty() ? std::filesystem::path() : cfg.parent_path() / "init.sql";
+}
+
+// The gateway is unreachable from here and no tunnel is configured. That is a
+// fork in the road, not a failure to report and move past: either someone opens
+// a route, or the server reaches the gateway through a tunnel. Setup is the only
+// place that knows the diagnosis, so it is the right place to ask.
+//
+// Returns true when a tunnel was scaffolded (and o.tunnel_secret set), so the
+// caller can re-render the handout knowing reginfo's HOST= is now the exit node.
+bool OfferTunnel(Options &o, bool interactive) {
+    std::cout
+        << "\nThis machine cannot reach the gateway at " << o.gwhost << ":" << o.gwserv
+        << ".\n"
+           "Two ways forward:\n\n"
+           "  1. A route. Ask for outbound TCP from this host to that one host and\n"
+           "     port. Usually the cheapest fix, and it needs nothing from erpl-rev.\n"
+           "  2. A tunnel. The server reaches the gateway through an erpl-tunnel\n"
+           "     forward (Tailscale, NetBird or SSH). Also encrypts the leg, which\n"
+           "     matters here: erpl-rev cannot configure SNC yet, so an off-box\n"
+           "     deployment is otherwise cleartext. See docs/tunnel.md.\n\n";
+
+    if (!interactive) {
+        std::cout << "  Re-run with --tunnel-secret <name> to have setup scaffold option 2.\n\n";
+        return false;
+    }
+    if (!cli::Confirm("Set up a tunnel now?", false)) {
+        std::cout << "  Fine -- fix the route and re-run `erpl-rev doctor`.\n\n";
+        return false;
+    }
+
+    // Mesh first, deliberately: erpl-tunnel's own security guide says the SSH
+    // backend does not pin the server's host key, so a bastion is MITM-able while
+    // presenting as encrypted. Offering it first would recommend the weakest one.
+    const std::string backend_in = cli::Prompt(
+        "  Backend — tailscale, netbird or ssh (mesh backends authenticate peers by\n"
+        "  key; the SSH backend does not pin host keys)", "tailscale");
+    tunnel::Backend backend;
+    if (!tunnel::ParseBackend(backend_in, backend)) {
+        std::cout << "  '" << backend_in << "' is not one of tailscale, netbird, ssh."
+                     " Skipping.\n\n";
+        return false;
+    }
+
+    tunnel::SecretSpec spec;
+    spec.backend = backend;
+    spec.secret = cli::Prompt("  Name for the secret", "sap_gateway");
+    if (backend == tunnel::Backend::Ssh) {
+        spec.hostname = cli::Prompt("  SSH bastion host", "");
+        spec.ssh_user = cli::Prompt("  SSH user", "");
+        spec.ssh_port = cli::Prompt("  SSH port", "22");
+    } else {
+        spec.hostname = cli::Prompt("  Node name for this server on the mesh",
+                                    cli::LocalHostname());
+        spec.state_dir = cli::Prompt("  Where to persist the node identity",
+                                     "/var/lib/erpl/mesh");
+    }
+    // Never a flag, never echoed -- the same rule the SAP password follows. Empty
+    // is allowed and renders a marked placeholder, which is the honest outcome
+    // when the operator does not have the key to hand yet.
+    spec.key = cli::PromptSecret(
+        backend == tunnel::Backend::Ssh    ? "  SSH password (blank to fill in later)"
+        : backend == tunnel::Backend::NetBird ? "  NetBird setup key (blank to fill in later)"
+                                              : "  Tailscale auth key (blank to fill in later)");
+
+    const auto path = InitFilePath();
+    if (path.empty()) {
+        std::cout << "  Cannot work out where to write the init file. Skipping.\n\n";
+        return false;
+    }
+    // Append rather than overwrite: --init-file is also where ATTACH statements
+    // and warehouse secrets live, and silently discarding those would be a much
+    // worse bug than anything this feature fixes.
+    std::string body;
+    {
+        std::ifstream in(path);
+        if (in) body.assign(std::istreambuf_iterator<char>(in), {});
+        if (!body.empty() && body.back() != '\n') body += "\n";
+        if (!body.empty()) body += "\n";
+    }
+    body += tunnel::RenderSecretSql(spec);
+
+    if (!cli::WriteSecretFile(path, body)) {
+        std::cout << "  Could not write " << path.string() << ". Skipping.\n\n";
+        return false;
+    }
+    o.tunnel_secret = spec.secret;
+
+    std::cout << "\n  Wrote " << path.string() << " (mode 0600"
+              << (spec.key.empty() ? ", with a placeholder key to fill in" : "") << ").\n"
+              << "  Start the server with:\n\n"
+              << "    erpl-rev serve --gwhost " << o.gwhost << " --gwserv " << o.gwserv
+              << " \\\n         --tunnel-secret " << spec.secret
+              << " --init-file " << path.string() << "\n\n"
+              << "  The gateway keeps its name everywhere: --gwhost is the real gateway,\n"
+              << "  and erpl-rev handles the forward and the local port itself.\n\n";
+    return true;
+}
+
 std::string RenderBasisHandout(const Diagnosis &d, const Options &o,
                                const std::string &server_host) {
     std::ostringstream s;
@@ -479,12 +615,29 @@ std::string RenderBasisHandout(const Diagnosis &d, const Options &o,
       << "Add to the `reginfo` file (SMGW → Goto → Expert Functions → External Security,\n"
       << "or the file named by the `gw/reg_info` profile parameter):\n\n"
       << "```\n"
-      << "P TP=" << o.program_id << " HOST=" << server_host
+      << "P TP=" << o.program_id << " HOST="
+      // Under a tunnel the gateway sees the address the forward egresses from --
+      // the exit node -- not this machine. Printing a gethostname() value as if it
+      // were authoritative would generate a line that refuses the registration,
+      // and the usual "fix" for that is the wildcard the deny line exists to
+      // prevent. Say where the real value comes from instead.
+      << (o.tunnel_secret.empty() ? server_host : std::string("<see below>"))
       << " ACCESS=" << o.gwhost << " CANCEL=" << o.gwhost << "\n"
       << "D TP=*\n"
       << "```\n\n"
-      << "`TP` is the PROGRAM_ID exactly, no wildcards. `HOST` is the machine erpl-rev\n"
-      << "runs on. Keep the trailing deny line, or the allow-list permits everything.\n\n"
+      << "`TP` is the PROGRAM_ID exactly, no wildcards. Keep the trailing deny line,\n"
+      << "or the allow-list permits everything.\n\n"
+      << (o.tunnel_secret.empty()
+              ? "`HOST` is the machine erpl-rev runs on.\n\n"
+              : "`HOST` **cannot be filled in from here.** This server reaches the gateway\n"
+                "through a tunnel (`" + o.tunnel_secret + "`), so the gateway sees the address\n"
+                "the forward egresses from -- an exit node or bastion -- not the erpl-rev\n"
+                "host. Take the value from the registration attempt in SMGW (Goto → Logged\n"
+                "On Clients / the gateway trace) rather than inferring it, and pin the ACL\n"
+                "to that one address. Do not widen it to a wildcard.\n\n"
+                "The tunnel itself is outside SAP: it lives in the erpl-rev process and\n"
+                "changes nothing in the `ZERPL` package, the RFC user's role, or the\n"
+                "destination.\n\n")
       << "**Reloading reginfo needs no restart**: SMGW → Goto → Expert Functions →\n"
       << "External Security → Reread.\n\n"
       << "## 2. Profile parameters — only if registration is still refused\n\n"
@@ -655,6 +808,11 @@ int RunSetup(Options o) {
     std::cout << "Diagnosing " << o.host << ":" << o.port << " (client " << o.client << ")…\n";
     Diagnosis d = Diagnose(o);
     PrintReport(d);
+
+    // Asked before the plan is printed, because the answer changes the reginfo
+    // line in the handout the plan hands over.
+    if (!d.gateway_reachable && !d.gateway_unknown && o.tunnel_secret.empty())
+        OfferTunnel(o, interactive);
 
     const Plan p = MakePlan(d, o);
 

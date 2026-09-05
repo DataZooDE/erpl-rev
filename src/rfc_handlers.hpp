@@ -28,6 +28,13 @@ std::string StartQuackServer(const std::string &listen, bool allow_other_host,
                              const std::string &token = "");
 void        StopQuackServer(const std::string &listen);
 
+// Open the optional gateway tunnel on the shared bridge, and read back its
+// tunnels() row (empty => the forward is not there). Same mutex as the handlers.
+// Only called when the operator named a secret; with no tunnel configured the
+// server never touches either of these.
+void        StartTunnelForward(const std::string &import_sql);
+std::string TunnelForwardInfo(const std::string &local_port);
+
 } // namespace erpl_rev
 
 // RFC_SERVER_FUNCTION callbacks must have C linkage to match the SDK typedef.

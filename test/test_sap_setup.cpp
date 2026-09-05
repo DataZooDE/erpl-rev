@@ -321,3 +321,36 @@ TEST_CASE("the S_DEVELOP verdict is read from the probe", "[setup]") {
         CHECK(DevelopAuthFromProbe("note: s_develop create=0 change=0") == Status::Unknown);
     }
 }
+
+// ---------------------------------------------------------------------------
+// The handout under a tunnel
+//
+// reginfo's HOST= is matched against the source address the GATEWAY observes. With
+// a tunnel that is the exit node, not this machine, so printing a gethostname()
+// value as if it were authoritative generates a line that refuses the registration
+// -- and the usual field fix for a refused registration is the wildcard the deny
+// line exists to prevent. Better to say where the real value comes from.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("without a tunnel the handout still names this host", "[setup]") {
+    Options o = DefaultOptions();
+    const std::string h = RenderBasisHandout(HealthyDiagnosis(), o, "ingest01.corp");
+    CHECK_THAT(h, ContainsSubstring("HOST=ingest01.corp"));
+    CHECK_THAT(h, ContainsSubstring("`HOST` is the machine erpl-rev runs on."));
+}
+
+TEST_CASE("under a tunnel the handout refuses to guess HOST=", "[setup]") {
+    Options o = DefaultOptions();
+    o.tunnel_secret = "sap";
+    const std::string h = RenderBasisHandout(HealthyDiagnosis(), o, "ingest01.corp");
+
+    // The inferred hostname must not appear as the ACL value at all.
+    CHECK_THAT(h, !ContainsSubstring("HOST=ingest01.corp"));
+    CHECK_THAT(h, ContainsSubstring("HOST=<see below>"));
+    // ... and the reader is told where to get it, and warned off the wildcard.
+    CHECK_THAT(h, ContainsSubstring("SMGW"));
+    CHECK_THAT(h, ContainsSubstring("wildcard"));
+    CHECK_THAT(h, ContainsSubstring("sap"));          // names the tunnel secret
+    // ACCESS/CANCEL still name the real gateway, not the forward's local end.
+    CHECK_THAT(h, ContainsSubstring("ACCESS=sap.example.com"));
+}

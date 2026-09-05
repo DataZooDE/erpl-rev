@@ -12,6 +12,13 @@
 
 #include "duckdb.hpp"
 
+// Same guard as erpl_rev_telemetry.cpp: the version is a compile definition on
+// the real targets, and this keeps the file compilable (and readable by tooling)
+// without it.
+#ifndef ERPL_REV_DUCKDB_VERSION
+#define ERPL_REV_DUCKDB_VERSION "unknown"
+#endif
+
 namespace erpl_rev {
 
 namespace {
@@ -394,6 +401,35 @@ std::string DuckDbBridge::StartQuack(const std::string &listen, bool allow_other
     for (size_t i = 0; i < r.rows.size(); i++) { if (i) out += ","; out += r.rows[i]; }
     out += "]";
     return out;
+}
+
+void DuckDbBridge::StartTunnel(const std::string &import_sql) {
+    // From `community`, not a bare INSTALL: erpl_tunnel is published in DuckDB's
+    // community-extensions repository, so this is a signed artifact over HTTPS --
+    // the same trust story as the quack install above, and the reason no
+    // allow_unsigned_extensions widening is needed anywhere in this process.
+    try {
+        Execute("INSTALL erpl_tunnel FROM community");
+        Execute("LOAD erpl_tunnel");
+    } catch (const std::exception &e) {
+        throw std::runtime_error(
+            std::string("cannot load the erpl_tunnel extension: ") + e.what() +
+            "\n  A DuckDB extension is built against one exact engine version, and this"
+            "\n  binary embeds DuckDB " ERPL_REV_DUCKDB_VERSION ". Check that a community"
+            "\n  build exists for it, or drop --tunnel-secret and reach the gateway"
+            "\n  directly (an outbound route to it is all the server needs).");
+    }
+    // tunnel_import returns (tunnel_id, message); run it as a query so a failure
+    // message from the backend reaches the caller rather than being discarded.
+    Query(import_sql);
+}
+
+std::string DuckDbBridge::TunnelInfo(const std::string &local_port) {
+    // tunnels() is the extension's own view of its forwards. Matching on the
+    // local port rather than the tunnel id keeps this independent of how
+    // erpl-tunnel names things.
+    QueryResult r = Query("SELECT * FROM tunnels() WHERE local_port = " + local_port);
+    return r.rows.empty() ? std::string() : r.rows.front();
 }
 
 void DuckDbBridge::StopQuack(const std::string &listen) {

@@ -153,6 +153,33 @@ bool TcpReachable(const std::string &host, const std::string &port) {
     return ok;
 }
 
+int FreeLoopbackPort() {
+#ifdef _WIN32
+    static WinsockInit winsock;
+#endif
+    // Bind port 0 and ask the kernel what it gave us. Portable, and cheaper than
+    // guessing a range and probing it.
+    int fd = static_cast<int>(::socket(AF_INET, SOCK_STREAM, 0));
+    if (fd < 0) return 0;
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    int port = 0;
+    if (::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0) {
+        sockaddr_in got{};
+        socklen_t len = sizeof(got);
+        if (::getsockname(fd, reinterpret_cast<sockaddr *>(&got), &len) == 0)
+            port = ntohs(got.sin_port);
+    }
+#ifdef _WIN32
+    ::closesocket(fd);
+#else
+    ::close(fd);
+#endif
+    return port;
+}
+
 std::string LocalHostname() {
 #ifdef _WIN32
     static WinsockInit winsock;   // gethostname needs it too
@@ -173,6 +200,8 @@ std::string Trim(std::string s) {
     while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
     return s;
 }
+
+} // namespace
 
 // Write `body` to `p` so that it is never briefly world-readable and never
 // left half-written. The obvious version -- truncate, write, chmod -- has a
@@ -205,8 +234,6 @@ bool WriteSecretFile(const std::filesystem::path &p, const std::string &body) {
     return out.good();
 #endif
 }
-
-} // namespace
 
 std::filesystem::path ConfigPath() {
 #ifdef _WIN32
