@@ -267,6 +267,7 @@ endif()
 add_library(erpl_rev_core OBJECT
   src/duckdb_bridge.cpp
   src/control_schema.cpp
+  src/delta_plan.cpp
   src/cdc_dialect.cpp
   src/json_util.cpp
   src/sxml_binary.cpp
@@ -334,6 +335,7 @@ if(TRUE)  # tests always build; DuckDB is in-tree
     test/test_cdc_dialect.cpp
     test/test_sql_name.cpp
     test/test_control_schema.cpp
+    test/test_delta_plan.cpp
     test/test_sxml_binary.cpp
     test/test_payload.cpp
     test/test_telemetry.cpp
