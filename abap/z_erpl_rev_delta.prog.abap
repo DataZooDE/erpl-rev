@@ -134,6 +134,12 @@ START-OF-SELECTION.
 *&---------------------------------------------------------------------*
 FORM drain_cli.
   DATA(lt_cmd) = zcl_erpl_rev_clidrv=>drain( ).
+
+  " Daemon starter. This job already runs every minute and already drains the
+  " CLI queue, so it is also the cheapest place to notice that the streaming
+  " daemon is gone -- after a system restart, or a cancelled job -- and put it
+  " back. A dedicated watchdog job would cost another slot to do the same thing.
+  PERFORM restart_daemon_if_stale.
   LOOP AT lt_cmd INTO DATA(ls_cmd).
     WRITE: / |cli { ls_cmd-cmd_id } { ls_cmd-verb } { ls_cmd-status } | &&
              |{ ls_cmd-result }{ ls_cmd-error }|.
@@ -165,4 +171,46 @@ FORM show USING it_run TYPE zcl_erpl_rev_delta=>tt_run.
     ENDIF.
   ENDLOOP.
   ULINE.
+ENDFORM.
+
+
+*&---------------------------------------------------------------------*
+*& Re-submit Z_ERPL_REV_DAEMON when its heartbeat has gone stale.
+*&
+*& "Stale" is judged against the daemon's own tick interval, read from the
+*& same row, so a deliberately slow tick is not mistaken for a dead daemon.
+*& The daemon itself claims the row atomically, so a race here is harmless:
+*& the loser reports the winner and exits.
+*&---------------------------------------------------------------------*
+FORM restart_daemon_if_stale.
+  DATA lv_rows TYPE string.
+  DATA lv_err  TYPE string.
+
+  CALL FUNCTION 'Z_DUCKDB_QUERY' DESTINATION 'ERPL_REV'
+    EXPORTING iv_sql = |SELECT count(*) AS c FROM _erpl_rev_daemon | &&
+                       |WHERE id=1 AND status='RUNNING' | &&
+                       |AND (heartbeat_ts IS NULL | &&
+                       |     OR heartbeat_ts < now() - INTERVAL '1' MINUTE)|
+    IMPORTING ev_rows = lv_rows ev_error = lv_err
+    EXCEPTIONS communication_failure = 1 system_failure = 2 OTHERS = 3.
+  IF sy-subrc <> 0 OR lv_err IS NOT INITIAL.
+    RETURN.   " server unreachable: nothing useful to do from here
+  ENDIF.
+  IF lv_rows NS '"c":1'.
+    RETURN.   " either not running, or running and healthy
+  ENDIF.
+
+  DATA lv_jobname TYPE tbtcjob VALUE 'ERPL_REV_DAEMON'.
+  DATA lv_jobcount TYPE tbtcjob-jobcount.
+  CALL FUNCTION 'JOB_OPEN'
+    EXPORTING jobname = lv_jobname
+    IMPORTING jobcount = lv_jobcount
+    EXCEPTIONS OTHERS = 1.
+  IF sy-subrc <> 0. RETURN. ENDIF.
+
+  SUBMIT z_erpl_rev_daemon VIA JOB lv_jobname NUMBER lv_jobcount AND RETURN.
+
+  CALL FUNCTION 'JOB_CLOSE'
+    EXPORTING jobname = lv_jobname jobcount = lv_jobcount strtimmed = abap_true
+    EXCEPTIONS OTHERS = 1.
 ENDFORM.

@@ -32,6 +32,7 @@ set(ERPL_ABAP_ASSETS
     "z_erpl_rev_replicate.prog.abap|Z_ERPL_REV_REPLICATE|PROG/P||replicate SAP table -> DuckDB"
     "z_erpl_rev_sql.prog.abap|Z_ERPL_REV_SQL|PROG/P||DuckDB SQL console"
     "z_erpl_rev_delta.prog.abap|Z_ERPL_REV_DELTA|PROG/P||delta orchestration loop"
+    "z_erpl_rev_daemon.prog.abap|Z_ERPL_REV_DAEMON|PROG/P||streaming daemon (second-scale)"
 )
 
 function(erpl_generate_abap_assets OUT_VAR)

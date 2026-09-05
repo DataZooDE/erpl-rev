@@ -399,11 +399,18 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       EXIT.
     ENDLOOP.
     IF lv_keyf IS INITIAL. lv_keyf = to_upper( VALUE string( lt_keys[ 1 ] OPTIONAL ) ). ENDIF.
-    DATA lt_in TYPE string_table.
+    " Built by the shared predicate helper rather than by hand here: the trigger
+    " tier re-reads by the FULL composite key and needs the same code, and a
+    " hand-rolled IN list has no chunking -- a change document touching thousands
+    " of objects would exceed what the parser accepts.
+    DATA lt_rows TYPE zcl_erpl_rev_util=>tt_keyrows.
     LOOP AT lt_oid INTO DATA(lv_oid).
-      APPEND |'{ q( lv_oid ) }'| TO lt_in.
+      APPEND VALUE #( ( lv_oid ) ) TO lt_rows.
     ENDLOOP.
-    DATA(lv_where) = |{ lv_keyf } IN ( { concat_lines_of( table = lt_in sep = `,` ) } )|.
+    DATA(lv_where) = zcl_erpl_rev_util=>key_in_predicate(
+      it_key_cols  = VALUE #( ( lv_keyf ) )
+      it_key_types = VALUE #( ( `CHAR` ) )
+      it_rows      = lt_rows ).
     DATA(r) = zcl_erpl_rev_util=>replicate(
       iv_tab      = is_state-source_from
       iv_target   = is_state-target
@@ -431,11 +438,14 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       rs-wm = is_state-wm_value.
       RETURN.
     ENDIF.
-    DATA lt_in TYPE string_table.
+    DATA lt_crows TYPE zcl_erpl_rev_util=>tt_keyrows.
     LOOP AT lt_chg INTO DATA(lv_c).
-      APPEND |'{ q( lv_c ) }'| TO lt_in.
+      APPEND VALUE #( ( lv_c ) ) TO lt_crows.
     ENDLOOP.
-    DATA(lv_where) = |changenr IN ( { concat_lines_of( table = lt_in sep = `,` ) } )|.
+    DATA(lv_where) = zcl_erpl_rev_util=>key_in_predicate(
+      it_key_cols  = VALUE #( ( `CHANGENR` ) )
+      it_key_types = VALUE #( ( `CHAR` ) )
+      it_rows      = lt_crows ).
     DATA(r) = zcl_erpl_rev_util=>replicate(
       iv_tab      = is_state-source_from
       iv_target   = is_state-target

@@ -295,6 +295,30 @@ CLASS zcl_erpl_rev_util DEFINITION PUBLIC FINAL CREATE PUBLIC.
                 iv_page       TYPE i DEFAULT 8192
       RETURNING VALUE(rs)     TYPE ty_stream.
 
+    "! One key tuple, values in key order.
+    TYPES ty_keyrow  TYPE string_table.
+    TYPES tt_keyrows TYPE STANDARD TABLE OF ty_keyrow WITH DEFAULT KEY.
+
+    "! An OpenSQL predicate selecting exactly the given key tuples, chunked so a
+    "! large key set does not exceed the parser's limits.
+    "!
+    "! One shared implementation on purpose. The change-document delta re-reads by
+    "! ONE business key; the trigger tier re-reads by the FULL composite key
+    "! (MANDT, CARRID, CONNID, FLDATE on SFLIGHT). Those had to be the same code,
+    "! or the two callers drift -- and the single-key version cannot express a
+    "! composite key at all, which is what the trigger cycle needs.
+    "!
+    "! @parameter it_key_cols  | key column names, in key order
+    "! @parameter it_key_types | DDIC datatype per key column, same order
+    "! @parameter it_rows      | the key tuples to select
+    "! @parameter iv_chunk     | tuples per OR-group
+    CLASS-METHODS key_in_predicate
+      IMPORTING it_key_cols  TYPE string_table
+                it_key_types TYPE string_table
+                it_rows      TYPE tt_keyrows
+                iv_chunk     TYPE i DEFAULT 500
+      RETURNING VALUE(rv)    TYPE string.
+
   PRIVATE SECTION.
     "! Build an empty typed standard table from a columns JSON ([{name,type}]).
     CLASS-METHODS build_table
@@ -544,6 +568,65 @@ CLASS zcl_erpl_rev_util IMPLEMENTATION.
                                THEN |, PRIMARY KEY ({ rs-keys })| ELSE `` ).
     rs-ddl      = |CREATE TABLE IF NOT EXISTS { iv_target } ({ lv_collist }{ lv_pk });|.
     rs-ddl_nopk = |CREATE TABLE IF NOT EXISTS { iv_target } ({ lv_collist });|.
+  ENDMETHOD.
+
+  METHOD key_in_predicate.
+    " Empty key set: a predicate that selects nothing. Returning an empty string
+    " would mean "no filter", i.e. re-read the WHOLE table -- the opposite.
+    IF it_rows IS INITIAL OR it_key_cols IS INITIAL.
+      rv = `1 = 0`.
+      RETURN.
+    ENDIF.
+
+    DATA lt_groups TYPE string_table.
+    DATA lt_items  TYPE string_table.
+    DATA lv_n      TYPE i.
+    DATA(lv_single) = xsdbool( lines( it_key_cols ) = 1 ).
+
+    " Column list, once.
+    DATA lv_cols TYPE string.
+    LOOP AT it_key_cols INTO DATA(lv_col).
+      IF sy-tabix > 1. lv_cols = |{ lv_cols },|. ENDIF.
+      lv_cols = |{ lv_cols }{ to_upper( condense( lv_col ) ) }|.
+    ENDLOOP.
+
+    LOOP AT it_rows INTO DATA(lt_row).
+      DATA lv_tuple TYPE string.
+      CLEAR lv_tuple.
+      LOOP AT it_key_cols INTO DATA(lv_k).
+        DATA(lv_i) = sy-tabix.
+        DATA(lv_ty) = VALUE string( it_key_types[ lv_i ] OPTIONAL ).
+        DATA(lv_va) = VALUE string( lt_row[ lv_i ] OPTIONAL ).
+        DATA(lv_lit) = key_literal( iv_datatype = lv_ty iv_value = lv_va ).
+        IF lv_i > 1. lv_tuple = |{ lv_tuple },|. ENDIF.
+        lv_tuple = |{ lv_tuple }{ lv_lit }|.
+      ENDLOOP.
+      " A composite tuple is parenthesised; a single value is not, so the
+      " single-key form stays the plain `k IN ( a, b )` it always was.
+      APPEND COND string( WHEN lv_single = abap_true THEN lv_tuple
+                          ELSE |( { lv_tuple } )| ) TO lt_items.
+      lv_n = lv_n + 1.
+
+      IF lv_n >= iv_chunk.
+        APPEND |{ COND string( WHEN lv_single = abap_true THEN lv_cols ELSE |( { lv_cols } )| ) } | &&
+               |IN ( { concat_lines_of( table = lt_items sep = `,` ) } )| TO lt_groups.
+        CLEAR lt_items.
+        lv_n = 0.
+      ENDIF.
+    ENDLOOP.
+
+    IF lt_items IS NOT INITIAL.
+      APPEND |{ COND string( WHEN lv_single = abap_true THEN lv_cols ELSE |( { lv_cols } )| ) } | &&
+             |IN ( { concat_lines_of( table = lt_items sep = `,` ) } )| TO lt_groups.
+    ENDIF.
+
+    " OR between chunks: every tuple is still selected, the predicate just does
+    " not exceed what the parser will take in one IN list.
+    IF lines( lt_groups ) = 1.
+      rv = lt_groups[ 1 ].
+    ELSE.
+      rv = |( { concat_lines_of( table = lt_groups sep = ` OR ` ) } )|.
+    ENDIF.
   ENDMETHOD.
 
   METHOD key_literal.

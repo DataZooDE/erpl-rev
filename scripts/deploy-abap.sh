@@ -96,6 +96,7 @@ prog Z_ERPL_REV_REPL_WORKER   z_erpl_rev_repl_worker.prog.abap   "parallel-repli
 prog Z_ERPL_REV_REPLICATE     z_erpl_rev_replicate.prog.abap     "replicate SAP table -> DuckDB"
 prog Z_ERPL_REV_SQL           z_erpl_rev_sql.prog.abap           "DuckDB SQL console"
 prog Z_ERPL_REV_DELTA         z_erpl_rev_delta.prog.abap         "delta orchestration loop"
+prog Z_ERPL_REV_DAEMON        z_erpl_rev_daemon.prog.abap        "streaming daemon (second-scale)"
 prog Z_ERPL_REV_DELTA_SFLIGHT z_erpl_rev_delta_sflight.prog.abap "SFLIGHT delta demo"
 cls  ZCL_ERPL_REV_REPLRUN     zcl_erpl_rev_replrun.abap          "report parallel-branch E2E"
 
