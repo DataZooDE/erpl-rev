@@ -53,6 +53,22 @@ CLASS zcl_erpl_rev_delta DEFINITION PUBLIC FINAL CREATE PUBLIC.
       IMPORTING is_state        TYPE ty_state
       RETURNING VALUE(rv_error) TYPE string.
 
+
+    "! Call the server's planning FM. One function module, many actions, because
+    "! the alternative is a new stub -- and a new upgrade event on every installed
+    "! system -- per decision the server needs to make.
+    CLASS-METHODS plan_json
+      IMPORTING iv_action TYPE string
+                iv_target TYPE string DEFAULT ''
+                iv_params TYPE string DEFAULT ''
+      RETURNING VALUE(rv) TYPE string.
+
+    "! One scalar out of a flat JSON object the server produced.
+    CLASS-METHODS jstr
+      IMPORTING iv_json   TYPE string
+                iv_key    TYPE string
+      RETURNING VALUE(rv) TYPE string.
+
     "! Read the full config+state row for a target ('' target => not registered).
     CLASS-METHODS state
       IMPORTING iv_target    TYPE csequence
@@ -134,7 +150,7 @@ CLASS zcl_erpl_rev_delta DEFINITION PUBLIC FINAL CREATE PUBLIC.
                 iv_remove  TYPE abap_bool DEFAULT abap_false
       RETURNING VALUE(rv_msg) TYPE string.
 
-    "! Period in MINUTES implied by a cadence string (micro:<sec>->sec/60, hourly->60,
+    "! Period in MINUTES implied by a cadence string (micro:N -> N/60, hourly->60,
     "! nightly->1440, manual/unknown->0). Used to derive the heartbeat-job period from
     "! a target's chosen refresh interval, so one setting drives both.
     CLASS-METHODS cadence_minutes
@@ -153,7 +169,9 @@ CLASS zcl_erpl_rev_delta DEFINITION PUBLIC FINAL CREATE PUBLIC.
       IMPORTING is_state     TYPE ty_state
       RETURNING VALUE(rv)    TYPE string.
     "! The four dispatch implementations (each returns rows/ins/upd/del/wm/error).
-    CLASS-METHODS run_watermark   IMPORTING is_state TYPE ty_state RETURNING VALUE(rs) TYPE ty_run.
+    CLASS-METHODS run_watermark   IMPORTING is_state     TYPE ty_state
+                                            iv_load_type TYPE string DEFAULT 'D'
+                                  RETURNING VALUE(rs)    TYPE ty_run.
     CLASS-METHODS run_changedoc   IMPORTING is_state TYPE ty_state RETURNING VALUE(rs) TYPE ty_run.
     CLASS-METHODS run_insert_only IMPORTING is_state TYPE ty_state RETURNING VALUE(rs) TYPE ty_run.
     CLASS-METHODS run_snapshot    IMPORTING is_state TYPE ty_state RETURNING VALUE(rs) TYPE ty_run.
@@ -264,7 +282,7 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
     ENDIF.
     GET TIME STAMP FIELD DATA(lv_t0).
     CASE ls_state-method.
-      WHEN 'WATERMARK'.   rs = run_watermark( ls_state ).
+      WHEN 'WATERMARK'.   rs = run_watermark( is_state = ls_state iv_load_type = CONV string( iv_load_type ) ).
       WHEN 'INSERT_ONLY'. rs = run_insert_only( ls_state ).
       WHEN 'CHANGEDOC'.   rs = run_changedoc( ls_state ).
       WHEN 'SNAPSHOT'.    rs = run_snapshot( ls_state ).
@@ -312,28 +330,100 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
   ENDMETHOD.
 
   METHOD run_watermark.
-    " Read chg_col > wm (numeric) and keyed-upsert via MERGE. New wm = source max.
-    DATA lv_where TYPE string.
-    IF is_state-wm_value IS NOT INITIAL.
-      " safety overlap is expressed at cadence/value level by the caller; the
-      " numeric watermark compares strictly greater-than the stored high-water.
-      " Quote the literal: a DEC(21,7) TIMESTAMPL carries a decimal point, which the
-      " ABAP SQL parser rejects as a bare numeric literal in a dynamic condition.
-      lv_where = |{ is_state-chg_col } > '{ is_state-wm_value }'|.
+    " The cycle contract. The server decides the window and owns the commit; this
+    " reads and stages.
+    "
+    " BEGIN_CYCLE returns VALUES -- a floor, a ceiling, an as-of date, a run id --
+    " and the predicate is composed here, so the driver's "parameters are only
+    " ever read as values" posture holds on this path too.
+    "
+    " The watermark advances to the CEILING inside CYCLE_COMMIT, never to the
+    " maximum of whatever happened to arrive. A row that commits during a read
+    " longer than the safety window carries a value below that maximum, and
+    " advancing to the maximum would put it below the next floor permanently.
+    DATA(lv_plan) = plan_json( iv_action = 'BEGIN_CYCLE'
+                               iv_target = is_state-target
+                               iv_params = |\{"load_type":"{ iv_load_type }"\}| ).
+    IF lv_plan IS INITIAL.
+      rs-error = 'BEGIN_CYCLE returned nothing'.
+      RETURN.
     ENDIF.
-    DATA(r) = zcl_erpl_rev_util=>replicate(
-      iv_tab      = is_state-source_from
-      iv_target   = is_state-target
-      iv_mode     = 'MERGE'
-      iv_truncate = abap_false
-      iv_where    = lv_where
-      iv_record   = abap_false ).   " the cycle is recorded by run() as one DELTA row
-    rs-rows  = r-rows_affected.
-    rs-error = r-error.
-    IF r-error IS INITIAL.
-      rs-wm = source_max( is_state ).
-      IF rs-wm IS INITIAL OR rs-wm = '0'. rs-wm = is_state-wm_value. ENDIF.
+
+    DATA(lv_stage)  = jstr( iv_json = lv_plan iv_key = 'stage' ).
+    DATA(lv_run_id) = jstr( iv_json = lv_plan iv_key = 'run_id' ).
+    DATA(lv_floor)  = jstr( iv_json = lv_plan iv_key = 'floor' ).
+    DATA(lv_ceil)   = jstr( iv_json = lv_plan iv_key = 'ceiling' ).
+    DATA(lv_asof)   = jstr( iv_json = lv_plan iv_key = 'as_of_date' ).
+    DATA(lv_chg)    = jstr( iv_json = lv_plan iv_key = 'chg_col' ).
+    DATA(lv_tcol)   = jstr( iv_json = lv_plan iv_key = 'time_col' ).
+
+    IF lv_stage IS INITIAL OR lv_run_id IS INITIAL.
+      rs-error = |BEGIN_CYCLE gave no run: { lv_plan }|.
+      RETURN.
     ENDIF.
+
+    " A load type that transfers nothing still opens and commits a cycle: that is
+    " how it adopts a position without moving data.
+    DATA lv_rows TYPE i.
+    IF lv_plan CS '"read_rows":true'.
+      DATA lv_where TYPE string.
+
+      IF lv_tcol IS NOT INITIAL.
+        " A DATS + TIMS pair, compared as one value. The parentheses matter: the
+        " same-day case has to bind tighter than the later-day case, or every row
+        " after the floor's time-of-day is selected on every later day.
+        DATA(lv_fd) = lv_floor(8).
+        DATA(lv_ft) = COND string( WHEN strlen( lv_floor ) >= 14 THEN lv_floor+8(6) ELSE '000000' ).
+        IF lv_floor IS NOT INITIAL.
+          lv_where = |( { lv_chg } > '{ lv_fd }' OR | &&
+                     |( { lv_chg } = '{ lv_fd }' AND { lv_tcol } > '{ lv_ft }' ) )|.
+        ENDIF.
+      ELSEIF lv_floor IS NOT INITIAL.
+        lv_where = |{ lv_chg } > '{ lv_floor }'|.
+      ENDIF.
+
+      " The ceiling bounds the READ only when the server says it should, which is
+      " the day-granular case: today is not a complete day, so reading it would
+      " lose everything posted later today.
+      "
+      " For a clock-based column it must NOT bound the read. The ceiling is the
+      " read start minus the safety window, so capping the read there would hide
+      " every change until that window elapsed -- 120 seconds of latency on a
+      " 2-second tick. The cycle reads everything above the floor and advances the
+      " watermark only to the ceiling; rows above it are delivered now and
+      " re-delivered next cycle, which the keyed merge absorbs.
+      IF lv_ceil IS NOT INITIAL AND lv_plan CS '"ceiling_bounds_read":true'.
+        DATA(lv_ub) = |{ lv_chg } < '{ lv_ceil }'|.
+        lv_where = COND string( WHEN lv_where IS INITIAL THEN lv_ub
+                                ELSE |{ lv_where } AND { lv_ub }| ).
+      ENDIF.
+
+      DATA(r) = zcl_erpl_rev_util=>replicate(
+        iv_tab      = is_state-source_from
+        iv_target   = lv_stage
+        iv_mode     = 'INSERT'
+        iv_truncate = abap_true
+        iv_where    = lv_where
+        iv_record   = abap_false ).   " the cycle is recorded by run() as one DELTA row
+      IF r-error IS NOT INITIAL.
+        rs-error = r-error.
+        RETURN.
+      ENDIF.
+      lv_rows = r-rows_affected.
+    ENDIF.
+
+    " One transaction on the server: merge the stage, append the change log,
+    " advance the watermark to the ceiling, finish the stats row, drop the stage.
+    DATA(lv_done) = plan_json( iv_action = 'CYCLE_COMMIT'
+                               iv_target = is_state-target
+                               iv_params = |\{"run_id":{ lv_run_id },"rows_read":{ lv_rows }\}| ).
+    IF lv_done IS INITIAL.
+      rs-error = 'CYCLE_COMMIT returned nothing'.
+      RETURN.
+    ENDIF.
+
+    rs-rows = lv_rows.
+    rs-wm   = jstr( iv_json = lv_done iv_key = 'wm' ).
   ENDMETHOD.
 
   METHOD cdhdr_feed.
@@ -660,6 +750,42 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
     ELSE.
       rv = 0.   " manual / unknown -> not scheduled
     ENDIF.
+  ENDMETHOD.
+
+
+  METHOD plan_json.
+    DATA lv_err TYPE string.
+    DATA lv_msg TYPE c LENGTH 255.
+    CALL FUNCTION 'Z_DUCKDB_PLAN' DESTINATION c_dest
+      EXPORTING iv_action = iv_action
+                iv_target = iv_target
+                iv_params = iv_params
+      IMPORTING ev_plan   = rv
+                ev_error  = lv_err
+      EXCEPTIONS system_failure        = 1 MESSAGE lv_msg
+                 communication_failure = 2 MESSAGE lv_msg
+                 OTHERS                = 3.
+    IF sy-subrc <> 0.
+      rv = ||.
+      RETURN.
+    ENDIF.
+    " An action that failed server-side returns its reason in EV_ERROR; the
+    " caller sees an empty plan and reports it, rather than proceeding on a
+    " half-answer.
+    IF lv_err IS NOT INITIAL.
+      rv = ||.
+    ENDIF.
+  ENDMETHOD.
+
+  METHOD jstr.
+    " Quoted string first, then a bare number: the server writes run_id and the
+    " counts unquoted, and everything else quoted.
+    DATA(lv_p1) = `"` && iv_key && `"\s*:\s*"([^"]*)"`.
+    FIND PCRE lv_p1 IN iv_json SUBMATCHES rv.
+    IF sy-subrc = 0. RETURN. ENDIF.
+    DATA(lv_p2) = `"` && iv_key && `"\s*:\s*(-?[0-9.]+)`.
+    FIND PCRE lv_p2 IN iv_json SUBMATCHES rv.
+    IF sy-subrc <> 0. CLEAR rv. ENDIF.
   ENDMETHOD.
 
 ENDCLASS.

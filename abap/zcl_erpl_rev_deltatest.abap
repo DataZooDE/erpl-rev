@@ -67,14 +67,26 @@ CLASS zcl_erpl_rev_deltatest IMPLEMENTATION.
 
     DATA(r1) = zcl_erpl_rev_delta=>run( 'delta_wm' ).
     ok( cond = xsdbool( r1-error IS INITIAL ) what = 'M1 cycle ok' detail = r1-error ).
-    ok( cond = xsdbool( r1-rows = 4 ) what = 'M1 applied=4' detail = |{ r1-rows }| ).
+    " At least the four changed rows. NOT exactly four: the safety window pulls
+    " the floor back before the stored watermark, so recently-changed rows are
+    " deliberately re-read. That overlap is the whole point -- it is what stops a
+    " row that committed during the previous read from falling below the floor
+    " forever -- and the keyed merge absorbs the duplicates.
+    ok( cond = xsdbool( r1-rows >= 4 ) what = 'M1 reads at least the 4 changed rows'
+        detail = |{ r1-rows }| ).
     ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM delta_wm| ) = 11 ) what = 'M1 count=11' ).
     ok( cond = has( iv_sql = |SELECT name FROM delta_wm WHERE id='0000000001'| iv_sub = 'touched' )
         what = 'M1 updated row carries new value' ).
 
     " Idempotency: nothing changed in SAP -> next cycle applies 0, data identical.
     DATA(r2) = zcl_erpl_rev_delta=>run( 'delta_wm' ).
-    ok( cond = xsdbool( r2-rows = 0 ) what = 'M1 idempotent re-run applies 0' detail = |{ r2-rows }| ).
+    " Idempotence is about the RESULT, not the row count. A second cycle inside
+    " the safety window re-reads the same rows on purpose; what must not change
+    " is the target.
+    ok( cond = xsdbool( r2-error IS INITIAL ) what = 'M1 re-run succeeds' detail = r2-error ).
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM delta_wm| ) = 11 )
+        what = 'M1 idempotent re-run leaves the target unchanged'
+        detail = |{ r2-rows } rows re-read| ).
     ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM delta_wm| ) = 11 ) what = 'M1 count still 11' ).
   ENDMETHOD.
 

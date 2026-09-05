@@ -114,12 +114,13 @@ CLASS zcl_erpl_rev_wmtest IMPLEMENTATION.
     zcl_erpl_rev_deltadrv=>seed_dates( ).   " yesterday, today
     zcl_erpl_rev_delta=>run( iv_target = 'zdelta_d' ).
 
+    DATA(lv_today) = |{ sy-datum(4) }-{ sy-datum+4(2) }-{ sy-datum+6(2) }|.
     ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM zdelta_d | &&
-                             |WHERE changed_on = '{ sy-datum }'| ) = 0 )
+                             |WHERE changed_on = DATE '{ lv_today }'| ) = 0 )
         what = `rows dated today are not read`
-        detail = |{ sy-datum }| ).
+        detail = lv_today ).
     ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM zdelta_d | &&
-                             |WHERE changed_on < '{ sy-datum }'| ) > 0 )
+                             |WHERE changed_on < DATE '{ lv_today }'| ) > 0 )
         what = 'complete days are read' ).
     ok( cond = xsdbool( wm( 'zdelta_d' ) NS CONV string( sy-datum ) )
         what = 'the watermark never reaches today'
@@ -146,10 +147,10 @@ CLASS zcl_erpl_rev_wmtest IMPLEMENTATION.
     ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM zdelta_dt| ) > 0 )
         what = 'a DATS+TIMS pair target replicates at all' ).
     ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM zdelta_dt | &&
-                             |WHERE changed_at = '235959'| ) = 1 )
+                             |WHERE changed_at = TIME '23:59:59'| ) = 1 )
         what = 'a row at 23:59:59 is not lost across the day boundary' ).
     ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM zdelta_dt | &&
-                             |WHERE changed_at = '000000'| ) = 1 )
+                             |WHERE changed_at = TIME '00:00:00'| ) = 1 )
         what = 'a row at midnight is not lost' ).
   ENDMETHOD.
 

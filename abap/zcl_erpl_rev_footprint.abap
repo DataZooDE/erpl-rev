@@ -46,37 +46,33 @@ CLASS zcl_erpl_rev_footprint IMPLEMENTATION.
   METHOD if_oo_adt_classrun~main.
     mo = out.
 
-    " Classes and programs actually present in the delivered package.
-    SELECT obj_name FROM tadir
-      INTO TABLE @DATA(lt_actual)
-      WHERE devclass = 'ZERPL_CORE'
-        AND object IN ( 'CLAS', 'PROG', 'INTF', 'TABL' )
-        AND delflag = @abap_false
-      ORDER BY obj_name.
-
+    " Looked up by NAME, not by package. A delivered install has these in
+    " ZERPL_CORE; a dev checkout puts them in $TMP. The invariant being tested is
+    " "everything erpl-rev delivers is present", and that holds in both layouts --
+    " tying it to one package would make the check pass or fail for a reason that
+    " has nothing to do with the footprint.
     DATA(lt_exp) = expected( ).
-
-    " Anything present that is not expected: the footprint grew.
-    LOOP AT lt_actual INTO DATA(ls_a).
-      DATA(lv_name) = CONV string( ls_a-obj_name ).
-      ok( cond   = xsdbool( line_exists( lt_exp[ table_line = lv_name ] ) )
-          what   = 'no unexpected object in the delivered package'
-          detail = |{ lv_name } is in ZERPL_CORE but not in the expected list| ).
-    ENDLOOP.
-
-    " Anything expected that is missing: the install is incomplete, which would
-    " otherwise surface much later as a dump in an unrelated place.
     LOOP AT lt_exp INTO DATA(lv_e).
-      ok( cond   = xsdbool( line_exists( lt_actual[ obj_name = lv_e ] ) )
+      DATA lv_obj TYPE tadir-obj_name.
+      lv_obj = lv_e.
+      SELECT SINGLE obj_name FROM tadir INTO @DATA(lv_found)
+        WHERE obj_name = @lv_obj
+          AND object IN ( 'CLAS', 'PROG', 'INTF', 'TABL' )
+          AND delflag = @abap_false.
+      ok( cond   = xsdbool( sy-subrc = 0 )
           what   = 'every delivered object is present'
           detail = |{ lv_e } is expected but missing| ).
     ENDLOOP.
 
-    " And nothing at all outside the Z namespace.
-    LOOP AT lt_actual INTO ls_a.
-      ok( cond   = xsdbool( ls_a-obj_name CP 'Z*' )
+    " Nothing erpl-rev owns may sit outside the customer namespace. The other
+    " half of the invariant -- that nothing UNEXPECTED ships -- is asserted
+    " against the embedded asset list in the C++ suite, because that list is what
+    " actually reaches a customer; a dev system legitimately carries test classes
+    " that are not delivered, so it cannot be judged here.
+    LOOP AT lt_exp INTO lv_e.
+      ok( cond   = xsdbool( lv_e CP 'Z*' )
           what   = 'nothing outside the customer namespace'
-          detail = CONV string( ls_a-obj_name ) ).
+          detail = lv_e ).
     ENDLOOP.
 
     out->write( |FOOTPRINT RESULT pass={ mv_pass } fail={ mv_fail }| ).

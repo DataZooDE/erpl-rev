@@ -48,6 +48,20 @@ struct WatermarkSpec {
 struct Bounds {
     bool has_floor = false;
     bool has_ceiling = false;
+    // Does the ceiling bound the READ, or only the watermark?
+    //
+    // For a clock-based column it must NOT bound the read. The ceiling is
+    // read_start - safety_secs, so capping the read there would make every
+    // change invisible until the safety window had passed -- turning a 2-second
+    // streaming tick into 120-second latency and breaking the whole point of the
+    // daemon. Instead the cycle reads everything above the floor and advances the
+    // watermark only to the ceiling: rows above it are delivered NOW and simply
+    // re-delivered next cycle, which the keyed merge absorbs for free.
+    //
+    // For DATE it DOES bound the read: today is not a complete day, so reading it
+    // at all is the bug (rows posted later today would fall below tomorrow's
+    // floor).
+    bool ceiling_bounds_read = false;
     bool ceiling_from_stage = false;  // counter kinds: cut it at commit instead
     std::string floor;
     std::string ceiling;

@@ -80,6 +80,14 @@ on_server() {
 REMOTE_ENV=""
 [ -n "$REMOTE" ] && REMOTE_ENV="export SAP_HOST=$GWHOST SAP_PORT=50000 \
 SAP_CLIENT=001 SAP_USER=DEVELOPER SAP_PASSWORD=$(printf '%q' "$SAP_PASSWORD"); "
+# The same connection details for a LOCAL run. They used to be set only in the
+# remote case, so the CLI stages silently depended on the operator happening to
+# have a saved erpl-rev config -- and failed with an empty --user on any machine
+# that did not. The ABAP stages never noticed, because they go through erpl-adt.
+if [ -z "$REMOTE" ]; then
+  export SAP_HOST="${SAP_HOST:-localhost}" SAP_PORT="${SAP_PORT:-50000}" \
+         SAP_CLIENT="${SAP_CLIENT:-001}" SAP_USER="${SAP_USER:-DEVELOPER}"
+fi
 # The erpl-rev CLI, wherever the server is. `sql`/`sync`/`replicate` reach the
 # server through its loopback quack listener, so they must run on its host.
 cli() {

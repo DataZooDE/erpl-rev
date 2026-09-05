@@ -67,10 +67,10 @@ START-OF-SELECTION.
 
   " --- status only -----------------------------------------------------
   IF p_stat = abap_true.
-    PERFORM q USING |SELECT instance_id, status, ticks, | &&
+    DATA(lv_sql1) = |SELECT instance_id, status, ticks, | &&
                     |epoch(now()) - epoch(heartbeat_ts) AS age_s | &&
-                    |FROM _erpl_rev_daemon|
-              CHANGING lv_rows lv_err.
+                    |FROM _erpl_rev_daemon|.
+    PERFORM q USING lv_sql1 CHANGING lv_rows lv_err.
     IF lv_err IS NOT INITIAL.
       WRITE: / |DAEMON RESULT pass=0 fail=1 error={ lv_err }|.
     ELSE.
@@ -81,8 +81,8 @@ START-OF-SELECTION.
 
   " --- ask a running daemon to stop ------------------------------------
   IF p_stop = abap_true.
-    PERFORM q USING |UPDATE _erpl_rev_daemon SET stop=true|
-              CHANGING lv_rows lv_err.
+    DATA(lv_sql2) = |UPDATE _erpl_rev_daemon SET stop=true|.
+    PERFORM q USING lv_sql2 CHANGING lv_rows lv_err.
     WRITE: / COND string( WHEN lv_err IS INITIAL
                           THEN |DAEMON STOP requested; it ends at the next tick|
                           ELSE |DAEMON STOP failed: { lv_err }| ).
@@ -96,26 +96,26 @@ START-OF-SELECTION.
   " at the same moment cannot both believe they won: exactly one row is
   " changed. A heartbeat older than three ticks means the holder is gone.
   gv_instance = |{ sy-host }/{ sy-uname }/{ sy-datum }{ sy-uzeit }|.
-  PERFORM q USING
+  DATA(lv_claim) =
     |UPDATE _erpl_rev_daemon SET instance_id='{ gv_instance }', status='RUNNING', | &&
     |heartbeat_ts=now(), started_ts=now(), stop=false, ticks=0 | &&
     |WHERE id=1 AND (status <> 'RUNNING' | &&
     |     OR heartbeat_ts IS NULL | &&
-    |     OR heartbeat_ts < now() - INTERVAL '{ p_secs * 3 }' SECOND)|
-    CHANGING lv_rows lv_err.
+    |     OR heartbeat_ts < now() - INTERVAL '{ p_secs * 3 }' SECOND)|.
+  PERFORM q USING lv_claim CHANGING lv_rows lv_err.
   IF lv_err IS NOT INITIAL.
     WRITE: / |DAEMON RESULT pass=0 fail=1 error={ lv_err }|.
     RETURN.
   ENDIF.
 
   " Did we get it? Read back rather than trusting the update count.
-  PERFORM q USING |SELECT instance_id FROM _erpl_rev_daemon WHERE id=1|
-            CHANGING lv_rows lv_err.
+  DATA(lv_who) = |SELECT instance_id FROM _erpl_rev_daemon WHERE id=1|.
+  PERFORM q USING lv_who CHANGING lv_rows lv_err.
   IF lv_rows NS gv_instance.
     " Someone else holds it. Report their status and leave -- starting a second
     " daemon would run every target twice, against each other.
-    PERFORM q USING |SELECT instance_id, status, ticks FROM _erpl_rev_daemon|
-              CHANGING lv_rows lv_err.
+    DATA(lv_st) = |SELECT instance_id, status, ticks FROM _erpl_rev_daemon|.
+    PERFORM q USING lv_st CHANGING lv_rows lv_err.
     WRITE: / |DAEMON ALREADY RUNNING { lv_rows }|.
     RETURN.
   ENDIF.
@@ -130,7 +130,10 @@ START-OF-SELECTION.
 
   DO.
     DATA lv_plan TYPE string.
-    PERFORM plan USING `TICK` `` `` CHANGING lv_plan lv_err.
+    DATA(lv_a) = `TICK`.
+    DATA(lv_t) = ``.
+    DATA(lv_p) = ``.
+    PERFORM plan USING lv_a lv_t lv_p CHANGING lv_plan lv_err.
 
     IF lv_err IS NOT INITIAL.
       " The server is unreachable or unhappy. Do not spin: wait a tick and try
@@ -156,9 +159,9 @@ START-OF-SELECTION.
     ENDTRY.
 
     lv_ticks = lv_ticks + 1.
-    PERFORM q USING |UPDATE _erpl_rev_daemon SET heartbeat_ts=now(), ticks={ lv_ticks } | &&
-                    |WHERE id=1 AND instance_id='{ gv_instance }'|
-              CHANGING lv_rows lv_err.
+    DATA(lv_beat) = |UPDATE _erpl_rev_daemon SET heartbeat_ts=now(), ticks={ lv_ticks } | &&
+                    |WHERE id=1 AND instance_id='{ gv_instance }'|.
+    PERFORM q USING lv_beat CHANGING lv_rows lv_err.
 
     GET RUN TIME FIELD DATA(lv_now).
     lv_elapsed = ( lv_now - lv_start ) / 1000000.
@@ -172,8 +175,8 @@ START-OF-SELECTION.
 
   " Release the singleton so the next start does not have to wait for the
   " heartbeat to go stale.
-  PERFORM q USING |UPDATE _erpl_rev_daemon SET status='STOPPED', stop=false | &&
-                  |WHERE id=1 AND instance_id='{ gv_instance }'|
-            CHANGING lv_rows lv_err.
+  DATA(lv_rel) = |UPDATE _erpl_rev_daemon SET status='STOPPED', stop=false | &&
+                 |WHERE id=1 AND instance_id='{ gv_instance }'|.
+  PERFORM q USING lv_rel CHANGING lv_rows lv_err.
 
   WRITE: / |DAEMON RESULT pass={ lv_ticks } fail=0|.

@@ -1678,11 +1678,15 @@ CLASS zcl_erpl_rev_util IMPLEMENTATION.
     ENDIF.
 
     DATA(lv_pfx) = |ERPLR{ sy-uzeit }|.
-    DATA lt_state TYPE HASHED TABLE OF ty_portion_state WITH UNIQUE KEY portion_no.
+    " STANDARD/EMPTY KEY, not HASHED WITH UNIQUE KEY: dispatch_portion takes the
+    " row as CHANGING, and a hashed table's key field is read-only through a
+    " field symbol -- passing the whole line dumps with
+    " MOVE_TO_LIT_NOTALLOWED_NODATA. The table is only ever looped over anyway.
+    DATA lt_state TYPE STANDARD TABLE OF ty_portion_state WITH EMPTY KEY.
     LOOP AT it_portions INTO DATA(ls_p).
-      INSERT VALUE ty_portion_state( portion_no = ls_p-portion_no
+      APPEND VALUE ty_portion_state( portion_no = ls_p-portion_no
                                      predicate  = ls_p-predicate
-                                     attempts   = 0 ) INTO TABLE lt_state.
+                                     attempts   = 0 ) TO lt_state.
     ENDLOOP.
 
     " --- dispatch ------------------------------------------------------------

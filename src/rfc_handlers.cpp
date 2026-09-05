@@ -579,6 +579,8 @@ extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE,
                    "\"has_floor\":" + (b.bounds.has_floor ? "true" : "false") + "," +
                    "\"floor\":" + json::QuoteString(b.bounds.floor) + "," +
                    "\"has_ceiling\":" + (b.bounds.has_ceiling ? "true" : "false") + "," +
+                   "\"ceiling_bounds_read\":" +
+                       (b.bounds.ceiling_bounds_read ? "true" : "false") + "," +
                    "\"ceiling\":" + json::QuoteString(b.bounds.ceiling) + "," +
                    "\"as_of_date\":" + json::QuoteString(b.bounds.as_of_date) + "," +
                    "\"read_rows\":" + (b.plan.read_rows ? "true" : "false") + "," +

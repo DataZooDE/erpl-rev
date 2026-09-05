@@ -177,6 +177,24 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
         key_join += "t." + keys[i] + " = s." + keys[i];
     }
 
+    // A first-ever cycle has no target yet: the delta engine is documented as
+    // self-creating, and the old direct-merge path created it as a side effect
+    // of replicating into it. Staging has to do the same, or a target can only
+    // ever be started by a separate full load.
+    const bool have_target =
+        Scalar(con, "SELECT count(*) FROM duckdb_tables() WHERE table_name=" + Lit(Lower(target)))
+        == "1";
+    if (have_stage && !have_target) {
+        Exec(con, "CREATE TABLE " + target + " AS SELECT * FROM " + stage, "create target");
+        if (!keys.empty()) {
+            std::string kl;
+            for (size_t i = 0; i < keys.size(); ++i) { if (i) kl += ","; kl += keys[i]; }
+            // Best-effort: a source whose "keys" are not unique in the staged
+            // slice should still replicate rather than fail the cycle.
+            con.Query("ALTER TABLE " + target + " ADD PRIMARY KEY (" + kl + ")");
+        }
+    }
+
     // The columns to move: target columns the stage also has.
     std::vector<std::string> cols;
     if (have_stage) {
@@ -206,8 +224,9 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
         }
     }
 
-    const bool will_merge = have_stage && !cols.empty() && counts.rows_read >= 0 &&
-                            !keys.empty();
+    // Nothing to merge when the target was just created FROM the stage -- the
+    // rows are already there, and merging would be a no-op over itself.
+    const bool will_merge = have_stage && have_target && !cols.empty() && !keys.empty();
 
     // Counts and log rows are derived BEFORE the merge, because both depend on
     // whether the key was already present -- which the merge is about to change.

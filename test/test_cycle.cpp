@@ -300,3 +300,33 @@ TEST_CASE("cycle: the stage name is collision-safe across target names", "[cycle
     // ...but a run id still separates two runs of the same target.
     CHECK(cycle::StageName("T", 1) != cycle::StageName("T", 2));
 }
+
+TEST_CASE("cycle: a first cycle creates the target it merges into", "[cycle]") {
+    // The delta engine is documented as self-creating: registering a target and
+    // running it is supposed to be enough. The old direct-merge path created the
+    // table as a side effect of replicating into it, so staging has to do the
+    // same -- otherwise a target can only ever be started by a separate full
+    // load, which is not what the docs promise.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    schema::Migrate(con, "test");
+    Exec(con, "INSERT INTO _erpl_rev_delta_state "
+              "(target, method, source_from, keys, chg_col, wm_kind, wm_value, safety_secs, "
+              " cadence, status) VALUES "
+              "('fresh','WATERMARK','ZDELTA_WM','id','CHANGED_AT','NUMTS','',120,'manual','IDLE')");
+
+    const auto b = cycle::Begin(con, "fresh", LoadType::Delta, kReadStart);
+    Exec(con, "CREATE TABLE " + b.stage_table + "(id INTEGER, v VARCHAR)");
+    Exec(con, "INSERT INTO " + b.stage_table + " VALUES (1,'a'),(2,'b')");
+    cycle::Commit(con, "fresh", b.run_id, {2});
+
+    CHECK(Scalar(con, "SELECT count(*) FROM fresh") == "2");
+    CHECK(Scalar(con, "SELECT v FROM fresh WHERE id=2") == "b");
+    // ...and the second cycle merges into it rather than recreating it.
+    const auto b2 = cycle::Begin(con, "fresh", LoadType::Delta, kReadStart + 60);
+    Exec(con, "CREATE TABLE " + b2.stage_table + "(id INTEGER, v VARCHAR)");
+    Exec(con, "INSERT INTO " + b2.stage_table + " VALUES (2,'b2'),(3,'c')");
+    cycle::Commit(con, "fresh", b2.run_id, {2});
+    CHECK(Scalar(con, "SELECT count(*) FROM fresh") == "3");
+    CHECK(Scalar(con, "SELECT v FROM fresh WHERE id=2") == "b2");
+}

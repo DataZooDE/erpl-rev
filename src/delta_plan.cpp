@@ -170,6 +170,7 @@ Bounds ComputeBounds(const WatermarkSpec &spec, int64_t read_start_epoch) {
             if (b.has_floor)
                 b.floor = FormatDats(ParseDats(spec.wm_value) - days * kDay);
             b.has_ceiling = true;
+            b.ceiling_bounds_read = true;   // today is not a complete day
             b.ceiling = b.as_of_date;                       // exclusive
             b.next_watermark = FormatDats(ParseDats(b.as_of_date) - kDay);
             break;

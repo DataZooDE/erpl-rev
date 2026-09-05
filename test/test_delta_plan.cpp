@@ -79,6 +79,28 @@ TEST_CASE("delta_plan: a row committed during a slow read is not lost", "[waterm
     CHECK(next.floor < missed);
 }
 
+TEST_CASE("delta_plan: a clock ceiling bounds the watermark, not the read",
+          "[watermark]") {
+    // The distinction that keeps the daemon fast. If the ceiling capped the read,
+    // a row committed now would not be visible until safety_secs had elapsed --
+    // 120 seconds of latency on a 2-second tick, which defeats the daemon
+    // entirely. So the cycle reads everything above the floor and only ADVANCES
+    // to the ceiling; rows above it are delivered now and re-delivered next
+    // cycle, which the keyed merge absorbs.
+    const auto b = ComputeBounds(Spec(WmKind::Numts, "20260905000000"), kReadStart);
+    CHECK(b.has_ceiling);
+    CHECK_FALSE(b.ceiling_bounds_read);
+    CHECK(b.next_watermark == b.ceiling);
+}
+
+TEST_CASE("delta_plan: a DATE ceiling DOES bound the read", "[watermark]") {
+    // Today is not a complete day. Reading it is the bug: rows posted later today
+    // would fall below tomorrow's floor and never arrive.
+    const auto b = ComputeBounds(Spec(WmKind::Date, "20260903"), kReadStart);
+    CHECK(b.ceiling_bounds_read);
+    CHECK(b.ceiling == "20260905");
+}
+
 TEST_CASE("delta_plan: an initial load has a ceiling but no floor", "[watermark]") {
     const auto b = ComputeBounds(Spec(WmKind::Numts, ""), kReadStart);
     CHECK_FALSE(b.has_floor);
