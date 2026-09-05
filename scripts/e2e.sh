@@ -7,6 +7,30 @@
 #   - FMs Z_DUCKDB_QUERY / Z_DUCKDB_INGEST exist (deploy+run zcl_erpl_rev_mkfm)
 #
 # Builds, starts the server, deploys+runs the caller classruns, asserts results.
+#
+# REMOTE SERVER (proving a platform this box is not, issue #87)
+# ------------------------------------------------------------
+# The server does not have to run here. It registers at the SAP gateway over the
+# network, so it can sit on a Mac or a Windows box while SAP and this script stay
+# put -- which is the only way a Linux workstation can prove the registered-server
+# path on another platform, and the gap CI cannot close.
+#
+#   ERPL_REV_E2E_REMOTE=mac \
+#   ERPL_REV_E2E_REMOTE_BIN='~/erpl-rev/erpl-rev-macos-arm64' \
+#   ERPL_REV_E2E_GWHOST=100.119.230.107 \
+#   SAP_PASSWORD=... scripts/e2e.sh
+#
+#   ERPL_REV_E2E_REMOTE      ssh target the server runs on. Unset = this machine.
+#   ERPL_REV_E2E_REMOTE_BIN  path to the erpl-rev binary THERE (already installed;
+#                            this script cannot cross-compile one for it).
+#   ERPL_REV_E2E_GWHOST      gateway address as the REMOTE host reaches it. The
+#                            default `localhost` is this box, so remote runs must
+#                            set it. Ports 3300 (gateway) and 50000 (ADT) have to
+#                            be reachable from there.
+#
+# Remote mode skips the local build and the unit suite (they say nothing about the
+# other platform's binary) and runs `--smoke` there instead; the ABAP stages are
+# unchanged, because they are driven through SAP either way.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -28,35 +52,102 @@ TRIPLET="${VCPKG_TRIPLET:-x64-linux}"
 ADT=(--host localhost --port 50000 --user DEVELOPER --client 001 --password-env SAP_PASSWORD)
 
 cd "$HERE"
-SRV=""
-fail() { echo "E2E FAIL: $*" >&2; [ -n "$SRV" ] && kill "$SRV" 2>/dev/null; exit 1; }
+
+# --- where the server runs -------------------------------------------------
+REMOTE="${ERPL_REV_E2E_REMOTE:-}"
+REMOTE_BIN="${ERPL_REV_E2E_REMOTE_BIN:-}"
+GWHOST="${ERPL_REV_E2E_GWHOST:-localhost}"
+LOCAL_BIN=./build/erpl_rev_server
+SRV=""            # local pid, or the remote pid when REMOTE is set
+
+if [ -n "$REMOTE" ]; then
+  [ -n "$REMOTE_BIN" ] || { echo "set ERPL_REV_E2E_REMOTE_BIN too" >&2; exit 2; }
+  [ "$GWHOST" = localhost ] && { echo "set ERPL_REV_E2E_GWHOST: 'localhost' is this box, not $REMOTE" >&2; exit 2; }
+fi
+
+# Run a command where the server is. The command goes over ssh on STDIN rather
+# than in argv, so SAP_PASSWORD -- which the CLI stages need on the server's host
+# -- never appears in the remote machine's process list.
+on_server() {
+  if [ -n "$REMOTE" ]; then
+    printf '%s%s\n' "$REMOTE_ENV" "$(printf '%q ' "$@")" | ssh "$REMOTE" bash -s
+  else
+    "$@"
+  fi
+}
+# What the CLI needs to reach SAP from the server's host. Locally it is already
+# in this shell's environment; remotely it has to travel.
+REMOTE_ENV=""
+[ -n "$REMOTE" ] && REMOTE_ENV="export SAP_HOST=$GWHOST SAP_PORT=50000 \
+SAP_CLIENT=001 SAP_USER=DEVELOPER SAP_PASSWORD=$(printf '%q' "$SAP_PASSWORD"); "
+# The erpl-rev CLI, wherever the server is. `sql`/`sync`/`replicate` reach the
+# server through its loopback quack listener, so they must run on its host.
+cli() {
+  if [ -n "$REMOTE" ]; then on_server "$REMOTE_BIN" "$@"; else "$LOCAL_BIN" "$@"; fi
+}
+srv_kill() {
+  [ -n "$SRV" ] || return 0
+  if [ -n "$REMOTE" ]; then ssh "$REMOTE" "kill $SRV" 2>/dev/null
+  else kill "$SRV" 2>/dev/null; fi
+}
+fail() { echo "E2E FAIL: $*" >&2; srv_kill; exit 1; }
 
 echo "== build =="
-if [ "$RFC_BACKEND" = proto ]; then
-  cargo build --release -p erpl-proto-nwrfc \
-        --manifest-path "$ERPL_PROTO_ROOT/Cargo.toml" >/dev/null 2>&1 \
-    || fail "build erpl-proto's nwrfc shim"
+if [ -n "$REMOTE" ]; then
+  # Nothing here can build or test the other platform's binary; that is CI's job
+  # and the reason this mode exists. Check the one thing that is checkable from
+  # here: the binary is present, runs, and its RFC backend and DuckDB load.
+  on_server "$REMOTE_BIN" --smoke || fail "--smoke on $REMOTE"
+  echo "   remote binary smoke OK on $REMOTE (build + unit tests are CI's, not ours)"
+else
+  if [ "$RFC_BACKEND" = proto ]; then
+    cargo build --release -p erpl-proto-nwrfc \
+          --manifest-path "$ERPL_PROTO_ROOT/Cargo.toml" >/dev/null 2>&1 \
+      || fail "build erpl-proto's nwrfc shim"
+  fi
+  cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+        -DRFC_BACKEND="$RFC_BACKEND" -DRFC_LINK="$RFC_LINK" \
+        -DERPL_PROTO_ROOT="$ERPL_PROTO_ROOT" \
+        -DCMAKE_TOOLCHAIN_FILE="$VCPKG/scripts/buildsystems/vcpkg.cmake" \
+        -DVCPKG_TARGET_TRIPLET="$TRIPLET" -DVCPKG_HOST_TRIPLET="$TRIPLET" \
+        >/dev/null 2>&1 || fail "configure"
+  cmake --build build >/dev/null 2>&1 || fail "build"
+  ./build/erpl_rev_tests >/dev/null 2>&1 || fail "unit tests"
+  echo "   build + unit tests OK (incl. delta merge/snapshot/state cases)"
 fi
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-      -DRFC_BACKEND="$RFC_BACKEND" -DRFC_LINK="$RFC_LINK" \
-      -DERPL_PROTO_ROOT="$ERPL_PROTO_ROOT" \
-      -DCMAKE_TOOLCHAIN_FILE="$VCPKG/scripts/buildsystems/vcpkg.cmake" \
-      -DVCPKG_TARGET_TRIPLET="$TRIPLET" -DVCPKG_HOST_TRIPLET="$TRIPLET" \
-      >/dev/null 2>&1 || fail "configure"
-cmake --build build >/dev/null 2>&1 || fail "build"
-./build/erpl_rev_tests >/dev/null 2>&1 || fail "unit tests"
-echo "   build + unit tests OK (incl. delta merge/snapshot/state cases)"
 
 echo "== start server =="
-rm -f /tmp/erpl_rev_sap_export.parquet
+on_server rm -f /tmp/erpl_rev_sap_export.parquet
+# The taxi fixture is read by DuckDB, so it has to exist on the SERVER's disk,
+# not this one. Ship it there every run rather than assume: it is 654 bytes, and
+# a stale copy is a confusing failure three stages later.
+if [ -n "$REMOTE" ]; then
+  scp -q "$HERE/data/taxi.parquet" "$REMOTE:/tmp/erpl_taxi.parquet" \
+    || fail "copy the taxi fixture to $REMOTE"
+else
+  cp "$HERE/data/taxi.parquet" /tmp/erpl_taxi.parquet || fail "stage the taxi fixture"
+fi
 # Isolate the DB: the server is now file-backed by default, so give e2e a fresh
 # throwaway file (removed around the run) — never the persistent default.
 E2E_DB="/tmp/erpl_e2e_$$.duckdb"
-rm -f "$E2E_DB" "$E2E_DB".wal
-LD_LIBRARY_PATH="$RFC_LIB_DIR" ./build/erpl_rev_server --db "$E2E_DB" >/tmp/erpl_e2e_srv.log 2>&1 &
-SRV=$!
-sleep 6
-ps -p "$SRV" >/dev/null || { cat /tmp/erpl_e2e_srv.log; fail "server died"; }
+on_server rm -f "$E2E_DB" "$E2E_DB".wal
+if [ -n "$REMOTE" ]; then
+  # Detached, and its pid comes back so srv_kill can reach it. `ssh -n` keeps the
+  # remote process off this script's stdin.
+  SRV=$(ssh -n "$REMOTE" "ERPL_REV_GWHOST=$GWHOST ERPL_REV_GWSERV=3300 \
+        nohup $(printf '%q' "$REMOTE_BIN") --db $E2E_DB \
+        > /tmp/erpl_e2e_srv.log 2>&1 & echo \$!") \
+    || fail "start the server on $REMOTE"
+  sleep 8
+  ssh "$REMOTE" "kill -0 $SRV" 2>/dev/null \
+    || { ssh "$REMOTE" "cat /tmp/erpl_e2e_srv.log"; SRV=""; fail "server died on $REMOTE"; }
+  echo "   server up on $REMOTE (pid $SRV), registered at gateway $GWHOST:3300"
+else
+  LD_LIBRARY_PATH="$RFC_LIB_DIR" "$LOCAL_BIN" --db "$E2E_DB" >/tmp/erpl_e2e_srv.log 2>&1 &
+  SRV=$!
+  sleep 6
+  ps -p "$SRV" >/dev/null || { cat /tmp/erpl_e2e_srv.log; fail "server died"; }
+fi
 
 run() {  # cls file -> $OUT (cleaned). Uses ABSOLUTE --file path.
   local cls="$1" file="$HERE/$2"
@@ -79,7 +170,7 @@ echo "== Ingest E2E (SAP T000 -> parquet, UPSERT) =="
 run ZCL_ERPL_REV_INGEST abap/zcl_erpl_rev_ingest.abap
 echo "$OUT" | grep -q 'ERPL-REV-UPSERT' || fail "ingest upsert verify ($OUT)"
 echo "$OUT" | grep -q 'affected=' || fail "ingest affected"
-[ -f /tmp/erpl_rev_sap_export.parquet ] || fail "parquet not written"
+on_server test -f /tmp/erpl_rev_sap_export.parquet || fail "parquet not written"
 echo "   ingest OK (parquet written, upsert verified)"
 
 echo "== Console E2E (arbitrary SQL -> arbitrary result column names) =="
@@ -175,30 +266,43 @@ echo "== CLI E2E (operate the server from the shell) =="
 # The commands that replace the SAP GUI reports. The server started above is
 # still running with quack on the default loopback listener, so the CLI should
 # find it through the runtime state file with no flags at all.
-CLI=./build/erpl_rev_server
 adt() { uvx erpl-adt "${ADT[@]}" "$@"; }
-STATE="${XDG_RUNTIME_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}}/erpl-rev/server.json"
+# Run the CLI with every SAP credential removed, wherever the server is. Step 7
+# turns on this, and unsetting them in THIS shell says nothing about the remote
+# one -- the whole point is a caller who cannot log into SAP at all.
+cli_nocreds() {
+  if [ -n "$REMOTE" ]; then
+    # Append rather than replace, so this strips exactly what `env -u` strips
+    # below: the credentials, not SAP_HOST/PORT/CLIENT. Removing those too would
+    # make the command fail for want of an address and look like it passed.
+    REMOTE_ENV="${REMOTE_ENV}unset SAP_USER SAP_PASSWORD ERPL_REV_SAP_PASSWORD; " cli "$@"
+  else
+    env -u SAP_USER -u SAP_PASSWORD -u ERPL_REV_SAP_PASSWORD "$LOCAL_BIN" "$@"
+  fi
+}
 
-[ -f "$STATE" ] || fail "no server state file at $STATE"
-if [ "$(stat -c %a "$STATE" 2>/dev/null || stat -f %Lp "$STATE")" != "600" ]; then
-  fail "server state file is not 0600 -- it holds the quack token"
-fi
+# The state file lives next to the server, so it is checked next to the server.
+on_server sh -c 'S="${XDG_RUNTIME_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}}/erpl-rev/server.json"
+  [ -f "$S" ] || { echo "no server state file at $S" >&2; exit 1; }
+  M=$(stat -c %a "$S" 2>/dev/null || stat -f %Lp "$S")
+  [ "$M" = 600 ] || { echo "state file is $M, not 0600 -- it holds the quack token" >&2; exit 1; }' \
+  || fail "server runtime state file"
 
 # 1. Zero-config: no flags, finds the running server.
-OUT="$($CLI sql "SELECT 42 AS answer" 2>&1)" || fail "sql failed: $OUT"
+OUT="$(cli sql "SELECT 42 AS answer" 2>&1)" || fail "sql failed: $OUT"
 grep -q "using the running server" <<<"$OUT" || fail "sql did not use quack: $OUT"
 grep -q "42" <<<"$OUT" || fail "sql returned no answer: $OUT"
 
 # 2. Formats.
-[ "$($CLI sql "SELECT 1 AS n" --format csv 2>/dev/null)" = "n
+[ "$(cli sql "SELECT 1 AS n" --format csv 2>/dev/null)" = "n
 1" ] || fail "csv output wrong"
-$CLI sql "SELECT 1 AS n" --format json 2>/dev/null | grep -q '"rows":\[{"n":1}\]' \
+cli sql "SELECT 1 AS n" --format json 2>/dev/null | grep -q '"rows":\[{"n":1}\]' \
   || fail "json output wrong"
 
 # 3. --print-abap contacts nothing and produces activatable ABAP. This is the
 #    only compile check the generated skeletons ever get.
 GEN="/tmp/erpl_cli_gen_$$.abap"
-$CLI replicate --table T000 --target t000_cli --print-abap > "$GEN" 2>/dev/null \
+cli replicate --table T000 --target t000_cli --print-abap > "$GEN" 2>/dev/null \
   || fail "--print-abap failed"
 grep -q "SUBMIT z_erpl_rev_replicate" "$GEN" || fail "generated ABAP has no SUBMIT"
 # Deploy it under a stable name purely to prove it compiles.
@@ -214,33 +318,33 @@ echo "   generated ABAP compiles"
 
 # 4. Injection: each payload must become a literal, never a statement.
 for BAD in "MANDT = '000' OR '1'='1'" "x' ). DELETE FROM t000. \"" 'a` ). zcl_evil=>go( ). `'; do
-  P="$($CLI replicate --table T000 --where "$BAD" --print-abap 2>&1)" \
+  P="$(cli replicate --table T000 --where "$BAD" --print-abap 2>&1)" \
     || fail "print-abap refused a legitimate payload: $BAD"
   grep -q "DELETE FROM" <<<"$(grep -v p_where <<<"$P")" \
     && fail "payload escaped its literal: $BAD"
 done
 # A newline cannot be escaped into an ABAP literal, so it must be refused.
-$CLI replicate --table T000 --where "$(printf 'a\nENDMETHOD.')" --print-abap >/dev/null 2>&1
+cli replicate --table T000 --where "$(printf 'a\nENDMETHOD.')" --print-abap >/dev/null 2>&1
 [ $? -eq 2 ] || fail "a newline in --where was not refused with exit 2"
 echo "   injection payloads render as literals; a newline is refused"
 
 # 5. A real load, submitted as a background job and verified from run stats.
-$CLI replicate --table T000 --target t000_cli --yes --wait 180 --quiet >/dev/null 2>&1 \
+cli replicate --table T000 --target t000_cli --yes --wait 180 --quiet >/dev/null 2>&1 \
   || fail "replicate did not report success"
-CNT="$($CLI sql "SELECT count(*) AS n FROM t000_cli" --format csv --quiet 2>/dev/null | tail -1)"
+CNT="$(cli sql "SELECT count(*) AS n FROM t000_cli" --format csv --quiet 2>/dev/null | tail -1)"
 [ "${CNT:-0}" -gt 0 ] || fail "replicate produced no rows"
 echo "   replicate -> $CNT rows via a background job"
 
 # 6. sync: register through ABAP, list from DuckDB.
-$CLI sync create t000_cli --method SNAPSHOT --source T000 --keys MANDT \
+cli sync create t000_cli --method SNAPSHOT --source T000 --keys MANDT \
      --cadence nightly --yes >/dev/null 2>&1 || fail "sync create failed"
-$CLI sync ls --quiet 2>/dev/null | grep -q t000_cli || fail "sync ls does not show the job"
+cli sync ls --quiet 2>/dev/null | grep -q t000_cli || fail "sync ls does not show the job"
 # The granularity gate lives in ABAP; the CLI must not be able to bypass it.
-if $CLI sync create t000_bad --method WATERMARK --source T000 --keys MANDT \
+if cli sync create t000_bad --method WATERMARK --source T000 --keys MANDT \
         --chg-col X --wm-kind DATE --cadence micro:30 --yes >/dev/null 2>&1; then
   fail "the ABAP granularity gate was bypassed"
 fi
-$CLI sync run t000_cli --yes >/dev/null 2>&1 || fail "sync run failed"
+cli sync run t000_cli --yes >/dev/null 2>&1 || fail "sync run failed"
 echo "   sync create/ls/run, and the granularity gate still applies"
 
 # 7. The driver: parameters as data, no generated ABAP, no authorisation.
@@ -251,8 +355,7 @@ adt source write ZCL_ERPL_REV_CLIDRV --file "$HERE/abap/zcl_erpl_rev_clidrv.abap
   2>&1 | grep -qE "Activated|Nothing to activate" || fail "clidrv did not activate"
 
 # --queue-only must not touch SAP: run it with the credentials stripped.
-QOUT="$(env -u SAP_USER -u SAP_PASSWORD -u ERPL_REV_SAP_PASSWORD \
-        $CLI replicate --table T000 --target t000_q --queue-only --yes 2>&1)"
+QOUT="$(cli_nocreds replicate --table T000 --target t000_q --queue-only --yes 2>&1)"
 grep -q "Queued as command" <<<"$QOUT" || fail "--queue-only did not queue: $QOUT"
 CID="$(sed -n 's/.*Queued as command \([0-9]*\).*/\1/p' <<<"$QOUT" | head -1)"
 [ -n "$CID" ] || fail "no command id in: $QOUT"
@@ -282,10 +385,10 @@ adt source write ZCL_ERPL_E2E_TICK --file "/tmp/erpl_e2e_tick_$$.abap" --activat
 adt object run ZCL_ERPL_E2E_TICK >/dev/null 2>&1 || fail "heartbeat tick failed"
 rm -f "/tmp/erpl_e2e_tick_$$.abap"
 
-ST="$($CLI sql "SELECT status FROM _erpl_rev_cli_cmd WHERE cmd_id = $CID" \
+ST="$(cli sql "SELECT status FROM _erpl_rev_cli_cmd WHERE cmd_id = $CID" \
       --format csv --quiet 2>/dev/null | tail -1)"
 [ "$ST" = "DONE" ] || fail "queued command $CID is '$ST', not DONE"
-QROWS="$($CLI sql "SELECT count(*) AS n FROM t000_q" --format csv --quiet 2>/dev/null | tail -1)"
+QROWS="$(cli sql "SELECT count(*) AS n FROM t000_q" --format csv --quiet 2>/dev/null | tail -1)"
 [ "${QROWS:-0}" -gt 0 ] || fail "the queued replicate loaded no rows"
 adt object delete /sap/bc/adt/oo/classes/zcl_erpl_e2e_tick >/dev/null 2>&1 || true
 echo "   driver: queued with no SAP credentials, heartbeat ran it, $QROWS rows"
@@ -297,9 +400,11 @@ LEFT="$(adt search 'ZCL_ERPL_REV_CLI_*' 2>/dev/null | grep -c 'ZCL_ERPL_REV_CLI_
 [ "$LEFT" -eq 0 ] || fail "$LEFT temporary CLI class(es) leaked into SAP"
 echo "   no temporary classes left behind"
 
-kill "$SRV" 2>/dev/null; sleep 1
-rm -f "$E2E_DB" "$E2E_DB".wal
-if [ "$RFC_BACKEND" = proto ]; then
+srv_kill; sleep 1
+on_server rm -f "$E2E_DB" "$E2E_DB".wal /tmp/erpl_taxi.parquet
+# ldd and the SDK path are this box's; a remote binary is a different platform's
+# and was linked by CI, which has its own check.
+if [ "$RFC_BACKEND" = proto ] && [ -z "$REMOTE" ]; then
   echo "== SDK-absence check =="
   # Matched on the resolved *path*, not the SONAME: erpl-proto's shim is called
   # libsapnwrfc.so on purpose, so a name check cannot tell it from SAP's and

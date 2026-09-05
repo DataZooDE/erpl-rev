@@ -14,8 +14,7 @@ CLASS zcl_erpl_rev_query IMPLEMENTATION.
 
     lv_sql = `SELECT payment_type, count(*) AS c, ` &&
              `CAST(sum(fare_amount) AS DECIMAL(10,2)) AS s ` &&
-             `FROM read_parquet('/home/jr/Projects/tmp/research/` &&
-             `2026-05-30-erpl-rev/data/taxi.parquet') ` &&
+             `FROM read_parquet('/tmp/erpl_taxi.parquet') ` &&
              `GROUP BY 1 ORDER BY 1`.
 
     CALL FUNCTION 'Z_DUCKDB_QUERY' DESTINATION 'ERPL_REV'

@@ -270,7 +270,8 @@ Cli ParseArgs(int argc, char **argv) {
             // sync and replicate mirror a five-tab SAP selection screen. Rather
             // than redeclare thirty flags here, their words are collected and
             // read by name in the command itself; an unrecognised one is
-            // reported there, where the valid set for that subcommand is known.
+            // reported there, where the valid set for that subcommand is known
+            // -- cmd::UnknownFlag, called first thing in RunSync/RunReplicate.
             c.cmd.args.push_back(key);
             if (has_inval) c.cmd.args.push_back(inval);
             else if (i + 1 < argc && argv[i + 1][0] != '-') c.cmd.args.push_back(argv[++i]);
