@@ -10,6 +10,7 @@
 
 #include "commands.hpp"
 #include "db_client.hpp"
+#include "load_type.hpp"
 
 using namespace erpl_rev;
 using Catch::Matchers::ContainsSubstring;
@@ -170,4 +171,37 @@ TEST_CASE("each sync subcommand has its own flag set", "[args]") {
     // ls / show / run read no flags of their own.
     CHECK(cmd::UnknownFlag({"ls", "--every", "5"}, "sync ls") == "--every");
     CHECK(cmd::UnknownFlag({"ls"}, "sync ls").empty());
+}
+
+// ---------------------------------------------------------------------------
+// --load-type: three separate failure modes, not one
+//
+// UnknownFlag validates flag NAMES against a per-subcommand whitelist. It never
+// looks at a value -- so `sync run --load-type Z` sails past it. Asserting on
+// UnknownFlag alone would have "proved" validation that does not exist.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("args: sync run accepts --load-type", "[args]") {
+    CHECK(cmd::UnknownFlag({"run", "ZDELTA_WM", "--load-type", "I"}, "sync run").empty());
+}
+
+TEST_CASE("args: an unknown flag on sync run is still refused", "[args]") {
+    CHECK(cmd::UnknownFlag({"run", "ZDELTA_WM", "--lod-type", "I"}, "sync run") == "--lod-type");
+}
+
+TEST_CASE("args: an unknown SUBCOMMAND is a different failure from an unknown flag",
+          "[args]") {
+    // Nothing is registered for "sync frobnicate", so every flag reads as
+    // unknown -- which is why the subcommand has to be rejected on its own,
+    // before its flags are judged.
+    CHECK(cmd::UnknownFlag({"frobnicate", "--load-type", "I"}, "sync frobnicate") ==
+          "--load-type");
+}
+
+TEST_CASE("args: an invalid --load-type VALUE is caught by the type, not the whitelist",
+          "[args]") {
+    // The whitelist passes it...
+    CHECK(cmd::UnknownFlag({"run", "T", "--load-type", "Z"}, "sync run").empty());
+    // ...so this is the only thing that stops a silently wrong run.
+    CHECK_FALSE(erpl_rev::IsValidLoadTypeCode("Z"));
 }

@@ -14,6 +14,7 @@
 #include "abap_codegen.hpp"
 #include "abap_skeletons.hpp"
 #include "commands.hpp"
+#include "load_type.hpp"
 #include "db_client.hpp"
 #include "json_util.hpp"
 
@@ -50,14 +51,22 @@ std::string UnknownFlag(const std::vector<std::string> &args, const std::string 
     static const Spec kSyncSchedule[] = {
         {"--every", true}, {"--remove", false},
     };
+    // `run` selects which of the four load types the cycle is. Note the value is
+    // NOT validated here -- this table only knows flag names -- so the caller
+    // checks it against load_type.hpp before anything contacts SAP.
+    static const Spec kSyncRun[] = {
+        {"--load-type", true},
+    };
 
     const Spec *known = nullptr;
     size_t count = 0;
     if (sub == "replicate")           { known = kReplicate;    count = std::size(kReplicate); }
     else if (sub == "sync create")    { known = kSyncCreate;   count = std::size(kSyncCreate); }
     else if (sub == "sync schedule")  { known = kSyncSchedule; count = std::size(kSyncSchedule); }
-    // ls / show / run / run-due read no flags of their own; count stays 0, so
-    // any `--word` at all is unknown -- which is the right answer for them.
+    else if (sub == "sync run" || sub == "sync run-due")
+                                      { known = kSyncRun;      count = std::size(kSyncRun); }
+    // ls / show read no flags of their own; count stays 0, so any `--word` at
+    // all is unknown -- which is the right answer for them.
 
     for (size_t i = 0; i < args.size(); i++) {
         if (args[i].rfind("--", 0) != 0) continue;   // a positional, e.g. the target
@@ -361,13 +370,27 @@ static int SyncCreate(Options &o, const std::string &target) {
 }
 
 static int SyncRun(Options &o, const std::string &target) {
+    // The flag whitelist above passes any value through, so this is the only
+    // thing between `--load-type Z` and a run that quietly does the wrong thing.
+    // Checked before the consent gate: a typo should cost an error, not a
+    // password prompt and a wrong job.
+    std::string load_type = Field(o, "--load-type");
+    if (!load_type.empty()) {
+        if (!IsValidLoadTypeCode(load_type)) {
+            std::fprintf(stderr, "erpl-rev sync run: %s\n",
+                         [&] { try { ParseLoadType(load_type); } catch (const std::exception &e) {
+                                   return std::string(e.what()); } return std::string(); }().c_str());
+            return 2;
+        }
+        load_type = LoadTypeCode(ParseLoadType(load_type));
+    }
     if (!o.print_abap && !o.dry_run && (o.queue_only || DriverAvailable(o))) {
         if (const int rc = ConsentGate(o, target.empty()
                                               ? "Run every due sync job on " + o.host
                                               : "Run sync job '" + target + "' on " + o.host))
             return rc;
         return RunViaDriver(o, "sync_run",
-                            BuildParams({{"target", target}}));
+                            BuildParams({{"target", target}, {"load_type", load_type}}));
     }
     const std::string nonce = abapgen::MakeNonce();
     const std::string src = abapgen::RenderSyncRun(target, nonce);
