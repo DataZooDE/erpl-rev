@@ -1,5 +1,6 @@
 #include "duckdb_bridge.hpp"
 #include "control_schema.hpp"
+#include "transform_macros.hpp"
 
 #include <set>
 #include "payload.hpp"
@@ -235,6 +236,28 @@ DuckDbBridge::DuckDbBridge(const std::string &path, const std::string &init_sql)
         "FROM _erpl_rev_run_stats");
     if (rview->HasError())
         throw std::runtime_error("DuckDB run-stats view init failed: " + rview->GetError());
+
+    // Transformation macros, recreated on every open for the same reason as the
+    // view above: a macro stored as versioned DDL in a customer's file could
+    // never be corrected, so a bug found later would stay broken on every file
+    // already created.
+    auto macros = con.Query(TransformMacroSql());
+    if (macros->HasError())
+        throw std::runtime_error("DuckDB transform macros init failed: " + macros->GetError());
+
+    // The currency macros depend on TCURX being replicated. DuckDB binds a macro
+    // body eagerly, so referencing a missing table here would stop the server
+    // booting; instead the macro is defined to raise a clear error, and the
+    // failure lands on the query that needs it.
+    bool have_tcurx = false;
+    {
+        auto t = con.Query("SELECT count(*) FROM duckdb_tables() WHERE lower(table_name)='tcurx'");
+        have_tcurx = !t->HasError() && t->RowCount() > 0 &&
+                     t->GetValue(0, 0).GetValue<int64_t>() > 0;
+    }
+    auto cmac = con.Query(CurrencyMacroSql(have_tcurx));
+    if (cmac->HasError())
+        throw std::runtime_error("DuckDB currency macros init failed: " + cmac->GetError());
 
     // Boot init: explicit init_sql (CLI/--init-file) wins; else env fallback. Runs
     // INSTALL/LOAD/CREATE SECRET/ATTACH so replication can publish to external

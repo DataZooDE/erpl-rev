@@ -274,6 +274,7 @@ add_library(erpl_rev_core OBJECT
   src/cycle.cpp
   src/split_planner.cpp
   src/drift.cpp
+  src/transform_macros.cpp
   src/cdc_dialect.cpp
   src/json_util.cpp
   src/sxml_binary.cpp
@@ -349,6 +350,7 @@ if(TRUE)  # tests always build; DuckDB is in-tree
     test/test_cycle.cpp
     test/test_split_planner.cpp
     test/test_drift.cpp
+    test/test_transform_macros.cpp
     test/test_sxml_binary.cpp
     test/test_payload.cpp
     test/test_telemetry.cpp
