@@ -490,6 +490,17 @@ PV="$(cli sync preview t000_cli --rows 1 --yes 2>&1)" || fail "sync preview fail
 grep -qE '[{]|MANDT|mandt' <<<"$PV" || fail "sync preview returned no rows: $PV"
 echo "   sync set-wm (audited) and sync preview"
 
+# mass: the server cuts the portions and PERSISTS them before any worker starts,
+# which is what makes a mass load restartable rather than merely parallel.
+cli sql "DROP TABLE IF EXISTS t000_mass" >/dev/null 2>&1
+MR="$(cli mass run --target t000_mass --source T000 --split records --part-col MANDT --limit-rows 1 --yes 2>&1)" || fail "mass run failed: $MR"
+grep -qE "portion" <<<"$MR" || fail "mass run reported no portions: $MR"
+MP="$(cli sql "SELECT CASE WHEN count(*) > 1 THEN 'PERSISTED' ELSE 'NONE' END AS v FROM _erpl_rev_portion WHERE target='t000_mass'" 2>&1)"
+grep -q PERSISTED <<<"$MP" || fail "the portion list was not persisted: $MP"
+MRW="$(cli sql "SELECT CASE WHEN count(*) > 0 THEN 'LOADED' ELSE 'EMPTY' END AS v FROM t000_mass" 2>&1)"
+grep -q LOADED <<<"$MRW" || fail "mass run moved no rows: $MRW"
+echo "   mass run: portions cut by the server, persisted, and loaded"
+
 # cdc status on a target that is not a trigger target must say so, not crash.
 CS="$(cli cdc status --target t000_cli --yes 2>&1 || true)"
 grep -qiE "not a registered trigger target|no registration" <<<"$CS"   || fail "cdc status on a non-CDC target gave no usable message: $CS"

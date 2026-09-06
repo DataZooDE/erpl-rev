@@ -88,6 +88,7 @@ std::string UnknownFlag(const std::vector<std::string> &args, const std::string 
     else if (sub.rfind("sub", 0) == 0)    { known = kSub;    count = std::size(kSub); }
     else if (sub == "retain")             { known = kRetain; count = std::size(kRetain); }
     else if (sub.rfind("cdc", 0) == 0)    { known = kCdc;    count = std::size(kCdc); }
+    else if (sub.rfind("mass", 0) == 0)   { known = kMass;   count = std::size(kMass); }
     else if (sub.rfind("daemon", 0) == 0)  { known = kDaemon;  count = std::size(kDaemon); }
     else if (sub.rfind("sub", 0) == 0)     { known = kSub;     count = std::size(kSub); }
     else if (sub.rfind("mass", 0) == 0)    { known = kMass;    count = std::size(kMass); }
@@ -652,6 +653,34 @@ int RunSub(Options o) {
 
     std::fprintf(stderr, "erpl-rev sub: expected create, advance or ls.\n");
     return 2;
+}
+
+int RunMass(Options o) {
+    const std::string sub = o.args.empty() ? "" : o.args[0];
+    if (const int rc = RefuseUnknownFlags(o, "mass " + sub)) return rc;
+    const auto cfg = cli::ReadConfig();
+    cli::ResolveConn(o, cfg, !o.queue_only && !o.non_interactive && cli::IsTty());
+
+    if (sub != "run") {
+        std::fprintf(stderr, "erpl-rev mass run --target T --source S --part-col C "
+                             "[--split STRATEGY]\n"
+                             "  STRATEGY is records (default), size, time, fiscal, list or key.\n");
+        return 2;
+    }
+    const std::string target = Field(o, "--target"), source = Field(o, "--source");
+    if (target.empty() || source.empty()) {
+        std::fprintf(stderr, "erpl-rev mass run: --target and --source are required.\n");
+        return 2;
+    }
+    if (const int rc = ConsentGate(o, "Mass load '" + source + "' into '" + target + "'"))
+        return rc;
+    return RunViaDriver(o, "mass_run", BuildParams({
+        {"target", target}, {"source", source},
+        {"strategy", Field(o, "--split", "records")},
+        {"part_col", Field(o, "--part-col")},
+        {"limit_rows", Field(o, "--limit-rows", "100000")},
+        {"limit_mb", Field(o, "--limit-mb")},
+        {"time_unit", Field(o, "--time-unit")}}));
 }
 
 int RunCdc(Options o) {

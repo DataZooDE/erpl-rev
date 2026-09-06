@@ -251,6 +251,92 @@ CLASS zcl_erpl_rev_clidrv IMPLEMENTATION.
           ENDIF.
         ENDIF.
 
+      WHEN 'mass_run'.
+        " The server cuts the portions and persists them BEFORE any worker
+        " starts -- that is what makes the run restartable -- and ABAP dispatches
+        " them through the one portion runner the daemon also uses.
+        DATA(lv_mt) = jstr( iv_json = iv_params iv_key = 'target' ).
+        DATA(lv_ms) = jstr( iv_json = iv_params iv_key = 'source' ).
+        DATA(lv_pc) = jstr( iv_json = iv_params iv_key = 'part_col' ).
+        DATA(lv_facts) = ``.
+        IF lv_pc IS NOT INITIAL AND lv_ms IS NOT INITIAL.
+          " Scalar MIN/MAX and a count -- the shape parallel replication has used
+          " here for a long time. A per-value histogram would be a better input,
+          " but it needs a multi-row dynamic SELECT: an inline target cannot
+          " infer a type from a dynamic select list, and a declared target that
+          " does not fit the columns dumps the work process instead of raising.
+          "
+          " These are FACTS. Every boundary is still decided by the server, so
+          " one code path cuts every strategy.
+          DATA: lv_mn TYPE c LENGTH 40, lv_mx TYPE c LENGTH 40.
+          DATA lv_tot TYPE i.
+          TRY.
+              DATA(lv_mmsel) = |MIN( { lv_pc } ), MAX( { lv_pc } )|.
+              SELECT (lv_mmsel) FROM (lv_ms) INTO (@lv_mn, @lv_mx).
+              ENDSELECT.
+              SELECT COUNT(*) FROM (lv_ms) INTO @lv_tot.
+            CATCH cx_root INTO DATA(lx_h).
+              ev_error = |bounds of { lv_ms }.{ lv_pc } could not be read: | &&
+                         |{ lx_h->get_text( ) }|.
+              RETURN.
+          ENDTRY.
+          IF lv_tot = 0.
+            ev_error = |{ lv_ms } has no rows to load|.
+            RETURN.
+          ENDIF.
+          lv_facts = |"range_min":"{ condense( CONV string( lv_mn ) ) }",| &&
+                     |"range_max":"{ condense( CONV string( lv_mx ) ) }",| &&
+                     |"total_rows":{ lv_tot },|.
+        ELSE.
+          ev_error = |mass run needs --part-col: the portions are cut on it|.
+          RETURN.
+        ENDIF.
+
+        " The facts are spliced into the params the CLI sent, so the server sees
+        " one object with everything it needs.
+        DATA(lv_mp) = iv_params.
+        REPLACE FIRST OCCURRENCE OF `{` IN lv_mp WITH |\{{ lv_facts }|.
+
+        DATA(ls_sp2) = zcl_erpl_rev_delta=>plan_json(
+          iv_action = 'SPLIT' iv_target = lv_mt iv_params = lv_mp ).
+        IF ls_sp2-error IS NOT INITIAL.
+          ev_error = ls_sp2-error.
+        ELSE.
+          " Predicates in the order the server numbered them: a portion list
+          " reordered here would not match the persisted one a restart reads.
+          DATA(lt_pred) = zcl_erpl_rev_delta=>jarr_items( iv_json = ls_sp2-json
+                                                          iv_key = 'predicates' ).
+          DATA lt_port TYPE zcl_erpl_rev_util=>tt_portion.
+          LOOP AT lt_pred INTO DATA(lv_pr).
+            APPEND VALUE #( portion_no = sy-tabix predicate = lv_pr ) TO lt_port.
+          ENDLOOP.
+          IF lt_port IS INITIAL.
+            ev_error = |SPLIT produced no portions|.
+          ELSE.
+            " EVERY optional parameter supplied, explicitly.
+            "
+            " replicate_portions takes iv_columns/iv_init/iv_params as
+            " generically typed OPTIONAL parameters and passes them on. Leaving
+            " one unsupplied does not default it -- it has no value at all, and
+            " the first method that reads it dumps the work process. That
+            " reaches the operator as "SAP server internal error" and says
+            " nothing, which cost a long afternoon to find.
+            DATA(ls_mr) = zcl_erpl_rev_util=>replicate_portions(
+              iv_tab      = lv_ms
+              iv_target   = lv_mt
+              it_portions = lt_port
+              iv_recreate = abap_true
+              iv_columns  = ``
+              iv_init     = ``
+              iv_batch    = 0
+              iv_params   = `` ).
+            ev_error = ls_mr-error.
+            IF ev_error IS INITIAL.
+              ev_result = |{ lines( lt_port ) } portion(s), { ls_mr-rows_affected } rows|.
+            ENDIF.
+          ENDIF.
+        ENDIF.
+
       WHEN 'cdc_status' OR 'cdc_repair'.
         " Two round trips, because the catalogue lives in HANA and the registry
         " lives in DuckDB and neither can see the other. The server says what to
