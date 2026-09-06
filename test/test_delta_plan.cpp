@@ -295,3 +295,43 @@ TEST_CASE("delta_plan: DATS and TIMS bounds are local, TIMESTAMPL bounds are UTC
     CHECK(std::abs(offset) < 15 * 3600);
     CHECK((ParseNumts(utc_kind.ceiling) + offset) == ParseNumts(local_kind.ceiling));
 }
+
+TEST_CASE("watermark: a reload of a DATE target reads today as well", "[wm]") {
+    // The complete-day rule exists so a DELTA cycle never reads a day still in
+    // progress: rows posted later today would fall below tomorrow's floor. It
+    // has no business bounding a RELOAD, and applied there it destroys data --
+    // the reload empties the target and re-inserts only rows dated before
+    // today, so today's rows are deleted and, because F does not move the
+    // watermark, nothing re-delivers them until tomorrow at the earliest.
+    WatermarkSpec s;
+    s.kind = WmKind::Date;
+    s.chg_col = "BUDAT";
+    s.wm_value = "20260901";
+    s.safety_secs = 0;
+
+    const auto delta = ComputeBounds(s, kReadStart);
+    CHECK(delta.ceiling_bounds_read);   // unchanged: a delta still stops at today
+
+    const auto reload = ComputeBounds(s, kReadStart, /*full_reload=*/true);
+    CHECK_FALSE(reload.ceiling_bounds_read);
+    // The stored watermark is still the last COMPLETE day. Reading today and
+    // remembering yesterday just re-delivers today next cycle, which the keyed
+    // merge absorbs; the reverse would lose it.
+    CHECK(reload.next_watermark == delta.next_watermark);
+}
+
+TEST_CASE("watermark: a reload ignores the floor for every kind", "[wm]") {
+    // Not a new rule -- apply_floor is already false for F -- but worth pinning
+    // next to the ceiling: a reload that read only part of the source and then
+    // truncated would be the same defect from the other end.
+    for (auto kind : {WmKind::Date, WmKind::Numts, WmKind::Datetime, WmKind::Int}) {
+        WatermarkSpec s;
+        s.kind = kind;
+        s.chg_col = "C";
+        s.time_col = "T";
+        s.wm_value = kind == WmKind::Date ? "20260901" : "20260901000000";
+        const auto b = ComputeBounds(s, kReadStart, /*full_reload=*/true);
+        INFO("kind " << static_cast<int>(kind));
+        CHECK_FALSE(b.ceiling_bounds_read);
+    }
+}

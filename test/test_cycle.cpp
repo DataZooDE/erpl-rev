@@ -790,35 +790,42 @@ TEST_CASE("cycle: an empty stage table is not the same as no stage table", "[cyc
                       std::string("'") + b.stage_table + "'") == "0");
 }
 
-TEST_CASE("cycle: a full load that read nothing at all does not empty the target",
+TEST_CASE("cycle: a reload that staged nothing refuses rather than emptying the target",
           "[cycle]") {
-    // F truncates before it loads, and that is what the operator asked for. But
-    // a read that produced no staging table at all did not decide the source is
-    // empty -- it produced nothing: a short read that reported success, a
-    // connection dropped between packages. Truncating on that evidence deletes
-    // the customer's replicated table and reports SUCCESS. Keeping the previous
-    // contents is recoverable and visible as rows_read=0; deleting them is not.
+    // "The stage exists, so the reader ran" is not evidence of anything: the
+    // reader DROPs and CREATEs its staging table before its first SELECT, so
+    // the stage always exists by the time a commit is reached. An empty one is
+    // therefore indistinguishable between "the source really is empty" and "a
+    // wrong client, a bad filter or a mistyped source matched no rows" -- and
+    // one of those two readings deletes a replica of any size and reports
+    // SUCCESS.
+    //
+    // So a reload that staged nothing against a NON-EMPTY target refuses. The
+    // operator sees why, the data is still there, and the genuinely-empty
+    // source is one flag away. The reverse mistake is not recoverable.
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
     Setup(con);
 
     const auto b = cycle::Begin(con, "zdelta_wm", LoadType::Full, kReadStart);
-    const auto r = cycle::Commit(con, "zdelta_wm", b.run_id, {0});
+    Exec(con, "CREATE TABLE " + b.stage_table + "(id INTEGER, v VARCHAR, changed_at VARCHAR)");
 
+    CHECK_THROWS_WITH(cycle::Commit(con, "zdelta_wm", b.run_id, {0}),
+                      Catch::Matchers::ContainsSubstring("staged no rows"));
     CHECK(Scalar(con, "SELECT count(*) FROM zdelta_wm") == "2");
-    CHECK(r.del == 0);
+    // Refused, not silently skipped: the run says so and the target is free.
+    CHECK(Scalar(con, "SELECT status FROM _erpl_rev_run_stats WHERE run_id=" +
+                          std::to_string(b.run_id)) == "ERROR");
 }
 
-TEST_CASE("cycle: a full load from a genuinely empty source does empty the target",
-          "[cycle]") {
-    // The other half, and the reason the rule above is about the STAGE rather
-    // than about the row count: here the reader ran, created its stage and
-    // found nothing. The source is empty, so the replica must be too --
-    // otherwise F silently stops being a reload the moment a table is
-    // truncated at the source.
+TEST_CASE("cycle: a reload of a source that really is empty is one flag away", "[cycle]") {
+    // The other half. A source table that has genuinely been emptied must be
+    // replicable, or F stops being a reload for exactly the case that needs it
+    // most -- it just cannot be the DEFAULT reading of an empty stage.
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
     Setup(con);
+    Exec(con, "UPDATE _erpl_rev_delta_state SET allow_empty_reload=true");
 
     const auto b = cycle::Begin(con, "zdelta_wm", LoadType::Full, kReadStart);
     Exec(con, "CREATE TABLE " + b.stage_table + "(id INTEGER, v VARCHAR, changed_at VARCHAR)");
@@ -826,4 +833,151 @@ TEST_CASE("cycle: a full load from a genuinely empty source does empty the targe
 
     CHECK(Scalar(con, "SELECT count(*) FROM zdelta_wm") == "0");
     CHECK(r.del == 2);
+}
+
+TEST_CASE("cycle: an empty reload of an already-empty target is not an error", "[cycle]") {
+    // Nothing to lose, so nothing to refuse. Failing here would make a
+    // freshly-registered target's first reload an error.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con);
+    Exec(con, "DELETE FROM zdelta_wm");
+
+    const auto b = cycle::Begin(con, "zdelta_wm", LoadType::Full, kReadStart);
+    Exec(con, "CREATE TABLE " + b.stage_table + "(id INTEGER, v VARCHAR, changed_at VARCHAR)");
+    const auto r = cycle::Commit(con, "zdelta_wm", b.run_id, {0});
+    CHECK(r.del == 0);
+}
+
+TEST_CASE("cycle: the first cycle of a log-enabled target logs its rows", "[cycle][log]") {
+    // The self-creating first cycle: a registered target whose table does not
+    // exist yet, created FROM the stage inside the commit. Every other log test
+    // starts from a fixture that pre-creates the target, so this path -- the one
+    // every real target takes exactly once -- was never exercised. A
+    // subscription created at offset 0 before the first cycle silently began at
+    // the second batch, and no later cycle back-fills it.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    schema::Migrate(con, "test");
+    Exec(con, "INSERT INTO _erpl_rev_delta_state "
+              "(target, method, source_from, keys, chg_col, wm_kind, wm_value, safety_secs, "
+              " cadence, status, log_enabled) VALUES "
+              "('fresh','WATERMARK','FRESH','id','CHANGED_AT','NUMTS',"
+              "'20260905100000',120,'micro:5','IDLE',true)");
+
+    const auto b = cycle::Begin(con, "fresh", LoadType::Delta, kReadStart);
+    Exec(con, "CREATE TABLE " + b.stage_table + "(id INTEGER, v VARCHAR, changed_at VARCHAR)");
+    Exec(con, "INSERT INTO " + b.stage_table +
+                  " VALUES (1,'a','20260905110000'),(2,'b','20260905110100')");
+    const auto r = cycle::Commit(con, "fresh", b.run_id, {2});
+
+    CHECK(Scalar(con, "SELECT count(*) FROM fresh") == "2");
+    const std::string log = cycle::ChangeLogName("fresh");
+    CHECK(Scalar(con, "SELECT count(*) FROM " + log) == "2");
+    // Everything a target's first cycle brings is new.
+    CHECK(Scalar(con, "SELECT count(*) FROM " + log + " WHERE _op='I'") == "2");
+    CHECK(r.logged == 2);
+}
+
+TEST_CASE("cycle: a reload records the rows it removed, so subscribers converge",
+          "[cycle][log]") {
+    // The invariant a change log exists to hold up: replaying it reproduces the
+    // target. A reload deletes rows the source no longer has -- that IS what an
+    // operator runs F for -- and if those deletions are absent from the log,
+    // every caught-up subscriber keeps them forever. The drift F repairs in the
+    // target becomes permanent downstream, and invisible.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con, /*log_enabled=*/true);
+    const std::string log = cycle::ChangeLogName("zdelta_wm");
+
+    // Target holds 1 and 2. The reload carries 2 and 3: 1 is gone at the source.
+    const auto b = cycle::Begin(con, "zdelta_wm", LoadType::Full, kReadStart);
+    StageRows(con, b.stage_table);
+    const auto r = cycle::Commit(con, "zdelta_wm", b.run_id, {2});
+
+    CHECK(Scalar(con, "SELECT count(*) FROM zdelta_wm") == "2");
+    CHECK(Scalar(con, "SELECT _op FROM " + log + " WHERE id=1") == "D");
+    CHECK(r.del == 1);
+
+    // Replay: the log alone reproduces the post-reload target.
+    Exec(con, "CREATE TABLE replay AS SELECT id, v, changed_at FROM (SELECT *, "
+              "row_number() OVER (PARTITION BY id ORDER BY _seq DESC) AS rn FROM " + log +
+              ") WHERE rn=1 AND _op<>'D'");
+    CHECK(Scalar(con, "SELECT count(*) FROM replay") == "2");
+    CHECK(Scalar(con, "SELECT count(*) FROM (SELECT id FROM replay EXCEPT SELECT id "
+                      "FROM zdelta_wm)") == "0");
+}
+
+TEST_CASE("cycle: a reload reports the rows it removed, not a count difference",
+          "[cycle]") {
+    // res.del was `had - staged`, which is right only when the stage is a subset
+    // of the target. Overlapping key sets of the same size -- some rows gone,
+    // as many new ones arrived -- reported zero deletions while rows really
+    // disappeared.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con);   // target holds 1 and 2
+
+    const auto b = cycle::Begin(con, "zdelta_wm", LoadType::Full, kReadStart);
+    Exec(con, "CREATE TABLE " + b.stage_table + "(id INTEGER, v VARCHAR, changed_at VARCHAR)");
+    // Same row count as the target; 1 is gone, 3 is new.
+    Exec(con, "INSERT INTO " + b.stage_table +
+                  " VALUES (2,'b2','20260905110000'),(3,'c','20260905110500')");
+    const auto r = cycle::Commit(con, "zdelta_wm", b.run_id, {2});
+
+    CHECK(r.del == 1);   // was 0: 2 staged, 2 had, difference zero
+    CHECK(r.ins == 1);
+    CHECK(r.upd == 1);
+    CHECK(Scalar(con, "SELECT count(*) FROM zdelta_wm WHERE id=1") == "0");
+}
+
+TEST_CASE("cycle: a stage with two rows for one key fails the cycle", "[cycle]") {
+    // Removing the stage's PRIMARY KEY was a performance decision, and it also
+    // removed the only assertion that staged data was unique on the key --
+    // which nobody recorded, because it was a side effect. Duplicates then flow
+    // into the merge, and the target's own key can multiply: reachable whenever
+    // the registered keys are not actually unique at the source (a view, a
+    // partial key list), and the target's PRIMARY KEY is built best-effort and
+    // silently skipped when it fails.
+    //
+    // The check is a probe, not an index: it costs one grouped scan of the
+    // stage, not an index build, and it says which key.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con);
+
+    const auto b = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart);
+    Exec(con, "CREATE TABLE " + b.stage_table + "(id INTEGER, v VARCHAR, changed_at VARCHAR)");
+    Exec(con, "INSERT INTO " + b.stage_table +
+                  " VALUES (2,'first','20260905110000'),(2,'second','20260905110100')");
+
+    CHECK_THROWS_WITH(cycle::Commit(con, "zdelta_wm", b.run_id, {2}),
+                      Catch::Matchers::ContainsSubstring("duplicate"));
+    // Nothing applied, and the watermark did not move: the cycle is replayable
+    // once the registration is corrected.
+    CHECK(Scalar(con, "SELECT v FROM zdelta_wm WHERE id=2") == "b");
+    CHECK(Scalar(con, "SELECT wm_value FROM _erpl_rev_delta_state") == "20260905100000");
+}
+
+TEST_CASE("cycle: the orphan sweep does not reach a target whose name differs by one "
+          "underscore", "[cycle]") {
+    // The sweep matched stage names with LIKE '<target>__stg_%'. An underscore
+    // is a single-character wildcard in LIKE, and SAP names are full of them --
+    // so a target named with an underscore could drop a sibling's live staging
+    // table, which is exactly the failure the surrounding comment says it fixed.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con);
+    Exec(con, "UPDATE _erpl_rev_delta_state SET target='a_b'");
+    Exec(con, "ALTER TABLE zdelta_wm RENAME TO a_b");
+
+    // A live stage belonging to the OTHER target, whose name differs from
+    // 'a_b' only where the wildcard sits.
+    Exec(con, "CREATE TABLE axb__stg_9(id INTEGER)");
+
+    const auto b = cycle::Begin(con, "a_b", LoadType::Delta, kReadStart);
+    CHECK(Scalar(con, "SELECT count(*) FROM duckdb_tables() WHERE table_name='axb__stg_9'")
+          == "1");
+    CHECK(b.run_id > 0);
 }

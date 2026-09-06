@@ -149,7 +149,8 @@ std::string CeilingFromStagedMax(const WatermarkSpec &spec, const std::string &s
 std::string FloorDate(const Bounds &b) { return b.floor.substr(0, 8); }
 std::string FloorTime(const Bounds &b) { return b.floor.substr(8, 6); }
 
-Bounds ComputeBounds(const WatermarkSpec &spec, int64_t read_start_epoch) {
+Bounds ComputeBounds(const WatermarkSpec &spec, int64_t read_start_epoch,
+                     bool full_reload) {
     Bounds b;
     b.has_floor = !spec.wm_value.empty();
 
@@ -186,7 +187,9 @@ Bounds ComputeBounds(const WatermarkSpec &spec, int64_t read_start_epoch) {
             if (b.has_floor)
                 b.floor = FormatDats(ParseDats(spec.wm_value) - days * kDay);
             b.has_ceiling = true;
-            b.ceiling_bounds_read = true;   // today is not a complete day
+            // Today is not a complete day, so a DELTA must not read it. A
+            // reload must -- see the header.
+            b.ceiling_bounds_read = !full_reload;
             b.ceiling = b.as_of_date;                       // exclusive
             b.next_watermark = FormatDats(ParseDats(b.as_of_date) - kDay);
             break;

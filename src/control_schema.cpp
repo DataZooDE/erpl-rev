@@ -131,6 +131,18 @@ const std::vector<Migration> &Migrations() {
         "SELECT 1",
     }},
 
+    // v7 -- the one flag that lets a reload empty a target.
+    //
+    // A reload that staged no rows is ambiguous: the source really is empty, or
+    // a wrong client, a bad filter or a mistyped source name matched nothing.
+    // The reader cannot tell the two apart -- it DROPs and CREATEs its staging
+    // table before its first SELECT, so an empty stage is what both look like.
+    // One reading deletes a replica of any size and reports SUCCESS, and it is
+    // not recoverable; the other is one flag and one re-run away.
+    {7, "delta state: allow a reload to empty a target", {
+        "SELECT 1",
+    }},
+
     };
     // clang-format on
     return kMigrations;
@@ -186,6 +198,9 @@ void ApplyColumnAdds(duckdb::Connection &con, int version) {
         AddColumnIfMissing(con, rs, "lag_ms", "BIGINT");
     } else if (version == 6) {
         AddColumnIfMissing(con, "_erpl_rev_run_stats", "clock_skew_secs", "BIGINT DEFAULT 0");
+    } else if (version == 7) {
+        AddColumnIfMissing(con, "_erpl_rev_delta_state", "allow_empty_reload",
+                           "BOOLEAN DEFAULT false");
     }
 }
 

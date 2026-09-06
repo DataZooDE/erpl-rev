@@ -69,7 +69,14 @@ struct Bounds {
     std::string as_of_date;      // DATE/DATETIME: the day that must not be read
 };
 
-Bounds ComputeBounds(const WatermarkSpec &spec, int64_t read_start_epoch);
+// `full_reload` is the load plan's truncate decision, and it changes exactly one
+// thing: a reload must read EVERYTHING, so the ceiling never bounds its read.
+// The complete-day rule below exists to keep a delta out of a day still in
+// progress; applied to a reload it deletes the target and re-inserts only the
+// rows dated before today, and since a reload does not move the watermark
+// nothing re-delivers the rest until tomorrow.
+Bounds ComputeBounds(const WatermarkSpec &spec, int64_t read_start_epoch,
+                     bool full_reload = false);
 
 // Counter kinds: the ceiling once the staged rows are visible.
 std::string CeilingFromStagedMax(const WatermarkSpec &spec, const std::string &staged_max);

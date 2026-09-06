@@ -58,6 +58,7 @@ struct State {
     long long safety_secs = 120, safety_units = 0;
     long long max_cycle_secs = 3600;
     bool log_enabled = false;
+    bool allow_empty_reload = false;
 };
 
 State LoadState(duckdb::Connection &con, const std::string &target) {
@@ -65,6 +66,7 @@ State LoadState(duckdb::Connection &con, const std::string &target) {
         "SELECT method, source_from, keys, coalesce(chg_col,''), coalesce(wm_kind,'NUMTS'), "
         "coalesce(wm_value,''), coalesce(safety_secs,120), coalesce(time_col,''), "
         "coalesce(safety_units,0), coalesce(log_enabled,false), "
+        "coalesce(allow_empty_reload,false), "
         "coalesce(max_cycle_secs,3600) "
         "FROM _erpl_rev_delta_state WHERE target=" + Lit(target));
     if (r->HasError()) throw std::runtime_error("cycle: state read failed: " + r->GetError());
@@ -80,7 +82,8 @@ State LoadState(duckdb::Connection &con, const std::string &target) {
     s.time_col = r->GetValue(7, 0).ToString();
     s.safety_units = r->GetValue(8, 0).GetValue<int64_t>();
     s.log_enabled = r->GetValue(9, 0).GetValue<bool>();
-    s.max_cycle_secs = r->GetValue(10, 0).GetValue<int64_t>();
+    s.allow_empty_reload = r->GetValue(10, 0).GetValue<bool>();
+    s.max_cycle_secs = r->GetValue(11, 0).GetValue<int64_t>();
     return s;
 }
 
@@ -171,7 +174,7 @@ BeginResult Begin(duckdb::Connection &con, const std::string &target, LoadType l
             // For a UTC-based kind the server's clock is the right ruler anyway.
         }
     }
-    out.bounds = wm::ComputeBounds(spec, read_start);
+    out.bounds = wm::ComputeBounds(spec, read_start, out.plan.truncate_target);
 
     // Allocate the run id NOW, so everything the cycle writes can carry it. It
     // used to exist only as a sequence default on the stats table, consumed when
@@ -208,8 +211,14 @@ BeginResult Begin(duckdb::Connection &con, const std::string &target, LoadType l
     for (const auto &orphan : [&] {
              std::vector<std::string> v;
              auto r = con.Query(
-                 "SELECT table_name FROM duckdb_tables() WHERE table_name LIKE " +
-                 Lit(Lower(sqlname::UniqueToken(target)) + "__stg_%") +
+                 // starts_with, not LIKE. An underscore is a single-character
+                 // wildcard in LIKE and SAP names are full of them, so the
+                 // pattern for a target named a_b also matched axb's stages --
+                 // and the sweep dropped a live staging table belonging to a
+                 // different target, which is the exact failure the paragraph
+                 // above says it fixed.
+                 "SELECT table_name FROM duckdb_tables() WHERE starts_with(table_name, " +
+                 Lit(Lower(sqlname::UniqueToken(target)) + "__stg_") + ")" +
                  " AND table_name NOT IN (SELECT " +
                  Lit(Lower(sqlname::UniqueToken(target)) + "__stg_") +
                  " || CAST(run_id AS VARCHAR) FROM _erpl_rev_run_stats "
@@ -358,10 +367,15 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
     }
 
     std::string collist, sellist, setlist;
+    // The same columns read from the TARGET side, for the delete records a
+    // reload writes: those rows exist only in the target.
+    std::string tsellist;
     for (size_t i = 0; i < cols.size(); ++i) {
         if (i) { collist += ","; sellist += ","; }
         collist += cols[i];
         sellist += "s." + cols[i];
+        if (!tsellist.empty()) tsellist += ",";
+        tsellist += "t." + cols[i];
         bool is_key = false;
         for (const auto &k : keys) if (k == cols[i]) is_key = true;
         if (!is_key) {
@@ -373,6 +387,14 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
     // Nothing to merge when the target was just created FROM the stage -- the
     // rows are already there, and merging would be a no-op over itself.
     const bool will_merge = have_stage && have_target && !cols.empty() && !keys.empty();
+
+    // The self-creating first cycle: the target does not exist yet and is about
+    // to be created FROM the stage. No merge -- the rows are already there once
+    // the CREATE runs -- but it is still a cycle that delivered rows, and a
+    // log-enabled target must record them. It used to record nothing, and had no
+    // log table at all, so a subscription created before a target's first cycle
+    // silently began at the second batch.
+    const bool will_create = have_stage && !have_target && !cols.empty();
 
     // Counts and log rows are derived BEFORE the merge, because both depend on
     // whether the key was already present -- which the merge is about to change.
@@ -389,6 +411,10 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
         if (cr->HasError()) throw std::runtime_error("cycle: count failed: " + cr->GetError());
         res.upd = cr->GetValue(0, 0).GetValue<int64_t>();
         res.ins = cr->GetValue(1, 0).GetValue<int64_t>();
+    } else if (will_create) {
+        // Everything a target's first cycle brings is new, by definition.
+        res.ins = std::stoll(Scalar(con, "SELECT count(*) FROM " + stage));
+        res.upd = 0;
     }
 
     // The new watermark. For a clock-based kind it is the ceiling computed at
@@ -468,9 +494,59 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
     // nothing else -- in particular not a stage, which a quiet cycle has none
     // of. (The column reconcile below iterates the stage's columns and is
     // simply a no-op when there are none.)
-    const bool want_log = st.log_enabled && have_target;
-    const bool append_log = want_log && will_merge;
+    const bool want_log = st.log_enabled && (have_target || will_create);
+    const bool append_log = want_log && (will_merge || will_create);
     const std::string log = ChangeLogName(target);
+
+    // Staged data must be unique on the key. The stage used to carry a PRIMARY
+    // KEY, which asserted this as a side effect; dropping that index for speed
+    // dropped the assertion with it. Without it duplicates flow into the merge
+    // and a key can multiply in the target -- the target's own PRIMARY KEY is
+    // built best-effort and silently skipped when it cannot be. One grouped
+    // scan of the stage, which is the small side.
+    if (have_stage && !keys.empty()) {
+        std::string kl;
+        for (size_t i = 0; i < keys.size(); ++i) { if (i) kl += ","; kl += keys[i]; }
+        auto d = con.Query("SELECT " + kl + ", count(*) AS n FROM " + stage + " GROUP BY " + kl +
+                           " HAVING count(*) > 1 ORDER BY n DESC LIMIT 1");
+        if (!d->HasError() && d->RowCount() > 0) {
+            std::string key_text;
+            for (duckdb::idx_t c = 0; c + 1 < d->ColumnCount(); ++c) {
+                if (c) key_text += ",";
+                key_text += d->GetValue(c, 0).ToString();
+            }
+            con.Query("UPDATE _erpl_rev_run_stats SET status='ERROR', error_text="
+                      "'duplicate key in staged data' WHERE run_id=" + std::to_string(run_id));
+            con.Query("UPDATE _erpl_rev_delta_state SET status='IDLE', active_run_id=NULL "
+                      "WHERE target=" + Lit(target) + " AND active_run_id=" +
+                      std::to_string(run_id));
+            throw std::runtime_error(
+                "cycle: the staged data for " + target + " has a duplicate key (" + key_text +
+                " appears " + d->GetValue(d->ColumnCount() - 1, 0).ToString() +
+                " times); the registered keys do not identify a row at the source");
+        }
+    }
+
+    // A reload that staged nothing, against a target that is not empty, is
+    // refused. See the migration for v7: the reader cannot distinguish "the
+    // source is empty" from "a filter matched nothing", and only one of those
+    // two readings is recoverable. Before BEGIN, so the message is clean.
+    if (load_plan.truncate_target && have_target && !st.allow_empty_reload) {
+        const auto staged = have_stage ? Scalar(con, "SELECT count(*) FROM " + stage) : "0";
+        const auto held = Scalar(con, "SELECT count(*) FROM " + target);
+        if (staged == "0" && held != "0") {
+            con.Query("UPDATE _erpl_rev_run_stats SET status='ERROR', error_text="
+                      "'reload staged no rows against a non-empty target' WHERE run_id=" +
+                      std::to_string(run_id));
+            con.Query("UPDATE _erpl_rev_delta_state SET status='IDLE', active_run_id=NULL "
+                      "WHERE target=" + Lit(target) + " AND active_run_id=" +
+                      std::to_string(run_id));
+            throw std::runtime_error(
+                "cycle: the reload of " + target + " staged no rows while the target holds " +
+                held + "; refusing to empty it. If the source really is empty, set "
+                "allow_empty_reload on this target and run it again.");
+        }
+    }
 
     Exec(con, "BEGIN", "begin");
     {
@@ -484,29 +560,6 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
                 con.Query("ALTER TABLE " + target + " ADD PRIMARY KEY (" + kl + ")");
             }
         }
-        // A reload REPLACES the target. Upserting without this left every row the
-        // source had since deleted -- which is the drift an operator runs F to
-        // repair, so the repair reported success and fixed nothing. Inside the
-        // transaction, so a failure leaves the old contents intact rather than
-        // an emptied target.
-        // ...but only when the reader actually produced a stage. A reload whose
-        // read returned nothing at all -- a short read that reported success, a
-        // connection that dropped between packages -- would otherwise empty the
-        // customer's target and report SUCCESS. Leaving the previous contents
-        // in place is recoverable and visible in rows_read; deleting them is
-        // neither. An EMPTY stage is different: the reader ran and the source
-        // really is empty, and that is a reload the operator asked for.
-        if (load_plan.truncate_target && have_target && have_stage) {
-            const auto before = Scalar(con, "SELECT count(*) FROM " + target);
-            Exec(con, "DELETE FROM " + target, "truncate target for reload");
-            const long long had = before.empty() ? 0 : std::stoll(before);
-            const long long staged =
-                have_stage ? std::stoll(Scalar(con, "SELECT count(*) FROM " + stage)) : 0;
-            // Rows that were in the target and are not coming back: what the
-            // reload actually removed, rather than a field that was always zero.
-            res.del = had > staged ? had - staged : 0;
-        }
-
         if (want_log) {
             // Provision the log ONCE, not on every commit. This block used to run
             // its CREATE, five duckdb_columns() probes and a CREATE SEQUENCE every
@@ -549,6 +602,47 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
                     Exec(con, "ALTER TABLE " + log + " ADD COLUMN " + c, "log column");
                 Exec(con, "CREATE SEQUENCE IF NOT EXISTS " + log + "_seq START 1", "log sequence");
             }
+        }
+
+        // A reload REPLACES the target. Upserting without this left every row
+        // the source had since deleted -- the drift an operator runs F to
+        // repair -- so the repair reported success and fixed nothing. Inside
+        // the transaction, so a failure leaves the old contents intact rather
+        // than an emptied target.
+        //
+        // After the log is provisioned, because the deletions have to be
+        // recorded BEFORE the rows are gone.
+        if (load_plan.truncate_target && have_target && have_stage) {
+            const std::string gone_where = " t WHERE NOT EXISTS (SELECT 1 FROM " + stage +
+                                           " s WHERE " + key_join + ")";
+            // What the reload actually removes: target keys the stage does not
+            // carry. The old arithmetic was `had - staged`, which is right only
+            // when the stage is a subset of the target -- two overlapping key
+            // sets of the same size reported zero deletions while rows really
+            // disappeared.
+            res.del = std::stoll(Scalar(con, "SELECT count(*) FROM " + target + gone_where));
+
+            if (append_log && res.del > 0) {
+                // Without this, a caught-up subscriber keeps every row the
+                // source dropped: the target is repaired and the sink is not,
+                // permanently and invisibly, which falsifies the one invariant
+                // a change log exists to hold up -- that replaying it
+                // reproduces the target.
+                //
+                // _commit_ts is NULL: a deletion inferred by comparing two
+                // images has no source timestamp, and inventing one would put
+                // fiction into the latency percentiles.
+                auto d = con.Query("INSERT INTO " + log + " (" + collist +
+                                   ", _seq, _op, _run_id, _commit_ts, _applied_at) SELECT " +
+                                   tsellist + ", nextval('" + log + "_seq'), 'D', " +
+                                   std::to_string(run_id) + ", NULL, now() FROM " + target +
+                                   gone_where);
+                if (d->HasError())
+                    throw std::runtime_error("cycle: reload delete-log append failed: " +
+                                             d->GetError());
+                res.logged += res.del;
+            }
+            Exec(con, "DELETE FROM " + target, "truncate target for reload");
         }
 
         if (append_log) {
@@ -630,21 +724,28 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
             // and latency is genuinely unmeasurable for it. Reported as "no
             // samples" rather than as zero.
 
-            auto r = con.Query(
-                "INSERT INTO " + log + " (" + collist +
-                ", _seq, _op, _run_id, _commit_ts, _applied_at) SELECT " + sellist +
-                ", nextval('" + log + "_seq'), "
-                // A literal marker from the joined side, not a key column. With
-                // null-safe matching a genuinely-NULL key can MATCH, and testing
-                // that key for NULL would then report an update as an insert.
-                // __erpl_matched is 1 exactly when the join found a row.
-                "CASE WHEN t.__erpl_matched IS NULL THEN 'I' ELSE 'U' END, " +
-                std::to_string(run_id) + ", " + commit_ts + ", now() FROM " + stage +
-                " s LEFT JOIN (SELECT *, 1 AS __erpl_matched FROM " + target + ") t ON " +
-                left_on);
+            // On the self-creating first cycle every row is an insert, and the
+            // join must not be asked: the target was created FROM the stage a
+            // few statements ago, so it already holds every staged row and the
+            // join would call all of them updates.
+            //
+            // A literal marker from the joined side, not a key column. With
+            // null-safe matching a genuinely-NULL key can MATCH, and testing
+            // that key for NULL would then report an update as an insert.
+            // __erpl_matched is 1 exactly when the join found a row.
+            const std::string op_expr =
+                will_create ? "'I'" : "CASE WHEN t.__erpl_matched IS NULL THEN 'I' ELSE 'U' END";
+            const std::string from_expr =
+                will_create ? (" FROM " + stage + " s")
+                            : (" FROM " + stage + " s LEFT JOIN (SELECT *, 1 AS __erpl_matched "
+                                                  "FROM " + target + ") t ON " + left_on);
+            auto r = con.Query("INSERT INTO " + log + " (" + collist +
+                               ", _seq, _op, _run_id, _commit_ts, _applied_at) SELECT " + sellist +
+                               ", nextval('" + log + "_seq'), " + op_expr + ", " +
+                               std::to_string(run_id) + ", " + commit_ts + ", now()" + from_expr);
             if (r->HasError())
                 throw std::runtime_error("cycle: change-log append failed: " + r->GetError());
-            res.logged = res.ins + res.upd;
+            res.logged += res.ins + res.upd;
         }
 
         if (will_merge) {
