@@ -137,12 +137,26 @@ BeginResult Begin(duckdb::Connection &con, const std::string &target, LoadType l
     out.run_id = std::stoll(Scalar(con, "SELECT nextval('_erpl_rev_run_seq')"));
     out.stage_table = StageName(target, out.run_id);
 
-    // Whatever a previous run left behind is safe to drop: its watermark never
-    // moved, so its read is simply repeated.
+    // Drop what a DEAD run left behind -- and only that.
+    //
+    // The stage of a run that is still going is not an orphan. A healthy cycle
+    // can be mid-INSERT into its stage for a long time (the ingest pipe waits up
+    // to an hour), far longer than the advisory lease, so "the lease expired"
+    // does not mean "the cycle is gone". Dropping that table out from under it
+    // produced an opaque "table does not exist" failure attributed to SAP.
+    //
+    // A run is in flight if its statistics row is still RUNNING; those rows are
+    // opened here and closed by Commit, so they are the authority on which run
+    // ids are live.
     for (const auto &orphan : [&] {
              std::vector<std::string> v;
-             auto r = con.Query("SELECT table_name FROM duckdb_tables() WHERE table_name LIKE " +
-                                Lit(Lower(sqlname::UniqueToken(target)) + "__stg_%"));
+             auto r = con.Query(
+                 "SELECT table_name FROM duckdb_tables() WHERE table_name LIKE " +
+                 Lit(Lower(sqlname::UniqueToken(target)) + "__stg_%") +
+                 " AND table_name NOT IN (SELECT " +
+                 Lit(Lower(sqlname::UniqueToken(target)) + "__stg_") +
+                 " || CAST(run_id AS VARCHAR) FROM _erpl_rev_run_stats "
+                 "WHERE status='RUNNING')");
              if (!r->HasError())
                  for (size_t i = 0; i < r->RowCount(); ++i)
                      v.push_back(r->GetValue(0, i).ToString());
@@ -436,12 +450,29 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
             Exec(con, m, "merge stage");
         }
 
-        Exec(con,
-             "UPDATE _erpl_rev_delta_state SET wm_value=" + Lit(new_wm) +
-                 ", status='IDLE', last_run_ts=now(), active_run_id=NULL, fail_count=0, "
-                 "rows_applied=" + std::to_string(res.ins + res.upd) +
-                 " WHERE target=" + Lit(target) + " AND active_run_id=" + std::to_string(run_id),
-             "advance watermark");
+        // The fence, and its RESULT is checked. A zero-row UPDATE is not an error
+        // in DuckDB, so without this a cycle whose target was reclaimed between
+        // the pre-check above and here would merge its stage, append its log,
+        // drop its stage and report SUCCESS with a watermark that was never
+        // stored -- the one outcome the fencing exists to prevent, arriving
+        // silently.
+        {
+            auto up = con.Query(
+                "UPDATE _erpl_rev_delta_state SET wm_value=" + Lit(new_wm) +
+                ", status='IDLE', last_run_ts=now(), active_run_id=NULL, fail_count=0, "
+                "rows_applied=" + std::to_string(res.ins + res.upd) +
+                " WHERE target=" + Lit(target) + " AND active_run_id=" + std::to_string(run_id));
+            if (up->HasError())
+                throw std::runtime_error("cycle: advance watermark failed: " + up->GetError());
+            const auto changed = up->RowCount() > 0 && !up->GetValue(0, 0).IsNull()
+                                     ? up->GetValue(0, 0).GetValue<int64_t>()
+                                     : 0;
+            if (changed == 0)
+                throw std::runtime_error(
+                    "cycle: run " + std::to_string(run_id) + " lost ownership of " + target +
+                    " while committing; rolling back rather than reporting a watermark that "
+                    "was never stored");
+        }
 
         Exec(con,
              "UPDATE _erpl_rev_run_stats SET status='SUCCESS', rows_read=" +

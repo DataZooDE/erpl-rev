@@ -199,10 +199,38 @@ TEST_CASE("delta_plan: a counter watermark takes its ceiling from the staged row
     s.safety_units = 50;
 
     const auto b = ComputeBounds(s, kReadStart);
-    CHECK(b.floor == "950");
+    // "0950", not "950": the comparison is lexical, so the floor has to keep the
+    // stored value's width or it sorts wrong against it. '1000' > '950' is FALSE
+    // lexically -- an unpadded floor excluded exactly the rows it should admit.
+    CHECK(b.floor == "0950");
     CHECK_FALSE(b.has_ceiling);          // not knowable before the read
     CHECK(b.ceiling_from_stage);         // ... but knowable after it
     CHECK(CeilingFromStagedMax(s, "20000") == "19950");
+}
+
+TEST_CASE("delta_plan: a counter ceiling keeps the source's zero padding",
+          "[watermark]") {
+    // A NUMC/CHAR document number is zero-padded and the generated predicate is
+    // a STRING comparison. Strip the padding and the comparison inverts:
+    // '0000020000' > '19950' is false lexically, so the target reads zero rows
+    // on every cycle after the first -- silently, forever.
+    WatermarkSpec s;
+    s.kind = WmKind::Int;
+    s.chg_col = "BELNR";
+    s.wm_value = "0000010000";
+    s.safety_units = 50;
+
+    CHECK(CeilingFromStagedMax(s, "0000020000") == "0000019950");
+    CHECK(ComputeBounds(s, kReadStart).floor == "0000009950");
+
+    // An unpadded source stays unpadded -- the rule is "preserve what the source
+    // gave", not "always pad".
+    WatermarkSpec plain;
+    plain.kind = WmKind::Int;
+    plain.chg_col = "DOCNR";
+    plain.wm_value = "1000";
+    plain.safety_units = 50;
+    CHECK(CeilingFromStagedMax(plain, "20000") == "19950");
 }
 
 TEST_CASE("delta_plan: a counter floor never goes below zero", "[watermark]") {
@@ -211,7 +239,7 @@ TEST_CASE("delta_plan: a counter floor never goes below zero", "[watermark]") {
     s.chg_col = "DOCNR";
     s.wm_value = "10";
     s.safety_units = 50;
-    CHECK(ComputeBounds(s, kReadStart).floor == "0");
+    CHECK(ComputeBounds(s, kReadStart).floor == "00");   // clamped, still width-preserving
 }
 
 TEST_CASE("delta_plan: CHANGENR is refused as a generic watermark", "[watermark]") {

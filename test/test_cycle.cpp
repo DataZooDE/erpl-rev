@@ -151,6 +151,24 @@ TEST_CASE("cycle: a failed commit leaves the watermark and the stage untouched",
                           b.stage_table + "'") == "1");
 }
 
+TEST_CASE("cycle: begin leaves a LIVE cycle's stage alone", "[cycle]") {
+    // A cycle that is still running is not an orphan. Its stage can be under an
+    // INSERT that takes far longer than the advisory lease, so a second Begin
+    // must not drop it -- doing so surfaced as an opaque "table does not exist"
+    // blamed on SAP, rather than as the clean fencing refusal.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con);
+
+    const auto live = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart);
+    StageRows(con, live.stage_table);          // ...still being written
+
+    const auto next = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart + 60);
+    CHECK(Scalar(con, "SELECT count(*) FROM duckdb_tables() WHERE table_name='" +
+                          live.stage_table + "'") == "1");
+    CHECK(next.run_id != live.run_id);
+}
+
 TEST_CASE("cycle: begin discards a previous run's orphaned stage", "[cycle]") {
     // A cycle that died after staging leaves exactly one identifiable orphan.
     // It is free to discard because the watermark never moved.
@@ -160,6 +178,10 @@ TEST_CASE("cycle: begin discards a previous run's orphaned stage", "[cycle]") {
 
     const auto dead = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart);
     StageRows(con, dead.stage_table);   // ... and then nothing commits it
+    // The run is over -- the process died and something (a restart, an operator)
+    // marked it so. Only then is its stage an orphan.
+    Exec(con, "UPDATE _erpl_rev_run_stats SET status='ERROR' WHERE run_id=" +
+                  std::to_string(dead.run_id));
 
     const auto next = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart + 60);
     CHECK(next.run_id != dead.run_id);
@@ -267,12 +289,14 @@ TEST_CASE("cycle: a counter watermark takes its ceiling from the staged rows", "
               "('docs','WATERMARK','DOCS','id','DOCNR','INT','1000',50,'micro:5','IDLE')");
 
     const auto b = cycle::Begin(con, "docs", LoadType::Delta, kReadStart);
-    CHECK(b.bounds.floor == "950");
+    // Width-preserving: the predicate compares text, so the floor keeps the
+    // stored watermark's width or it sorts wrong against it.
+    CHECK(b.bounds.floor == "0950");
     Exec(con, "CREATE TABLE " + b.stage_table + "(id INTEGER, docnr BIGINT)");
     Exec(con, "INSERT INTO " + b.stage_table + " VALUES (1,19000),(2,20000)");
     cycle::Commit(con, "docs", b.run_id, {2});
 
-    // max(20000) - 50 units of overlap.
+    // max(20000) - 50 units of overlap, at the source's width.
     CHECK(Scalar(con, "SELECT wm_value FROM _erpl_rev_delta_state") == "19950");
 }
 
@@ -341,4 +365,29 @@ TEST_CASE("cycle: a first cycle creates the target it merges into", "[cycle]") {
     cycle::Commit(con, "fresh", b2.run_id, {2});
     CHECK(Scalar(con, "SELECT count(*) FROM fresh") == "3");
     CHECK(Scalar(con, "SELECT v FROM fresh WHERE id=2") == "b2");
+}
+
+TEST_CASE("cycle: a target reclaimed mid-commit is rolled back, not reported as done",
+          "[cycle]") {
+    // The pre-check at the top of Commit catches the common case. This is the
+    // narrow one it cannot: the target is reclaimed AFTER that check, so the
+    // fencing UPDATE matches zero rows. A zero-row UPDATE is not an error in
+    // DuckDB, so without checking its result the cycle would merge, log, drop
+    // its stage and report SUCCESS carrying a watermark that was never stored.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con);
+
+    const auto b = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart);
+    StageRows(con, b.stage_table);
+
+    // Simulate the reclaim landing after Commit's pre-check: the row now belongs
+    // to a different run, exactly as a second Begin would leave it.
+    Exec(con, "UPDATE _erpl_rev_delta_state SET active_run_id = " +
+                  std::to_string(b.run_id + 999) + " WHERE target='zdelta_wm'");
+
+    REQUIRE_THROWS(cycle::Commit(con, "zdelta_wm", b.run_id, {2}));
+    // Nothing of the cycle survives: not the merge, not the watermark.
+    CHECK(Scalar(con, "SELECT count(*) FROM zdelta_wm") == "2");
+    CHECK(Scalar(con, "SELECT wm_value FROM _erpl_rev_delta_state") == "20260905100000");
 }

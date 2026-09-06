@@ -42,6 +42,13 @@ CLASS zcl_erpl_rev_delta DEFINITION PUBLIC FINAL CREATE PUBLIC.
              del     TYPE i,
              wm      TYPE string,
              skipped TYPE abap_bool,
+             " The server already committed this cycle: it advanced the
+             " watermark, released the target and finished its own statistics
+             " row, all inside one transaction. ABAP must then do NONE of those
+             " again -- a second, unfenced UPDATE of wm_value can move the
+             " watermark BACKWARDS if another cycle claimed the target in
+             " between, and a second stats INSERT double-counts every run.
+             server_committed TYPE abap_bool,
              error   TYPE string,
            END OF ty_run.
     TYPES tt_run TYPE STANDARD TABLE OF ty_run WITH EMPTY KEY.
@@ -304,7 +311,15 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
     rs-target = iv_target.
     rs-method = ls_state-method.
     GET TIME STAMP FIELD DATA(lv_t1).
-    IF rs-error IS INITIAL.
+    IF rs-server_committed = abap_true.
+      " Nothing to do. CYCLE_COMMIT advanced the watermark, cleared
+      " active_run_id, set the status and finished the run-statistics row -- in
+      " one transaction, fenced on the run id. Repeating any of it here would
+      " undo the fencing that transaction exists to provide.
+      IF rs-error IS NOT INITIAL.
+        release( iv_target = iv_target iv_status = 'ERROR' iv_error = rs-error ).
+      ENDIF.
+    ELSEIF rs-error IS INITIAL.
       commit( iv_target = iv_target iv_wm = rs-wm iv_rows = rs-rows ).
       release( iv_target = iv_target iv_status = 'IDLE' ).
     ELSE.
@@ -313,6 +328,12 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
     " Dashboard stats: one DELTA run row per cycle (every method). WATERMARK/CHANGEDOC/
     " INSERT_ONLY report a row count but not an I/U/D split, so attribute it to ins so
     " rows_applied is meaningful; SNAPSHOT carries the real ins/upd/del.
+    " The server writes its own statistics row for a cycle it committed; a second
+    " one here would double every count in the dashboard view and carry
+    " duration_ms=0, making rows_per_sec meaningless for half the rows.
+    IF rs-server_committed = abap_true.
+      RETURN.
+    ENDIF.
     zcl_erpl_rev_util=>record_run(
       iv_target   = iv_target
       iv_source   = ls_state-source_from
@@ -448,6 +469,7 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
 
     rs-rows = lv_rows.
     rs-wm   = jstr( iv_json = lv_done iv_key = 'wm' ).
+    rs-server_committed = abap_true.
   ENDMETHOD.
 
   METHOD cdhdr_feed.

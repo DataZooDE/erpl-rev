@@ -134,7 +134,16 @@ std::string KindName(WmKind k) {
 std::string CeilingFromStagedMax(const WatermarkSpec &spec, const std::string &staged_max) {
     if (staged_max.empty()) return spec.wm_value;
     const int64_t max_v = std::stoll(staged_max);
-    return std::to_string(ClampNonNegative(max_v - spec.safety_units));
+    const auto out = std::to_string(ClampNonNegative(max_v - spec.safety_units));
+
+    // Keep the source's zero padding. A NUMC or CHAR document number is stored
+    // padded and the generated predicate is a STRING comparison, so dropping the
+    // padding inverts it: '0000020000' > '19950' is FALSE lexically, and the
+    // target reads nothing on every cycle after the first, silently and forever.
+    // Widths are preserved, never invented -- an unpadded counter stays unpadded.
+    if (out.size() < staged_max.size())
+        return std::string(staged_max.size() - out.size(), '0') + out;
+    return out;
 }
 
 std::string FloorDate(const Bounds &b) { return b.floor.substr(0, 8); }
@@ -150,9 +159,14 @@ Bounds ComputeBounds(const WatermarkSpec &spec, int64_t read_start_epoch) {
 
         case WmKind::Int: {
             // No clock: the ceiling is cut from the staged rows at commit time.
-            if (b.has_floor)
-                b.floor = std::to_string(
+            if (b.has_floor) {
+                const auto f = std::to_string(
                     ClampNonNegative(std::stoll(spec.wm_value) - spec.safety_units));
+                // Same reasoning as the ceiling: the floor is compared as text.
+                b.floor = f.size() < spec.wm_value.size()
+                              ? std::string(spec.wm_value.size() - f.size(), '0') + f
+                              : f;
+            }
             b.ceiling_from_stage = true;
             b.next_watermark = spec.wm_value;
             break;

@@ -33,16 +33,33 @@ void Exec(duckdb::Connection &con, const std::string &sql) {
 }
 
 // A target with a change log holding five changes.
+//
+// Built by running REAL cycles rather than by hand-writing the log DDL. The
+// hand-built version carried a _changed_at column the product has never
+// created, so a retention bug that threw on every production target passed CI
+// for as long as it existed. A fixture that invents its own schema cannot catch
+// a mismatch with the real one.
 void SetupLog(duckdb::Connection &con) {
     schema::Migrate(con, "test");
-    Exec(con, "CREATE TABLE t(id INTEGER, v VARCHAR)");
-    const auto log = cycle::ChangeLogName("t");
-    Exec(con, "CREATE TABLE " + log + "(id INTEGER, v VARCHAR, _seq BIGINT, _op VARCHAR, "
-              "_run_id BIGINT, _changed_at TIMESTAMPTZ, _commit_ts TIMESTAMPTZ)");
-    Exec(con, "INSERT INTO " + log + " VALUES "
-              "(1,'a',1,'I',10,now(),now()),(2,'b',2,'I',10,now(),now()),"
-              "(1,'a2',3,'U',11,now(),now()),(3,'c',4,'I',11,now(),now()),"
-              "(2,'b2',5,'U',12,now(),now())");
+    Exec(con, "CREATE TABLE t(id INTEGER, v VARCHAR, changed_at VARCHAR)");
+    Exec(con, "INSERT INTO _erpl_rev_delta_state "
+              "(target, method, source_from, keys, chg_col, wm_kind, wm_value, safety_secs, "
+              " cadence, status, log_enabled) VALUES "
+              "('t','WATERMARK','T','id','CHANGED_AT','NUMTS','20260101000000',0,"
+              "'manual','IDLE',true)");
+
+    // Three cycles: two inserts, then an update plus an insert, then an update.
+    const char *batches[] = {
+        "(1,'a','20260905120000'),(2,'b','20260905120000')",
+        "(1,'a2','20260905120100'),(3,'c','20260905120100')",
+        "(2,'b2','20260905120200')",
+    };
+    for (const auto *rows : batches) {
+        const auto b = cycle::Begin(con, "t", LoadType::Delta, 1788609600);
+        Exec(con, "CREATE TABLE " + b.stage_table + "(id INTEGER, v VARCHAR, changed_at VARCHAR)");
+        Exec(con, "INSERT INTO " + b.stage_table + " VALUES " + std::string(rows));
+        cycle::Commit(con, "t", b.run_id, {2});
+    }
 }
 }  // namespace
 
@@ -80,7 +97,7 @@ TEST_CASE("subscription: advance publishes only what is past the offset", "[publ
     duckdb::Connection con(db);
     SetupLog(con);
     CreateSubscription(con, "s1", "t", "TABLE:sink1:APPEND");
-    Exec(con, "CREATE TABLE sink1(id INTEGER, v VARCHAR)");
+    Exec(con, "CREATE TABLE sink1(id INTEGER, v VARCHAR, changed_at VARCHAR)");
 
     const auto r1 = Advance(con, "s1");
     CHECK(r1.published == 5);
@@ -101,8 +118,8 @@ TEST_CASE("subscription: two subscriptions advance independently", "[publish]") 
     SetupLog(con);
     CreateSubscription(con, "fast", "t", "TABLE:sink_fast:APPEND");
     CreateSubscription(con, "slow", "t", "TABLE:sink_slow:APPEND");
-    Exec(con, "CREATE TABLE sink_fast(id INTEGER, v VARCHAR)");
-    Exec(con, "CREATE TABLE sink_slow(id INTEGER, v VARCHAR)");
+    Exec(con, "CREATE TABLE sink_fast(id INTEGER, v VARCHAR, changed_at VARCHAR)");
+    Exec(con, "CREATE TABLE sink_slow(id INTEGER, v VARCHAR, changed_at VARCHAR)");
 
     Advance(con, "fast");
     CHECK(Scalar(con, "SELECT \"offset\" FROM _erpl_rev_subscription WHERE name='fast'") == "5");
@@ -128,7 +145,7 @@ TEST_CASE("subscription: key deduplication keeps the last write per key", "[publ
     SetupLog(con);
     CreateSubscription(con, "dedup", "t", "TABLE:sink_d:APPEND");
     Exec(con, "UPDATE _erpl_rev_subscription SET dedup_keys='id' WHERE name='dedup'");
-    Exec(con, "CREATE TABLE sink_d(id INTEGER, v VARCHAR)");
+    Exec(con, "CREATE TABLE sink_d(id INTEGER, v VARCHAR, changed_at VARCHAR)");
 
     const auto r = Advance(con, "dedup");
     // Five log rows, three distinct keys.
@@ -144,7 +161,7 @@ TEST_CASE("subscription: replay from an earlier offset reproduces the sink",
     duckdb::Connection con(db);
     SetupLog(con);
     CreateSubscription(con, "r", "t", "TABLE:sink_r:APPEND");
-    Exec(con, "CREATE TABLE sink_r(id INTEGER, v VARCHAR)");
+    Exec(con, "CREATE TABLE sink_r(id INTEGER, v VARCHAR, changed_at VARCHAR)");
 
     Advance(con, "r");
     const auto first = Scalar(con, "SELECT count(*) FROM sink_r");
@@ -162,8 +179,8 @@ TEST_CASE("retention: rows are kept until every subscription has passed them",
     SetupLog(con);
     CreateSubscription(con, "fast", "t", "TABLE:sf:APPEND");
     CreateSubscription(con, "slow", "t", "TABLE:sl:APPEND");
-    Exec(con, "CREATE TABLE sf(id INTEGER, v VARCHAR)");
-    Exec(con, "CREATE TABLE sl(id INTEGER, v VARCHAR)");
+    Exec(con, "CREATE TABLE sf(id INTEGER, v VARCHAR, changed_at VARCHAR)");
+    Exec(con, "CREATE TABLE sl(id INTEGER, v VARCHAR, changed_at VARCHAR)");
 
     Advance(con, "fast");   // fast is at 5, slow still at 0
 
@@ -193,4 +210,24 @@ TEST_CASE("retention: the window protects recent rows", "[publish]") {
     SetupLog(con);
     // Everything was just written, so an hour-long window keeps all of it.
     CHECK(Retain(con, "t", 3600) == 0);
+}
+
+TEST_CASE("retention: a window actually works against a real log", "[publish]") {
+    // The regression this exists for: Retain() filtered on a column the change
+    // log has never had, so windowed retention threw on every production target
+    // while the suite stayed green -- because the fixture invented the schema
+    // the code wanted. This asserts against a log built by real cycles.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    SetupLog(con);
+
+    const auto before = Scalar(con, "SELECT count(*) FROM " + cycle::ChangeLogName("t"));
+    CHECK(before != "0");
+
+    // A generous window protects everything just written...
+    CHECK(Retain(con, "t", 3600) == 0);
+    CHECK(Scalar(con, "SELECT count(*) FROM " + cycle::ChangeLogName("t")) == before);
+
+    // ...and a zero window, with no subscriptions to wait for, prunes it.
+    CHECK(Retain(con, "t", 0) > 0);
 }

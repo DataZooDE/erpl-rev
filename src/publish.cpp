@@ -171,7 +171,17 @@ long long Retain(duckdb::Connection &con, const std::string &target, long long w
 
     std::string where = have_subs ? "_seq <= " + std::to_string(low) : "true";
     if (window_secs > 0)
-        where += " AND _changed_at < now() - INTERVAL '" + std::to_string(window_secs) + "' SECOND";
+        // _applied_at, not _changed_at: the log has never had a column by that
+        // name. Retention with a window threw on every real target, and the test
+        // suite missed it because the fixture hand-built a schema the product
+        // does not produce -- which is why those fixtures now come from a real
+        // cycle::Commit instead.
+        //
+        // _applied_at is also the right clock for retention: how long WE have
+        // held the row, not when the source changed it. A source timestamp can
+        // be arbitrarily old on a first load and would prune it instantly.
+        where += " AND _applied_at < now() - INTERVAL '" + std::to_string(window_secs) +
+                 "' SECOND";
 
     const auto before = std::stoll(Scalar(con, "SELECT count(*) FROM " + log));
     Exec(con, "DELETE FROM " + log + " WHERE " + where, "retain");
