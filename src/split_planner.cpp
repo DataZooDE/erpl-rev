@@ -116,6 +116,15 @@ std::vector<Portion> ByEvenRanges(const SplitRequest &r, long long limit) {
     std::vector<Portion> out;
     if (limit <= 0 || r.total_rows <= 0 || r.range_min.empty() || r.range_max.empty())
         return out;
+    // Bounds come from source DATA, not from a fixed vocabulary, and they land
+    // in a predicate ABAP runs as dynamic Open SQL. A quote in one would end the
+    // literal early. They are digit-checked above, so this is defence rather
+    // than the only guard -- but the only guard should never be somewhere else.
+    auto lit = [](const std::string &v) {
+        std::string q;
+        for (char c : v) { if (c == '\'') q += "''"; else q += c; }
+        return q;
+    };
     const bool numeric = r.range_min.find_first_not_of("0123456789") == std::string::npos &&
                          r.range_max.find_first_not_of("0123456789") == std::string::npos;
     if (!numeric) {
@@ -125,8 +134,8 @@ std::vector<Portion> ByEvenRanges(const SplitRequest &r, long long limit) {
         Portion p;
         p.portion_no = 1;
         p.est_rows = r.total_rows;
-        p.predicate = WithUserFilter(r.part_col + " >= '" + r.range_min + "' AND " +
-                                         r.part_col + " <= '" + r.range_max + "'",
+        p.predicate = WithUserFilter(r.part_col + " >= '" + lit(r.range_min) + "' AND " +
+                                         r.part_col + " <= '" + lit(r.range_max) + "'",
                                      r.user_where);
         out.push_back(p);
         return out;
@@ -151,8 +160,8 @@ std::vector<Portion> ByEvenRanges(const SplitRequest &r, long long limit) {
         Portion p;
         p.portion_no = ++no;
         p.est_rows = r.total_rows / n;
-        p.predicate = WithUserFilter(r.part_col + " >= '" + pad(start) + "' AND " +
-                                         r.part_col + " <= '" + pad(end) + "'",
+        p.predicate = WithUserFilter(r.part_col + " >= '" + lit(pad(start)) + "' AND " +
+                                         r.part_col + " <= '" + lit(pad(end)) + "'",
                                      r.user_where);
         out.push_back(p);
     }

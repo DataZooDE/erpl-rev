@@ -132,11 +132,19 @@ CLASS zcl_erpl_rev_cdctest IMPLEMENTATION.
                                   IMPORTING ev_result = lv_res ev_error = lv_err ).
     ok( cond = xsdbool( lv_err IS INITIAL ) what = 'CDC repair ran' detail = |{ lv_err }{ lv_res }| ).
 
-    zcl_erpl_rev_clidrv=>execute( EXPORTING iv_verb = 'cdc_status'
-                                            iv_params = '{"target":"cdc_wm"}'
-                                  IMPORTING ev_result = lv_res ev_error = lv_err ).
-    ok( cond = xsdbool( lv_res CS 'ACTIVE' )
-        what = 'CDC repair: the trigger set is whole again' detail = |{ lv_err }{ lv_res }| ).
+    " Read the STORED status, without asking for a fresh derivation.
+    "
+    " This used to call cdc_status again, which re-probed and re-persisted --
+    " so the assertion passed whether or not repair had updated anything, and
+    " it hid the real gap: repair left the target INCONSISTENT and the tick
+    " planner went on skipping it. The operator is told the repair worked and
+    " replication stays stopped.
+    DATA(lv_stored) = zcl_erpl_rev_delta=>scalar(
+      |SELECT count(*) AS c FROM _erpl_rev_cdc | &&
+      |WHERE target='cdc_wm' AND status='ACTIVE'| ).
+    ok( cond = xsdbool( lv_stored = 1 )
+        what = 'CDC repair: it left the target ACTIVE, so the planner runs it again'
+        detail = |stored status rows matching ACTIVE: { lv_stored }| ).
     DATA(lv_pos1) = zcl_erpl_rev_delta=>scalar(
       |SELECT position AS c FROM _erpl_rev_cdc WHERE target='cdc_wm'| ).
     ok( cond = xsdbool( lv_pos0 = lv_pos1 )

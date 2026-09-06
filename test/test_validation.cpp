@@ -94,3 +94,40 @@ TEST_CASE("validation: a verdict names the offending keys", "[validation]") {
     r.mismatched_keys.clear();
     CHECK(Passed(r));
 }
+
+TEST_CASE("validation: the plan emits a key, so rows are paired not counted",
+          "[validation]") {
+    // Positional comparison assumed two engines given the same ORDER BY produce
+    // the same sequence. They need not: collation, NULL placement and
+    // numeric-versus-text ordering all differ between HANA and DuckDB. Paired
+    // wrongly, the comparison reports FAILED on correct data -- and, worse, can
+    // report PASSED when row i on one side happens to match row i on the other
+    // while both sets genuinely differ.
+    //
+    // A key makes the pairing explicit: each side says which row it is talking
+    // about, and a row present on one side and missing on the other is a
+    // mismatch rather than an off-by-one that shifts everything after it.
+    Policy p;
+    std::vector<Field> fields{
+        {"MANDT", "CLNT", 3, 0}, {"BELNR", "CHAR", 10, 0}, {"DMBTR", "CURR", 23, 2}};
+
+    const auto plan = BuildPlan(p, "t", fields, {"MANDT", "BELNR"});
+
+    CHECK(plan.sql.find(" AS k") != std::string::npos);
+    CHECK(plan.sql.find(" AS fp") != std::string::npos);
+    // The key is built from the key columns only, in the order given.
+    CHECK(plan.sql.find("mandt") < plan.sql.find(" AS k"));
+    CHECK(plan.sql.find("belnr") < plan.sql.find(" AS k"));
+}
+
+TEST_CASE("validation: a keyless target still produces a usable plan",
+          "[validation]") {
+    // Not every registration has keys, and a validator that throws on one is a
+    // feature an operator cannot run at all. Falling back to the whole row as
+    // its own key keeps the pairing honest: identical rows pair, and a row that
+    // exists on one side only is still reported.
+    Policy p;
+    std::vector<Field> fields{{"A", "CHAR", 5, 0}};
+    const auto plan = BuildPlan(p, "t", fields, {});
+    CHECK(plan.sql.find(" AS k") != std::string::npos);
+}

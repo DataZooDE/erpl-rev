@@ -51,10 +51,26 @@ std::string RowFingerprint(const std::vector<Field> &fields) {
     return expr;
 }
 
-Plan BuildPlan(const Policy &p, const std::string &target, const std::vector<Field> &fields) {
+Plan BuildPlan(const Policy &p, const std::string &target, const std::vector<Field> &fields,
+               const std::vector<std::string> &keys) {
     Plan plan;
     std::string fp = RowFingerprint(fields);
     if (p.hash) fp = "md5(" + fp + ")";
+
+    // The row's identity, rendered the same way on both sides. Falls back to the
+    // fingerprint itself when the registration has no keys -- identical rows
+    // still pair, and a row on one side only is still reported.
+    std::string key;
+    for (const auto &k : keys) {
+        const auto lk = Lower(k);
+        for (const auto &f : fields) {
+            if (Lower(f.name) != lk) continue;
+            if (!key.empty()) key += " || '|' || ";
+            key += DuckExpr(f);
+            break;
+        }
+    }
+    if (key.empty()) key = fp;
 
     std::string order;
     for (const auto &f : fields) {
@@ -64,7 +80,7 @@ Plan BuildPlan(const Policy &p, const std::string &target, const std::vector<Fie
     }
 
     // Ordered, always: two unordered result sets cannot be compared row by row.
-    plan.sql = "SELECT " + fp + " AS fp FROM " + target;
+    plan.sql = "SELECT " + key + " AS k, " + fp + " AS fp FROM " + target;
     if (!order.empty()) plan.sql += " ORDER BY " + order;
     if (p.mode == Mode::Sample) plan.sql += " LIMIT " + std::to_string(p.sample_rows);
     return plan;

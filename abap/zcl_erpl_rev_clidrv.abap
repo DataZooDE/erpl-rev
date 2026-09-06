@@ -419,7 +419,52 @@ CLASS zcl_erpl_rev_clidrv IMPLEMENTATION.
                   IF lv_er IS NOT INITIAL. ev_error = lv_er. EXIT. ENDIF.
                 ENDLOOP.
                 IF ev_error IS INITIAL.
-                  ev_result = |repaired { lines( lt_ddl ) } object(s)|.
+                  " Re-derive and PERSIST the status. Without this the repair
+                  " recreated the objects and left the target INCONSISTENT, so
+                  " the tick planner went on skipping it: the operator is told
+                  " the repair worked and replication stays stopped. The status
+                  " is derived from the catalogue, so the only way to know it is
+                  " fixed is to look again.
+                  DATA(lv_tj2) = zcl_erpl_rev_cdc=>probe_names(
+                                   zcl_erpl_rev_delta=>jstr( iv_json = ls_pr-json
+                                                             iv_key = 'tables_sql' ) ).
+                  DATA(lv_sj2) = zcl_erpl_rev_cdc=>probe_names(
+                                   zcl_erpl_rev_delta=>jstr( iv_json = ls_pr-json
+                                                             iv_key = 'sequences_sql' ) ).
+                  DATA(lv_gj2) = zcl_erpl_rev_cdc=>probe_names(
+                                   zcl_erpl_rev_delta=>jstr( iv_json = ls_pr-json
+                                                             iv_key = 'triggers_sql' ) ).
+                  IF lv_tj2 IS NOT INITIAL AND lv_sj2 IS NOT INITIAL AND lv_gj2 IS NOT INITIAL.
+                    DATA lv_en2 TYPE string VALUE `[`.
+                    DATA lv_di2 TYPE string VALUE `[`.
+                    SPLIT lv_gj2 AT ',' INTO TABLE DATA(lt_tg2).
+                    LOOP AT lt_tg2 INTO DATA(lv_tg2).
+                      REPLACE ALL OCCURRENCES OF `[` IN lv_tg2 WITH ``.
+                      REPLACE ALL OCCURRENCES OF `]` IN lv_tg2 WITH ``.
+                      REPLACE ALL OCCURRENCES OF `"` IN lv_tg2 WITH ``.
+                      IF lv_tg2 IS INITIAL. CONTINUE. ENDIF.
+                      SPLIT lv_tg2 AT ':' INTO DATA(lv_nm2) DATA(lv_fl2).
+                      IF lv_fl2 = 'TRUE' OR lv_fl2 = 'true' OR lv_fl2 = 'X'.
+                        IF lv_en2 <> `[`. lv_en2 = lv_en2 && `,`. ENDIF.
+                        lv_en2 = lv_en2 && `"` && lv_nm2 && `"`.
+                      ELSE.
+                        IF lv_di2 <> `[`. lv_di2 = lv_di2 && `,`. ENDIF.
+                        lv_di2 = lv_di2 && `"` && lv_nm2 && `"`.
+                      ENDIF.
+                    ENDLOOP.
+                    lv_en2 = lv_en2 && `]`.
+                    lv_di2 = lv_di2 && `]`.
+                    DATA(lv_sp3) = |\{"tables":{ lv_tj2 },"sequences":{ lv_sj2 },| &&
+                                   |"enabled_triggers":{ lv_en2 },"disabled_triggers":{ lv_di2 },| &&
+                                   |"log_table":"{ zcl_erpl_rev_delta=>jstr( iv_json = ls_pr-json iv_key = 'log_table' ) }",| &&
+                                   |"seq_name":"{ zcl_erpl_rev_delta=>jstr( iv_json = ls_pr-json iv_key = 'seq_name' ) }",| &&
+                                   |"triggers":{ zcl_erpl_rev_delta=>jarr( iv_json = ls_pr-json iv_key = 'triggers' ) }\}|.
+                    DATA(ls_st2) = zcl_erpl_rev_delta=>plan_json(
+                      iv_action = 'CDC_STATUS' iv_target = lv_ct iv_params = lv_sp3 ).
+                    ev_result = |repaired { lines( lt_ddl ) } object(s); { ls_st2-json }|.
+                  ELSE.
+                    ev_result = |repaired { lines( lt_ddl ) } object(s)|.
+                  ENDIF.
                 ENDIF.
               ENDIF.
             ENDIF.
@@ -456,6 +501,10 @@ CLASS zcl_erpl_rev_clidrv IMPLEMENTATION.
           " The comparable columns, in one order, used for both the ORDER BY and
           " the fingerprint. Position is the contract between the two sides.
           DATA lt_vf TYPE string_table.
+          " The registered key columns, in order, so both sides render the same
+          " identity for the same row.
+          DATA(lt_vkeys) = VALUE string_table( ).
+          SPLIT ls_vs-keys AT ',' INTO TABLE lt_vkeys.
           DATA lv_vfj TYPE string VALUE `[`.
           LOOP AT ls_vd-fields INTO DATA(ls_vfl).
             " FLTP is excluded on both sides: binary floating point does not
@@ -509,10 +558,30 @@ CLASS zcl_erpl_rev_clidrv IMPLEMENTATION.
                     lv_fp = lv_fp && zcl_erpl_rev_util=>fingerprint_cell(
                                        is_field = ls_vf2 iv_val = <vc> ).
                   ENDLOOP.
+                  " The row's IDENTITY alongside its fingerprint. Sending
+                  " fingerprints alone made the two sides pair by position,
+                  " which assumes HANA and DuckDB order a column identically --
+                  " they need not, and a single misalignment reports every row
+                  " after it as wrong.
+                  DATA(lv_k) = ``.
+                  LOOP AT lt_vkeys INTO DATA(lv_kc).
+                    ASSIGN COMPONENT lv_kc OF STRUCTURE <vr> TO <vc>.
+                    IF <vc> IS NOT ASSIGNED. CONTINUE. ENDIF.
+                    READ TABLE ls_vd-fields INTO DATA(ls_kf) WITH KEY name = lv_kc.
+                    IF sy-subrc <> 0. CONTINUE. ENDIF.
+                    IF lv_k IS NOT INITIAL. lv_k = lv_k && `|`. ENDIF.
+                    lv_k = lv_k && zcl_erpl_rev_util=>fingerprint_cell(
+                                     is_field = ls_kf iv_val = <vc> ).
+                  ENDLOOP.
+                  " No registered keys: the row is its own identity, which still
+                  " pairs identical rows and still reports one that exists on
+                  " only one side.
+                  IF lv_k IS INITIAL. lv_k = lv_fp. ENDIF.
+
                   IF lv_vrows <> `[`. lv_vrows = lv_vrows && `,`. ENDIF.
-                  lv_vrows = lv_vrows && `"` && escape( val = lv_fp
-                                                        format = cl_abap_format=>e_json_string )
-                                      && `"`.
+                  lv_vrows = lv_vrows &&
+                    |\{"k":"{ escape( val = lv_k format = cl_abap_format=>e_json_string ) }",| &&
+                    |"fp":"{ escape( val = lv_fp format = cl_abap_format=>e_json_string ) }"\}|.
                 ENDLOOP.
                 lv_vrows = lv_vrows && `]`.
               CATCH cx_root INTO DATA(lx_v).

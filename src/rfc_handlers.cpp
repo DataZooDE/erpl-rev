@@ -9,6 +9,8 @@
 #include "sap_uc.hpp"
 #include "duckdb_bridge.hpp"
 #include "cdc_dialect.hpp"
+#include <map>
+#include <set>
 #include "cdc_status.hpp"
 #include "split_planner.hpp"
 #include "validation.hpp"
@@ -1051,50 +1053,66 @@ extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE,
             if (fields.empty())
                 throw std::runtime_error("VALIDATE: no comparable columns for " + target);
 
-            const auto vplan = validation::BuildPlan(pol, target, fields);
+            // The registered keys, so both sides pair rows by identity.
+            std::vector<std::string> vkeys;
+            {
+                auto kr = con.Query("SELECT coalesce(keys,'') FROM _erpl_rev_delta_state "
+                                    "WHERE target=" + SqlLit(target));
+                if (!kr->HasError() && kr->RowCount() > 0)
+                    vkeys = SplitCsv(kr->GetValue(0, 0).ToString());
+            }
+            const auto vplan = validation::BuildPlan(pol, target, fields, vkeys);
             QueryResult ours = g_bridge->Query(vplan.sql);
 
-            // The SAP side's fingerprints, compared POSITIONALLY.
+            // Paired by KEY, not by position.
             //
-            // Both sides render the same columns in the same order and sort by
-            // them, which is what BuildPlan's ORDER BY is for -- two unordered
-            // result sets cannot be compared row by row at all. Position is the
-            // contract; inventing a key here would have been a second one.
-            std::vector<std::string> theirs;
+            // Positional comparison assumed two engines given the same ORDER BY
+            // produce the same sequence. They need not -- collation, NULL
+            // placement and numeric-versus-text ordering all differ between
+            // HANA and DuckDB -- and a single misalignment reports every row
+            // after it as wrong, or worse, lines two genuinely different sets
+            // up index for index and reports PASSED.
+            std::map<std::string, std::string> mine;
+            for (const auto &row : ours.rows)
+                mine[JsonField(row, "k")] = JsonField(row, "fp");
+
+            long long compared = 0, mismatched = 0;
+            std::string first_bad;
+            std::set<std::string> seen;
             {
                 const auto arr = JsonArray(params, "rows");
                 size_t at = 0;
-                while (at < arr.size()) {
-                    const auto b = arr.find('"', at);
-                    if (b == std::string::npos) break;
-                    std::string v;
-                    size_t i = b + 1;
-                    for (; i < arr.size() && arr[i] != '"'; ++i) {
-                        if (arr[i] == '\\' && i + 1 < arr.size()) ++i;
-                        v += arr[i];
+                while ((at = arr.find("{", at)) != std::string::npos) {
+                    const auto end2 = arr.find("}", at);
+                    if (end2 == std::string::npos) break;
+                    const auto obj = arr.substr(at, end2 - at + 1);
+                    at = end2 + 1;
+                    const auto k = JsonField(obj, "k");
+                    if (k.empty()) continue;
+                    ++compared;
+                    seen.insert(k);
+                    const auto it = mine.find(k);
+                    if (it == mine.end()) {
+                        // In SAP, absent from the replica: a lost row, which is
+                        // the failure this whole product exists to prevent.
+                        ++mismatched;
+                        if (first_bad.empty()) first_bad = k + " (missing from the replica)";
+                    } else if (it->second != JsonField(obj, "fp")) {
+                        ++mismatched;
+                        if (first_bad.empty()) first_bad = k;
                     }
-                    theirs.push_back(v);
-                    at = i + 1;
                 }
             }
-            long long compared = 0, mismatched = 0;
-            std::string first_bad;
-            const size_t n = std::min(theirs.size(), ours.rows.size());
-            for (size_t i = 0; i < n; ++i) {
-                ++compared;
-                const auto mine = JsonField(ours.rows[i], "fp");
-                if (mine != theirs[i]) {
+            // ...and the other direction. A row in the replica that the source
+            // does not have is just as wrong, and counting only one direction
+            // calls a replica with extra rows identical.
+            if (pol.mode == validation::Mode::Full) {
+                for (const auto &kv : mine) {
+                    if (seen.count(kv.first)) continue;
                     ++mismatched;
-                    if (first_bad.empty()) first_bad = "row " + std::to_string(i + 1);
+                    if (first_bad.empty())
+                        first_bad = kv.first + " (in the replica, not at the source)";
                 }
-            }
-            // A row count that differs is itself a mismatch, and reporting only
-            // the overlap would call a truncated replica identical.
-            if (theirs.size() != ours.rows.size()) {
-                ++mismatched;
-                if (first_bad.empty())
-                    first_bad = "row count: SAP " + std::to_string(theirs.size()) +
-                                ", replica " + std::to_string(ours.rows.size());
             }
 
             // Recorded like any other run: a validation nobody can find later

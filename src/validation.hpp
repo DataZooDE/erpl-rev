@@ -49,7 +49,19 @@ bool IsComparable(const Field &f);
 
 std::string RowFingerprint(const std::vector<Field> &fields);
 
-Plan BuildPlan(const Policy &p, const std::string &target, const std::vector<Field> &fields);
+// `keys` names the columns that identify a row. The plan emits them as a `k`
+// column alongside the fingerprint, so the two sides PAIR rows rather than
+// assume their orderings agree.
+//
+// They need not agree: collation, NULL placement and numeric-versus-text
+// ordering all differ between HANA and DuckDB. Paired positionally, the
+// comparison reports FAILED on correct data -- and can report PASSED when both
+// sets genuinely differ but happen to line up index for index.
+//
+// Empty `keys` falls back to the whole row as its own key: a keyless
+// registration must still be validatable, and identical rows still pair.
+Plan BuildPlan(const Policy &p, const std::string &target, const std::vector<Field> &fields,
+               const std::vector<std::string> &keys = {});
 
 bool Passed(const Result &r);
 std::string Verdict(const Result &r);

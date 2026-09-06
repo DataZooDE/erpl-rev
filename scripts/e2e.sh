@@ -531,7 +531,10 @@ echo "   sync unpark releases a parked target and clears its backoff"
 
 # The Prometheus endpoint, scraped for real. A metrics surface that is only
 # unit-tested is a page nobody has ever fetched.
-if command -v curl >/dev/null 2>&1; then
+# Local only. In remote mode the server runs on another host and the port is
+# loopback-bound there, so curling it from here fails unconditionally -- a lane
+# that cannot pass is not a test, it is a broken build.
+if [ -z "$REMOTE" ] && command -v curl >/dev/null 2>&1; then
   MET="$(curl -s --max-time 5 "http://127.0.0.1:${ERPL_REV_METRICS_PORT}/metrics" 2>&1 || true)"
   grep -q "# TYPE erpl_rev_target_lag_seconds gauge" <<<"$MET"     || fail "the metrics endpoint served no target gauge: $(head -c 300 <<<"$MET")"
   grep -q "erpl_rev_daemon_up" <<<"$MET" || fail "no daemon gauge in the exposition"
@@ -546,11 +549,16 @@ fi
 # The monitor, rendered for real. --once draws one frame through the same
 # element tree the live display uses, so what a script sees is what an operator
 # sees -- a second formatter would drift from the first.
+# Same reason: `top` reads the server's database over its loopback listener.
+if [ -n "$REMOTE" ]; then
+  echo "   top --once skipped (remote server)"
+else
 TOP="$(cli top --once 2>&1 || true)"
 grep -q "TARGET" <<<"$TOP" || fail "top --once drew no table: $(head -c 300 <<<"$TOP")"
 grep -q "t000_cli" <<<"$TOP" || fail "top --once does not show the registered targets: $TOP"
 grep -qE "daemon (RUNNING|STOPPED)" <<<"$TOP" || fail "top --once shows no daemon state: $TOP"
 echo "   top --once renders the targets and the daemon state"
+fi
 
 # cdc status on a target that is not a trigger target must say so, not crash.
 CS="$(cli cdc status --target t000_cli --yes 2>&1 || true)"

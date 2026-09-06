@@ -69,8 +69,14 @@ std::string Render(DuckDbBridge &db) {
         flag("erpl_rev_target_healthy", Field(row, "is_healthy"));
         flag("erpl_rev_target_blocked", Field(row, "is_blocked"));
         flag("erpl_rev_target_parked", Field(row, "is_parked"));
-        out += "erpl_rev_target_fail_count" + label + Field(row, "fail_count") + "\n";
-        out += "erpl_rev_target_rows_applied" + label + Field(row, "last_rows") + "\n";
+        // A number, always. An empty value renders "metric{...} " with no
+        // sample, which a scraper rejects as a parse error -- and it rejects the
+        // WHOLE response, so one odd row voids every metric in the scrape.
+        auto num = [&](const char *name, const std::string &v) {
+            out += std::string(name) + label + (v.empty() ? "0" : v) + "\n";
+        };
+        num("erpl_rev_target_fail_count", Field(row, "fail_count"));
+        num("erpl_rev_target_rows_applied", Field(row, "last_rows"));
     }
 
     // --- the system as a whole ----------------------------------------------
@@ -89,15 +95,18 @@ std::string Render(DuckDbBridge &db) {
         "daemon_heartbeat_age_s, daemon_ticks FROM erpl_rev_health");
     if (!health.rows.empty()) {
         const auto &h = health.rows[0];
-        out += "erpl_rev_targets " + Field(h, "targets") + "\n";
-        out += "erpl_rev_targets_healthy " + Field(h, "healthy") + "\n";
+        auto gnum = [&](const char *name, const std::string &v) {
+            out += std::string(name) + " " + (v.empty() ? "0" : v) + "\n";
+        };
+        gnum("erpl_rev_targets", Field(h, "targets"));
+        gnum("erpl_rev_targets_healthy", Field(h, "healthy"));
         const auto worst = Field(h, "worst_lag_seconds");
         if (!worst.empty()) out += "erpl_rev_worst_lag_seconds " + worst + "\n";
         out += std::string("erpl_rev_daemon_up ") +
                (Field(h, "daemon_status") == "RUNNING" ? "1" : "0") + "\n";
         const auto age = Field(h, "daemon_heartbeat_age_s");
         if (!age.empty()) out += "erpl_rev_daemon_heartbeat_age_seconds " + age + "\n";
-        out += "erpl_rev_daemon_ticks " + Field(h, "daemon_ticks") + "\n";
+        gnum("erpl_rev_daemon_ticks", Field(h, "daemon_ticks"));
     }
     return out;
 }
