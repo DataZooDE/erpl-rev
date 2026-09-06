@@ -9,6 +9,7 @@
 #include "sap_uc.hpp"
 #include "duckdb_bridge.hpp"
 #include "cdc_dialect.hpp"
+#include <algorithm>
 #include <map>
 #include <set>
 #include "cdc_status.hpp"
@@ -1072,9 +1073,14 @@ extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE,
             // HANA and DuckDB -- and a single misalignment reports every row
             // after it as wrong, or worse, lines two genuinely different sets
             // up index for index and reports PASSED.
-            std::map<std::string, std::string> mine;
+            // Multiplicity, not one fingerprint per key. A map collapsed
+            // duplicates, so a double-applied load -- the same key twice in the
+            // replica -- paired against its single source row and PASSED. That
+            // used to be caught by the row-count check this comparison
+            // replaced, so the rewrite quietly removed the only guard.
+            std::map<std::string, std::vector<std::string>> mine;
             for (const auto &row : ours.rows)
-                mine[JsonField(row, "k")] = JsonField(row, "fp");
+                mine[JsonField(row, "k")].push_back(JsonField(row, "fp"));
 
             long long compared = 0, mismatched = 0;
             std::string first_bad;
@@ -1092,27 +1098,55 @@ extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE,
                     ++compared;
                     seen.insert(k);
                     const auto it = mine.find(k);
-                    if (it == mine.end()) {
+                    if (it == mine.end() || it->second.empty()) {
                         // In SAP, absent from the replica: a lost row, which is
                         // the failure this whole product exists to prevent.
                         ++mismatched;
                         if (first_bad.empty()) first_bad = k + " (missing from the replica)";
-                    } else if (it->second != JsonField(obj, "fp")) {
-                        ++mismatched;
-                        if (first_bad.empty()) first_bad = k;
+                    } else {
+                        // Consume one occurrence, so a key present twice in the
+                        // replica and once at the source leaves a leftover that
+                        // the reverse pass reports.
+                        auto &fps = it->second;
+                        const auto want = JsonField(obj, "fp");
+                        auto f = std::find(fps.begin(), fps.end(), want);
+                        if (f == fps.end()) {
+                            ++mismatched;
+                            if (first_bad.empty()) first_bad = k;
+                            fps.erase(fps.begin());
+                        } else {
+                            fps.erase(f);
+                        }
                     }
                 }
             }
-            // ...and the other direction. A row in the replica that the source
-            // does not have is just as wrong, and counting only one direction
-            // calls a replica with extra rows identical.
-            if (pol.mode == validation::Mode::Full) {
+            // ...and the other direction, in BOTH modes when neither side was
+            // capped. A replica holding rows the source does not -- deletes that
+            // never propagated, the flagship failure of any replicator -- was
+            // caught by the row-count check until the keyed rewrite dropped it.
+            // Anything left in `mine` after the pass above is exactly that.
+            const bool capped = pol.mode != validation::Mode::Full &&
+                                (static_cast<long long>(ours.rows.size()) >= pol.sample_rows ||
+                                 compared >= pol.sample_rows);
+            if (!capped) {
                 for (const auto &kv : mine) {
-                    if (seen.count(kv.first)) continue;
-                    ++mismatched;
-                    if (first_bad.empty())
-                        first_bad = kv.first + " (in the replica, not at the source)";
+                    for (size_t n = 0; n < kv.second.size(); ++n) {
+                        ++mismatched;
+                        if (first_bad.empty())
+                            first_bad = kv.first + " (in the replica, not at the source)";
+                    }
                 }
+            }
+
+            // A comparison of nothing is not a pass. An empty or unparseable
+            // payload from the source side would otherwise report
+            // compared=0, mismatched=0 -> PASSED, which is the most confident
+            // possible way to say nothing was checked.
+            if (compared == 0 && !ours.rows.empty()) {
+                ++mismatched;
+                if (first_bad.empty())
+                    first_bad = "the source returned no rows while the replica has " +
+                                std::to_string(ours.rows.size());
             }
 
             // Recorded like any other run: a validation nobody can find later

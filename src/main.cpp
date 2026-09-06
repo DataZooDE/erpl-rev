@@ -698,6 +698,9 @@ int main(int argc, char **argv) {
         // Before the handlers, which destroy the bridge. The metrics thread holds a
         // reference to it and would keep serving scrapes against freed memory --
         // a use-after-free on every shutdown with metrics enabled.
+        // A guard, not two statements on the happy path: main's catch returns
+        // without unwinding to here, and the metrics thread would then keep
+        // serving scrapes against a bridge destroyed at exit.
         StopMetricsServer();
         ShutdownHandlers();
         return 0;
@@ -709,6 +712,12 @@ int main(int argc, char **argv) {
         // Routine per-request errors are deliberately left unannotated: this
         // process runs for weeks, and a link on every error line becomes noise.
         log::get().Error("server", datazoo::IssueHint(kBanner).substr(1));
+        // Tear down here too. This path returns without unwinding to the normal
+        // shutdown, so the metrics thread would outlive the bridge it holds a
+        // reference to and keep serving scrapes against destroyed memory --
+        // the same use-after-free the success path was fixed for, on the branch
+        // taken precisely when things have gone wrong.
+        StopMetricsServer();
         return 1;
     }
 }

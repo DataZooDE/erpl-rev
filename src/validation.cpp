@@ -61,16 +61,27 @@ Plan BuildPlan(const Policy &p, const std::string &target, const std::vector<Fie
     // fingerprint itself when the registration has no keys -- identical rows
     // still pair, and a row on one side only is still reported.
     std::string key;
+    bool any_key = false;
     for (const auto &k : keys) {
-        const auto lk = Lower(k);
+        // Trimmed and case-folded: `--keys "mandt, bukrs"` is stored verbatim,
+        // and a literal match finds nothing.
+        std::string lk = Lower(k);
+        while (!lk.empty() && std::isspace(static_cast<unsigned char>(lk.front()))) lk.erase(0, 1);
+        while (!lk.empty() && std::isspace(static_cast<unsigned char>(lk.back()))) lk.pop_back();
+        if (lk.empty()) continue;
         for (const auto &f : fields) {
             if (Lower(f.name) != lk) continue;
-            if (!key.empty()) key += " || '|' || ";
+            // The separator goes in UNCONDITIONALLY, per part. Joining only
+            // non-empty parts makes ('','B') render "B" here and "|B" there, so
+            // nothing pairs -- and full mode then calls a byte-perfect replica
+            // wrong in both directions.
+            if (any_key) key += " || '|' || ";
             key += DuckExpr(f);
+            any_key = true;
             break;
         }
     }
-    if (key.empty()) key = fp;
+    if (!any_key) key = fp;
 
     std::string order;
     for (const auto &f : fields) {

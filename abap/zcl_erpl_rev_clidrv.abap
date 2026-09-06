@@ -461,9 +461,15 @@ CLASS zcl_erpl_rev_clidrv IMPLEMENTATION.
                                    |"triggers":{ zcl_erpl_rev_delta=>jarr( iv_json = ls_pr-json iv_key = 'triggers' ) }\}|.
                     DATA(ls_st2) = zcl_erpl_rev_delta=>plan_json(
                       iv_action = 'CDC_STATUS' iv_target = lv_ct iv_params = lv_sp3 ).
+                    " The re-derivation's own error propagates. Swallowing it
+                    " reported a clean repair while the stored status was still
+                    " the INCONSISTENT one -- the very bug this block closes.
+                    ev_error  = ls_st2-error.
                     ev_result = |repaired { lines( lt_ddl ) } object(s); { ls_st2-json }|.
                   ELSE.
-                    ev_result = |repaired { lines( lt_ddl ) } object(s)|.
+                    ev_error = |repaired { lines( lt_ddl ) } object(s), but the catalogue | &&
+                               |could not be re-read: the stored status is stale and the | &&
+                               |planner will keep skipping this target|.
                   ENDIF.
                 ENDIF.
               ENDIF.
@@ -503,8 +509,17 @@ CLASS zcl_erpl_rev_clidrv IMPLEMENTATION.
           DATA lt_vf TYPE string_table.
           " The registered key columns, in order, so both sides render the same
           " identity for the same row.
-          DATA(lt_vkeys) = VALUE string_table( ).
-          SPLIT ls_vs-keys AT ',' INTO TABLE lt_vkeys.
+          " UPPER-CASED and trimmed, per token. `sync create --keys "mandt,
+          " bukrs"` is stored verbatim, and READ TABLE ... WITH KEY name = is
+          " case- and blank-sensitive: a lowercase registration matched no field
+          " here while DuckDB matched them all, so nothing paired and full mode
+          " called a byte-perfect replica wrong in BOTH directions.
+          DATA lt_vkeys TYPE string_table.
+          SPLIT ls_vs-keys AT ',' INTO TABLE DATA(lt_vraw).
+          LOOP AT lt_vraw INTO DATA(lv_vraw).
+            DATA(lv_vk1) = to_upper( condense( lv_vraw ) ).
+            IF lv_vk1 IS NOT INITIAL. APPEND lv_vk1 TO lt_vkeys. ENDIF.
+          ENDLOOP.
           DATA lv_vfj TYPE string VALUE `[`.
           LOOP AT ls_vd-fields INTO DATA(ls_vfl).
             " FLTP is excluded on both sides: binary floating point does not
@@ -540,6 +555,19 @@ CLASS zcl_erpl_rev_clidrv IMPLEMENTATION.
                 " the row-count difference -- the one verdict an operator acts
                 " on destructively.
                 IF lv_vfull = abap_true.
+                  " Bounded, with an actionable refusal. An unbounded read plus
+                  " a JSON payload of the same data in one work process fails
+                  " with TSV_TNEW_PAGE_ALLOC_FAILED -- a runtime error, not an
+                  " exception, so the driver-wide TRY cannot catch it and the
+                  " queue row stays claimed forever.
+                  DATA lv_vcnt TYPE i.
+                  SELECT COUNT(*) FROM (lv_vsrc) INTO @lv_vcnt.
+                  IF lv_vcnt > 500000.
+                    ev_error = |{ lv_vsrc } has { lv_vcnt } rows; a full validation | &&
+                               |loads them all into one work process. Validate a | &&
+                               |sample, or split the table.|.
+                    RETURN.
+                  ENDIF.
                   SELECT (lv_vcols) FROM (lv_vsrc)
                     ORDER BY (lv_vcols)
                     INTO CORRESPONDING FIELDS OF TABLE @<vtab>.
@@ -564,19 +592,25 @@ CLASS zcl_erpl_rev_clidrv IMPLEMENTATION.
                   " they need not, and a single misalignment reports every row
                   " after it as wrong.
                   DATA(lv_k) = ``.
+                  DATA(lv_anyk) = abap_false.
                   LOOP AT lt_vkeys INTO DATA(lv_kc).
                     ASSIGN COMPONENT lv_kc OF STRUCTURE <vr> TO <vc>.
                     IF <vc> IS NOT ASSIGNED. CONTINUE. ENDIF.
                     READ TABLE ls_vd-fields INTO DATA(ls_kf) WITH KEY name = lv_kc.
                     IF sy-subrc <> 0. CONTINUE. ENDIF.
-                    IF lv_k IS NOT INITIAL. lv_k = lv_k && `|`. ENDIF.
+                    " The separator goes in per PART, not only between non-empty
+                    " ones: ('','B') must render the same here as in DuckDB, and
+                    " joining only non-empty parts renders "B" against "|B".
+                    IF lv_anyk = abap_true. lv_k = lv_k && `|`. ENDIF.
                     lv_k = lv_k && zcl_erpl_rev_util=>fingerprint_cell(
                                      is_field = ls_kf iv_val = <vc> ).
+                    lv_anyk = abap_true.
                   ENDLOOP.
-                  " No registered keys: the row is its own identity, which still
-                  " pairs identical rows and still reports one that exists on
-                  " only one side.
-                  IF lv_k IS INITIAL. lv_k = lv_fp. ENDIF.
+                  " Falls back only when there are NO usable key columns -- the
+                  " same condition the server uses. Falling back when the key
+                  " VALUES render empty made a blank-keyed row send a fingerprint
+                  " here and an empty string there.
+                  IF lv_anyk = abap_false. lv_k = lv_fp. ENDIF.
 
                   IF lv_vrows <> `[`. lv_vrows = lv_vrows && `,`. ENDIF.
                   lv_vrows = lv_vrows &&

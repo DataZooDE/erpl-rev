@@ -131,3 +131,33 @@ TEST_CASE("validation: a keyless target still produces a usable plan",
     const auto plan = BuildPlan(p, "t", fields, {});
     CHECK(plan.sql.find(" AS k") != std::string::npos);
 }
+
+TEST_CASE("validation: key parts keep their separators when a value is empty",
+          "[validation]") {
+    // The two sides must render the SAME key for the same row. Joining only
+    // non-empty parts makes ('','B') render as "B" on one side and "|B" on the
+    // other, so nothing pairs -- and on a byte-perfect replica full mode then
+    // reports every source row missing AND every replica row extra, whose
+    // documented remedy is a destructive reload.
+    Policy p;
+    std::vector<Field> fields{{"A", "CHAR", 5, 0}, {"B", "CHAR", 5, 0}};
+    const auto plan = BuildPlan(p, "t", fields, {"A", "B"});
+    // Both parts present in order, separated unconditionally.
+    const auto k = plan.sql.substr(0, plan.sql.find(" AS k"));
+    CHECK(k.find("a") != std::string::npos);
+    CHECK(k.find("b") != std::string::npos);
+    CHECK(k.find("'|'") != std::string::npos);
+}
+
+TEST_CASE("validation: key names are matched case- and blank-insensitively",
+          "[validation]") {
+    // `sync create --keys "mandt, bukrs"` stores exactly that. If either side
+    // matches key names literally, it finds no columns, falls back to something
+    // else, and nothing pairs.
+    Policy p;
+    std::vector<Field> fields{{"MANDT", "CLNT", 3, 0}, {"BUKRS", "CHAR", 4, 0}};
+    const auto plan = BuildPlan(p, "t", fields, {"mandt", " BUKRS "});
+    const auto k = plan.sql.substr(0, plan.sql.find(" AS k"));
+    CHECK(k.find("mandt") != std::string::npos);
+    CHECK(k.find("bukrs") != std::string::npos);
+}

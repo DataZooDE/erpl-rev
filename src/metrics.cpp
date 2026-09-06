@@ -124,6 +124,7 @@ using socket_t = SOCKET;
 #define ERPL_BADSOCK INVALID_SOCKET
 #else
 #include <arpa/inet.h>
+#include <poll.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -146,6 +147,25 @@ socket_t g_sock = ERPL_BADSOCK;
 
 void Serve(DuckDbBridge *db) {
     while (g_run.load()) {
+        // poll() with a timeout, not a blocking accept().
+        //
+        // The previous shutdown relied on shutdown() waking a blocked accept().
+        // That is Linux behaviour: on macOS and the BSDs shutdown() on a
+        // LISTENING socket returns ENOTCONN and wakes nothing, so Stop() -- which
+        // joins before closing -- would have hung forever, and `erpl-rev serve
+        // --metrics-port` would never exit on SIGTERM. Linux CI would have
+        // stayed green the whole time.
+        //
+        // A timeout re-checks g_run on its own, so shutting down needs no
+        // cross-thread wakeup trick at all.
+#ifdef _WIN32
+        WSAPOLLFD pfd{g_sock, POLLRDNORM, 0};
+        const int pr = WSAPoll(&pfd, 1, 200);
+#else
+        pollfd pfd{g_sock, POLLIN, 0};
+        const int pr = ::poll(&pfd, 1, 200);
+#endif
+        if (pr <= 0) continue;              // timeout, or interrupted: re-check g_run
         socket_t c = ::accept(g_sock, nullptr, nullptr);
         if (c == ERPL_BADSOCK) {
             if (!g_run.load()) break;
@@ -227,19 +247,9 @@ bool Start(DuckDbBridge &db, int port, std::string &error) {
 
 void Stop() {
     if (!g_run.exchange(false)) return;
-    if (g_sock != ERPL_BADSOCK) {
-        // shutdown() BEFORE close(). Closing a descriptor another thread is
-        // blocked in accept() on is a race: the number can be reused by any
-        // thread that opens something in the window, and the accept then
-        // returns a connection on an unrelated socket. shutdown wakes the
-        // accept without freeing the descriptor, and only then is it closed --
-        // after the thread that was using it has been joined.
-#ifdef _WIN32
-        ::shutdown(g_sock, SD_BOTH);
-#else
-        ::shutdown(g_sock, SHUT_RDWR);
-#endif
-    }
+    // Nothing to wake: the serve loop polls with a timeout and notices g_run
+    // within one interval. The descriptor stays valid until after the join, so
+    // no thread can be blocked on a number that has been reused.
     if (g_thread.joinable()) g_thread.join();
     if (g_sock != ERPL_BADSOCK) { ERPL_CLOSESOCK(g_sock); g_sock = ERPL_BADSOCK; }
 }
