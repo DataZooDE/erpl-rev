@@ -251,3 +251,49 @@ TEST_CASE("cdc_keys: an apply that cannot succeed parks the target instead of lo
     // Rolled back: the position did not move, so nothing was lost.
     CHECK(db.CdcGet("t").position == 0);
 }
+
+TEST_CASE("cdc_keys: a rolled-back apply leaves no change log behind",
+          "[bridge][cdc][keys]") {
+    // Both tiers make the same promise now: the log appears on a target's first
+    // SUCCESSFUL cycle. The trigger tier used to provision before opening its
+    // transaction, so a failed apply left an empty log table for a cycle that
+    // never happened -- and the readers' "no table yet" handling then meant two
+    // different things depending on which tier had touched the target.
+    DuckDbBridge db;
+    SetupKeysTarget(db);
+    db.Execute("INSERT INTO _erpl_rev_delta_state (target, method, source_from, keys, "
+               "log_enabled) VALUES ('t','CDC','T','id',true)");
+    db.Execute("INSERT INTO klog VALUES (1,'U',1)");
+    // No images table at all: the apply fails inside the transaction.
+    CHECK_THROWS(db.CdcApply("t", "klog", {"id"}, "no_such_images"));
+
+    CHECK(db.Query("SELECT count(*) AS c FROM duckdb_tables() WHERE table_name='" +
+                   cycle::ChangeLogName("t") + "'").rows[0] == R"({"c":0})");
+}
+
+TEST_CASE("cdc_keys: the log carries the engine's verdict and a real run id",
+          "[bridge][cdc][keys]") {
+    // Both tiers write one shared log, so a subscriber must be able to read it
+    // one way. The trigger says what happened at the SOURCE; what a sink needs
+    // is whether the key was already in the target -- a seeded target replaying
+    // an old 'I' for a key it already holds would make a subscriber conflict on
+    // insert. And _run_id was hard-coded 0, so anything joining the log to the
+    // run statistics dropped every trigger-tier row.
+    DuckDbBridge db;
+    SetupKeysTarget(db);   // target holds 1, 2, 3
+    db.Execute("INSERT INTO _erpl_rev_delta_state (target, method, source_from, keys, "
+               "log_enabled) VALUES ('t','CDC','T','id',true)");
+    // The source calls both an insert; only key 4 is new to the target.
+    db.Execute("INSERT INTO klog VALUES (1,'I',1),(4,'I',2)");
+    db.Execute("CREATE TABLE kimg(id INTEGER, v VARCHAR)");
+    db.Execute("INSERT INTO kimg VALUES (1,'a2'),(4,'d')");
+
+    REQUIRE(db.CdcApply("t", "klog", {"id"}, "kimg").applied);
+
+    const std::string log = cycle::ChangeLogName("t");
+    CHECK(db.Query("SELECT _op AS o FROM " + log + " WHERE id=1").rows[0] == R"({"o":"U"})");
+    CHECK(db.Query("SELECT _op AS o FROM " + log + " WHERE id=4").rows[0] == R"({"o":"I"})");
+    // The run id joins to a real statistics row.
+    CHECK(db.Query("SELECT count(*) AS c FROM " + log + " l JOIN _erpl_rev_run_stats r "
+                   "ON r.run_id = l._run_id").rows[0] == R"({"c":2})");
+}

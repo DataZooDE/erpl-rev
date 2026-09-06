@@ -197,6 +197,17 @@ BeginResult Begin(duckdb::Connection &con, const std::string &target, LoadType l
                   int64_t read_start_epoch, const std::string &sap_now) {
     const State st = LoadState(con, target);
 
+    // Only the watermark tier implements a load type. Refused HERE, on the
+    // server, before anything is claimed or recorded: this is a decision about
+    // the request, and the executor was the wrong place for it -- the server
+    // handed out the F and only ABAP declined, after taking the lease, counting
+    // it against the target's backoff and parking a healthy target for what is
+    // an operator typo.
+    if (load_type != LoadType::Delta && st.method != "WATERMARK")
+        throw std::runtime_error("cycle: load type " + std::string(LoadTypeCode(load_type)) +
+                                 " is not implemented for method " + st.method + "; only " +
+                                 "WATERMARK targets support one");
+
     BeginResult out;
     out.plan = PlanLoad(load_type);
     out.chg_col = st.chg_col;
@@ -503,6 +514,9 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
     // knowable only now.
     std::string new_wm = st.wm_value;
     LoadPlan load_plan;
+    // The load type this run actually ran, hoisted: the one-shot spend below
+    // compares it with what stands in the target's default column.
+    std::string run_load_type;
     {
         wm::WatermarkSpec spec;
         spec.kind = wm::ParseKind(st.wm_kind.empty() ? "NUMTS" : st.wm_kind);
@@ -524,6 +538,7 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
             throw std::runtime_error("cycle: run " + std::to_string(run_id) +
                                      " has no recorded load type; it was not opened by Begin()");
         const std::string lt = rt->GetValue(0, 0).ToString();
+        run_load_type = lt;
         const auto plan = PlanLoad(ParseLoadType(lt));
         load_plan = plan;
 
@@ -595,19 +610,28 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
     if (have_stage && !keys.empty()) {
         std::string kl;
         for (size_t i = 0; i < keys.size(); ++i) { if (i) kl += ","; kl += keys[i]; }
-        auto d = con.Query("SELECT " + kl + ", count(*) AS n FROM " + stage + " GROUP BY " + kl +
-                           " HAVING count(*) > 1 ORDER BY n DESC LIMIT 1");
-        if (!d->HasError() && d->RowCount() > 0) {
+        // __erpl_dupes, not `n`: a key column actually named `n` made ORDER BY
+        // ambiguous against the alias. And a probe that ERRORS is not a pass --
+        // it means the stage does not have the shape the registration claims,
+        // which is the thing this check exists to catch.
+        auto d = con.Query("SELECT " + kl + ", count(*) AS __erpl_dupes FROM " + stage +
+                           " GROUP BY " + kl +
+                           " HAVING count(*) > 1 ORDER BY __erpl_dupes DESC LIMIT 1");
+        if (d->HasError())
+            throw std::runtime_error(
+                "cycle: cannot check the staged data for duplicate keys (" + d->GetError() +
+                "); the registered keys do not match the staged columns");
+        if (d->RowCount() > 0) {
             std::string key_text;
             for (duckdb::idx_t c = 0; c + 1 < d->ColumnCount(); ++c) {
                 if (c) key_text += ",";
                 key_text += d->GetValue(c, 0).ToString();
             }
+            // No delta_state write here: this throw is inside the try, and the
+            // catch below owns the target's status. Setting IDLE first was dead
+            // -- overwritten a moment later with ERROR and a backoff increment.
             con.Query("UPDATE _erpl_rev_run_stats SET status='ERROR', error_text="
                       "'duplicate key in staged data' WHERE run_id=" + std::to_string(run_id));
-            con.Query("UPDATE _erpl_rev_delta_state SET status='IDLE', active_run_id=NULL "
-                      "WHERE target=" + Lit(target) + " AND active_run_id=" +
-                      std::to_string(run_id));
             throw std::runtime_error(
                 "cycle: the staged data for " + target + " has a duplicate key (" + key_text +
                 " appears " + d->GetValue(d->ColumnCount() - 1, 0).ToString() +
@@ -623,11 +647,9 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
         const auto staged = have_stage ? Scalar(con, "SELECT count(*) FROM " + stage) : "0";
         const auto held = Scalar(con, "SELECT count(*) FROM " + target);
         if (staged == "0" && held != "0") {
+            // As above: the catch owns delta_state.
             con.Query("UPDATE _erpl_rev_run_stats SET status='ERROR', error_text="
                       "'reload staged no rows against a non-empty target' WHERE run_id=" +
-                      std::to_string(run_id));
-            con.Query("UPDATE _erpl_rev_delta_state SET status='IDLE', active_run_id=NULL "
-                      "WHERE target=" + Lit(target) + " AND active_run_id=" +
                       std::to_string(run_id));
             throw std::runtime_error(
                 "cycle: the reload of " + target + " staged no rows while the target holds " +
@@ -672,6 +694,13 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
             // sets of the same size reported zero deletions while rows really
             // disappeared.
             res.del = std::stoll(Scalar(con, "SELECT count(*) FROM " + target + gone_where));
+            // ...and the counts follow the same story. They were computed
+            // against the un-truncated target, so they described an upsert that
+            // did not happen: rows_upd said N while the log could not contain a
+            // single 'U'. A reload inserts what it staged and deletes what it
+            // did not.
+            res.ins = std::stoll(Scalar(con, "SELECT count(*) FROM " + stage));
+            res.upd = 0;
 
             if (append_log && res.del > 0) {
                 // Without this, a caught-up subscriber keeps every row the
@@ -784,10 +813,17 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
             // null-safe matching a genuinely-NULL key can MATCH, and testing
             // that key for NULL would then report an update as an insert.
             // __erpl_matched is 1 exactly when the join found a row.
+            // A reload is the same shape as a first cycle: the target was
+            // emptied a few statements ago, so every surviving row is an insert
+            // and the keys that did not come back are the deletes already
+            // written above. Asking the join here would call them all inserts
+            // anyway -- this makes that explicit rather than accidental, and
+            // keeps _op meaning what the doc says it means.
+            const bool all_inserts = will_create || load_plan.truncate_target;
             const std::string op_expr =
-                will_create ? "'I'" : "CASE WHEN t.__erpl_matched IS NULL THEN 'I' ELSE 'U' END";
+                all_inserts ? "'I'" : "CASE WHEN t.__erpl_matched IS NULL THEN 'I' ELSE 'U' END";
             const std::string from_expr =
-                will_create ? (" FROM " + stage + " s")
+                all_inserts ? (" FROM " + stage + " s")
                             : (" FROM " + stage + " s LEFT JOIN (SELECT *, 1 AS __erpl_matched "
                                                   "FROM " + target + ") t ON " + left_on);
             auto r = con.Query("INSERT INTO " + log + " (" + collist +
@@ -816,9 +852,18 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
         // tick planner hands the daemon, so a target left at either truncated
         // and reloaded on every due tick, unattended. Spent on success, in the
         // same transaction, so a failed reload stays scheduled.
+        //
+        // Spent only when THIS run's type is the one standing in the column.
+        // Keying on "the run truncated" instead meant a hand-driven
+        // `sync run --load-type F` consumed a pending scheduled 'L' -- and the
+        // two are not interchangeable: L advances the watermark, F deliberately
+        // does not, so the seed silently became a repair and the target was
+        // never seeded. Comparing the two needs no extra plumbing: the daemon
+        // runs the default, so they match; an operator overriding it does not.
         if (load_plan.truncate_target)
             Exec(con, "UPDATE _erpl_rev_delta_state SET load_type_default='D' WHERE target=" +
-                          Lit(target) + " AND load_type_default IN ('F','L')",
+                          Lit(target) + " AND load_type_default IN ('F','L')" +
+                          " AND load_type_default=" + Lit(run_load_type),
                  "spend the one-shot load type");
 
         Exec(con,

@@ -45,7 +45,7 @@ TEST_CASE("delta_plan: the safety offset is subtracted from the floor", "[waterm
     // D1. The floor is the stored watermark pulled BACK by the safety window, so
     // rows that committed late are re-read. The merge is keyed, so re-delivery
     // costs nothing.
-    const auto b = ComputeBounds(Spec(WmKind::Numts, "20260905120000"), kReadStart);
+    const auto b = ComputeBounds(Spec(WmKind::Numts, "20260905120000"), kReadStart, /*full_reload=*/false);
     CHECK(b.has_floor);
     CHECK(b.floor == "20260905115800");   // 12:00:00 minus 120s
 }
@@ -53,7 +53,7 @@ TEST_CASE("delta_plan: the safety offset is subtracted from the floor", "[waterm
 TEST_CASE("delta_plan: the ceiling is read_start minus the safety window", "[watermark]") {
     // D1'. This is the value the watermark advances to -- never the maximum of
     // the rows that happened to be delivered.
-    const auto b = ComputeBounds(Spec(WmKind::Numts, "20260905000000"), kReadStart);
+    const auto b = ComputeBounds(Spec(WmKind::Numts, "20260905000000"), kReadStart, /*full_reload=*/false);
     CHECK(b.has_ceiling);
     CHECK(b.ceiling == "20260905115800");
     CHECK(b.next_watermark == b.ceiling);
@@ -69,7 +69,7 @@ TEST_CASE("delta_plan: a row committed during a slow read is not lost", "[waterm
     // With the watermark advancing to the delivered maximum it would sit at
     // 12:09:00 and the row is below the next floor forever. With the ceiling it
     // sits at 11:58:00, and the next cycle's floor is earlier still.
-    const auto b = ComputeBounds(Spec(WmKind::Numts, "20260905000000"), kReadStart);
+    const auto b = ComputeBounds(Spec(WmKind::Numts, "20260905000000"), kReadStart, /*full_reload=*/false);
     const std::string missed = "20260905115900";
     const std::string delivered_max = "20260905120900";
 
@@ -77,7 +77,7 @@ TEST_CASE("delta_plan: a row committed during a slow read is not lost", "[waterm
     CHECK(delivered_max > missed);             // ... whereas the delivered max did
 
     // Next cycle, starting an hour later, re-reads from below the missed row.
-    const auto next = ComputeBounds(Spec(WmKind::Numts, b.next_watermark), kReadStart + 3600);
+    const auto next = ComputeBounds(Spec(WmKind::Numts, b.next_watermark), kReadStart + 3600, /*full_reload=*/false);
     CHECK(next.floor < missed);
 }
 
@@ -89,7 +89,7 @@ TEST_CASE("delta_plan: a clock ceiling bounds the watermark, not the read",
     // entirely. So the cycle reads everything above the floor and only ADVANCES
     // to the ceiling; rows above it are delivered now and re-delivered next
     // cycle, which the keyed merge absorbs.
-    const auto b = ComputeBounds(Spec(WmKind::Numts, "20260905000000"), kReadStart);
+    const auto b = ComputeBounds(Spec(WmKind::Numts, "20260905000000"), kReadStart, /*full_reload=*/false);
     CHECK(b.has_ceiling);
     CHECK_FALSE(b.ceiling_bounds_read);
     CHECK(b.next_watermark == b.ceiling);
@@ -98,20 +98,20 @@ TEST_CASE("delta_plan: a clock ceiling bounds the watermark, not the read",
 TEST_CASE("delta_plan: a DATE ceiling DOES bound the read", "[watermark]") {
     // Today is not a complete day. Reading it is the bug: rows posted later today
     // would fall below tomorrow's floor and never arrive.
-    const auto b = ComputeBounds(Spec(WmKind::Date, "20260903"), kReadStart);
+    const auto b = ComputeBounds(Spec(WmKind::Date, "20260903"), kReadStart, /*full_reload=*/false);
     CHECK(b.ceiling_bounds_read);
     CHECK(b.ceiling == "20260905");
 }
 
 TEST_CASE("delta_plan: an initial load has a ceiling but no floor", "[watermark]") {
-    const auto b = ComputeBounds(Spec(WmKind::Numts, ""), kReadStart);
+    const auto b = ComputeBounds(Spec(WmKind::Numts, ""), kReadStart, /*full_reload=*/false);
     CHECK_FALSE(b.has_floor);
     CHECK(b.has_ceiling);
     CHECK(b.ceiling == "20260905115800");
 }
 
 TEST_CASE("delta_plan: a zero safety window still yields a ceiling", "[watermark]") {
-    const auto b = ComputeBounds(Spec(WmKind::Numts, "20260905000000", 0), kReadStart);
+    const auto b = ComputeBounds(Spec(WmKind::Numts, "20260905000000", 0), kReadStart, /*full_reload=*/false);
     CHECK(b.floor == "20260905000000");
     CHECK(b.ceiling == "20260905120000");
 }
@@ -120,7 +120,7 @@ TEST_CASE("delta_plan: DATE never reads or stores the current day", "[watermark]
     // D2. A nightly cycle at 23:00 used to advance the watermark to today, so
     // rows posted between 23:00 and midnight fell below the next floor.
     auto s = Spec(WmKind::Date, "20260903");
-    const auto b = ComputeBounds(s, kReadStart);
+    const auto b = ComputeBounds(s, kReadStart, /*full_reload=*/false);
 
     CHECK(b.as_of_date == "20260905");
     CHECK(b.ceiling == "20260905");            // exclusive: today is not read
@@ -131,13 +131,13 @@ TEST_CASE("delta_plan: DATE never reads or stores the current day", "[watermark]
 TEST_CASE("delta_plan: DATE applies its safety window in whole days", "[watermark]") {
     // A duration in seconds means nothing against a day-granular column; any
     // non-zero window has to be at least one whole day or it rounds to nothing.
-    CHECK(ComputeBounds(Spec(WmKind::Date, "20260903", 120), kReadStart).floor == "20260902");
-    CHECK(ComputeBounds(Spec(WmKind::Date, "20260903", 0), kReadStart).floor == "20260903");
-    CHECK(ComputeBounds(Spec(WmKind::Date, "20260903", 172800), kReadStart).floor == "20260901");
+    CHECK(ComputeBounds(Spec(WmKind::Date, "20260903", 120), kReadStart, /*full_reload=*/false).floor == "20260902");
+    CHECK(ComputeBounds(Spec(WmKind::Date, "20260903", 0), kReadStart, /*full_reload=*/false).floor == "20260903");
+    CHECK(ComputeBounds(Spec(WmKind::Date, "20260903", 172800), kReadStart, /*full_reload=*/false).floor == "20260901");
 }
 
 TEST_CASE("delta_plan: DATE on an initial load still defers today", "[watermark]") {
-    const auto b = ComputeBounds(Spec(WmKind::Date, ""), kReadStart);
+    const auto b = ComputeBounds(Spec(WmKind::Date, ""), kReadStart, /*full_reload=*/false);
     CHECK_FALSE(b.has_floor);
     CHECK(b.ceiling == "20260905");
     CHECK(b.next_watermark == "20260904");
@@ -151,7 +151,7 @@ TEST_CASE("delta_plan: DATETIME composes the DATS+TIMS pair", "[watermark]") {
     s.wm_value = "20260905115959";
     s.safety_secs = 120;
 
-    const auto b = ComputeBounds(s, kReadStart);
+    const auto b = ComputeBounds(s, kReadStart, /*full_reload=*/false);
     // The FLOOR is derived from the stored watermark, so it is exact whatever
     // the machine's timezone. The CEILING is derived from the clock and is
     // therefore local for a DATS+TIMS pair -- asserted as a relationship in
@@ -172,7 +172,7 @@ TEST_CASE("delta_plan: DATETIME crosses midnight without wrapping", "[watermark]
     s.wm_value = "20260905000030";
     s.safety_secs = 120;   // 30s past midnight, minus 2 minutes -> the day before
 
-    const auto b = ComputeBounds(s, kReadStart);
+    const auto b = ComputeBounds(s, kReadStart, /*full_reload=*/false);
     CHECK(b.floor == "20260904235830");
     CHECK(FloorDate(b) == "20260904");
     CHECK(FloorTime(b) == "235830");
@@ -180,7 +180,7 @@ TEST_CASE("delta_plan: DATETIME crosses midnight without wrapping", "[watermark]
 
 TEST_CASE("delta_plan: TIMESTAMPL keeps its fractional digits", "[watermark]") {
     auto s = Spec(WmKind::Timestampl, "20260905120000.1234567");
-    const auto b = ComputeBounds(s, kReadStart);
+    const auto b = ComputeBounds(s, kReadStart, /*full_reload=*/false);
     // The floor drops back a whole number of seconds; the fraction is preserved
     // so a re-read cannot skip sub-second rows at the boundary.
     CHECK(b.floor == "20260905115800.1234567");
@@ -198,7 +198,7 @@ TEST_CASE("delta_plan: a counter watermark takes its ceiling from the staged row
     s.wm_value = "1000";
     s.safety_units = 50;
 
-    const auto b = ComputeBounds(s, kReadStart);
+    const auto b = ComputeBounds(s, kReadStart, /*full_reload=*/false);
     // "0950", not "950": the comparison is lexical, so the floor has to keep the
     // stored value's width or it sorts wrong against it. '1000' > '950' is FALSE
     // lexically -- an unpadded floor excluded exactly the rows it should admit.
@@ -221,7 +221,7 @@ TEST_CASE("delta_plan: a counter ceiling keeps the source's zero padding",
     s.safety_units = 50;
 
     CHECK(CeilingFromStagedMax(s, "0000020000") == "0000019950");
-    CHECK(ComputeBounds(s, kReadStart).floor == "0000009950");
+    CHECK(ComputeBounds(s, kReadStart, /*full_reload=*/false).floor == "0000009950");
 
     // An unpadded source stays unpadded -- the rule is "preserve what the source
     // gave", not "always pad".
@@ -239,7 +239,7 @@ TEST_CASE("delta_plan: a counter floor never goes below zero", "[watermark]") {
     s.chg_col = "DOCNR";
     s.wm_value = "10";
     s.safety_units = 50;
-    CHECK(ComputeBounds(s, kReadStart).floor == "00");   // clamped, still width-preserving
+    CHECK(ComputeBounds(s, kReadStart, /*full_reload=*/false).floor == "00");   // clamped, still width-preserving
 }
 
 TEST_CASE("delta_plan: CHANGENR is refused as a generic watermark", "[watermark]") {
@@ -278,7 +278,7 @@ TEST_CASE("delta_plan: DATS and TIMS bounds are local, TIMESTAMPL bounds are UTC
     //
     // Asserted as a RELATIONSHIP rather than against fixed strings, so the test
     // means the same thing in every timezone CI might run in.
-    const auto utc_kind = ComputeBounds(Spec(WmKind::Numts, "20260101000000"), kReadStart);
+    const auto utc_kind = ComputeBounds(Spec(WmKind::Numts, "20260101000000"), kReadStart, /*full_reload=*/false);
 
     WatermarkSpec pair;
     pair.kind = WmKind::Datetime;
@@ -286,7 +286,7 @@ TEST_CASE("delta_plan: DATS and TIMS bounds are local, TIMESTAMPL bounds are UTC
     pair.time_col = "ERZET";
     pair.wm_value = "20260101000000";
     pair.safety_secs = 120;
-    const auto local_kind = ComputeBounds(pair, kReadStart);
+    const auto local_kind = ComputeBounds(pair, kReadStart, /*full_reload=*/false);
 
     const auto offset = ParseNumts(local_kind.ceiling) - ParseNumts(utc_kind.ceiling);
     // Whatever the offset is, both must agree with their own clock: the pair's
@@ -309,7 +309,7 @@ TEST_CASE("watermark: a reload of a DATE target reads today as well", "[wm]") {
     s.wm_value = "20260901";
     s.safety_secs = 0;
 
-    const auto delta = ComputeBounds(s, kReadStart);
+    const auto delta = ComputeBounds(s, kReadStart, /*full_reload=*/false);
     CHECK(delta.ceiling_bounds_read);   // unchanged: a delta still stops at today
 
     const auto reload = ComputeBounds(s, kReadStart, /*full_reload=*/true);
@@ -330,6 +330,6 @@ TEST_CASE("watermark: only DATE ever bounds the read, and a reload never does", 
     s.chg_col = "BUDAT";
     s.wm_value = "20260901";
 
-    CHECK(ComputeBounds(s, kReadStart).ceiling_bounds_read);
+    CHECK(ComputeBounds(s, kReadStart, /*full_reload=*/false).ceiling_bounds_read);
     CHECK_FALSE(ComputeBounds(s, kReadStart, /*full_reload=*/true).ceiling_bounds_read);
 }

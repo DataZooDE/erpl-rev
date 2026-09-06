@@ -76,7 +76,7 @@ struct Bounds {
 // rows dated before today, and since a reload does not move the watermark
 // nothing re-delivers the rest until tomorrow.
 Bounds ComputeBounds(const WatermarkSpec &spec, int64_t read_start_epoch,
-                     bool full_reload = false);
+                     bool full_reload);
 
 // Counter kinds: the ceiling once the staged rows are visible.
 std::string CeilingFromStagedMax(const WatermarkSpec &spec, const std::string &staged_max);

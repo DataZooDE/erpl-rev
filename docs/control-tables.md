@@ -43,9 +43,23 @@ macros are `CREATE OR REPLACE`d on every open.
 | `_erpl_rev_cli_cmd` | queued command | the CLI's queue, drained by the ABAP driver |
 | `_erpl_rev_log_<target>` | applied change | opt-in change log: `_seq`, `_op`, `_run_id`, `_commit_ts`, `_applied_at`, plus the target's own columns |
 
-`_op` is `I`, `U` or `D` on both tiers. A `D` arrives from a trigger's own
-delete event, or from a reload noticing that a key the target held is not in the
-new image -- the second has no source timestamp, so its `_commit_ts` is NULL.
+`_op` is `I`, `U` or `D`, and it is the **engine's** verdict on both tiers: `U`
+when the key was already in the target, `I` when it was not — never the source's
+own claim about what it did. That matters to a subscriber, which would otherwise
+conflict on an insert for a key it already holds when a seeded target replays an
+old trigger row.
+
+A `D` arrives from a trigger's delete event, from the mirror race (a changed key
+the re-read could not find, so it is removed), or from a reload noticing that a
+key the target held is not in the new image. Only the first has a source
+timestamp; the others carry `_commit_ts` NULL, because a deletion inferred by
+comparing two images has no moment at the source.
+
+A **reload** emits `I` and `D` only. It replaces the target, so every surviving
+row is an insert and the keys that did not come back are deletes; `rows_upd` on
+such a run is 0 for the same reason.
+
+`_run_id` joins to `_erpl_rev_run_stats` on both tiers.
 
 `_commit_ts` is when the **source** says the row changed; `_applied_at` is when
 erpl-rev wrote it. Two columns, not one: the difference between them is the

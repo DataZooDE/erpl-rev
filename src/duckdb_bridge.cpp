@@ -1064,6 +1064,14 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
     std::vector<std::string> dcols, dtypes;
     for (duckdb::idx_t c = 0; c < tcols->ColumnCount(); c++) {
         std::string n = LowerName(tcols->names[c]);
+        // __erpl_* is this engine's own namespace: the keys-mode projection
+        // carries the trigger's op and timestamp through as __erpl_op/__erpl_ts,
+        // and a source column of that name would make the projection ambiguous
+        // or feed the log the wrong value. Refuse rather than mis-replicate.
+        if (n.rfind("__erpl_", 0) == 0)
+            throw std::runtime_error(
+                "CDC: " + target + " has a column named '" + n +
+                "'; __erpl_ is reserved for replication control columns");
         const bool present = keys_mode ? in_images(n) : in_staging(n);
         if (present) { dcols.push_back(n); dtypes.push_back(tcols->types[c].ToString()); }
     }
@@ -1169,7 +1177,23 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
     // as the apply -- a log that records changes the target never received is
     // worse than no log. _commit_ts comes from the trigger's own timestamp, so
     // the trigger tier's latency is measurable exactly like the watermark tier's.
+    // A real run id, from the same sequence the watermark tier uses. The log's
+    // _run_id was a hard-coded 0, so anything joining it to _erpl_rev_run_stats
+    // dropped every trigger-tier row -- and the two tiers write one shared log.
+    long long run_id = 0;
+    {
+        auto rq = con.Query("SELECT nextval('_erpl_rev_run_seq')");
+        if (rq->HasError() || rq->RowCount() == 0)
+            throw std::runtime_error("CDC: cannot allocate a run id: " + rq->GetError());
+        run_id = rq->GetValue(0, 0).GetValue<int64_t>();
+    }
+
     std::string log_sql, log_del_sql;
+    // Provisioned INSIDE the apply transaction, below, not here. Both tiers make
+    // the same promise: a change log appears on a target's first SUCCESSFUL
+    // cycle, so an apply that rolls back leaves no half-made log behind and the
+    // readers' "no table yet" handling means one thing rather than two.
+    bool provision_log = false;
     {
         auto le = con.Query("SELECT count(*) FROM _erpl_rev_delta_state "
                             "WHERE target=" + SqlLit(target) +
@@ -1188,7 +1212,7 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
             // a log for a trigger target, so a log-enabled CDC target had no log
             // forever and every subscription on it published an empty stream and
             // reported success. One provisioner, shared with the watermark tier.
-            cycle::EnsureChangeLog(con, target, dcols);
+            provision_log = true;
             {
                 std::string cl, sl;
                 for (size_t i = 0; i < dcols.size(); ++i) {
@@ -1208,7 +1232,10 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
                     // was then swallowed as "best-effort", so a log-enabled
                     // trigger target wrote nothing and reported success.
                     const std::string op_src = keys_mode ? "c.__erpl_op" : "c.\"_op\"";
-                    const bool have_ts = keys_mode ? in_staging("_ts") : in_staging("_ts");
+                    // The shadow batch carries the trigger's timestamp in both
+                    // modes -- in keys mode it rides through upsert_src as
+                    // __erpl_ts, gated on this same predicate.
+                    const bool have_ts = in_staging("_ts");
                     const std::string ts_src =
                         !have_ts ? std::string("NULL")
                                  : (keys_mode ? std::string("c.__erpl_ts")
@@ -1227,9 +1254,23 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
                         have_ts ? "(try_strptime(CAST(" + ts_src +
                                       " AS VARCHAR), '%Y%m%d%H%M%S') AT TIME ZONE 'UTC')"
                                 : "NULL";
+                    // The ENGINE's verdict, not the source's claim -- the same
+                    // rule the watermark tier follows, so one subscriber reads
+                    // both tiers the same way. The trigger says 'I' or 'U'
+                    // about what happened at the source; what matters to a sink
+                    // is whether the key was already in the target. A seeded
+                    // target replaying an old 'I' for a key it already holds
+                    // would otherwise make a subscriber conflict on insert.
+                    //
+                    // op_src is still consulted for nothing here, but the
+                    // presence test is exactly the one res.ins/res.upd use.
+                    (void)op_src;
+                    const std::string tgt_has =
+                        "EXISTS (SELECT 1 FROM " + target + " t WHERE " + key_join("t", "c") + ")";
                     log_sql = "INSERT INTO " + logtab + " (" + cl +
                               ", _seq, _op, _run_id, _commit_ts, _applied_at) SELECT " + sl +
-                              ", nextval('" + logtab + "_seq'), upper(" + op_src + "), 0, " +
+                              ", nextval('" + logtab + "_seq'), CASE WHEN " + tgt_has +
+                              " THEN 'U' ELSE 'I' END, " + std::to_string(run_id) + ", " +
                               commit_ts + ", now() FROM " + src + " c";
 
                     // The deletes, which this never recorded at all: the append
@@ -1270,7 +1311,8 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
                                vanished + ")");
                     log_del_sql = "INSERT INTO " + logtab + " (" + kcl +
                                   ", _seq, _op, _run_id, _commit_ts, _applied_at) SELECT " + ksl +
-                                  ", nextval('" + logtab + "_seq'), 'D', 0, " + dts +
+                                  ", nextval('" + logtab + "_seq'), 'D', " +
+                                  std::to_string(run_id) + ", " + dts +
                                   ", now() FROM " + del_src + " c WHERE EXISTS (SELECT 1 FROM " +
                                   target + " t WHERE " + key_join("t", "c") + ")";
                 }
@@ -1293,6 +1335,10 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
                 throw std::runtime_error("CDC: change-log append failed: " + lr->GetError());
         };
 
+        // Provision, then append -- both inside the transaction, so a rolled-back
+        // apply leaves no log table for a cycle that never happened.
+        if (provision_log) cycle::EnsureChangeLog(con, target, dcols);
+
         // The delete records go FIRST, before anything leaves the target. They
         // are qualified by the row still being there -- so running them after
         // the deletes, which is where they used to sit, logged nothing at all.
@@ -1310,6 +1356,13 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
             Exec(con, "DELETE FROM " + target + " t WHERE EXISTS (SELECT 1 FROM " + vanished +
                       " c WHERE " + key_join("t", "c") + ")");
         }
+        // The cycle, in the same statistics table the watermark tier writes, so
+        // one view answers "what has this target been doing" for both tiers.
+        Exec(con, "INSERT INTO _erpl_rev_run_stats (run_id, target, source, run_type, method, "
+                  "status, rows_ins, rows_upd, rows_del) VALUES (" + std::to_string(run_id) +
+                  "," + SqlLit(target) + "," + SqlLit(target) + ",'CDC','CDC','SUCCESS'," +
+                  std::to_string(res.ins) + "," + std::to_string(res.upd) + "," +
+                  std::to_string(res.del) + ")");
         Exec(con, "UPDATE _erpl_rev_cdc SET position=" + std::to_string(max_seq) +
                   ", last_run_ts=now(), status='ACTIVE' WHERE target=" + SqlLit(target));
         Exec(con, "DROP TABLE " + staging);

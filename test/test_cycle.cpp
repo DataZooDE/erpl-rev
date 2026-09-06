@@ -834,9 +834,17 @@ TEST_CASE("cycle: a reload that staged nothing refuses rather than emptying the 
     CHECK_THROWS_WITH(cycle::Commit(con, "zdelta_wm", b.run_id, {0}),
                       Catch::Matchers::ContainsSubstring("staged no rows"));
     CHECK(Scalar(con, "SELECT count(*) FROM zdelta_wm") == "2");
-    // Refused, not silently skipped: the run says so and the target is free.
+    // Refused, not silently skipped, and the reason is recorded rather than
+    // just the generic failure the catch would write for any error.
     CHECK(Scalar(con, "SELECT status FROM _erpl_rev_run_stats WHERE run_id=" +
                           std::to_string(b.run_id)) == "ERROR");
+    CHECK(Scalar(con, "SELECT error_text FROM _erpl_rev_run_stats WHERE run_id=" +
+                          std::to_string(b.run_id)) ==
+          "reload staged no rows against a non-empty target");
+    // The target is released and parked, like any other failed cycle -- NOT
+    // left free. An earlier comment here claimed otherwise.
+    CHECK(Scalar(con, "SELECT status FROM _erpl_rev_delta_state") == "ERROR");
+    CHECK(Scalar(con, "SELECT active_run_id FROM _erpl_rev_delta_state").empty());
 }
 
 TEST_CASE("cycle: a reload of a source that really is empty is one flag away", "[cycle]") {
@@ -955,8 +963,12 @@ TEST_CASE("cycle: a reload reports the rows it removed, not a count difference",
     const auto r = cycle::Commit(con, "zdelta_wm", b.run_id, {2});
 
     CHECK(r.del == 1);   // was 0: 2 staged, 2 had, difference zero
-    CHECK(r.ins == 1);
-    CHECK(r.upd == 1);
+    // A reload replaces, so its counts are insert-shaped: the target was emptied
+    // and both staged rows went in. Reporting one insert and one update
+    // described an upsert that did not happen, and disagreed with a change log
+    // that cannot contain a 'U' on a reload.
+    CHECK(r.ins == 2);
+    CHECK(r.upd == 0);
     CHECK(Scalar(con, "SELECT count(*) FROM zdelta_wm WHERE id=1") == "0");
 }
 
@@ -1121,4 +1133,60 @@ TEST_CASE("cycle: the change log's sequence is ensured even when the table exist
     cycle::EnsureChangeLog(con, "zdelta_wm", {"id", "v", "changed_at"});
 
     CHECK(Scalar(con, "SELECT nextval('" + log + "_seq') > 0") == "true");
+}
+
+TEST_CASE("cycle: a manual repair does not consume a scheduled seed", "[cycle]") {
+    // The spend fired on "this run truncated", not on "this run's load type came
+    // from the default". An operator running `sync run --load-type F` by hand
+    // against a target whose default is a pending 'L' therefore consumed the
+    // seed -- and F and L are not interchangeable: L advances the watermark, F
+    // deliberately does not. The scheduled initial load silently became a
+    // repair, and the target never got seeded.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con);
+    Exec(con, "UPDATE _erpl_rev_delta_state SET load_type_default='L'");
+
+    // A hand-driven F: the caller asked for it, the default did not.
+    const auto b = cycle::Begin(con, "zdelta_wm", LoadType::Full, kReadStart);
+    StageRows(con, b.stage_table);
+    cycle::Commit(con, "zdelta_wm", b.run_id, {2});
+
+    CHECK(Scalar(con, "SELECT load_type_default FROM _erpl_rev_delta_state") == "L");
+}
+
+TEST_CASE("cycle: a scheduled seed is consumed by the run it scheduled", "[cycle]") {
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con);
+    Exec(con, "UPDATE _erpl_rev_delta_state SET load_type_default='L'");
+
+    // What the daemon does: it runs the target's own default.
+    const auto b = cycle::Begin(con, "zdelta_wm", LoadType::InitAndFull, kReadStart);
+    StageRows(con, b.stage_table);
+    cycle::Commit(con, "zdelta_wm", b.run_id, {2});
+
+    CHECK(Scalar(con, "SELECT load_type_default FROM _erpl_rev_delta_state") == "D");
+}
+
+TEST_CASE("cycle: a load type the method cannot honour is refused before anything is claimed",
+          "[cycle]") {
+    // An input error, not a target failure. It used to be caught in ABAP, after
+    // the lease was taken, and released as 'ERROR' -- which increments
+    // fail_count, engages the planner's backoff and eventually parks a target
+    // that is working perfectly. The same reasoning already says a run that
+    // loses a race must not count against its target.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con);
+    Exec(con, "UPDATE _erpl_rev_delta_state SET method='SNAPSHOT'");
+
+    CHECK_THROWS_WITH(cycle::Begin(con, "zdelta_wm", LoadType::Full, kReadStart),
+                      Catch::Matchers::ContainsSubstring("not implemented for method SNAPSHOT"));
+
+    // Nothing claimed, nothing recorded, nothing counted against the target.
+    CHECK(Scalar(con, "SELECT active_run_id FROM _erpl_rev_delta_state").empty());
+    CHECK(Scalar(con, "SELECT status FROM _erpl_rev_delta_state") == "IDLE");
+    CHECK(Scalar(con, "SELECT fail_count FROM _erpl_rev_delta_state") == "0");
+    CHECK(Scalar(con, "SELECT count(*) FROM _erpl_rev_run_stats") == "0");
 }

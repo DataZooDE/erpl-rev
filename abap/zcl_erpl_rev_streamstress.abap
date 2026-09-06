@@ -31,10 +31,16 @@ CLASS zcl_erpl_rev_streamstress DEFINITION PUBLIC FINAL CREATE PUBLIC.
                                iv_units TYPE i DEFAULT 0.
     METHODS report IMPORTING iv_target TYPE string iv_label TYPE string iv_sap TYPE int8.
     METHODS load_oracles.
-    METHODS wait_for_job IMPORTING iv_name TYPE tbtcjob-jobname iv_count TYPE tbtcjob-jobcount
+    METHODS job_status IMPORTING iv_name TYPE tbtcjob-jobname iv_count TYPE tbtcjob-jobcount
                          RETURNING VALUE(rv_status) TYPE btcstatus.
     METHODS cycle IMPORTING iv_target TYPE string.
+    " Two different renderings of "the key", on purpose, and they are not
+    " interchangeable: key_expr builds the AUDIT's key format
+    " (BUKRS/BELNR/GJAHR/BUZEI, no client) to match a keyval; key_cols lists the
+    " TABLE's key columns. The latency query grouped by the first and so
+    " collapsed distinct changes that differ only by client.
     METHODS key_expr IMPORTING iv_alias TYPE string RETURNING VALUE(rv) TYPE string.
+    METHODS key_cols RETURNING VALUE(rv) TYPE string.
     METHODS same_key IMPORTING iv_a TYPE string iv_b TYPE string RETURNING VALUE(rv) TYPE string.
     METHODS out_line IMPORTING iv_text TYPE string.
 ENDCLASS.
@@ -117,7 +123,7 @@ CLASS zcl_erpl_rev_streamstress IMPLEMENTATION.
       cycle( 'str_dt' ).
       cycle( 'str_int' ).
       lv_cycles = lv_cycles + 1.
-      lv_status = wait_for_job( iv_name = lv_jn iv_count = lv_jc ).
+      lv_status = job_status( iv_name = lv_jn iv_count = lv_jc ).
       IF lv_status = 'F' OR lv_status = 'A'. EXIT. ENDIF.
       WAIT UP TO 2 SECONDS.
     ENDDO.
@@ -280,7 +286,7 @@ CLASS zcl_erpl_rev_streamstress IMPLEMENTATION.
       |round(max(lat),2) AS worst FROM (| &&
       |SELECT epoch(min(_applied_at))-epoch(_commit_ts) AS lat | &&
       |FROM _erpl_rev_log_{ iv_target } WHERE _commit_ts IS NOT NULL | &&
-      |GROUP BY { key_expr( '' ) }, _commit_ts)| ).
+      |GROUP BY { key_cols( ) }, _commit_ts)| ).
     out_line( |{ iv_label } latency { lv_stats }| ).
 
     DATA(lv_ops) = scalar(
@@ -307,10 +313,10 @@ CLASS zcl_erpl_rev_streamstress IMPLEMENTATION.
     ENDIF.
   ENDMETHOD.
 
-  METHOD wait_for_job.
-    " The job's own status, from the job table. SUBMIT ... strtimmed asks for an
-    " immediate start and promises nothing, and nothing here ever looked at the
-    " job again.
+  METHOD job_status.
+    " The job's own status, from the job table -- a single SELECT, not a wait:
+    " the caller loops. SUBMIT ... strtimmed asks for an immediate start and
+    " promises nothing, and nothing here ever looked at the job again.
     SELECT SINGLE status FROM tbtco
       WHERE jobname = @iv_name AND jobcount = @iv_count
       INTO @rv_status.
@@ -346,6 +352,10 @@ CLASS zcl_erpl_rev_streamstress IMPLEMENTATION.
     DATA(lp) = COND string( WHEN iv_alias IS INITIAL THEN `` ELSE |{ iv_alias }.| ).
     rv = |{ lp }bukrs| && lc && |{ lp }belnr| && lc &&
          |{ lp }gjahr| && lc && |{ lp }buzei|.
+  ENDMETHOD.
+
+  METHOD key_cols.
+    rv = `client, bukrs, belnr, gjahr, buzei`.
   ENDMETHOD.
 
   METHOD same_key.
