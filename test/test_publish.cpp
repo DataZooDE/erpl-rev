@@ -13,11 +13,11 @@
 #include <catch2/catch_test_macros.hpp>
 #include <duckdb.hpp>
 
-#include <cstdlib>
 
 #include "control_schema.hpp"
 #include "cycle.hpp"
 #include "publish.hpp"
+#include "temp_path.hpp"
 
 using namespace erpl_rev;
 
@@ -161,8 +161,8 @@ TEST_CASE("subscription: a parquet sink that cannot be written leaves the offset
     // And it is recoverable: pointed somewhere writable, the same subscription
     // delivers the rows it never lost.
     Exec(con, "UPDATE _erpl_rev_subscription SET sink_spec='PARQUET:" +
-                  std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
-                  "/erpl_rev_pubfail.parquet:FULL' WHERE name='brokenfile'");
+                  erpl_rev_test::TmpPath("erpl_rev_pubfail.parquet") +
+                  ":FULL' WHERE name='brokenfile'");
     const auto r = Advance(con, "brokenfile");
     CHECK(r.published == 5);
 }

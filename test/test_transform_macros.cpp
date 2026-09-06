@@ -11,10 +11,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include <unistd.h>
 #include <cstdio>
+#include <string>
 
 #include "duckdb_bridge.hpp"
+#include "temp_path.hpp"
 
 using namespace erpl_rev;
 
@@ -67,9 +68,7 @@ TEST_CASE("macros: currency amounts are corrected by TCURX", "[macros][currency]
     // wrong by a factor of 100, silently, on real money.
     // TCURX has to exist when the macros are bound, which is at boot. That is
     // the real sequence too: replicate TCURX, then restart the server.
-    const std::string path = "/tmp/erpl_rev_curr_" + std::to_string(::getpid()) + ".duckdb";
-    std::remove(path.c_str());
-    std::remove((path + ".wal").c_str());
+    const std::string path = erpl_rev_test::TmpDbPath("curr");
     {
         DuckDbBridge seed(path);
         seed.Execute("CREATE TABLE tcurx(currkey VARCHAR, currdec INTEGER)");
@@ -111,8 +110,7 @@ TEST_CASE("macros: they are recreated on every open, so a fix reaches old files"
           "[macros]") {
     // The reason they are not migrations. Simulate a file carrying an older,
     // wrong definition and confirm reopening replaces it.
-    const std::string path = "/tmp/erpl_rev_macro_" + std::to_string(::getpid()) + ".duckdb";
-    std::remove(path.c_str());
+    const std::string path = erpl_rev_test::TmpDbPath("macro");
     {
         DuckDbBridge db(path);
         db.Execute("CREATE OR REPLACE MACRO erpl_rev_xfeld(v) AS 'definitely wrong'");

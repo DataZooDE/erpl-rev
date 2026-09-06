@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "control_schema.hpp"
+#include "temp_path.hpp"
 
 using namespace erpl_rev;
 
@@ -29,7 +30,7 @@ namespace {
 // path; each test gets its own copy, because migrating mutates it.
 std::string UnpackV1Fixture(const std::string &tag) {
     const std::string src = std::string(ERPL_REV_TEST_FIXTURE_DIR) + "/control_schema_v1.duckdb.gz";
-    const std::string dst = "/tmp/erpl_rev_v1_" + tag + "_" + std::to_string(::getpid()) + ".duckdb";
+    const std::string dst = erpl_rev_test::TmpDbPath("v1_" + tag);
     std::remove(dst.c_str());
     std::remove((dst + ".wal").c_str());
 
