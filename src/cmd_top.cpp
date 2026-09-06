@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <mutex>
 #include <thread>
 #include <string>
 #include <vector>
@@ -57,6 +58,15 @@ int RunTop(Options o) {
         return 1;
     }
 
+    // The snapshot is written by the refresh thread and read by the renderer on
+    // FTXUI's thread. Unguarded, the renderer iterates a vector that the ticker
+    // is reallocating underneath it -- a crash in a monitor, which is the one
+    // tool an operator reaches for when things are already going wrong.
+    //
+    // A whole-snapshot swap under one lock rather than finer locking: the
+    // display must never show half of one poll and half of the next, and there
+    // is nothing here worth contending over.
+    std::mutex snap_mx;
     tui::Snapshot snap;
     int selected = 0;
     std::string action_note;
@@ -70,13 +80,19 @@ int RunTop(Options o) {
     // Re-opened per refresh rather than held: the monitor is expected to survive
     // the server restarting under it, and a held handle would not.
     auto refresh = [&] {
+        // Loaded OUTSIDE the lock: the read talks to the server and can block
+        // for as long as the network takes, and holding the lock across it
+        // would freeze the display exactly when the server is slow.
+        tui::Snapshot fresh;
         try {
             auto db = dbc::Db::Open(ep);
-            snap = tui::Load([&](const std::string &sql) { return db.Query(sql); });
+            fresh = tui::Load([&](const std::string &sql) { return db.Query(sql); });
         } catch (const std::exception &e) {
-            snap = tui::Snapshot{};
-            snap.error = e.what();
+            fresh = tui::Snapshot{};
+            fresh.error = e.what();
         }
+        std::lock_guard<std::mutex> g(snap_mx);
+        snap = std::move(fresh);
         if (selected >= static_cast<int>(snap.rows.size()))
             selected = snap.rows.empty() ? 0 : static_cast<int>(snap.rows.size()) - 1;
     };
@@ -85,6 +101,7 @@ int RunTop(Options o) {
     auto screen = ScreenInteractive::Fullscreen();
 
     auto render = [&] {
+        std::lock_guard<std::mutex> g(snap_mx);
         const auto &s = snap.summary;
         // The header answers "is anything wrong" before the eye reaches the
         // table. The daemon is here because "nothing is replicating" is usually
@@ -149,8 +166,12 @@ int RunTop(Options o) {
     // monitor that reached into the database directly would be a second way to
     // change replication state, and the two would drift.
     auto act = [&](const char *verb) {
-        if (snap.rows.empty()) return;
-        const auto target = snap.rows[selected].target;
+        std::string target;
+        {
+            std::lock_guard<std::mutex> g(snap_mx);
+            if (snap.rows.empty()) return;
+            target = snap.rows[selected].target;
+        }
         Options a = o;
         a.non_interactive = true;   // a monitor must never stop to ask
         a.assume_yes = true;
@@ -159,14 +180,24 @@ int RunTop(Options o) {
         // The REAL outcome. Saying "queued" regardless would be a key that
         // reports success for work that never happened, which is the whole
         // failure mode this session has been chasing out of the product.
-        action_note = rc == 0 || rc == 3
-                          ? std::string(verb) + " " + target + ": accepted"
-                          : std::string(verb) + " " + target + ": FAILED (rc " +
-                                std::to_string(rc) + ")";
+        {
+            std::lock_guard<std::mutex> g(snap_mx);
+            // rc 3 is "queued, outcome not yet known" -- reported as queued
+            // rather than as done, because a monitor that says "accepted" for
+            // something still sitting in a queue is telling the operator the
+            // work happened.
+            action_note = rc == 0   ? std::string(verb) + " " + target + ": done"
+                        : rc == 3   ? std::string(verb) + " " + target + ": queued"
+                                    : std::string(verb) + " " + target + ": FAILED (rc " +
+                                          std::to_string(rc) + ")";
+        }
         refresh();
     };
 
     if (once) {
+        // No lock here: the ticker has not started, this thread is the only one
+        // touching the snapshot, and render() takes the lock itself -- taking it
+        // here too would deadlock on a non-recursive mutex.
         // Rendered through the same element tree, so what a script sees is what
         // an operator sees -- a second formatter would drift from the first.
         auto doc = render();

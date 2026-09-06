@@ -142,6 +142,17 @@ void Serve(DuckDbBridge *db) {
             if (!g_run.load()) break;
             continue;
         }
+        // A receive timeout, because this loop serves one client at a time: a
+        // half-open connection that never sends a request would otherwise hold
+        // the endpoint shut for every scraper behind it. Two seconds is far
+        // longer than a local scrape and far shorter than a scrape interval.
+#ifdef _WIN32
+        DWORD tv = 2000;
+#else
+        timeval tv{2, 0};
+#endif
+        ::setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char *>(&tv), sizeof(tv));
+
         char buf[1024] = {0};
         const auto n = ::recv(c, buf, sizeof(buf) - 1, 0);
         std::string body, status = "200 OK", ctype = "text/plain; version=0.0.4";
@@ -207,8 +218,21 @@ bool Start(DuckDbBridge &db, int port, std::string &error) {
 
 void Stop() {
     if (!g_run.exchange(false)) return;
-    if (g_sock != ERPL_BADSOCK) { ERPL_CLOSESOCK(g_sock); g_sock = ERPL_BADSOCK; }
+    if (g_sock != ERPL_BADSOCK) {
+        // shutdown() BEFORE close(). Closing a descriptor another thread is
+        // blocked in accept() on is a race: the number can be reused by any
+        // thread that opens something in the window, and the accept then
+        // returns a connection on an unrelated socket. shutdown wakes the
+        // accept without freeing the descriptor, and only then is it closed --
+        // after the thread that was using it has been joined.
+#ifdef _WIN32
+        ::shutdown(g_sock, SD_BOTH);
+#else
+        ::shutdown(g_sock, SHUT_RDWR);
+#endif
+    }
     if (g_thread.joinable()) g_thread.join();
+    if (g_sock != ERPL_BADSOCK) { ERPL_CLOSESOCK(g_sock); g_sock = ERPL_BADSOCK; }
 }
 
 }  // namespace server
