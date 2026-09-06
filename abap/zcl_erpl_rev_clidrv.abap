@@ -193,6 +193,69 @@ CLASS zcl_erpl_rev_clidrv IMPLEMENTATION.
           ev_result = 'nothing due'.
         ENDIF.
 
+      WHEN 'daemon_status'.
+        " The singleton row, as the operator sees it. A plain read, so it goes
+        " through Z_DUCKDB_QUERY rather than a plan action.
+        DATA(ls_dst) = zcl_erpl_rev_util=>query(
+          |SELECT instance_id, status, ticks, tick_secs, max_workers, stop, | &&
+          |epoch(now()) - epoch(heartbeat_ts) AS heartbeat_age_s | &&
+          |FROM _erpl_rev_daemon WHERE id=1| ).
+        ev_error  = ls_dst-error.
+        ev_result = ls_dst-rows.
+
+      WHEN 'daemon_stop'.
+        " Sets the flag the daemon reads at the top of every tick. It used to be
+        " reachable only by hand-written SQL.
+        DATA(ls_dsp) = zcl_erpl_rev_util=>query(
+          |UPDATE _erpl_rev_daemon SET stop=true WHERE id=1| ).
+        ev_error  = ls_dsp-error.
+        IF ev_error IS INITIAL.
+          ev_result = |stop requested; the daemon ends at its next tick|.
+        ENDIF.
+
+      WHEN 'daemon_start'.
+        " Optional tuning first, then the job. Both are idempotent: starting a
+        " running daemon is refused by the singleton, not here.
+        DATA(lv_tick) = jint( iv_json = iv_params iv_key = 'tick_secs' ).
+        DATA(lv_wrk)  = jint( iv_json = iv_params iv_key = 'max_workers' ).
+        IF lv_tick > 0.
+          zcl_erpl_rev_util=>query(
+            |UPDATE _erpl_rev_daemon SET tick_secs={ lv_tick } WHERE id=1| ).
+        ENDIF.
+        IF lv_wrk > 0.
+          zcl_erpl_rev_util=>query(
+            |UPDATE _erpl_rev_daemon SET max_workers={ lv_wrk } WHERE id=1| ).
+        ENDIF.
+        DATA lv_djn TYPE tbtcjob-jobname VALUE 'ERPL_REV_DAEMON'.
+        DATA lv_djc TYPE tbtcjob-jobcount.
+        CALL FUNCTION 'JOB_OPEN' EXPORTING jobname = lv_djn
+          IMPORTING jobcount = lv_djc EXCEPTIONS OTHERS = 1.
+        IF sy-subrc <> 0.
+          ev_error = |JOB_OPEN failed subrc { sy-subrc }|.
+        ELSE.
+          DATA(lv_ts) = COND i( WHEN lv_tick > 0 THEN lv_tick ELSE 2 ).
+          SUBMIT z_erpl_rev_daemon WITH p_secs = lv_ts WITH p_dur = 0
+            VIA JOB lv_djn NUMBER lv_djc AND RETURN.
+          CALL FUNCTION 'JOB_CLOSE' EXPORTING jobcount = lv_djc jobname = lv_djn
+                                              strtimmed = abap_true EXCEPTIONS OTHERS = 1.
+          IF sy-subrc <> 0.
+            ev_error = |JOB_CLOSE failed subrc { sy-subrc }|.
+          ELSE.
+            ev_result = |daemon submitted as { lv_djn }/{ lv_djc }|.
+          ENDIF.
+        ENDIF.
+
+      WHEN 'subs' OR 'retain'.
+        " Both are server-side PLAN actions: the publish and the offset advance
+        " are one transaction, and it happens on the server. The queue carries
+        " the request, not the work.
+        DATA(ls_pl) = zcl_erpl_rev_delta=>plan_json(
+          iv_action = COND string( WHEN iv_verb = 'subs' THEN 'SUBS' ELSE 'RETAIN' )
+          iv_target = jstr( iv_json = iv_params iv_key = 'target' )
+          iv_params = iv_params ).
+        ev_error  = ls_pl-error.
+        ev_result = ls_pl-json.
+
       WHEN 'schedule'.
         ev_result = zcl_erpl_rev_delta=>schedule(
           iv_minutes = COND i( WHEN jint( iv_json = iv_params iv_key = 'minutes' ) > 0

@@ -436,6 +436,43 @@ LEFT="$(adt search 'ZCL_ERPL_REV_CLI_*' 2>/dev/null | grep -c 'ZCL_ERPL_REV_CLI_
 [ "$LEFT" -eq 0 ] || fail "$LEFT temporary CLI class(es) leaked into SAP"
 echo "   no temporary classes left behind"
 
+# 8. The operator verbs.
+#
+# The engine behind these was unit-tested from the day it was written and could
+# not be invoked: no CLI verb reached publish::Advance, publish::Retain or the
+# daemon's control row, so subscriptions, retention and "is the daemon alive"
+# were reachable only by hand-written SQL. The flag tables existed and were
+# consulted by nothing. This is the lane that makes each verb a reachable path
+# rather than a tested function.
+echo "== operator verbs =="
+
+# daemon status: reads the singleton row through the driver.
+DST="$(cli daemon status --yes 2>&1)"
+grep -qE '"status"|instance_id|STOPPED|RUNNING' <<<"$DST"   || fail "daemon status returned nothing usable: $DST"
+
+# daemon stop is what an operator presses; it must reach the flag the daemon
+# reads at the top of every tick.
+DSP="$(cli daemon stop --yes 2>&1)" || fail "daemon stop failed: $DSP"
+STOPPED="$(cli sql "SELECT CASE WHEN stop THEN 'FLAG_SET' ELSE 'NOT_SET' END AS v                     FROM _erpl_rev_daemon WHERE id=1" 2>&1)"
+grep -q FLAG_SET <<<"$STOPPED" || fail "daemon stop did not set the flag: $STOPPED"
+cli sql "UPDATE _erpl_rev_daemon SET stop=false WHERE id=1" >/dev/null 2>&1
+
+# A subscription over a target that has a change log, end to end: create,
+# advance, and the sink actually receives the rows.
+cli sql "DROP TABLE IF EXISTS ops_sink" >/dev/null 2>&1
+cli sql "CREATE TABLE ops_sink AS SELECT * FROM t000_cli LIMIT 0" >/dev/null 2>&1
+SC="$(cli sub create ops_s1 --target t000_cli --sink "TABLE:ops_sink:APPEND" --yes 2>&1)" || fail "sub create failed: $SC"
+SUBS="$(cli sub ls --yes 2>&1)"
+grep -q ops_s1 <<<"$SUBS" || fail "sub ls does not list the subscription: $SUBS"
+SA="$(cli sub advance ops_s1 --yes 2>&1)" || fail "sub advance failed: $SA"
+OFF="$(cli sql "SELECT CASE WHEN \"offset\" >= 0 THEN 'ADVANCED' ELSE 'NO' END AS v                 FROM _erpl_rev_subscription WHERE name='ops_s1'" 2>&1)"
+grep -q ADVANCED <<<"$OFF" || fail "the subscription offset was not advanced: $OFF"
+
+# retain prunes the change log; with no window everything behind the slowest
+# subscriber goes.
+RT="$(cli retain --target t000_cli --window-days 0 --yes 2>&1)" || fail "retain failed: $RT"
+echo "   daemon status/stop, sub create/ls/advance, retain -- all through the queue"
+
 srv_kill; sleep 1
 on_server rm -f "$E2E_DB" "$E2E_DB".wal /tmp/erpl_taxi.parquet
 # ldd and the SDK path are this box's; a remote binary is a different platform's

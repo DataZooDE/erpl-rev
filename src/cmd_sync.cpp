@@ -83,6 +83,9 @@ std::string UnknownFlag(const std::vector<std::string> &args, const std::string 
                                       { known = kSyncRun;      count = std::size(kSyncRun); }
     else if (sub == "sync set-wm")    { known = kSyncSetWm;    count = std::size(kSyncSetWm); }
     else if (sub == "sync preview")   { known = kSyncPreview;  count = std::size(kSyncPreview); }
+    else if (sub.rfind("daemon", 0) == 0) { known = kDaemon; count = std::size(kDaemon); }
+    else if (sub.rfind("sub", 0) == 0)    { known = kSub;    count = std::size(kSub); }
+    else if (sub == "retain")             { known = kRetain; count = std::size(kRetain); }
     else if (sub.rfind("daemon", 0) == 0)  { known = kDaemon;  count = std::size(kDaemon); }
     else if (sub.rfind("sub", 0) == 0)     { known = kSub;     count = std::size(kSub); }
     else if (sub.rfind("mass", 0) == 0)    { known = kMass;    count = std::size(kMass); }
@@ -155,19 +158,18 @@ bool CommandResult(Options &o, long long id, std::string &status,
             "SELECT status, coalesce(result,'') AS result, coalesce(error,'') AS error "
             "FROM _erpl_rev_cli_cmd WHERE cmd_id = " + std::to_string(id));
         if (r.rows.empty()) return false;
-        const std::string &row = r.rows[0];
-        auto pick = [&](const char *k) {
-            const std::string n = std::string("\"") + k + "\":";
-            const auto p = row.find(n);
-            if (p == std::string::npos) return std::string();
-            auto q = row.find('"', p + n.size());
-            if (q == std::string::npos) return std::string();
-            const auto e = row.find('"', q + 1);
-            return e == std::string::npos ? std::string() : row.substr(q + 1, e - q - 1);
-        };
-        status = pick("status");
-        result = pick("result");
-        error = pick("error");
+        // ParseRows, not a hand-rolled scan. The previous one took the first '"'
+        // after the key and the next '"' after that, so a result value
+        // containing an escaped quote was cut at the first one. Harmless while
+        // every result was a plain sentence; it truncated every operator
+        // command whose result is JSON to three characters.
+        const auto parsed = json::ParseRows("[" + r.rows[0] + "]");
+        if (parsed.empty()) return false;
+        for (const auto &c : parsed[0]) {
+            if (c.key == "status") status = c.value;
+            else if (c.key == "result") result = c.value;
+            else if (c.key == "error") error = c.value;
+        }
         return !status.empty();
     } catch (...) {
         return false;
@@ -565,6 +567,80 @@ int RunSync(Options o) {
     std::fprintf(stderr,
                  "erpl-rev sync: expected ls, show, create, rm, run, run-due or schedule.\n");
     return 2;
+}
+
+// ---------------------------------------------------------------------------
+// daemon | sub | retain -- the operator verbs
+//
+// The engine behind these has been unit-tested since it was written and could
+// not be invoked: no verb reached publish::Advance, publish::Retain or the
+// daemon's control row, so subscriptions, retention and "is the daemon alive"
+// were reachable only by hand-written SQL. The flag tables for them existed and
+// were consulted by nothing, and the tests asserting on those tables passed
+// while proving nothing about a reachable path.
+// ---------------------------------------------------------------------------
+
+int RunDaemon(Options o) {
+    const std::string sub = o.args.empty() ? "" : o.args[0];
+    if (const int rc = RefuseUnknownFlags(o, "daemon " + sub)) return rc;
+    const auto cfg = cli::ReadConfig();
+    cli::ResolveConn(o, cfg, !o.queue_only && !o.non_interactive && cli::IsTty());
+
+    if (sub == "start") {
+        const std::string tick = Field(o, "--tick"), workers = Field(o, "--workers");
+        return RunViaDriver(o, "daemon_start",
+                            BuildParams({{"tick_secs", tick}, {"max_workers", workers}}));
+    }
+    if (sub == "stop")   return RunViaDriver(o, "daemon_stop", BuildParams({}));
+    if (sub == "status") return RunViaDriver(o, "daemon_status", BuildParams({}));
+
+    std::fprintf(stderr, "erpl-rev daemon: expected start, stop or status.\n");
+    return 2;
+}
+
+int RunSub(Options o) {
+    const std::string sub = o.args.empty() ? "" : o.args[0];
+    const std::string name = o.args.size() > 1 ? o.args[1] : "";
+    if (const int rc = RefuseUnknownFlags(o, "sub " + sub)) return rc;
+    const auto cfg = cli::ReadConfig();
+    cli::ResolveConn(o, cfg, !o.queue_only && !o.non_interactive && cli::IsTty());
+
+    if (sub == "create") {
+        const std::string target = Field(o, "--target"), sink = Field(o, "--sink");
+        if (name.empty() || target.empty() || sink.empty()) {
+            std::fprintf(stderr, "erpl-rev sub create <name> --target T --sink SPEC\n"
+                                 "  SPEC is PARQUET:/path:FULL or TABLE:name:APPEND.\n");
+            return 2;
+        }
+        return RunViaDriver(o, "subs", BuildParams({{"op", "create"}, {"name", name},
+                                                    {"target", target}, {"sink", sink}}));
+    }
+    if (sub == "advance") {
+        if (name.empty()) { std::fprintf(stderr, "erpl-rev sub advance <name>\n"); return 2; }
+        return RunViaDriver(o, "subs", BuildParams({{"op", "advance"}, {"name", name}}));
+    }
+    if (sub == "ls") return RunViaDriver(o, "subs", BuildParams({{"op", "ls"}}));
+
+    std::fprintf(stderr, "erpl-rev sub: expected create, advance or ls.\n");
+    return 2;
+}
+
+int RunRetain(Options o) {
+    if (const int rc = RefuseUnknownFlags(o, "retain")) return rc;
+    const auto cfg = cli::ReadConfig();
+    cli::ResolveConn(o, cfg, !o.queue_only && !o.non_interactive && cli::IsTty());
+
+    const std::string target = Field(o, "--target");
+    if (target.empty()) {
+        std::fprintf(stderr, "erpl-rev retain --target T [--window-days N]\n");
+        return 2;
+    }
+    // Days on the command line, seconds on the wire: an operator thinks in days
+    // and the engine's window is a duration.
+    const std::string days = Field(o, "--window-days", "0");
+    const long long secs = std::atoll(days.c_str()) * 86400;
+    return RunViaDriver(o, "retain",
+                        BuildParams({{"target", target}, {"window_secs", std::to_string(secs)}}));
 }
 
 // ---------------------------------------------------------------------------

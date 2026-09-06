@@ -2,6 +2,7 @@
 #include "cycle.hpp"
 #include "drift.hpp"
 #include "load_type.hpp"
+#include "publish.hpp"
 #include "tick_planner.hpp"
 #include "rfc_metadata.hpp"
 #include "sap_uc.hpp"
@@ -688,10 +689,43 @@ extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE,
             }
         } else if (action == "TICK") {
             plan = PlanTickJson(con);
+        } else if (action == "SUBS") {
+            // Subscriptions. The publish and the offset advance are one
+            // transaction, and that transaction happens HERE -- a round trip
+            // through SAP for an operation touching no SAP data could not be
+            // atomic with it. The command queue carries the request; the work
+            // is server-side.
+            const auto op = JsonField(params, "op");
+            if (op == "create") {
+                CreateSubscription(con, JsonField(params, "name"), target,
+                                   JsonField(params, "sink"));
+                plan = "{\"created\":" + json::QuoteString(JsonField(params, "name")) + "}";
+            } else if (op == "advance") {
+                const auto r = Advance(con, JsonField(params, "name"));
+                plan = "{\"published\":" + std::to_string(r.published) + ",\"offset\":" +
+                       std::to_string(r.new_offset) + "}";
+            } else if (op == "ls") {
+                // Through the bridge, so the rows come back in the same JSON
+                // shape every other read uses rather than a second rendering.
+                QueryResult qr = g_bridge->Query(
+                    "SELECT name, target, sink_spec, \"offset\", status "
+                    "FROM _erpl_rev_subscription ORDER BY name");
+                plan = "{\"subscriptions\":" + RowsToJsonArray(qr.rows) + "}";
+            } else {
+                throw std::runtime_error("SUBS: unknown op '" + op + "'. Known: create, "
+                                         "advance, ls.");
+            }
+        } else if (action == "RETAIN") {
+            // Prune the change log to the slowest subscriber, or to the window
+            // when nothing is subscribed.
+            const auto w = JsonField(params, "window_secs");
+            const long long window = w.empty() ? 0 : std::atoll(w.c_str());
+            const long long pruned = Retain(con, target, window);
+            plan = "{\"pruned\":" + std::to_string(pruned) + "}";
         } else {
             throw std::runtime_error(
                 "unknown plan action '" + action +
-                "'. Known: BEGIN_CYCLE, CYCLE_COMMIT, TICK, CDC_APPLY, DRIFT.");
+                "'. Known: BEGIN_CYCLE, CYCLE_COMMIT, TICK, CDC_APPLY, DRIFT, SUBS, RETAIN.");
         }
 
         SetString(funcHandle, "EV_PLAN", plan);

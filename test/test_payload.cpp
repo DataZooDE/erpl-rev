@@ -17,6 +17,8 @@
 #include "payload.hpp"
 #include "sxml_binary.hpp"
 
+#include "json_util.hpp"
+
 using namespace erpl_rev;
 
 namespace {
@@ -163,4 +165,28 @@ TEST_CASE("payload: binary (BLOB) cells survive the compressed path byte-for-byt
     auto r = db.Query("SELECT count(*) FROM b_raw a JOIN b_gz b USING (k) "
                       "WHERE a.b IS NOT DISTINCT FROM b.b");
     REQUIRE(r.rows.front().find('2') != std::string::npos);
+}
+
+// --- the queue's result column -----------------------------------------------
+
+TEST_CASE("json: a row value containing quotes survives parsing", "[json]") {
+    // The CLI read finished commands out of the queue with a hand-rolled
+    // extractor that found the first '"' after the key and the next '"' after
+    // that. Any result value containing an escaped quote was therefore cut at
+    // the first one -- which never showed while results were plain sentences
+    // like "registered t000_cli", and truncated every operator command whose
+    // result is JSON to the three characters `[{\`.
+    //
+    // ParseRows was here the whole time and does it properly. Pinning that,
+    // because the fix is "use this" and the next hand-rolled parser will look
+    // just as reasonable.
+    const std::string row =
+        R"([{"status":"DONE","result":"[{\"instance_id\":\"a/b/c\",\"ticks\":7}]","error":""}])";
+    const auto rows = json::ParseRows(row);
+    REQUIRE(rows.size() == 1);
+
+    std::string result;
+    for (const auto &c : rows[0]) if (c.key == "result") result = c.value;
+
+    CHECK(result == R"([{"instance_id":"a/b/c","ticks":7}])");
 }
