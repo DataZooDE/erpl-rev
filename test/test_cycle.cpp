@@ -1190,3 +1190,47 @@ TEST_CASE("cycle: a load type the method cannot honour is refused before anythin
     CHECK(Scalar(con, "SELECT fail_count FROM _erpl_rev_delta_state") == "0");
     CHECK(Scalar(con, "SELECT count(*) FROM _erpl_rev_run_stats") == "0");
 }
+
+// --- the commit timestamp expression, on its own -----------------------------
+//
+// Every one of these four cases was wrong at some point, and each was wrong by
+// exactly a timezone offset -- an error that looks like a working number and
+// shifts every latency percentile silently. Now that the expression is a pure
+// function of the registration, they can be read side by side.
+
+TEST_CASE("cycle: a UTC change column needs no clock correction", "[cycle][ts]") {
+    // NUMTS and TIMESTAMPL come from ABAP's GET TIME STAMP, which is UTC by
+    // definition, so a measured SAP-to-server offset must NOT be added: doing
+    // so would move a correct instant.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con, /*log_enabled=*/true);
+
+    const auto b = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart);
+    StageRows(con, b.stage_table);
+    // Pretend SAP's clock is two hours off, as it measurably was on A4H.
+    Exec(con, "UPDATE _erpl_rev_run_stats SET clock_skew_secs=7200 WHERE run_id=" +
+                  std::to_string(b.run_id));
+    cycle::Commit(con, "zdelta_wm", b.run_id, {2});
+
+    // Unshifted: the staged value 20260905110500 read as UTC.
+    CHECK(Scalar(con, "SELECT _commit_ts = (try_strptime('20260905110500','%Y%m%d%H%M%S') "
+                      "AT TIME ZONE 'UTC') FROM " + cycle::ChangeLogName("zdelta_wm") +
+                      " WHERE id=3") == "true");
+}
+
+TEST_CASE("cycle: a counter watermark has no commit timestamp at all", "[cycle][ts]") {
+    // An INT kind has no clock, so latency is genuinely unmeasurable for it.
+    // NULL says that; a zero would report it as instantaneous.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con, /*log_enabled=*/true);
+    Exec(con, "UPDATE _erpl_rev_delta_state SET wm_kind='INT', wm_value='0', chg_col='id'");
+
+    const auto b = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart);
+    StageRows(con, b.stage_table);
+    cycle::Commit(con, "zdelta_wm", b.run_id, {2});
+
+    CHECK(Scalar(con, "SELECT count(*) FROM " + cycle::ChangeLogName("zdelta_wm") +
+                      " WHERE _commit_ts IS NOT NULL") == "0");
+}

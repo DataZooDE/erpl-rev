@@ -370,79 +370,77 @@ BeginResult Begin(duckdb::Connection &con, const std::string &target, LoadType l
     return out;
 }
 
-CommitResult Commit(duckdb::Connection &con, const std::string &target, long long run_id,
-                    const CommitCounts &counts) {
-    const State st = LoadState(con, target);
-    const std::string stage = StageName(target, run_id);
+namespace {
 
-    // Fencing. Checked before the transaction so the message is clean, and again
-    // inside it as part of the UPDATE's WHERE so a concurrent claim cannot slip
-    // between the two.
-    const auto active = Scalar(con, "SELECT coalesce(active_run_id,-1) FROM _erpl_rev_delta_state "
-                                    "WHERE target=" + Lit(target));
-    if (active != std::to_string(run_id)) {
-        // Record the outcome before refusing. A run that is turned away here is
-        // just as dead as one that fails mid-transaction, and leaving its row
-        // RUNNING would pin its staging table forever.
-        con.Query("UPDATE _erpl_rev_run_stats SET status='ERROR', "
-                  "error_text='target reclaimed by run " + active +
-                  "' WHERE run_id=" + std::to_string(run_id) + " AND status='RUNNING'");
-        // Not a fail_count bump: this run lost a race, the TARGET is not broken,
-        // and backing off a healthy target because another cycle beat it to it
-        // would be exactly the wrong response.
-        throw std::runtime_error(
-            "cycle: run " + std::to_string(run_id) + " no longer owns " + target +
-            " (active run is " + active + "); refusing to commit a reclaimed cycle");
-    }
+// Everything the commit needs to know about the SHAPE of this cycle's write:
+// which columns move, how a stage row is matched to a target row, and which of
+// three shapes the cycle has -- merge into an existing target, create it from
+// the stage, or neither.
+//
+// Extracted because Commit was one function doing eight jobs, and four of the
+// defects three review rounds found were ordering or staleness bugs between
+// those jobs: state read in one and used in another after the transaction had
+// changed it. Naming the pieces does not prevent that by itself. It makes the
+// order visible enough to argue about, and gives the pure part somewhere to
+// live that is not 300 lines deep in a transaction.
+//
+// Read BEFORE the transaction, and every field is a fact about that moment.
+// Nothing here may be re-read afterwards expecting it to still be true.
+struct MergeShape {
+    bool have_stage = false;
+    bool have_target = false;
+    bool will_merge = false;    // an existing target: merge the stage into it
+    bool will_create = false;   // no target yet: create it FROM the stage
+    std::vector<std::string> keys;
+    std::vector<std::string> cols;   // target columns the stage also has
+    std::string key_join;   // t.<k> IS NOT DISTINCT FROM s.<k>, AND-joined
+    std::string collist;    // <col>, ...
+    std::string sellist;    // s.<col>, ...
+    std::string tsellist;   // t.<col>, ... for the deletes a reload records
+    std::string setlist;    // <col> = s.<col>, non-key columns only
+};
 
-    CommitResult res;
-    // The try opens HERE, not at BEGIN. Real work happens before the transaction
-    // -- describing the tables, counting, computing the watermark -- and a
-    // failure in any of it used to escape uncaught, leaving the run RUNNING
-    // forever (so its stage was never swept) and never counting against the
-    // target (so backoff never engaged). Which is exactly how a broken target
-    // retried at full cadence indefinitely.
-    try {
-    const bool have_stage =
+MergeShape DeriveMergeShape(duckdb::Connection &con, const std::string &target,
+                            const std::string &stage, const std::string &keys_csv) {
+    MergeShape m;
+    m.have_stage =
         Scalar(con, "SELECT count(*) FROM duckdb_tables() WHERE table_name=" + Lit(stage)) == "1";
 
-    const auto keys = SplitCsv(st.keys);
+    m.keys = SplitCsv(keys_csv);
     // IS NOT DISTINCT FROM, not "=". Plain equality is UNKNOWN when either side
     // is NULL, so a NULL-keyed row never matches its own copy in the target: the
     // merge inserts it again and the log records another insert, once per cycle,
     // forever -- because the safety overlap keeps re-reading it. A NULL key is
     // nearly always a modelling mistake, but it must not corrupt the target.
-    std::string key_join;
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if (i) key_join += " AND ";
-        key_join += "t." + keys[i] + " IS NOT DISTINCT FROM s." + keys[i];
+    for (size_t i = 0; i < m.keys.size(); ++i) {
+        if (i) m.key_join += " AND ";
+        m.key_join += "t." + m.keys[i] + " IS NOT DISTINCT FROM s." + m.keys[i];
     }
 
     // A first-ever cycle has no target yet: the delta engine is documented as
     // self-creating, and the old direct-merge path created it as a side effect
     // of replicating into it. Staging has to do the same, or a target can only
     // ever be started by a separate full load.
-    const bool have_target =
+    //
+    // NOTE: the creation itself happens inside the commit transaction. Doing it
+    // here left user-visible rows in a table the watermark said were never
+    // replicated, if anything failed in between -- and a retry then re-applied
+    // against a target that already held them.
+    m.have_target =
         Scalar(con, "SELECT count(*) FROM duckdb_tables() WHERE table_name=" + Lit(Lower(target)))
         == "1";
-    // NOTE: the creation itself happens inside the commit transaction below.
-    // Doing it here left user-visible rows in a table the watermark said were
-    // never replicated, if anything failed in between -- and a retry then
-    // re-applied against a target that already held them.
 
-    // The columns to move: target columns the stage also has.
-    std::vector<std::string> cols;
-    if (have_stage) {
+    if (m.have_stage) {
         auto sc = con.Query("SELECT * FROM " + stage + " LIMIT 0");
         if (sc->HasError())
             throw std::runtime_error("cycle: staging describe failed: " + sc->GetError());
 
-        if (!have_target) {
+        if (!m.have_target) {
             // First cycle: the target is about to be created FROM the stage, so
             // its columns are the stage's. Describing a table that does not
             // exist yet is not an error condition, it is the normal first run.
             for (duckdb::idx_t c = 0; c < sc->ColumnCount(); ++c)
-                cols.push_back(Lower(sc->names[c]));
+                m.cols.push_back(Lower(sc->names[c]));
         } else {
             auto tc = con.Query("SELECT * FROM " + target + " LIMIT 0");
             if (tc->HasError())
@@ -453,62 +451,58 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
             for (duckdb::idx_t c = 0; c < tc->ColumnCount(); ++c) {
                 const auto n = Lower(tc->names[c]);
                 for (const auto &s : sset)
-                    if (s == n) { cols.push_back(n); break; }
+                    if (s == n) { m.cols.push_back(n); break; }
             }
         }
     }
 
-    std::string collist, sellist, setlist;
-    // The same columns read from the TARGET side, for the delete records a
-    // reload writes: those rows exist only in the target.
-    std::string tsellist;
-    for (size_t i = 0; i < cols.size(); ++i) {
-        if (i) { collist += ","; sellist += ","; }
-        collist += cols[i];
-        sellist += "s." + cols[i];
-        if (!tsellist.empty()) tsellist += ",";
-        tsellist += "t." + cols[i];
+    for (size_t i = 0; i < m.cols.size(); ++i) {
+        if (i) { m.collist += ","; m.sellist += ","; }
+        m.collist += m.cols[i];
+        m.sellist += "s." + m.cols[i];
+        if (!m.tsellist.empty()) m.tsellist += ",";
+        m.tsellist += "t." + m.cols[i];
         bool is_key = false;
-        for (const auto &k : keys) if (k == cols[i]) is_key = true;
+        for (const auto &k : m.keys) if (k == m.cols[i]) is_key = true;
         if (!is_key) {
-            if (!setlist.empty()) setlist += ",";
-            setlist += cols[i] + " = s." + cols[i];
+            if (!m.setlist.empty()) m.setlist += ",";
+            m.setlist += m.cols[i] + " = s." + m.cols[i];
         }
     }
 
     // Nothing to merge when the target was just created FROM the stage -- the
     // rows are already there, and merging would be a no-op over itself.
-    const bool will_merge = have_stage && have_target && !cols.empty() && !keys.empty();
+    m.will_merge = m.have_stage && m.have_target && !m.cols.empty() && !m.keys.empty();
 
-    // The self-creating first cycle: the target does not exist yet and is about
-    // to be created FROM the stage. No merge -- the rows are already there once
-    // the CREATE runs -- but it is still a cycle that delivered rows, and a
-    // log-enabled target must record them. It used to record nothing, and had no
-    // log table at all, so a subscription created before a target's first cycle
-    // silently began at the second batch.
-    const bool will_create = have_stage && !have_target && !cols.empty();
+    // The self-creating first cycle: no merge, but still a cycle that delivered
+    // rows, and a log-enabled target must record them. It used to record
+    // nothing, and had no log table at all, so a subscription created before a
+    // target's first cycle silently began at the second batch.
+    m.will_create = m.have_stage && !m.have_target && !m.cols.empty();
+    return m;
+}
 
-    // Counts and log rows are derived BEFORE the merge, because both depend on
-    // whether the key was already present -- which the merge is about to change.
-    // MERGE ... RETURNING merge_action would express this in one statement, but
-    // DuckDB 1.5.5 does not allow a MERGE as a subquery or in a CTE. Two
-    // statements in one transaction are just as atomic, which is the property
-    // that actually matters.
-    if (will_merge) {
-        auto cr = con.Query(
-            "SELECT (SELECT count(*) FROM " + stage + " s WHERE EXISTS (SELECT 1 FROM " + target +
-            " t WHERE " + key_join + ")) AS upd, (SELECT count(*) FROM " + stage +
-            " s WHERE NOT EXISTS (SELECT 1 FROM " + target + " t WHERE " + key_join +
-            ")) AS ins");
-        if (cr->HasError()) throw std::runtime_error("cycle: count failed: " + cr->GetError());
-        res.upd = cr->GetValue(0, 0).GetValue<int64_t>();
-        res.ins = cr->GetValue(1, 0).GetValue<int64_t>();
-    } else if (will_create) {
-        // Everything a target's first cycle brings is new, by definition.
-        res.ins = std::stoll(Scalar(con, "SELECT count(*) FROM " + stage));
-        res.upd = 0;
-    }
+}  // namespace
 
+namespace {
+
+// What this cycle stores as the new high-water mark, and the load plan it ran
+// under. Both come out of the same place because both are decided from the run's
+// recorded load type: a reload does not move the watermark, a counter kind cuts
+// it from the rows actually staged, and a clock kind uses the ceiling that
+// BEGIN_CYCLE fixed before the read.
+//
+// Pulled out of Commit so the rule "the watermark is decided once, from the
+// read's own start" is a thing with a name rather than eighty lines in the
+// middle of a transaction body.
+struct WatermarkDecision {
+    std::string new_watermark;
+    LoadPlan plan;
+    std::string load_type;   // the code this run actually ran, for the one-shot spend
+};
+
+WatermarkDecision DecideWatermark(duckdb::Connection &con, const State &st,
+                                  const std::string &stage, long long run_id, bool have_stage) {
     // The new watermark. For a clock-based kind it is the ceiling computed at
     // begin; for a counter it is cut from the rows actually staged, which is
     // knowable only now.
@@ -585,6 +579,149 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
             }
         }
     }
+    WatermarkDecision d;
+    d.new_watermark = new_wm;
+    d.plan = load_plan;
+    d.load_type = run_load_type;
+    return d;
+}
+
+}  // namespace
+
+namespace {
+
+// The SQL expression for _commit_ts: when the SOURCE says the row changed,
+// parsed out of the change column, in a form comparable with now().
+//
+// Pure -- it renders text from the registration and the measured clock offset,
+// and touches no database -- so the four timezone cases can be read side by
+// side and tested without a cycle. That matters more here than anywhere else in
+// this file: every one of them was wrong at some point, and each was wrong by
+// exactly an offset, which is the kind of error that looks like a working
+// number.
+std::string CommitTsExpr(const State &st, long long skew) {
+    // The measured SAP-to-server offset, applied to the wall-clock kinds only.
+    // A DATS/TIMS value is local time in SAP's zone, which the server cannot
+    // know and must not guess; the UTC kinds need no correction.
+    const std::string skew_add =
+        skew == 0 ? "" : " + INTERVAL '" + std::to_string(skew) + "' SECOND";
+    const auto col = Lower(st.chg_col);
+    std::string commit_ts = "NULL";
+    if (!st.chg_col.empty() &&
+        (st.wm_kind == "NUMTS" || st.wm_kind == "TIMESTAMPL" || st.wm_kind.empty())) {
+        commit_ts = "(try_strptime(substr(CAST(s." + col + " AS VARCHAR), 1, 14), "
+                    "'%Y%m%d%H%M%S') AT TIME ZONE 'UTC')";
+    } else if (!st.chg_col.empty() && st.wm_kind == "DATETIME" && !st.time_col.empty()) {
+        // The pair, composed back into one value. Reading only the date
+        // half would parse to midnight and report every change as up to
+        // a day stale.
+        //
+        // strftime, not CAST: the staging table holds these as DuckDB
+        // DATE and TIME, whose text form is '2026-09-05' and '20:31:39'.
+        // Concatenating those gives something no SAP format string
+        // parses, and the failure is silent -- try_strptime returns NULL
+        // and the latency simply has no samples, which reads as "the
+        // feature is off" rather than "the parse is wrong".
+        // strftime handles the DATE half; it does NOT accept a bare
+        // TIME, so the time half is formatted by stripping the colons
+        // out of its text form. Both halves land as SAP writes them --
+        // YYYYMMDD and HHMMSS -- which is what the parse expects.
+        // ...plus the recorded SAP-to-server offset, which is what turns
+        // a wall-clock value into an instant comparable with now().
+        // AT TIME ZONE 'UTC', then the recorded offset. A parsed
+        // wall-clock value is a naive TIMESTAMP, and letting it cast into
+        // a TIMESTAMPTZ column picks up the SERVER's session zone -- which
+        // is how a two-hour error appears in a latency figure without
+        // anything looking wrong. Anchoring to UTC and adding the measured
+        // SAP-to-server offset makes it independent of where either
+        // machine happens to be.
+        commit_ts = "((try_strptime(strftime(s." + col + ", '%Y%m%d') || "
+                    "replace(substr(CAST(s." + Lower(st.time_col) +
+                    " AS VARCHAR), 1, 8), ':', ''), '%Y%m%d%H%M%S') "
+                    "AT TIME ZONE 'UTC')" + skew_add + ")";
+    } else if (!st.chg_col.empty() && st.wm_kind == "DATE") {
+        commit_ts = "((try_strptime(strftime(s." + col + ", '%Y%m%d'), '%Y%m%d') "
+                    "AT TIME ZONE 'UTC')" + skew_add + ")";
+    }
+    // A counter watermark has no clock at all, so _commit_ts stays NULL
+    // and latency is genuinely unmeasurable for it. Reported as "no
+    // samples" rather than as zero.
+
+    return commit_ts;
+}
+
+}  // namespace
+
+CommitResult Commit(duckdb::Connection &con, const std::string &target, long long run_id,
+                    const CommitCounts &counts) {
+    const State st = LoadState(con, target);
+    const std::string stage = StageName(target, run_id);
+
+    // Fencing. Checked before the transaction so the message is clean, and again
+    // inside it as part of the UPDATE's WHERE so a concurrent claim cannot slip
+    // between the two.
+    const auto active = Scalar(con, "SELECT coalesce(active_run_id,-1) FROM _erpl_rev_delta_state "
+                                    "WHERE target=" + Lit(target));
+    if (active != std::to_string(run_id)) {
+        // Record the outcome before refusing. A run that is turned away here is
+        // just as dead as one that fails mid-transaction, and leaving its row
+        // RUNNING would pin its staging table forever.
+        con.Query("UPDATE _erpl_rev_run_stats SET status='ERROR', "
+                  "error_text='target reclaimed by run " + active +
+                  "' WHERE run_id=" + std::to_string(run_id) + " AND status='RUNNING'");
+        // Not a fail_count bump: this run lost a race, the TARGET is not broken,
+        // and backing off a healthy target because another cycle beat it to it
+        // would be exactly the wrong response.
+        throw std::runtime_error(
+            "cycle: run " + std::to_string(run_id) + " no longer owns " + target +
+            " (active run is " + active + "); refusing to commit a reclaimed cycle");
+    }
+
+    CommitResult res;
+    // The try opens HERE, not at BEGIN. Real work happens before the transaction
+    // -- describing the tables, counting, computing the watermark -- and a
+    // failure in any of it used to escape uncaught, leaving the run RUNNING
+    // forever (so its stage was never swept) and never counting against the
+    // target (so backoff never engaged). Which is exactly how a broken target
+    // retried at full cadence indefinitely.
+    try {
+    const auto shape = DeriveMergeShape(con, target, stage, st.keys);
+    const bool have_stage = shape.have_stage;
+    const bool have_target = shape.have_target;
+    const bool will_merge = shape.will_merge;
+    const bool will_create = shape.will_create;
+    const auto &keys = shape.keys;
+    const auto &cols = shape.cols;
+    const auto &key_join = shape.key_join;
+    const auto &collist = shape.collist;
+    const auto &sellist = shape.sellist;
+    const auto &tsellist = shape.tsellist;
+    const auto &setlist = shape.setlist;
+    // Counts and log rows are derived BEFORE the merge, because both depend on
+    // whether the key was already present -- which the merge is about to change.
+    // MERGE ... RETURNING merge_action would express this in one statement, but
+    // DuckDB 1.5.5 does not allow a MERGE as a subquery or in a CTE. Two
+    // statements in one transaction are just as atomic, which is the property
+    // that actually matters.
+    if (will_merge) {
+        auto cr = con.Query(
+            "SELECT (SELECT count(*) FROM " + stage + " s WHERE EXISTS (SELECT 1 FROM " + target +
+            " t WHERE " + key_join + ")) AS upd, (SELECT count(*) FROM " + stage +
+            " s WHERE NOT EXISTS (SELECT 1 FROM " + target + " t WHERE " + key_join +
+            ")) AS ins");
+        if (cr->HasError()) throw std::runtime_error("cycle: count failed: " + cr->GetError());
+        res.upd = cr->GetValue(0, 0).GetValue<int64_t>();
+        res.ins = cr->GetValue(1, 0).GetValue<int64_t>();
+    } else if (will_create) {
+        // Everything a target's first cycle brings is new, by definition.
+        res.ins = std::stoll(Scalar(con, "SELECT count(*) FROM " + stage));
+        res.upd = 0;
+    }
+
+    const auto wmd = DecideWatermark(con, st, stage, run_id, have_stage);
+    const std::string new_wm = wmd.new_watermark;
+    const LoadPlan load_plan = wmd.plan;
+    const std::string run_load_type = wmd.load_type;
     res.new_watermark = new_wm;
 
     // Provisioning the log and appending to it are separate decisions. The log
@@ -759,51 +896,7 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
                                             "FROM _erpl_rev_run_stats WHERE run_id=" +
                                                 std::to_string(run_id));
             const long long skew = skew_s.empty() ? 0 : std::stoll(skew_s);
-            const std::string skew_add =
-                skew == 0 ? "" : " + INTERVAL '" + std::to_string(skew) + "' SECOND";
-
-            std::string commit_ts = "NULL";
-            const auto col = Lower(st.chg_col);
-            if (!st.chg_col.empty() &&
-                (st.wm_kind == "NUMTS" || st.wm_kind == "TIMESTAMPL" || st.wm_kind.empty())) {
-                commit_ts = "(try_strptime(substr(CAST(s." + col + " AS VARCHAR), 1, 14), "
-                            "'%Y%m%d%H%M%S') AT TIME ZONE 'UTC')";
-            } else if (!st.chg_col.empty() && st.wm_kind == "DATETIME" && !st.time_col.empty()) {
-                // The pair, composed back into one value. Reading only the date
-                // half would parse to midnight and report every change as up to
-                // a day stale.
-                //
-                // strftime, not CAST: the staging table holds these as DuckDB
-                // DATE and TIME, whose text form is '2026-09-05' and '20:31:39'.
-                // Concatenating those gives something no SAP format string
-                // parses, and the failure is silent -- try_strptime returns NULL
-                // and the latency simply has no samples, which reads as "the
-                // feature is off" rather than "the parse is wrong".
-                // strftime handles the DATE half; it does NOT accept a bare
-                // TIME, so the time half is formatted by stripping the colons
-                // out of its text form. Both halves land as SAP writes them --
-                // YYYYMMDD and HHMMSS -- which is what the parse expects.
-                // ...plus the recorded SAP-to-server offset, which is what turns
-                // a wall-clock value into an instant comparable with now().
-                // AT TIME ZONE 'UTC', then the recorded offset. A parsed
-                // wall-clock value is a naive TIMESTAMP, and letting it cast into
-                // a TIMESTAMPTZ column picks up the SERVER's session zone -- which
-                // is how a two-hour error appears in a latency figure without
-                // anything looking wrong. Anchoring to UTC and adding the measured
-                // SAP-to-server offset makes it independent of where either
-                // machine happens to be.
-                commit_ts = "((try_strptime(strftime(s." + col + ", '%Y%m%d') || "
-                            "replace(substr(CAST(s." + Lower(st.time_col) +
-                            " AS VARCHAR), 1, 8), ':', ''), '%Y%m%d%H%M%S') "
-                            "AT TIME ZONE 'UTC')" + skew_add + ")";
-            } else if (!st.chg_col.empty() && st.wm_kind == "DATE") {
-                commit_ts = "((try_strptime(strftime(s." + col + ", '%Y%m%d'), '%Y%m%d') "
-                            "AT TIME ZONE 'UTC')" + skew_add + ")";
-            }
-            // A counter watermark has no clock at all, so _commit_ts stays NULL
-            // and latency is genuinely unmeasurable for it. Reported as "no
-            // samples" rather than as zero.
-
+            const std::string commit_ts = CommitTsExpr(st, skew);
             // On the self-creating first cycle every row is an insert, and the
             // join must not be asked: the target was created FROM the stage a
             // few statements ago, so it already holds every staged row and the
