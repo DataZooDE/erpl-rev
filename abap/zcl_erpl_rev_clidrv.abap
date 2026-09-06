@@ -506,6 +506,13 @@ CLASS zcl_erpl_rev_clidrv IMPLEMENTATION.
           ENDIF.
         ENDIF.
 
+      WHEN 'unpark'.
+        DATA(ls_up) = zcl_erpl_rev_delta=>plan_json(
+          iv_action = 'UNPARK'
+          iv_target = jstr( iv_json = iv_params iv_key = 'target' ) ).
+        ev_error  = ls_up-error.
+        ev_result = ls_up-json.
+
       WHEN 'set_wm' OR 'preview'.
         " Server-side actions: set_wm moves the position and records the run
         " that moved it in one transaction; preview reads through whatever a

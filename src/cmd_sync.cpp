@@ -86,6 +86,8 @@ std::string UnknownFlag(const std::vector<std::string> &args, const std::string 
     else if (sub == "sync set-wm")    { known = kSyncSetWm;    count = std::size(kSyncSetWm); }
     else if (sub == "sync preview")   { known = kSyncPreview;  count = std::size(kSyncPreview); }
     else if (sub == "sync validate") { known = kSyncValidate; count = std::size(kSyncValidate); }
+    // unpark takes a target and nothing else, so any flag is unknown.
+    else if (sub == "sync unpark")   { known = nullptr;      count = 0; }
     else if (sub.rfind("daemon", 0) == 0) { known = kDaemon; count = std::size(kDaemon); }
     else if (sub.rfind("sub", 0) == 0)    { known = kSub;    count = std::size(kSub); }
     else if (sub == "retain")             { known = kRetain; count = std::size(kRetain); }
@@ -545,6 +547,7 @@ static int SyncSchedule(Options &o) {
 int SyncSetWm(Options &o, const std::string &target);
 int SyncPreview(Options &o, const std::string &target);
 int SyncValidate(Options &o, const std::string &target);
+int SyncUnpark(Options &o, const std::string &target);
 
 int RunSync(Options o) {
     const std::string sub = o.args.empty() ? "" : o.args.front();
@@ -569,6 +572,7 @@ int RunSync(Options o) {
         if (sub == "set-wm")        return SyncSetWm(o, arg);
         if (sub == "preview")       return SyncPreview(o, arg);
         if (sub == "validate")      return SyncValidate(o, arg);
+        if (sub == "unpark")        return SyncUnpark(o, arg);
     } catch (const abapgen::UnsafeValue &e) {
         std::fprintf(stderr, "erpl-rev: %s\n", e.what());
         return 2;
@@ -578,7 +582,7 @@ int RunSync(Options o) {
     }
     std::fprintf(stderr,
                  "erpl-rev sync: expected ls, show, create, run, run-due, schedule, "
-                 "set-wm, preview or validate.\n");
+                 "set-wm, preview, validate or unpark.\n");
     return 2;
 }
 
@@ -615,6 +619,15 @@ int SyncValidate(Options &o, const std::string &target) {
         {"target", target},
         {"mode", HasFlag(o, "--full") ? "full" : "sample"},
         {"sample_rows", Field(o, "--sample-rows", "1000")}}));
+}
+
+int SyncUnpark(Options &o, const std::string &target) {
+    if (target.empty()) {
+        std::fprintf(stderr, "erpl-rev sync unpark <target>\n"
+                             "  Releases a parked target and clears its backoff.\n");
+        return 2;
+    }
+    return RunViaDriver(o, "unpark", BuildParams({{"target", target}}));
 }
 
 // ---------------------------------------------------------------------------

@@ -515,6 +515,14 @@ VC="$(cli sync validate t000_cli --yes 2>&1 || true)"
 grep -qiE "FAILED|mismatch" <<<"$VC" || fail "validate did not detect a changed cell: $VC"
 echo "   sync validate: a clean target passes, a corrupted cell is caught"
 
+# unpark: a parked target needs a way back that is not raw SQL. Parking is what
+# stops a broken target hammering SAP; without an unpark it is a one-way door.
+cli sql "UPDATE _erpl_rev_delta_state SET parked_until = now() + INTERVAL '1 hour', fail_count = 9, park_reason = 'e2e' WHERE target='t000_cli'" >/dev/null 2>&1
+UP="$(cli sync unpark t000_cli --yes 2>&1)" || fail "sync unpark failed: $UP"
+UPV="$(cli sql "SELECT CASE WHEN parked_until IS NULL AND coalesce(fail_count,0)=0 THEN 'RELEASED' ELSE 'STILL_PARKED' END AS v FROM _erpl_rev_delta_state WHERE target='t000_cli'" 2>&1)"
+grep -q RELEASED <<<"$UPV" || fail "unpark did not release the target: $UPV"
+echo "   sync unpark releases a parked target and clears its backoff"
+
 # cdc status on a target that is not a trigger target must say so, not crash.
 CS="$(cli cdc status --target t000_cli --yes 2>&1 || true)"
 grep -qiE "not a registered trigger target|no registration" <<<"$CS"   || fail "cdc status on a non-CDC target gave no usable message: $CS"

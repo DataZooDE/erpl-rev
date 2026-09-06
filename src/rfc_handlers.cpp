@@ -1103,6 +1103,23 @@ extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE,
                    std::to_string(mismatched) + ",\"verdict\":" +
                    json::QuoteString(mismatched == 0 ? "PASSED" : "FAILED") +
                    ",\"first_mismatch\":" + json::QuoteString(first_bad) + "}";
+        } else if (action == "UNPARK") {
+            // Parking is what stops a broken target hammering SAP; without a way
+            // back it is a one-way door that only raw SQL can open. Clearing the
+            // failure count too, because a target the operator has just fixed
+            // should not resume at the far end of an exponential backoff.
+            auto up = con.Query("UPDATE _erpl_rev_delta_state SET parked_until=NULL, "
+                                "park_reason=NULL, fail_count=0, "
+                                "status=CASE WHEN coalesce(status,'')='BLOCKED' THEN 'IDLE' "
+                                "ELSE status END WHERE target=" + SqlLit(target));
+            if (up->HasError())
+                throw std::runtime_error("UNPARK failed: " + up->GetError());
+            const auto n = up->RowCount() > 0 && !up->GetValue(0, 0).IsNull()
+                               ? up->GetValue(0, 0).GetValue<int64_t>()
+                               : 0;
+            if (n == 0)
+                throw std::runtime_error("UNPARK: no delta registration for " + target);
+            plan = "{\"unparked\":" + json::QuoteString(target) + "}";
         } else if (action == "SET_WM") {
             // An operator moving the position, deliberately -- to re-deliver a
             // window after a downstream loss, or to adopt a position after a
@@ -1161,7 +1178,7 @@ extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE,
             throw std::runtime_error(
                 "unknown plan action '" + action +
                 "'. Known: BEGIN_CYCLE, CYCLE_COMMIT, TICK, CDC_APPLY, DRIFT, SUBS, "
-                "RETAIN, SET_WM, PREVIEW, CDC_PROBE, CDC_STATUS, CDC_REPAIR, SPLIT, VALIDATE.");
+                "RETAIN, SET_WM, PREVIEW, CDC_PROBE, CDC_STATUS, CDC_REPAIR, SPLIT, VALIDATE, UNPARK.");
         }
 
         SetString(funcHandle, "EV_PLAN", plan);
