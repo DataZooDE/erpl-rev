@@ -86,6 +86,21 @@ std::vector<std::string> SplitCsv(const std::string &s) {
 }
 
 // Build a JSON array string from the row JSON objects.
+// A SQL string literal, quotes doubled. The target and the watermark reach here
+// from an operator's command line.
+std::string SqlLit(const std::string &v) {
+    std::string q = "'";
+    for (char c : v) { if (c == '\'') q += "''"; else q += c; }
+    return q + "'";
+}
+
+// Run a statement, or say which one failed. A silent statement inside a
+// transaction is how a partial write gets reported as success.
+void Exec(duckdb::Connection &con, const std::string &sql) {
+    auto r = con.Query(sql);
+    if (r->HasError()) throw std::runtime_error(r->GetError());
+}
+
 std::string RowsToJsonArray(const std::vector<std::string> &rows) {
     std::string out = "[";
     for (size_t i = 0; i < rows.size(); i++) { if (i) out += ","; out += rows[i]; }
@@ -715,6 +730,53 @@ extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE,
                 throw std::runtime_error("SUBS: unknown op '" + op + "'. Known: create, "
                                          "advance, ls.");
             }
+        } else if (action == "SET_WM") {
+            // An operator moving the position, deliberately -- to re-deliver a
+            // window after a downstream loss, or to adopt a position after a
+            // restore. It writes engine state on purpose, so it records a run of
+            // its own: a watermark that moved with no record of who moved it is
+            // the hardest kind of replication question to answer afterwards.
+            const auto to = JsonField(params, "wm_value");
+            if (to.empty()) throw std::runtime_error("SET_WM: wm_value is required");
+            auto before = con.Query("SELECT coalesce(wm_value,'') FROM _erpl_rev_delta_state "
+                                    "WHERE target=" + SqlLit(target));
+            if (before->HasError() || before->RowCount() == 0)
+                throw std::runtime_error("SET_WM: no delta registration for " + target);
+            const auto from = before->GetValue(0, 0).ToString();
+
+            Exec(con, "BEGIN");
+            try {
+                Exec(con, "UPDATE _erpl_rev_delta_state SET wm_value=" + SqlLit(to) +
+                              " WHERE target=" + SqlLit(target));
+                Exec(con, "INSERT INTO _erpl_rev_run_stats "
+                          "(run_id, target, source, run_type, method, status, wm_from, wm_to) "
+                          "VALUES (nextval('_erpl_rev_run_seq')," + SqlLit(target) + "," +
+                          SqlLit(target) + ",'SET_WM','OPERATOR','SUCCESS'," + SqlLit(from) +
+                          "," + SqlLit(to) + ")");
+                Exec(con, "COMMIT");
+            } catch (...) {
+                Exec(con, "ROLLBACK");
+                throw;
+            }
+            plan = "{\"wm_from\":" + json::QuoteString(from) + ",\"wm_to\":" +
+                   json::QuoteString(to) + "}";
+        } else if (action == "PREVIEW") {
+            // The first rows of a target, read through the SAME path a
+            // subscriber reads -- the transform view when one is registered, the
+            // table otherwise. Reading the table directly here would let an
+            // operator approve output that is not what gets published.
+            const auto n = JsonField(params, "rows");
+            const long long rows = n.empty() ? 20 : std::atoll(n.c_str());
+            auto xf = con.Query("SELECT coalesce(xform_view,'') FROM _erpl_rev_delta_state "
+                                "WHERE target=" + SqlLit(target));
+            std::string from_rel = target;
+            if (!xf->HasError() && xf->RowCount() > 0) {
+                const auto v = xf->GetValue(0, 0).ToString();
+                if (!v.empty()) from_rel = v;
+            }
+            QueryResult qr = g_bridge->Query("SELECT * FROM " + from_rel + " LIMIT " +
+                                             std::to_string(rows));
+            plan = "{\"rows\":" + RowsToJsonArray(qr.rows) + "}";
         } else if (action == "RETAIN") {
             // Prune the change log to the slowest subscriber, or to the window
             // when nothing is subscribed.
@@ -725,7 +787,8 @@ extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE,
         } else {
             throw std::runtime_error(
                 "unknown plan action '" + action +
-                "'. Known: BEGIN_CYCLE, CYCLE_COMMIT, TICK, CDC_APPLY, DRIFT, SUBS, RETAIN.");
+                "'. Known: BEGIN_CYCLE, CYCLE_COMMIT, TICK, CDC_APPLY, DRIFT, SUBS, "
+                "RETAIN, SET_WM, PREVIEW.");
         }
 
         SetString(funcHandle, "EV_PLAN", plan);

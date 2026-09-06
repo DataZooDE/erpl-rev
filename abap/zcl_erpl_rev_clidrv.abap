@@ -245,6 +245,17 @@ CLASS zcl_erpl_rev_clidrv IMPLEMENTATION.
           ENDIF.
         ENDIF.
 
+      WHEN 'set_wm' OR 'preview'.
+        " Server-side actions: set_wm moves the position and records the run
+        " that moved it in one transaction; preview reads through whatever a
+        " subscriber would read.
+        DATA(ls_op) = zcl_erpl_rev_delta=>plan_json(
+          iv_action = COND string( WHEN iv_verb = 'set_wm' THEN 'SET_WM' ELSE 'PREVIEW' )
+          iv_target = jstr( iv_json = iv_params iv_key = 'target' )
+          iv_params = iv_params ).
+        ev_error  = ls_op-error.
+        ev_result = ls_op-json.
+
       WHEN 'subs' OR 'retain'.
         " Both are server-side PLAN actions: the publish and the offset advance
         " are one transaction, and it happens on the server. The queue carries

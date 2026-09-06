@@ -473,6 +473,23 @@ grep -q ADVANCED <<<"$OFF" || fail "the subscription offset was not advanced: $O
 RT="$(cli retain --target t000_cli --window-days 0 --yes 2>&1)" || fail "retain failed: $RT"
 echo "   daemon status/stop, sub create/ls/advance, retain -- all through the queue"
 
+# set-wm: an operator moving a target's position back so a window re-delivers.
+# It writes engine state deliberately, so it audits a run of its own -- a
+# watermark that moved with no record of who moved it is the hardest kind of
+# replication question to answer later.
+WM0="$(cli sql "SELECT wm_value AS v FROM _erpl_rev_delta_state WHERE target='t000_cli'" 2>&1)"
+SW="$(cli sync set-wm t000_cli --wm-value 20200101000000 --yes 2>&1)"   || fail "sync set-wm failed: $SW"
+WM1="$(cli sql "SELECT CASE WHEN wm_value='20200101000000' THEN 'MOVED' ELSE 'NOT_MOVED' END AS v                 FROM _erpl_rev_delta_state WHERE target='t000_cli'" 2>&1)"
+grep -q MOVED <<<"$WM1" || fail "set-wm did not move the watermark: $WM1 (was $WM0)"
+AUD="$(cli sql "SELECT CASE WHEN count(*) > 0 THEN 'AUDITED' ELSE 'NO_RECORD' END AS v                 FROM _erpl_rev_run_stats WHERE target='t000_cli' AND run_type='SET_WM'" 2>&1)"
+grep -q AUDITED <<<"$AUD" || fail "set-wm left no audit row: $AUD"
+
+# preview: the first rows of a target, through the SAME path a subscriber reads,
+# so what an operator is shown cannot diverge from what is published.
+PV="$(cli sync preview t000_cli --rows 1 --yes 2>&1)" || fail "sync preview failed: $PV"
+grep -qE '[{]|MANDT|mandt' <<<"$PV" || fail "sync preview returned no rows: $PV"
+echo "   sync set-wm (audited) and sync preview"
+
 srv_kill; sleep 1
 on_server rm -f "$E2E_DB" "$E2E_DB".wal /tmp/erpl_taxi.parquet
 # ldd and the SDK path are this box's; a remote binary is a different platform's

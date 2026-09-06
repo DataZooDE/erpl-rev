@@ -537,6 +537,9 @@ static int SyncSchedule(Options &o) {
     return 1;
 }
 
+int SyncSetWm(Options &o, const std::string &target);
+int SyncPreview(Options &o, const std::string &target);
+
 int RunSync(Options o) {
     const std::string sub = o.args.empty() ? "" : o.args.front();
     const std::string arg = o.args.size() > 1 && o.args[1].rfind("--", 0) != 0
@@ -557,6 +560,8 @@ int RunSync(Options o) {
         if (sub == "run")           return SyncRun(o, arg);
         if (sub == "run-due")       return SyncRun(o, "");
         if (sub == "schedule")      return SyncSchedule(o);
+        if (sub == "set-wm")        return SyncSetWm(o, arg);
+        if (sub == "preview")       return SyncPreview(o, arg);
     } catch (const abapgen::UnsafeValue &e) {
         std::fprintf(stderr, "erpl-rev: %s\n", e.what());
         return 2;
@@ -565,8 +570,30 @@ int RunSync(Options o) {
         return 1;
     }
     std::fprintf(stderr,
-                 "erpl-rev sync: expected ls, show, create, rm, run, run-due or schedule.\n");
+                 "erpl-rev sync: expected ls, show, create, run, run-due, schedule, "
+                 "set-wm or preview.\n");
     return 2;
+}
+
+int SyncSetWm(Options &o, const std::string &target) {
+    const std::string wm = Field(o, "--wm-value");
+    if (target.empty() || wm.empty()) {
+        std::fprintf(stderr, "erpl-rev sync set-wm <target> --wm-value V\n"
+                             "  Moves the target's position. The next cycle re-reads from "
+                             "there.\n");
+        return 2;
+    }
+    if (const int rc = ConsentGate(o, "Set the watermark of '" + target + "' to " + wm)) return rc;
+    return RunViaDriver(o, "set_wm", BuildParams({{"target", target}, {"wm_value", wm}}));
+}
+
+int SyncPreview(Options &o, const std::string &target) {
+    if (target.empty()) {
+        std::fprintf(stderr, "erpl-rev sync preview <target> [--rows N]\n");
+        return 2;
+    }
+    return RunViaDriver(o, "preview",
+                        BuildParams({{"target", target}, {"rows", Field(o, "--rows", "20")}}));
 }
 
 // ---------------------------------------------------------------------------
