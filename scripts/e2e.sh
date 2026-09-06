@@ -365,6 +365,24 @@ fi
 cli sync run t000_cli --yes >/dev/null 2>&1 || fail "sync run failed"
 echo "   sync create/ls/run, and the granularity gate still applies"
 
+# Every register field must survive the QUEUE, which is the default CLI path.
+# It carried ten of fifteen: --log, --time-col, --safety-units,
+# --load-type-default and --allow-empty-reload existed on the command line, in
+# the server and in the schema, and did nothing at all -- no error either end.
+cli sync create t000_flags --method WATERMARK --source T000 --keys MANDT     --chg-col MANDT --wm-kind NUMTS --cadence manual     --log --allow-empty-reload --load-type-default L --safety-units 7 --yes     >/dev/null 2>&1 || fail "sync create with flags failed"
+# One expression, so a single grep cannot pass on one column while another was
+# dropped -- which is exactly what "grep -q true" over four columns would do.
+FLAGS="$(cli sql "SELECT CASE WHEN log_enabled AND allow_empty_reload AND load_type_default='L' AND safety_units=7 THEN 'ALL_FIELDS_ARRIVED' ELSE 'DROPPED' END AS v FROM _erpl_rev_delta_state WHERE target='t000_flags'" 2>&1)"
+grep -q "ALL_FIELDS_ARRIVED" <<<"$FLAGS" || fail "the queue dropped register fields: $FLAGS"
+
+# ...and a re-registration that does not mention them must LEAVE THEM ALONE.
+# Registering wrote all three unconditionally, so changing a cadence silently
+# turned off a target's change log and cancelled its pending seed.
+cli sync create t000_flags --method WATERMARK --source T000 --keys MANDT     --chg-col MANDT --wm-kind NUMTS --cadence hourly --yes >/dev/null 2>&1   || fail "re-registration failed"
+KEPT="$(cli sql "SELECT CASE WHEN log_enabled AND allow_empty_reload AND load_type_default='L' AND cadence='hourly' THEN 'ALL_KEPT' ELSE 'CLOBBERED' END AS v FROM _erpl_rev_delta_state WHERE target='t000_flags'" 2>&1)"
+grep -q "ALL_KEPT" <<<"$KEPT" || fail "re-registration clobbered unmentioned fields: $KEPT"
+echo "   every register field survives the queue, and a re-registration keeps them"
+
 # 7. The driver: parameters as data, no generated ABAP, no authorisation.
 #    Deploy it first -- setup ships it, but this suite deploys via deploy-abap.sh.
 adt object create --type CLAS/OC --name ZCL_ERPL_REV_CLIDRV --package '$TMP' \

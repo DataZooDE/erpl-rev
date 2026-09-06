@@ -48,8 +48,9 @@ std::string UnknownFlag(const std::vector<std::string> &args, const std::string 
         {"--chg-col", true},  {"--wm-kind", true}, {"--wm-value", true},
         {"--cadence", true},  {"--extra", true},   {"--safety-secs", true},
         {"--time-col", true}, {"--safety-units", true},
-        {"--log", false},     {"--load-type-default", true},
-        {"--allow-empty-reload", false},
+        {"--log", false},     {"--no-log", false},
+        {"--load-type-default", true},
+        {"--allow-empty-reload", false}, {"--no-allow-empty-reload", false},
     };
     static const Spec kSyncSchedule[] = {
         {"--every", true}, {"--remove", false},
@@ -353,8 +354,16 @@ static int SyncCreate(Options &o, const std::string &target) {
     if (!safety.empty()) st.safety_secs = std::atoll(safety.c_str());
     const std::string units = Field(o, "--safety-units");
     if (!units.empty()) st.safety_units = std::atoll(units.c_str());
-    st.log_enabled        = HasFlag(o, "--log");
-    st.allow_empty_reload = HasFlag(o, "--allow-empty-reload");
+    // Tri-state: --log, --no-log, or neither. "Neither" has to survive all the
+    // way to the server as NULL, or every registration asserts the flag and a
+    // re-registration for an unrelated reason turns a target's change log off.
+    auto tri = [&](const char *on, const char *off) -> std::string {
+        if (HasFlag(o, on)) return "true";
+        if (HasFlag(o, off)) return "false";
+        return "";
+    };
+    st.log_enabled        = tri("--log", "--no-log");
+    st.allow_empty_reload = tri("--allow-empty-reload", "--no-allow-empty-reload");
     st.load_type_default  = Field(o, "--load-type-default");
     if (!st.load_type_default.empty() && st.load_type_default != "D" &&
         st.load_type_default != "F" && st.load_type_default != "I" &&
@@ -376,14 +385,12 @@ static int SyncCreate(Options &o, const std::string &target) {
         // Rendered from the SAME list as the generated-ABAP path, so the two
         // writers of this surface cannot drift again. Backticks are the ABAP
         // literal form; the queue carries plain values.
+        // The RAW form, from the same list the generated-ABAP path renders. This
+        // used to take the rendered ABAP and strip the backticks back off to
+        // recover the value it had started with -- which works only while every
+        // rendering is trivially reversible, and a tri-state flag is not.
         std::vector<std::pair<std::string, std::string>> kv;
-        for (const auto &f : abapgen::RegisterFields(st)) {
-            std::string v = f.second;
-            if (v.size() >= 2 && v.front() == '`' && v.back() == '`') v = v.substr(1, v.size() - 2);
-            else if (v == "abap_true") v = "true";
-            else if (v == "abap_false") v = "false";
-            kv.push_back({f.first, v});
-        }
+        for (const auto &f : abapgen::RegisterFields(st)) kv.push_back({f.name, f.raw});
         const std::string j = BuildParams(kv);
         return RunViaDriver(o, "sync_register", j);
     }

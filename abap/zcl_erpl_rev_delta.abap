@@ -35,9 +35,14 @@ CLASS zcl_erpl_rev_delta DEFINITION PUBLIC FINAL CREATE PUBLIC.
              " escape hatch the reload refusal names in its own error message --
              " all reachable only by hand-written SQL until they were added
              " here. Exactly the failure the comment in register() warns about.
-             log_enabled       TYPE abap_bool,   " keep a per-target change log
+             " TRI-STATE, and string rather than abap_bool for exactly that
+             " reason: 'true', 'false', or empty meaning "the caller did not
+             " say". abap_bool has no third value, so a re-registration that
+             " never mentioned logging was indistinguishable from one that
+             " asked for it off -- and silently turned it off.
+             log_enabled       TYPE string,      " keep a per-target change log
              load_type_default TYPE string,      " D | F | I | L; F and L are one-shot
-             allow_empty_reload TYPE abap_bool,  " let a reload empty the target
+             allow_empty_reload TYPE string,     " let a reload empty the target
              status      TYPE string,
            END OF ty_state.
 
@@ -249,6 +254,16 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       rv_error = |unknown load type { is_state-load_type_default }; expected D, F, I or L|.
       RETURN.
     ENDIF.
+    " Cross-checked against the METHOD, here, where it is a typo an operator can
+    " still fix. Accepted, it becomes a target the planner hands an impossible
+    " load type on every due tick -- refused each time, and until the refusal
+    " learned to block, never backed off.
+    IF is_state-load_type_default IS NOT INITIAL AND is_state-load_type_default <> 'D' AND
+       is_state-method <> 'WATERMARK'.
+      rv_error = |load type { is_state-load_type_default } is not implemented for | &&
+                 |method { is_state-method }; only WATERMARK targets support one|.
+      RETURN.
+    ENDIF.
     " Every column of the state row is written here. A field added to ty_state but
     " forgotten in this statement is not a compile error and not a runtime error:
     " it simply arrives at the server as empty, and the feature that needed it
@@ -257,11 +272,18 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
     " server was comparing a pair whose time half it had never been told about.
     " Rendered before the statement: a multi-line COND inside a string template
     " is not a template any more.
-    DATA(lv_log) = COND string( WHEN is_state-log_enabled = abap_true THEN 'true' ELSE 'false' ).
-    DATA(lv_aer) = COND string( WHEN is_state-allow_empty_reload = abap_true
-                                THEN 'true' ELSE 'false' ).
-    DATA(lv_lt)  = COND string( WHEN is_state-load_type_default IS INITIAL
-                                THEN 'D' ELSE q( is_state-load_type_default ) ).
+    " NULL for "not said", which is what makes the coalescing upsert below mean
+    " anything. These used to render 'false'/'false'/'D' for an unset field, so
+    " every registration asserted all three whether the caller had mentioned
+    " them or not -- and a re-registration for an unrelated reason silently
+    " turned off a target's change log and cancelled its pending seed.
+    DATA(lv_log) = COND string( WHEN is_state-log_enabled IS INITIAL THEN 'NULL'
+                                WHEN is_state-log_enabled = 'true' THEN 'true' ELSE 'false' ).
+    DATA(lv_aer) = COND string( WHEN is_state-allow_empty_reload IS INITIAL THEN 'NULL'
+                                WHEN is_state-allow_empty_reload = 'true' THEN 'true'
+                                ELSE 'false' ).
+    DATA(lv_lt)  = COND string( WHEN is_state-load_type_default IS INITIAL THEN 'NULL'
+                                ELSE |'{ q( is_state-load_type_default ) }'| ).
     DATA(lv_sql) =
       |INSERT INTO _erpl_rev_delta_state | &&
       |(target,method,source_from,keys,chg_col,time_col,wm_kind,wm_value,| &&
@@ -274,14 +296,17 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       |{ COND string( WHEN is_state-wm_value IS INITIAL THEN 'NULL' ELSE |'{ q( is_state-wm_value ) }'| ) },| &&
       |{ is_state-safety_secs },{ is_state-safety_units },'{ q( is_state-cadence ) }',| &&
       |{ COND string( WHEN is_state-extra IS INITIAL THEN 'NULL' ELSE |'{ q( is_state-extra ) }'| ) },| &&
-      |{ lv_log },'{ lv_lt }',{ lv_aer },'IDLE') | &&
+      |{ lv_log },{ lv_lt },{ lv_aer },'IDLE') | &&
       |ON CONFLICT (target) DO UPDATE SET method=excluded.method, source_from=excluded.source_from, | &&
       |keys=excluded.keys, chg_col=excluded.chg_col, time_col=excluded.time_col, | &&
       |wm_kind=excluded.wm_kind, wm_value=excluded.wm_value, | &&
       |safety_secs=excluded.safety_secs, safety_units=excluded.safety_units, | &&
       |cadence=excluded.cadence, extra=excluded.extra, | &&
-      |log_enabled=excluded.log_enabled, load_type_default=excluded.load_type_default, | &&
-      |allow_empty_reload=excluded.allow_empty_reload|.
+      |log_enabled=coalesce(excluded.log_enabled, _erpl_rev_delta_state.log_enabled), | &&
+      |load_type_default=coalesce(excluded.load_type_default, | &&
+      |                           _erpl_rev_delta_state.load_type_default), | &&
+      |allow_empty_reload=coalesce(excluded.allow_empty_reload, | &&
+      |                            _erpl_rev_delta_state.allow_empty_reload)|.
     DATA(ls) = zcl_erpl_rev_util=>query( lv_sql ).
     rv_error = ls-error.
   ENDMETHOD.
@@ -294,9 +319,9 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       |coalesce(safety_secs,0) AS safety_secs, | &&
       |coalesce(safety_units,0) AS safety_units, coalesce(cadence,'manual') AS cadence, | &&
       |coalesce(extra,'') AS extra, | &&
-      |coalesce(log_enabled,false) AS log_enabled, | &&
+      |CASE WHEN log_enabled THEN 'true' ELSE 'false' END AS log_enabled, | &&
       |coalesce(load_type_default,'D') AS load_type_default, | &&
-      |coalesce(allow_empty_reload,false) AS allow_empty_reload, | &&
+      |CASE WHEN allow_empty_reload THEN 'true' ELSE 'false' END AS allow_empty_reload, | &&
       |coalesce(status,'IDLE') AS status | &&
       |FROM _erpl_rev_delta_state WHERE target='{ q( iv_target ) }'| ).
     IF ls-error IS NOT INITIAL OR ls-row_count = 0. RETURN. ENDIF.
@@ -340,9 +365,15 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
     "
     " active_run_id is cleared here too: an errored cycle no longer owns the
     " target, and leaving the token set would block every later claim.
+    " fail_count is zeroed only by SUCCESS. It used to be zeroed by every
+    " non-ERROR release -- including a refusal -- so a target turned away for a
+    " bad parameter wiped whatever backoff a genuinely failing target had
+    " accumulated, and went straight back to full cadence.
     DATA(lv_fail) = COND string(
       WHEN iv_status = 'ERROR'
       THEN |, fail_count = coalesce(fail_count,0) + 1, active_run_id = NULL|
+      WHEN iv_error IS NOT INITIAL
+      THEN |, active_run_id = NULL|
       ELSE |, fail_count = 0, active_run_id = NULL| ).
     zcl_erpl_rev_util=>query(
       |UPDATE _erpl_rev_delta_state SET status='{ q( iv_status ) }', | &&

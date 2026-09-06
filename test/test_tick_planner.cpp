@@ -347,3 +347,17 @@ TEST_CASE("tick_planner: a reservation nobody can spend does not waste the slot"
     // rather than being carried for a candidate that was never eligible.
     CHECK(p.cycles.size() == 3);
 }
+
+TEST_CASE("tick_planner: a target blocked by an impossible load type stops being planned",
+          "[plan]") {
+    // The other half of blocking it: the planner must actually stop handing it
+    // out, or blocking is just a message. This is what turns "refused every two
+    // seconds forever" into "refused once".
+    auto t = T("bad", "micro:1", kNow - 600);
+    t.method = "SNAPSHOT";
+    t.load_type_default = "F";
+    t.status = "BLOCKED";
+
+    const auto p = PlanTick({t}, {}, Daemon(2), kNow);
+    CHECK_FALSE(Has(p, "bad"));
+}

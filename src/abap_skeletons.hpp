@@ -44,20 +44,38 @@ struct SyncState {
     long long safety_units = 0;   // counter kinds; a duration means nothing there
     std::string cadence = "nightly";
     std::string extra;
-    bool log_enabled = false;             // keep a per-target change log
+    // Tri-state, deliberately not bool: empty means "the operator did not say",
+    // which must reach the server as NULL so a re-registration leaves the
+    // stored value alone. A bool cannot express that, and silently meant "off".
+    std::string log_enabled;              // "true" | "false" | ""
     std::string load_type_default;        // D | F | I | L; F and L are one-shot
-    bool allow_empty_reload = false;      // let a reload empty the target
+    std::string allow_empty_reload;       // "true" | "false" | ""
 };
 
-// The register call's fields, in one ordered list, as {ABAP field name, ABAP
-// literal}. Both writers of the register surface render from this: the
-// S_DEVELOP-free driver path and the generated-ABAP path.
+// One field of the register call, in both the forms its two writers need:
+// `raw` for the command queue, `abap` for generated ABAP source. Returning both
+// is what stops each writer parsing the other's encoding -- the queue path used
+// to strip backticks off rendered ABAP to recover the value it had started
+// with, which works only while every rendering is trivially reversible.
+struct RegisterField {
+    std::string name;    // the ty_state component, lower case
+    std::string raw;     // the value as text; empty means "the caller did not say"
+    std::string abap;    // the same value as an ABAP literal
+};
+
+// The register call's fields, in one ordered list. Every writer of the register
+// surface renders from this.
 //
-// One list because there were two, and they drifted: the generated skeleton
-// omitted time_col and safety_units entirely, so a field added to the state
-// arrived at the server empty and the feature that needed it simply did
-// nothing -- no compile error, no runtime error.
-std::vector<std::pair<std::string, std::string>> RegisterFields(const SyncState &s);
+// One list because there were three, and all three drifted: the generated
+// skeleton omitted time_col and safety_units, and the queue driver omitted
+// those plus all three flags. Each time the symptom was identical -- no compile
+// error, no runtime error, the field arrives empty and the feature that needed
+// it simply does not happen.
+//
+// Nothing here substitutes a default for an unset field. It did, and that made
+// the coalescing upsert on the ABAP side a no-op: every registration asserted
+// every flag whether the caller had mentioned it or not.
+std::vector<RegisterField> RegisterFields(const SyncState &s);
 
 // Each renderer returns complete, deployable ABAP with `nonce` woven into its
 // result lines. They throw UnsafeValue if any parameter cannot be embedded.

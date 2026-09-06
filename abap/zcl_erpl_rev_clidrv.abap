@@ -141,18 +141,35 @@ CLASS zcl_erpl_rev_clidrv IMPLEMENTATION.
         ev_result = |rows={ ls_r-rows_affected };seconds={ ls_r-seconds }|.
 
       WHEN 'sync_register'.
-        ev_error = zcl_erpl_rev_delta=>register( VALUE #(
-          target      = jstr( iv_json = iv_params iv_key = 'target' )
-          method      = jstr( iv_json = iv_params iv_key = 'method' )
-          source_from = jstr( iv_json = iv_params iv_key = 'source_from' )
-          keys        = jstr( iv_json = iv_params iv_key = 'keys' )
-          chg_col     = jstr( iv_json = iv_params iv_key = 'chg_col' )
-          wm_kind     = jstr( iv_json = iv_params iv_key = 'wm_kind' )
-          wm_value    = jstr( iv_json = iv_params iv_key = 'wm_value' )
-          safety_secs = COND i( WHEN jint( iv_json = iv_params iv_key = 'safety_secs' ) > 0
-                                THEN jint( iv_json = iv_params iv_key = 'safety_secs' ) ELSE 120 )
-          cadence     = jstr( iv_json = iv_params iv_key = 'cadence' )
-          extra       = jstr( iv_json = iv_params iv_key = 'extra' ) ) ).
+        " Every component of ty_state, by NAME, rather than a hand-written list.
+        "
+        " The hand-written list named ten of fifteen fields, so time_col,
+        " safety_units, log_enabled, load_type_default and allow_empty_reload
+        " were dropped on the floor by the DEFAULT CLI path -- the flags existed
+        " on the command line, in the server, and in the schema, and did nothing.
+        " This is the third writer of the same surface to drift, and each time
+        " the symptom was the same: no compile error, no runtime error, the
+        " feature simply does not happen. Iterating the structure makes a fourth
+        " drift impossible -- a field added to ty_state is carried from the day
+        " it is added.
+        DATA ls_reg TYPE zcl_erpl_rev_delta=>ty_state.
+        FIELD-SYMBOLS <lv_comp> TYPE any.
+        DATA(lo_sd) = CAST cl_abap_structdescr(
+                        cl_abap_typedescr=>describe_by_data( ls_reg ) ).
+        LOOP AT lo_sd->components INTO DATA(ls_comp).
+          ASSIGN COMPONENT ls_comp-name OF STRUCTURE ls_reg TO <lv_comp>.
+          IF sy-subrc <> 0. CONTINUE. ENDIF.
+          DATA(lv_key) = to_lower( CONV string( ls_comp-name ) ).
+          IF ls_comp-type_kind = cl_abap_typedescr=>typekind_int.
+            <lv_comp> = jint( iv_json = iv_params iv_key = lv_key ).
+          ELSE.
+            <lv_comp> = jstr( iv_json = iv_params iv_key = lv_key ).
+          ENDIF.
+        ENDLOOP.
+        " The one field with a default rather than a blank: a zero safety window
+        " on a clock kind means no overlap at all.
+        IF ls_reg-safety_secs <= 0. ls_reg-safety_secs = 120. ENDIF.
+        ev_error = zcl_erpl_rev_delta=>register( ls_reg ).
         IF ev_error IS INITIAL.
           ev_result = |registered { jstr( iv_json = iv_params iv_key = 'target' ) }|.
         ENDIF.

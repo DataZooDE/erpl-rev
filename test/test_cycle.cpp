@@ -1184,10 +1184,14 @@ TEST_CASE("cycle: a load type the method cannot honour is refused before anythin
     CHECK_THROWS_WITH(cycle::Begin(con, "zdelta_wm", LoadType::Full, kReadStart),
                       Catch::Matchers::ContainsSubstring("not implemented for method SNAPSHOT"));
 
-    // Nothing claimed, nothing recorded, nothing counted against the target.
+    // Nothing claimed, nothing recorded -- but the target is BLOCKED, not left
+    // free. Refusing without blocking meant the planner handed the same target
+    // the same impossible load type on every due tick, refused it, and never
+    // backed off: a micro-cadence target hammering SAP indefinitely with
+    // nothing recording why.
     CHECK(Scalar(con, "SELECT active_run_id FROM _erpl_rev_delta_state").empty());
-    CHECK(Scalar(con, "SELECT status FROM _erpl_rev_delta_state") == "IDLE");
-    CHECK(Scalar(con, "SELECT fail_count FROM _erpl_rev_delta_state") == "0");
+    CHECK(Scalar(con, "SELECT status FROM _erpl_rev_delta_state") == "BLOCKED");
+    CHECK_FALSE(Scalar(con, "SELECT last_error FROM _erpl_rev_delta_state").empty());
     CHECK(Scalar(con, "SELECT count(*) FROM _erpl_rev_run_stats") == "0");
 }
 
@@ -1233,4 +1237,50 @@ TEST_CASE("cycle: a counter watermark has no commit timestamp at all", "[cycle][
 
     CHECK(Scalar(con, "SELECT count(*) FROM " + cycle::ChangeLogName("zdelta_wm") +
                       " WHERE _commit_ts IS NOT NULL") == "0");
+}
+
+TEST_CASE("cycle: a reload that replaced nothing is not a reload", "[cycle]") {
+    // allow_empty_reload lets a reload empty a target, which is what it is for.
+    // It also skipped the refusal entirely -- so a run whose reader produced no
+    // staging table at all (a short read, a connection dropped between
+    // packages) truncated nothing, merged nothing, reported SUCCESS with
+    // 0/0/0, and spent the target's pending one-shot load type on the way out.
+    // The third case in this area of "a repair reports success and fixes
+    // nothing".
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con);
+    Exec(con, "UPDATE _erpl_rev_delta_state SET allow_empty_reload=true, "
+              "load_type_default='F'");
+
+    const auto b = cycle::Begin(con, "zdelta_wm", LoadType::Full, kReadStart);
+    // No stage: the read produced nothing at all.
+    CHECK_THROWS_WITH(cycle::Commit(con, "zdelta_wm", b.run_id, {0}),
+                      Catch::Matchers::ContainsSubstring("replaced nothing"));
+
+    // The target is intact and the one-shot type is unspent, so the repair can
+    // actually happen once someone fixes the read.
+    CHECK(Scalar(con, "SELECT count(*) FROM zdelta_wm") == "2");
+    CHECK(Scalar(con, "SELECT load_type_default FROM _erpl_rev_delta_state") == "F");
+}
+
+TEST_CASE("cycle: a reload that creates the target is still a reload", "[cycle]") {
+    // The counterpart the throw must not catch: F against a target that does
+    // not exist yet legitimately creates it from the stage.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    schema::Migrate(con, "test");
+    Exec(con, "INSERT INTO _erpl_rev_delta_state "
+              "(target, method, source_from, keys, chg_col, wm_kind, wm_value, safety_secs, "
+              " cadence, status) VALUES "
+              "('fresh_f','WATERMARK','FRESH','id','CHANGED_AT','NUMTS',"
+              "'20260905100000',120,'micro:5','IDLE')");
+
+    const auto b = cycle::Begin(con, "fresh_f", LoadType::Full, kReadStart);
+    Exec(con, "CREATE TABLE " + b.stage_table + "(id INTEGER, v VARCHAR, changed_at VARCHAR)");
+    Exec(con, "INSERT INTO " + b.stage_table + " VALUES (1,'a','20260905110000')");
+    const auto r = cycle::Commit(con, "fresh_f", b.run_id, {1});
+
+    CHECK(r.ins == 1);
+    CHECK(Scalar(con, "SELECT count(*) FROM fresh_f") == "1");
 }

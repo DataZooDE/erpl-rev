@@ -241,24 +241,31 @@ std::string RenderReplicate(const ReplicateParams &p, const std::string &nonce) 
     return t.Render();
 }
 
-std::vector<std::pair<std::string, std::string>> RegisterFields(const SyncState &s) {
+std::vector<RegisterField> RegisterFields(const SyncState &s) {
+    auto str = [](const std::string &name, const std::string &v, const char *flag) {
+        return RegisterField{name, v, Backtick(v, flag)};
+    };
+    auto num = [](const std::string &name, long long v) {
+        return RegisterField{name, std::to_string(v), Int(v)};
+    };
     return {
-        {"target", Backtick(s.target, "<target>")},
-        {"method", Backtick(s.method, "--method")},
-        {"source_from", Backtick(s.source_from, "--source")},
-        {"keys", Backtick(s.keys, "--keys")},
-        {"chg_col", Backtick(s.chg_col, "--chg-col")},
-        {"time_col", Backtick(s.time_col, "--time-col")},
-        {"wm_kind", Backtick(s.wm_kind, "--wm-kind")},
-        {"wm_value", Backtick(s.wm_value, "--wm-value")},
-        {"safety_secs", Int(s.safety_secs)},
-        {"safety_units", Int(s.safety_units)},
-        {"cadence", Backtick(s.cadence, "--cadence")},
-        {"extra", Backtick(s.extra, "--extra")},
-        {"log_enabled", s.log_enabled ? "abap_true" : "abap_false"},
-        {"load_type_default",
-         Backtick(s.load_type_default.empty() ? "D" : s.load_type_default, "--load-type-default")},
-        {"allow_empty_reload", s.allow_empty_reload ? "abap_true" : "abap_false"},
+        str("target", s.target, "<target>"),
+        str("method", s.method, "--method"),
+        str("source_from", s.source_from, "--source"),
+        str("keys", s.keys, "--keys"),
+        str("chg_col", s.chg_col, "--chg-col"),
+        str("time_col", s.time_col, "--time-col"),
+        str("wm_kind", s.wm_kind, "--wm-kind"),
+        str("wm_value", s.wm_value, "--wm-value"),
+        num("safety_secs", s.safety_secs),
+        num("safety_units", s.safety_units),
+        str("cadence", s.cadence, "--cadence"),
+        str("extra", s.extra, "--extra"),
+        // Left EMPTY when the operator did not say, so the server writes NULL
+        // and the upsert leaves the stored value alone.
+        str("log_enabled", s.log_enabled, "--log"),
+        str("load_type_default", s.load_type_default, "--load-type-default"),
+        str("allow_empty_reload", s.allow_empty_reload, "--allow-empty-reload"),
     };
 }
 
@@ -268,9 +275,9 @@ std::string RenderSyncRegister(const SyncState &s, const std::string &nonce) {
     Template t(kRegister);
     std::string body;
     for (const auto &f : RegisterFields(s)) {
-        body += "      " + f.first;
-        body += std::string(12 > f.first.size() ? 12 - f.first.size() : 1, ' ');
-        body += "= " + f.second + "\n";
+        body += "      " + f.name;
+        body += std::string(18 > f.name.size() ? 18 - f.name.size() : 1, ' ');
+        body += "= " + f.abap + "\n";
     }
     if (!body.empty()) body.pop_back();
     t.Set("CLASS", cls).Set("NONCE", Backtick(nonce, "nonce")).Set("REGFIELDS", body);

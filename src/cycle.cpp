@@ -203,10 +203,24 @@ BeginResult Begin(duckdb::Connection &con, const std::string &target, LoadType l
     // handed out the F and only ABAP declined, after taking the lease, counting
     // it against the target's backoff and parking a healthy target for what is
     // an operator typo.
-    if (load_type != LoadType::Delta && st.method != "WATERMARK")
+    if (load_type != LoadType::Delta && st.method != "WATERMARK") {
+        // BLOCK it, do not just refuse. Throwing before the claim means
+        // ReleaseFailedCycle never runs and fail_count never moves -- so a
+        // target mis-registered with load_type_default='F' on a SNAPSHOT method
+        // was handed that load type by the planner on every due tick, refused,
+        // and left completely unbacked-off: a micro:2 target hammering SAP
+        // every two seconds, indefinitely, with nothing recording why.
+        //
+        // BLOCKED is the status the planner already skips, and it is the honest
+        // one: this is a registration that cannot run, not a run that failed.
+        con.Query("UPDATE _erpl_rev_delta_state SET status='BLOCKED', "
+                  "last_error='load type " + std::string(LoadTypeCode(load_type)) +
+                  " is not implemented for method " + st.method + "' WHERE target=" + Lit(target));
         throw std::runtime_error("cycle: load type " + std::string(LoadTypeCode(load_type)) +
                                  " is not implemented for method " + st.method + "; only " +
-                                 "WATERMARK targets support one");
+                                 "WATERMARK targets support one. " + target +
+                                 " is blocked until it is registered correctly");
+    }
 
     BeginResult out;
     out.plan = PlanLoad(load_type);
@@ -795,6 +809,25 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
         }
     }
 
+    // Did this run actually REPLACE the target? A reload that did not is not a
+    // reload, and must not report success or spend the target's one-shot load
+    // type. Reachable: a target registered allow_empty_reload skips the
+    // empty-stage refusal above, so a read that produced no staging table at
+    // all -- a short read, a connection dropped between packages -- truncated
+    // nothing, merged nothing, reported SUCCESS with 0/0/0, and consumed a
+    // pending seed on the way out.
+    //
+    // A reload that CREATES the target is a real reload; only an existing
+    // target that was not replaced is the failure.
+    const bool replaced =
+        load_plan.truncate_target && have_target && have_stage && !keys.empty();
+    if (load_plan.truncate_target && have_target && !replaced)
+        throw std::runtime_error(
+            "cycle: the reload of " + target + " replaced nothing (" +
+            std::string(!have_stage ? "the read produced no staging table"
+                                    : "the target has no registered keys") +
+            "); refusing to report a repair that did not happen");
+
     Exec(con, "BEGIN", "begin");
     {
         if (have_stage && !have_target) {
@@ -953,7 +986,7 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
         // does not, so the seed silently became a repair and the target was
         // never seeded. Comparing the two needs no extra plumbing: the daemon
         // runs the default, so they match; an operator overriding it does not.
-        if (load_plan.truncate_target)
+        if (replaced || will_create)
             Exec(con, "UPDATE _erpl_rev_delta_state SET load_type_default='D' WHERE target=" +
                           Lit(target) + " AND load_type_default IN ('F','L')" +
                           " AND load_type_default=" + Lit(run_load_type),
