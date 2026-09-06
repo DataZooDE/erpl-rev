@@ -41,8 +41,14 @@ CLASS zcl_erpl_rev_daemontest IMPLEMENTATION.
   ENDMETHOD.
 
   METHOD scalar.
+    " Extract the VALUE. This used to return ls-rows -- the unparsed JSON --
+    " so `instance_id IS NOT INITIAL` was green for {"instance_id":null} and
+    " comparing two of them compared two JSON blobs that were equally green
+    " when both were null. Three assertions about the singleton could not
+    " fail, which is the whole thing this suite exists to check.
     DATA(ls) = zcl_erpl_rev_util=>query( iv_sql ).
-    rv = ls-rows.
+    FIND PCRE '"[^"]+"\s*:\s*"([^"]*)"' IN ls-rows SUBMATCHES rv.
+    IF sy-subrc <> 0. CLEAR rv. ENDIF.
   ENDMETHOD.
 
   METHOD sql.
@@ -120,7 +126,11 @@ CLASS zcl_erpl_rev_daemontest IMPLEMENTATION.
     seed_rows( iv_from = 0 iv_count = 5 ).
 
     " --- start it --------------------------------------------------------
-    DATA(lv_job) = start_daemon( iv_secs = 2 iv_dur = 60 ).
+    " iv_dur = 0: it runs until something STOPS it. With a duration the daemon
+    " ends on its own timer, and both stop assertions below were satisfied by
+    " that timer rather than by the flag -- the release path is identical for
+    " either exit. This is also production's setting.
+    DATA(lv_job) = start_daemon( iv_secs = 2 iv_dur = 0 ).
     ok( cond = xsdbool( lv_job IS NOT INITIAL )
         what = 'DAEMON-START: the daemon job was submitted' detail = |{ lv_job }| ).
     IF lv_job IS INITIAL.
@@ -159,7 +169,7 @@ CLASS zcl_erpl_rev_daemontest IMPLEMENTATION.
     " Two daemons run every target against each other: same source, same
     " target, two cycles racing for one lease. The per-target lease stops
     " double CYCLES; this is what stops double DAEMONS.
-    DATA(lv_job2) = start_daemon( iv_secs = 2 iv_dur = 60 ).
+    DATA(lv_job2) = start_daemon( iv_secs = 2 iv_dur = 0 ).
     WAIT UP TO 12 SECONDS.
     DATA(lv_inst2) = scalar( |SELECT instance_id FROM _erpl_rev_daemon WHERE id=1| ).
     ok( cond = xsdbool( lv_inst2 = lv_inst )
@@ -209,7 +219,23 @@ CLASS zcl_erpl_rev_daemontest IMPLEMENTATION.
                           = lv_inst )
         what = 'DAEMON-BACKOFF: the daemon survived a failing target' ).
 
+    " The id must be unique per PROCESS, not per second. Two daemons launched
+    " in the same second used to build the same host/user/timestamp id, and the
+    " loser's substring read-back then found its own string in the winner's and
+    " marched on -- two daemons, one row, every target run twice. This suite
+    " cannot stage that race (its two starts are a minute and a half apart), so
+    " what is asserted here is the property that removes it: the id carries a
+    " per-process unique component rather than a one-second clock.
+    ok( cond = xsdbool( strlen( lv_inst ) > 40 AND lv_inst CS '/' )
+        what = 'DAEMON-SINGLE: the instance id is unique per process, not per second'
+        detail = lv_inst ).
+
     " --- stop it ---------------------------------------------------------
+    " Alive first, so "it finished" below means the flag ended it. With
+    " iv_dur=0 nothing else can.
+    ok( cond = xsdbool( job_status( lv_job ) = 'R' )
+        what = 'DAEMON-STOP: it was still running before the flag was set'
+        detail = |status { job_status( lv_job ) }| ).
     sql( |UPDATE _erpl_rev_daemon SET stop=true WHERE id=1| ).
     DATA(lv_stopped) = wait_until(
       iv_sql = |SELECT count(*) AS c FROM _erpl_rev_daemon | &&
@@ -227,6 +253,12 @@ CLASS zcl_erpl_rev_daemontest IMPLEMENTATION.
     ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM _erpl_rev_daemon | &&
                              |WHERE id=1 AND stop=false| ) = 1 )
         what = 'DAEMON-STOP: the flag was cleared for the next start' ).
+
+    " Leave nothing behind. dmn_broken points at a table that does not exist on
+    " purpose; left registered, every later daemon or batch tick keeps failing
+    " it and piling up fail_count on a system that is not under test.
+    sql( |DELETE FROM _erpl_rev_delta_state WHERE target LIKE 'dmn\\_%' ESCAPE '\\'| ).
+    sql( |DROP TABLE IF EXISTS dmn_wm| ).
 
     out->write( |DAEMON RESULT pass={ mv_pass } fail={ mv_fail }| ).
   ENDMETHOD.

@@ -95,7 +95,22 @@ START-OF-SELECTION.
   " One UPDATE with the staleness test in its WHERE, so two daemons starting
   " at the same moment cannot both believe they won: exactly one row is
   " changed. A heartbeat older than three ticks means the holder is gone.
-  gv_instance = |{ sy-host }/{ sy-uname }/{ sy-datum }{ sy-uzeit }|.
+  " UNIQUE per process, not per second. This was host/user/date+time at
+  " one-second resolution, checked with a substring test -- so two daemons
+  " launched in the same second (a scheduler retrying a failed SUBMIT, two
+  " strtimmed jobs released together, an operator starting twice) built the
+  " SAME id. The loser's claim then changed zero rows, it read back the
+  " winner's id, found its own string inside it, and marched into the tick
+  " loop. Both beat the same row, both ran every due target against each
+  " other, and whichever finished first wrote STOPPED out from under the
+  " other -- precisely what the singleton exists to prevent.
+  DATA lv_uuid TYPE string.
+  TRY.
+      lv_uuid = cl_system_uuid=>create_uuid_c32_static( ).
+    CATCH cx_uuid_error.
+      lv_uuid = |{ sy-datum }{ sy-uzeit }{ sy-timlo }|.
+  ENDTRY.
+  gv_instance = |{ sy-host }/{ sy-uname }/{ lv_uuid }|.
   DATA(lv_claim) =
     |UPDATE _erpl_rev_daemon SET instance_id='{ gv_instance }', status='RUNNING', | &&
     |heartbeat_ts=now(), started_ts=now(), stop=false, ticks=0 | &&
@@ -108,10 +123,12 @@ START-OF-SELECTION.
     RETURN.
   ENDIF.
 
-  " Did we get it? Read back rather than trusting the update count.
-  DATA(lv_who) = |SELECT instance_id FROM _erpl_rev_daemon WHERE id=1|.
+  " Did we get it? An EXACT match on a unique id, not a substring test on a
+  " shared one: count the row that names us, and require exactly one.
+  DATA(lv_who) = |SELECT count(*) AS c FROM _erpl_rev_daemon | &&
+                 |WHERE id=1 AND instance_id='{ gv_instance }'|.
   PERFORM q USING lv_who CHANGING lv_rows lv_err.
-  IF lv_rows NS gv_instance.
+  IF lv_rows NS '"c":1'.
     " Someone else holds it. Report their status and leave -- starting a second
     " daemon would run every target twice, against each other.
     DATA(lv_st) = |SELECT instance_id, status, ticks FROM _erpl_rev_daemon|.
@@ -131,6 +148,22 @@ START-OF-SELECTION.
   GET TIME STAMP FIELD DATA(lv_start).
 
   DO.
+    " STOP is read here, unconditionally, before anything else can fail.
+    "
+    " It used to be read only out of the tick plan, inside the branch taken
+    " when the planner SUCCEEDED -- so a daemon whose planner was erroring for
+    " any reason ignored stop=true forever, and with p_dur=0 (which is
+    " production) had no other way out. The control channel for "stop" ran
+    " through the exact dependency whose misbehaviour is the likeliest reason
+    " an operator reaches for it. One statement per tick against a single-row
+    " table.
+    DATA(lv_stopq) = |SELECT count(*) AS c FROM _erpl_rev_daemon WHERE id=1 AND stop|.
+    PERFORM q USING lv_stopq CHANGING lv_rows lv_err.
+    IF lv_err IS INITIAL AND lv_rows CS '"c":1'.
+      WRITE: / |DAEMON STOP acknowledged after { lv_ticks } ticks|.
+      EXIT.
+    ENDIF.
+
     DATA lv_plan TYPE string.
     DATA(lv_a) = `TICK`.
     DATA(lv_t) = ``.
@@ -145,6 +178,8 @@ START-OF-SELECTION.
       " knew.
       WRITE: / |DAEMON TICK error={ lv_err }|.
     ELSE.
+      " The plan's own stop flag: a fast path only. The authoritative read is
+      " at the top of the loop, where a planner error cannot hide it.
       IF lv_plan CS '"stop":true'.
         WRITE: / |DAEMON STOP acknowledged after { lv_ticks } ticks|.
         EXIT.

@@ -266,7 +266,7 @@ suite publish ZCL_ERPL_REV_PUBTEST abap/zcl_erpl_rev_pubtest.abap PUBTEST 6 "" \
 suite watermark ZCL_ERPL_REV_WMTEST abap/zcl_erpl_rev_wmtest.abap WM 8 "" \
   "the corrections: a late commit below the observed max is delivered, DATE never reads today, a DATS+TIMS pair survives midnight, load types I and F"
 
-suite daemon ZCL_ERPL_REV_DAEMONTEST abap/zcl_erpl_rev_daemontest.abap DAEMON 13 "@soak" \
+suite daemon ZCL_ERPL_REV_DAEMONTEST abap/zcl_erpl_rev_daemontest.abap DAEMON 16 "@soak" \
   "the daemon as a real background job: it ticks, it replicates with nobody calling run(), a second one refuses to start, and the stop flag ends it"
 
 suite stress ZCL_ERPL_REV_STREAMSTRESS abap/zcl_erpl_rev_streamstress.abap STRESS 14 "@soak" \
