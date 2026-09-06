@@ -120,6 +120,20 @@ BeginResult Begin(duckdb::Connection &con, const std::string &target, LoadType l
     int64_t read_start = read_start_epoch;
     int64_t skew = 0;
     const bool sap_clock = spec.kind == wm::WmKind::Date || spec.kind == wm::WmKind::Datetime;
+
+    // A wall-clock kind CANNOT fall back to the server's clock. Where the two
+    // differ -- and on the reference system they differ by two hours -- the
+    // ceiling and therefore the stored watermark jump forward by the offset, and
+    // everything committed in that window falls below the next floor and is lost
+    // permanently. Refusing is loud and costs one cycle; guessing is silent and
+    // costs data.
+    if (sap_clock && sap_now.size() < 14)
+        throw std::runtime_error(
+            "cycle: " + target + " has wm_kind " + wm::KindName(spec.kind) +
+            ", whose change column is wall-clock in SAP's timezone, so the cycle needs "
+            "SAP's own clock in sap_now. Refusing rather than substituting the server's, "
+            "which would move the watermark by the offset between them.");
+
     if (sap_now.size() >= 14) {
         try {
             const int64_t sap_epoch = wm::ParseNumts(sap_now);
@@ -129,7 +143,11 @@ BeginResult Begin(duckdb::Connection &con, const std::string &target, LoadType l
             skew = read_start_epoch - sap_epoch;
             if (sap_clock) read_start = sap_epoch;
         } catch (...) {
-            // Unparseable: fall back rather than fail the cycle.
+            if (sap_clock)
+                throw std::runtime_error(
+                    "cycle: " + target + " received an unparseable sap_now ('" + sap_now +
+                    "'); refusing rather than substituting the server's clock.");
+            // For a UTC-based kind the server's clock is the right ruler anyway.
         }
     }
     out.bounds = wm::ComputeBounds(spec, read_start);
@@ -404,6 +422,14 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
                         "cycle: run " + std::to_string(run_id) +
                         " has no planned ceiling; it was not opened by Begin()");
                 new_wm = planned;
+                // Forward only. A clock that goes backwards -- an NTP
+                // correction, or a DST fall-back on a wall-clock target --
+                // would otherwise rewind the watermark and re-read a window
+                // already applied. Idempotent, so harmless once; but each quiet
+                // cycle would walk it back further.
+                if (!st.wm_value.empty() && new_wm.size() == st.wm_value.size() &&
+                    new_wm < st.wm_value)
+                    new_wm = st.wm_value;
             }
         }
     }

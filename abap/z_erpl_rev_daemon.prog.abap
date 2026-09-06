@@ -123,10 +123,12 @@ START-OF-SELECTION.
   WRITE: / |DAEMON START instance={ gv_instance } tick={ p_secs }s|.
 
   " --- the tick loop ----------------------------------------------------
-  DATA lv_t0 TYPE i.
   DATA lv_elapsed TYPE i.
   DATA lv_ticks TYPE i.
-  GET RUN TIME FIELD DATA(lv_start).
+  " GET TIME STAMP, not GET RUN TIME. Run time measures CPU-ish program time and
+  " does not advance across a WAIT, so a daemon started with p_dur=60 slept
+  " through its own deadline and ran until something stopped it.
+  GET TIME STAMP FIELD DATA(lv_start).
 
   DO.
     DATA lv_plan TYPE string.
@@ -138,6 +140,9 @@ START-OF-SELECTION.
     IF lv_err IS NOT INITIAL.
       " The server is unreachable or unhappy. Do not spin: wait a tick and try
       " again, so a restarting server is picked up without hammering the gateway.
+      " The server's own words are kept -- "the planner refused" without the
+      " reason sends an operator to a log file to learn what this line already
+      " knew.
       WRITE: / |DAEMON TICK error={ lv_err }|.
     ELSE.
       IF lv_plan CS '"stop":true'.
@@ -170,8 +175,8 @@ START-OF-SELECTION.
                     |WHERE id=1 AND instance_id='{ gv_instance }'|.
     PERFORM q USING lv_beat CHANGING lv_rows lv_err.
 
-    GET RUN TIME FIELD DATA(lv_now).
-    lv_elapsed = ( lv_now - lv_start ) / 1000000.
+    GET TIME STAMP FIELD DATA(lv_now).
+    lv_elapsed = CONV i( cl_abap_tstmp=>subtract( tstmp1 = lv_now tstmp2 = lv_start ) ).
     IF p_dur > 0 AND lv_elapsed >= p_dur.
       WRITE: / |DAEMON END after { lv_ticks } ticks ({ lv_elapsed }s)|.
       EXIT.

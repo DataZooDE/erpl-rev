@@ -182,6 +182,16 @@ reclaimed in the meantime. There is no cross-system 2-phase commit.
 methods watermark on `UDATE`+`UTIME` with the same safety offset applied — never a bare
 `CHANGENR > wm`.
 
+> **A DATS+TIMS pair and daylight saving.** `DATETIME` compares a wall-clock
+> value in SAP's own timezone. On the autumn transition that clock repeats an
+> hour, and the two passes through it are genuinely indistinguishable — no
+> watermark can order them. Rows committed in the *second* pass carry values the
+> cycle has already gone past, so they are read only if the safety window
+> reaches back that far. The watermark is clamped forward-only, so the target
+> cannot rewind and no later data is at risk; but if you need sub-daily delta
+> across a DST boundary, use `NUMTS`/`TIMESTAMPL`, which are UTC and have no
+> repeated hour. This is a property of wall-clock columns, not of erpl-rev.
+
 ### Load types
 
 Every run is one of four, selectable with `sync run --load-type`:

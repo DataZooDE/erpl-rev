@@ -574,3 +574,50 @@ TEST_CASE("cycle: a failed commit counts against the target, a lost race does no
     REQUIRE_THROWS(cycle::Commit(con, "zdelta_wm", b.run_id, {2}));
     CHECK(Scalar(con, "SELECT fail_count FROM _erpl_rev_delta_state") == "1");
 }
+
+TEST_CASE("cycle: a wall-clock target refuses to run without SAP's clock", "[cycle]") {
+    // DATS and TIMS are wall-clock in SAP's timezone. Without sap_now the server
+    // silently fell back to its OWN clock, so on a system where the two differ
+    // the ceiling -- and therefore the stored watermark -- jumped forward by the
+    // offset, and everything committed in that window fell below the next floor
+    // and was lost permanently.
+    //
+    // Guessing is the wrong response to a missing clock. Refusing is loud, and
+    // the cycle simply runs again once the caller sends one.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    schema::Migrate(con, "test");
+    Exec(con, "CREATE TABLE dt(id INTEGER, d DATE, t TIME)");
+    Exec(con, "INSERT INTO _erpl_rev_delta_state "
+              "(target, method, source_from, keys, chg_col, time_col, wm_kind, wm_value, "
+              " safety_secs, cadence, status) VALUES "
+              "('dt','WATERMARK','DT','id','ERDAT','ERZET','DATETIME','20260905100000',120,"
+              "'manual','IDLE')");
+
+    REQUIRE_THROWS(cycle::Begin(con, "dt", LoadType::Delta, kReadStart, /*sap_now=*/""));
+    // ...and with SAP's clock it starts normally.
+    REQUIRE_NOTHROW(cycle::Begin(con, "dt", LoadType::Delta, kReadStart, "20260905120000"));
+}
+
+TEST_CASE("cycle: the watermark never moves backwards, whatever the clock does",
+          "[cycle]") {
+    // A clock that goes backwards -- an NTP correction, or a DST fall-back on a
+    // wall-clock DATETIME target -- would otherwise rewind the watermark and
+    // re-read a window that was already applied. Harmless in itself (the merge
+    // is idempotent) but it compounds: each quiet cycle walks it back further.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con);
+
+    auto b = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart);
+    StageRows(con, b.stage_table);
+    cycle::Commit(con, "zdelta_wm", b.run_id, {2});
+    const auto after = Scalar(con, "SELECT wm_value FROM _erpl_rev_delta_state");
+
+    // A cycle whose clock reads an hour EARLIER than the last one.
+    b = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart - 3600);
+    Exec(con, "CREATE TABLE " + b.stage_table + "(id INTEGER, v VARCHAR, changed_at VARCHAR)");
+    cycle::Commit(con, "zdelta_wm", b.run_id, {0});
+
+    CHECK(Scalar(con, "SELECT wm_value FROM _erpl_rev_delta_state") == after);
+}

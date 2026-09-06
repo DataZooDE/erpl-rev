@@ -61,6 +61,17 @@ CLASS zcl_erpl_rev_delta DEFINITION PUBLIC FINAL CREATE PUBLIC.
       RETURNING VALUE(rv_error) TYPE string.
 
 
+    "! What the planning FM answered: the plan, or why there is none.
+    "!
+    "! Two fields rather than an empty string, because "no plan" and "the server
+    "! refused, and here is why" are different things. Collapsing them cost the
+    "! operator every reason a cycle was refused -- they all arrived as
+    "! "BEGIN_CYCLE returned nothing".
+    TYPES: BEGIN OF ty_plan_result,
+             json  TYPE string,
+             error TYPE string,
+           END OF ty_plan_result.
+
     "! Call the server's planning FM. One function module, many actions, because
     "! the alternative is a new stub -- and a new upgrade event on every installed
     "! system -- per decision the server needs to make.
@@ -68,7 +79,7 @@ CLASS zcl_erpl_rev_delta DEFINITION PUBLIC FINAL CREATE PUBLIC.
       IMPORTING iv_action TYPE string
                 iv_target TYPE string DEFAULT ''
                 iv_params TYPE string DEFAULT ''
-      RETURNING VALUE(rv) TYPE string.
+      RETURNING VALUE(rs) TYPE ty_plan_result.
 
     "! One scalar out of a flat JSON object the server produced.
     CLASS-METHODS jstr
@@ -390,7 +401,7 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
     " maximum of whatever happened to arrive. A row that commits during a read
     " longer than the safety window carries a value below that maximum, and
     " advancing to the maximum would put it below the next floor permanently.
-    DATA(lv_plan) = plan_json( iv_action = 'BEGIN_CYCLE'
+    DATA(ls_begin) = plan_json( iv_action = 'BEGIN_CYCLE'
                                iv_target = is_state-target
                                " SAP's own clock travels with the request. A DATS
                                " or TIMS column is wall-clock in THIS system's
@@ -401,8 +412,13 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
                                " replicated once and then went quiet.
                                iv_params = |\{"load_type":"{ iv_load_type }",| &&
                                            |"sap_now":"{ sy-datum }{ sy-uzeit }"\}| ).
+    IF ls_begin-error IS NOT INITIAL.
+      rs-error = ls_begin-error.
+      RETURN.
+    ENDIF.
+    DATA(lv_plan) = ls_begin-json.
     IF lv_plan IS INITIAL.
-      rs-error = 'BEGIN_CYCLE returned nothing'.
+      rs-error = 'BEGIN_CYCLE returned no plan and no reason'.
       RETURN.
     ENDIF.
 
@@ -478,11 +494,16 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
 
     " One transaction on the server: merge the stage, append the change log,
     " advance the watermark to the ceiling, finish the stats row, drop the stage.
-    DATA(lv_done) = plan_json( iv_action = 'CYCLE_COMMIT'
+    DATA(ls_done) = plan_json( iv_action = 'CYCLE_COMMIT'
                                iv_target = is_state-target
                                iv_params = |\{"run_id":{ lv_run_id },"rows_read":{ lv_rows }\}| ).
+    IF ls_done-error IS NOT INITIAL.
+      rs-error = ls_done-error.
+      RETURN.
+    ENDIF.
+    DATA(lv_done) = ls_done-json.
     IF lv_done IS INITIAL.
-      rs-error = 'CYCLE_COMMIT returned nothing'.
+      rs-error = 'CYCLE_COMMIT returned no result and no reason'.
       RETURN.
     ENDIF.
 
@@ -819,26 +840,27 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
 
 
   METHOD plan_json.
-    DATA lv_err TYPE string.
     DATA lv_msg TYPE c LENGTH 255.
     CALL FUNCTION 'Z_DUCKDB_PLAN' DESTINATION c_dest
       EXPORTING iv_action = iv_action
                 iv_target = iv_target
                 iv_params = iv_params
-      IMPORTING ev_plan   = rv
-                ev_error  = lv_err
+      IMPORTING ev_plan   = rs-json
+                ev_error  = rs-error
       EXCEPTIONS system_failure        = 1 MESSAGE lv_msg
                  communication_failure = 2 MESSAGE lv_msg
                  OTHERS                = 3.
     IF sy-subrc <> 0.
-      rv = ||.
+      CLEAR rs-json.
+      rs-error = |{ iv_action } RFC subrc={ sy-subrc } { lv_msg }|.
       RETURN.
     ENDIF.
-    " An action that failed server-side returns its reason in EV_ERROR; the
-    " caller sees an empty plan and reports it, rather than proceeding on a
-    " half-answer.
-    IF lv_err IS NOT INITIAL.
-      rv = ||.
+    " A server-side refusal carries its reason. It is kept, not discarded: the
+    " reason is the whole value of the message, and an operator told only that
+    " something "returned nothing" has to go and read a server log to learn that
+    " their target was reclaimed, or blocked by drift, or has no registration.
+    IF rs-error IS NOT INITIAL.
+      CLEAR rs-json.
     ENDIF.
   ENDMETHOD.
 

@@ -70,7 +70,10 @@ START-OF-SELECTION.
   " what anyone is worried about.
   DATA(lv_keyspace) = COND i( WHEN lv_total < 50 THEN 10 ELSE lv_total / 5 ).
 
-  GET RUN TIME FIELD DATA(lv_t0).
+  " GET TIME STAMP, not GET RUN TIME: run time does not advance across the WAIT
+  " between batches, so the duration check never fired and only the change count
+  " ended the run.
+  GET TIME STAMP FIELD DATA(lv_t0).
 
   WHILE lv_done < lv_total.
 
@@ -155,8 +158,8 @@ START-OF-SELECTION.
     " realistic granularity rather than all at the end.
     COMMIT WORK AND WAIT.
 
-    GET RUN TIME FIELD DATA(lv_now).
-    IF ( lv_now - lv_t0 ) / 1000000 >= p_dur. EXIT. ENDIF.
+    GET TIME STAMP FIELD DATA(lv_now).
+    IF cl_abap_tstmp=>subtract( tstmp1 = lv_now tstmp2 = lv_t0 ) >= p_dur. EXIT. ENDIF.
     WAIT UP TO 1 SECONDS.
   ENDWHILE.
 
