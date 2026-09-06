@@ -111,6 +111,20 @@ CLASS zcl_erpl_rev_delta DEFINITION PUBLIC FINAL CREATE PUBLIC.
                 iv_key  TYPE string
       RETURNING VALUE(rt) TYPE string_table.
 
+    "! The operator monitor's rows: one per target, worst first.
+    "!
+    "! Reads erpl_rev_targets -- the SAME view the CLI, the TUI and the metrics
+    "! endpoint read. Four surfaces over one definition of "healthy". A second
+    "! query here would be a second opinion, and the two would disagree the
+    "! first time either changed.
+    CLASS-METHODS monitor_rows
+      RETURNING VALUE(rs) TYPE zcl_erpl_rev_util=>ty_query.
+
+    "! The one-row health summary, including whether the daemon is beating.
+    "! "Nothing is replicating" is usually the daemon rather than the targets.
+    CLASS-METHODS monitor_health
+      RETURNING VALUE(rs) TYPE zcl_erpl_rev_util=>ty_query.
+
     "! One JSON ARRAY token out of a flat object, returned verbatim including
     "! its brackets. jstr stops at the first quote and cannot carry a list.
     CLASS-METHODS jarr
@@ -395,6 +409,26 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       ENDIF.
       lv_i = lv_i + 1.
     ENDWHILE.
+  ENDMETHOD.
+
+  METHOD monitor_rows.
+    " Ordered the way the operator needs it, not alphabetically: an operator
+    " opening a monitor is looking for the problem. Blocked first, then parked,
+    " then never-run, then most overdue.
+    rs = zcl_erpl_rev_util=>query(
+      |SELECT target, method, cadence, status, lag_seconds, last_rows, | &&
+      |fail_count, is_healthy, is_blocked, is_parked, | &&
+      |coalesce(park_reason, coalesce(last_error,'')) AS note | &&
+      |FROM erpl_rev_targets | &&
+      |ORDER BY is_blocked DESC, is_parked DESC, (lag_seconds IS NULL) DESC, | &&
+      |fail_count DESC, lag_seconds DESC NULLS LAST, target| ).
+  ENDMETHOD.
+
+  METHOD monitor_health.
+    rs = zcl_erpl_rev_util=>query(
+      |SELECT targets, healthy, blocked, parked, failing, never_run, | &&
+      |worst_lag_seconds, daemon_status, daemon_heartbeat_age_s, daemon_ticks | &&
+      |FROM erpl_rev_health| ).
   ENDMETHOD.
 
   METHOD jarr.

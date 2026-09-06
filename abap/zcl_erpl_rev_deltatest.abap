@@ -13,6 +13,7 @@ CLASS zcl_erpl_rev_deltatest DEFINITION PUBLIC FINAL CREATE PUBLIC.
     METHODS m3_changedoc.
     METHODS m4_orchestration.
     METHODS m5_sflight.
+    METHODS m7_monitor.
     METHODS m6_stats.
 ENDCLASS.
 
@@ -41,6 +42,7 @@ CLASS zcl_erpl_rev_deltatest IMPLEMENTATION.
         m4_orchestration( ).
         m5_sflight( ).
         m6_stats( ).
+        m7_monitor( ).
       CATCH cx_root INTO DATA(lx).
         mv_fail = mv_fail + 1.
         out->write( |DUMP: { lx->get_text( ) }| ).
@@ -298,6 +300,32 @@ CLASS zcl_erpl_rev_deltatest IMPLEMENTATION.
     ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM erpl_rev_run_stats | &&
                              |WHERE is_success AND rows_applied > 0| ) >= 1 )
         what = 'C15 dashboard view derives rows_applied / is_success' ).
+  ENDMETHOD.
+
+  METHOD m7_monitor.
+    " The SAP-side monitor reads the SAME views the CLI, the TUI and the metrics
+    " endpoint read. Four surfaces over one definition of "healthy" -- a second
+    " query here would be a second opinion, and the two would disagree the first
+    " time either changed.
+    "
+    " This is the data half, which is where anything can be wrong. The screen
+    " hands it to result_to_alv and draws it.
+    DATA(ls_m) = zcl_erpl_rev_delta=>monitor_rows( ).
+    ok( cond = xsdbool( ls_m-error IS INITIAL )
+        what = 'monitor: the target view is readable from ABAP' detail = ls_m-error ).
+    ok( cond = xsdbool( ls_m-row_count > 0 )
+        what = 'monitor: it returns the registered targets'
+        detail = |{ ls_m-row_count } row(s)| ).
+    " The columns an operator acts on must be there, or the screen is a table of
+    " names with nothing to decide from.
+    ok( cond = xsdbool( ls_m-rows CS 'lag_seconds' AND ls_m-rows CS 'is_healthy' )
+        what = 'monitor: lag and health are in the row'
+        detail = substring( val = ls_m-rows len = nmin( val1 = 120 val2 = strlen( ls_m-rows ) ) ) ).
+
+    DATA(ls_h) = zcl_erpl_rev_delta=>monitor_health( ).
+    ok( cond = xsdbool( ls_h-error IS INITIAL AND ls_h-rows CS 'daemon_status' )
+        what = 'monitor: the health summary includes the daemon'
+        detail = |{ ls_h-error }| ).
   ENDMETHOD.
 
 ENDCLASS.

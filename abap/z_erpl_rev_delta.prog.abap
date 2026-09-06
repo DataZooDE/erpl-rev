@@ -41,6 +41,22 @@ SELECTION-SCREEN BEGIN OF BLOCK run WITH FRAME TITLE t_run.
   SELECTION-SCREEN END OF LINE.
 SELECTION-SCREEN END OF BLOCK run.
 
+" ── Monitor ───────────────────────────────────────────────────────────────────
+" What ops looks at when the phone rings: one row per target, worst first, with
+" the reason it is worst. Reads the SAME views the CLI, the TUI and the metrics
+" endpoint read -- four surfaces over one definition of "healthy", rather than
+" four queries that disagree the first time any of them changes.
+"
+" On this report rather than a new one: E-FOOTPRINT asserts the delivered object
+" list exactly, and a monitor is not worth spending a report and a transaction
+" code out of a fixed budget when ops already runs this program.
+SELECTION-SCREEN BEGIN OF BLOCK mon WITH FRAME TITLE t_mon.
+  SELECTION-SCREEN BEGIN OF LINE.
+  PARAMETERS p_mon AS CHECKBOX.
+  SELECTION-SCREEN COMMENT 4(60) c_mon FOR FIELD p_mon.
+  SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN END OF BLOCK mon.
+
 " ── Schedule a periodic background job ────────────────────────────────────────
 SELECTION-SCREEN BEGIN OF BLOCK sch WITH FRAME TITLE t_sch.
   SELECTION-SCREEN COMMENT /1(79) c_sch1.
@@ -71,6 +87,8 @@ INITIALIZATION.
   c_sched = 'Install / re-time the job'.
   c_min   = 'Every (minutes, min 1)'.
   c_unsch = 'Remove the job'.
+  t_mon   = 'Monitor'.
+  c_mon   = 'Show every target: lag, health, and why it is unhealthy'.
 
 " The loop interval/duration only apply to "Keep ticking".
 AT SELECTION-SCREEN OUTPUT.
@@ -108,6 +126,11 @@ START-OF-SELECTION.
   " authorisation at all: the CLI writes a row into a local DuckDB table and
   " this job -- already running on a schedule -- picks it up. See issue #85.
   PERFORM drain_cli.
+
+  IF p_mon = abap_true.
+    PERFORM monitor.
+    RETURN.
+  ENDIF.
 
   IF p_tgt IS NOT INITIAL.
     APPEND zcl_erpl_rev_delta=>run( p_tgt ) TO lt_run.
@@ -213,4 +236,52 @@ FORM restart_daemon_if_stale.
   CALL FUNCTION 'JOB_CLOSE'
     EXPORTING jobname = lv_jobname jobcount = lv_jobcount strtimmed = abap_true
     EXCEPTIONS OTHERS = 1.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& The monitor screen.
+*&
+*& Health first, because it answers "is anything wrong" before the eye
+*& reaches the table, then one ALV row per target ordered worst-first.
+*& The data comes from zcl_erpl_rev_delta=>monitor_rows, which is the same
+*& call the e2e asserts on -- the screen adds no logic of its own.
+*&---------------------------------------------------------------------*
+FORM monitor.
+  DATA(ls_h) = zcl_erpl_rev_delta=>monitor_health( ).
+  IF ls_h-error IS NOT INITIAL.
+    MESSAGE |monitor: { ls_h-error }| TYPE 'I'.
+    RETURN.
+  ENDIF.
+  WRITE: / 'erpl-rev monitor'.
+  WRITE: / ls_h-rows.
+  SKIP.
+
+  DATA(ls_t) = zcl_erpl_rev_delta=>monitor_rows( ).
+  IF ls_t-error IS NOT INITIAL.
+    MESSAGE |monitor: { ls_t-error }| TYPE 'I'.
+    RETURN.
+  ENDIF.
+  IF ls_t-row_count = 0.
+    WRITE: / 'no registered targets'.
+    RETURN.
+  ENDIF.
+
+  " result_to_alv builds a typed table from the result's own columns, so the
+  " grid follows the view rather than a hand-maintained field catalogue that
+  " would go stale the moment a column is added.
+  DATA(lr_tab) = zcl_erpl_rev_util=>result_to_alv( ls_t ).
+  FIELD-SYMBOLS <mon> TYPE STANDARD TABLE.
+  ASSIGN lr_tab->* TO <mon>.
+  IF <mon> IS NOT ASSIGNED. RETURN. ENDIF.
+
+  DATA lo_alv TYPE REF TO cl_salv_table.
+  TRY.
+      cl_salv_table=>factory( IMPORTING r_salv_table = lo_alv
+                              CHANGING  t_table      = <mon> ).
+      lo_alv->get_functions( )->set_all( ).
+      lo_alv->get_columns( )->set_optimize( abap_true ).
+      lo_alv->display( ).
+    CATCH cx_root INTO DATA(lx_alv).
+      MESSAGE |monitor: { lx_alv->get_text( ) }| TYPE 'I'.
+  ENDTRY.
 ENDFORM.
