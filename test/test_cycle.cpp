@@ -391,3 +391,54 @@ TEST_CASE("cycle: a target reclaimed mid-commit is rolled back, not reported as 
     CHECK(Scalar(con, "SELECT count(*) FROM zdelta_wm") == "2");
     CHECK(Scalar(con, "SELECT wm_value FROM _erpl_rev_delta_state") == "20260905100000");
 }
+
+TEST_CASE("cycle: a counter watermark never moves backwards", "[cycle]") {
+    // The safety overlap deliberately re-reads rows BELOW the stored watermark.
+    // If a cycle happens to stage only those -- nothing new arrived -- then
+    // max(staged) - safety_units lands below where the watermark already was,
+    // and storing it walks the target backwards, widening the replay window a
+    // little further on every quiet cycle.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    schema::Migrate(con, "test");
+    Exec(con, "CREATE TABLE docs(id INTEGER PRIMARY KEY, docnr BIGINT)");
+    Exec(con, "INSERT INTO docs VALUES (1,980),(2,990)");
+    Exec(con, "INSERT INTO _erpl_rev_delta_state "
+              "(target, method, source_from, keys, chg_col, wm_kind, wm_value, safety_units, "
+              " cadence, status) VALUES "
+              "('docs','WATERMARK','DOCS','id','DOCNR','INT','1000',50,'manual','IDLE')");
+
+    const auto b = cycle::Begin(con, "docs", LoadType::Delta, kReadStart);
+    Exec(con, "CREATE TABLE " + b.stage_table + "(id INTEGER, docnr BIGINT)");
+    // Only overlap rows: both below the stored watermark of 1000.
+    Exec(con, "INSERT INTO " + b.stage_table + " VALUES (1,980),(2,990)");
+    cycle::Commit(con, "docs", b.run_id, {2});
+
+    CHECK(Scalar(con, "SELECT wm_value FROM _erpl_rev_delta_state") == "1000");
+}
+
+TEST_CASE("cycle: a first cycle is all-or-nothing, target creation included",
+          "[cycle]") {
+    // Commit is documented as ONE transaction. Creating the target outside it
+    // meant a failure in between left user-visible rows in a table the watermark
+    // says were never replicated -- and a retry then re-applies against a target
+    // that already holds them.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    schema::Migrate(con, "test");
+    Exec(con, "INSERT INTO _erpl_rev_delta_state "
+              "(target, method, source_from, keys, chg_col, wm_kind, wm_value, safety_secs, "
+              " cadence, status) VALUES "
+              "('newt','WATERMARK','T','id','CHANGED_AT','NUMTS','',120,'manual','IDLE')");
+
+    const auto b = cycle::Begin(con, "newt", LoadType::Delta, kReadStart);
+    // A stage the commit cannot finish: the fence is stolen after Begin.
+    Exec(con, "CREATE TABLE " + b.stage_table + "(id INTEGER, v VARCHAR)");
+    Exec(con, "INSERT INTO " + b.stage_table + " VALUES (1,'a')");
+    Exec(con, "UPDATE _erpl_rev_delta_state SET active_run_id=" +
+                  std::to_string(b.run_id + 999) + " WHERE target='newt'");
+
+    REQUIRE_THROWS(cycle::Commit(con, "newt", b.run_id, {1}));
+    // The target must not exist: nothing was committed, so nothing is visible.
+    CHECK(Scalar(con, "SELECT count(*) FROM duckdb_tables() WHERE table_name='newt'") == "0");
+}

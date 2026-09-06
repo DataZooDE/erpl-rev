@@ -145,9 +145,16 @@ START-OF-SELECTION.
         EXIT.
       ENDIF.
 
-      " The plan names the due targets; run() does the cycle. Each is leased
-      " individually, so a target already running elsewhere is skipped there.
-      zcl_erpl_rev_delta=>run_due( ).
+      " Run exactly what the PLAN says, in the order it says.
+      "
+      " This used to call run_due(), which re-decided "what is due" with its own
+      " ABAP query -- one that knows nothing about backoff, parking, the worker
+      " budget, a target BLOCKED by schema drift, or whether a trigger target's
+      " shadow table has anything in it. So the planner existed, was tested, and
+      " governed nothing: a blocked target kept replicating on every tick, and
+      " the whole reason the planner is server-side (one definition of "due",
+      " shared by the batch tick and the daemon) was quietly false.
+      PERFORM run_planned_cycles USING lv_plan.
     ENDIF.
 
     " The CLI queue is drained here too, so a `daemon stop` or a `sync run`
@@ -180,3 +187,37 @@ START-OF-SELECTION.
   PERFORM q USING lv_rel CHANGING lv_rows lv_err.
 
   WRITE: / |DAEMON RESULT pass={ lv_ticks } fail=0|.
+
+
+*&---------------------------------------------------------------------*
+*& Run the cycles the server's tick plan named, and only those.
+*&
+*& The plan is JSON: {"cycles":[{"target":"x","load_type":"D",...},...]}.
+*& Parsed with a scan rather than a JSON library because this runs every
+*& couple of seconds and the shape is ours, not user input.
+*&---------------------------------------------------------------------*
+FORM run_planned_cycles USING iv_plan TYPE string.
+  DATA lv_rest TYPE string.
+  DATA lv_obj  TYPE string.
+  DATA lv_off  TYPE i.
+
+  " Everything after "cycles":[
+  FIND '"cycles":[' IN iv_plan MATCH OFFSET lv_off.
+  IF sy-subrc <> 0. RETURN. ENDIF.
+  lv_rest = iv_plan+lv_off.
+
+  SPLIT lv_rest AT '{' INTO TABLE DATA(lt_parts).
+  LOOP AT lt_parts INTO lv_obj.
+    DATA lv_target TYPE string.
+    DATA lv_load   TYPE string.
+    CLEAR: lv_target, lv_load.
+    FIND PCRE '"target"\s*:\s*"([^"]*)"' IN lv_obj SUBMATCHES lv_target.
+    IF sy-subrc <> 0 OR lv_target IS INITIAL. CONTINUE. ENDIF.
+    FIND PCRE '"load_type"\s*:\s*"([^"]*)"' IN lv_obj SUBMATCHES lv_load.
+    IF lv_load IS INITIAL. lv_load = 'D'. ENDIF.
+
+    " Each cycle still takes the per-target lease, so a target already running
+    " elsewhere is skipped there rather than run twice.
+    zcl_erpl_rev_delta=>run( iv_target = lv_target iv_load_type = lv_load ).
+  ENDLOOP.
+ENDFORM.

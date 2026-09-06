@@ -1,5 +1,6 @@
 #include "duckdb_bridge.hpp"
 #include "control_schema.hpp"
+#include "cycle.hpp"
 #include "transform_macros.hpp"
 
 #include <set>
@@ -1169,7 +1170,12 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
         const bool want_log = !le->HasError() && le->RowCount() > 0 &&
                               le->GetValue(0, 0).GetValue<int64_t>() > 0;
         if (want_log) {
-            const std::string logtab = "_erpl_rev_log_" + LowerName(target);
+            // The SAME name the watermark path uses. Built by hand here, these
+            // diverged for any target whose name is not already a clean
+            // identifier: CDC wrote one table while subscriptions and retention
+            // read another, and the mismatch was invisible because the append is
+            // skipped when the table is missing.
+            const std::string logtab = cycle::ChangeLogName(target);
             auto ex = con.Query("SELECT count(*) FROM duckdb_tables() WHERE table_name='" +
                                 logtab + "'");
             const bool exists = !ex->HasError() && ex->RowCount() > 0 &&
@@ -1183,11 +1189,21 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
                 }
                 if (!cl.empty()) {
                     const std::string src = keys_mode ? upsert_src : net_iu;
+                    // upper(_OP): the shadow log writes 'i'/'u'/'d' while every
+                    // reader of the change log -- the latency statistics, the
+                    // stress harness, the subscription dedup -- filters on
+                    // 'I'/'U'/'D'. A target replicated by both tiers otherwise
+                    // ends up with two alphabets in one table.
+                    //
+                    // AT TIME ZONE 'UTC': the trigger's timestamp is a wall-clock
+                    // value like every other, and letting it cast into a
+                    // TIMESTAMPTZ column picks up the server's session zone --
+                    // the same two-hour error the watermark path was fixed for.
                     log_sql = "INSERT INTO " + logtab + " (" + cl +
                               ", _seq, _op, _run_id, _commit_ts, _applied_at) SELECT " + sl +
-                              ", nextval('" + logtab + "_seq'), c.\"_OP\", 0, "
-                              "try_strptime(c.\"_TS\", '%Y%m%d%H%M%S'), now() FROM " +
-                              src + " c";
+                              ", nextval('" + logtab + "_seq'), upper(c.\"_OP\"), 0, "
+                              "(try_strptime(c.\"_TS\", '%Y%m%d%H%M%S') AT TIME ZONE 'UTC'), "
+                              "now() FROM " + src + " c";
                 }
             }
         }

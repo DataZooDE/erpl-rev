@@ -217,30 +217,36 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
     const bool have_target =
         Scalar(con, "SELECT count(*) FROM duckdb_tables() WHERE table_name=" + Lit(Lower(target)))
         == "1";
-    if (have_stage && !have_target) {
-        Exec(con, "CREATE TABLE " + target + " AS SELECT * FROM " + stage, "create target");
-        if (!keys.empty()) {
-            std::string kl;
-            for (size_t i = 0; i < keys.size(); ++i) { if (i) kl += ","; kl += keys[i]; }
-            // Best-effort: a source whose "keys" are not unique in the staged
-            // slice should still replicate rather than fail the cycle.
-            con.Query("ALTER TABLE " + target + " ADD PRIMARY KEY (" + kl + ")");
-        }
-    }
+    // NOTE: the creation itself happens inside the commit transaction below.
+    // Doing it here left user-visible rows in a table the watermark said were
+    // never replicated, if anything failed in between -- and a retry then
+    // re-applied against a target that already held them.
 
     // The columns to move: target columns the stage also has.
     std::vector<std::string> cols;
     if (have_stage) {
-        auto tc = con.Query("SELECT * FROM " + target + " LIMIT 0");
         auto sc = con.Query("SELECT * FROM " + stage + " LIMIT 0");
-        if (tc->HasError() || sc->HasError())
-            throw std::runtime_error("cycle: describe failed");
-        std::vector<std::string> sset;
-        for (duckdb::idx_t c = 0; c < sc->ColumnCount(); ++c) sset.push_back(Lower(sc->names[c]));
-        for (duckdb::idx_t c = 0; c < tc->ColumnCount(); ++c) {
-            const auto n = Lower(tc->names[c]);
-            for (const auto &s : sset)
-                if (s == n) { cols.push_back(n); break; }
+        if (sc->HasError())
+            throw std::runtime_error("cycle: staging describe failed: " + sc->GetError());
+
+        if (!have_target) {
+            // First cycle: the target is about to be created FROM the stage, so
+            // its columns are the stage's. Describing a table that does not
+            // exist yet is not an error condition, it is the normal first run.
+            for (duckdb::idx_t c = 0; c < sc->ColumnCount(); ++c)
+                cols.push_back(Lower(sc->names[c]));
+        } else {
+            auto tc = con.Query("SELECT * FROM " + target + " LIMIT 0");
+            if (tc->HasError())
+                throw std::runtime_error("cycle: target describe failed: " + tc->GetError());
+            std::vector<std::string> sset;
+            for (duckdb::idx_t c = 0; c < sc->ColumnCount(); ++c)
+                sset.push_back(Lower(sc->names[c]));
+            for (duckdb::idx_t c = 0; c < tc->ColumnCount(); ++c) {
+                const auto n = Lower(tc->names[c]);
+                for (const auto &s : sset)
+                    if (s == n) { cols.push_back(n); break; }
+            }
         }
     }
 
@@ -304,6 +310,18 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
                 if (have_stage && !st.chg_col.empty())
                     staged_max = Scalar(con, "SELECT max(" + Lower(st.chg_col) + ") FROM " + stage);
                 new_wm = wm::CeilingFromStagedMax(spec, staged_max);
+                // Never backwards. The overlap re-reads rows BELOW the stored
+                // watermark on purpose, so a quiet cycle can stage only those --
+                // and max(staged) - safety_units then lands behind where we
+                // already were, widening the replay window a little more every
+                // time. Compared as text, at equal width, because that is how
+                // the predicate compares it.
+                if (!st.wm_value.empty()) {
+                    const std::string a = new_wm, bwm = st.wm_value;
+                    const bool shorter = a.size() < bwm.size();
+                    const bool lower = a.size() == bwm.size() && a < bwm;
+                    if (shorter || lower) new_wm = st.wm_value;
+                }
             } else {
                 // The ceiling was fixed at begin, from this cycle's read start,
                 // and stored on the stats row. Recomputing it here would use a
@@ -328,6 +346,16 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
 
     Exec(con, "BEGIN", "begin");
     try {
+        if (have_stage && !have_target) {
+            Exec(con, "CREATE TABLE " + target + " AS SELECT * FROM " + stage, "create target");
+            if (!keys.empty()) {
+                std::string kl;
+                for (size_t i = 0; i < keys.size(); ++i) { if (i) kl += ","; kl += keys[i]; }
+                // Best-effort: a source whose "keys" are not unique in the staged
+                // slice should still replicate rather than fail the cycle.
+                con.Query("ALTER TABLE " + target + " ADD PRIMARY KEY (" + kl + ")");
+            }
+        }
         if (want_log) {
             // Provision the log ONCE, not on every commit. This block used to run
             // its CREATE, five duckdb_columns() probes and a CREATE SEQUENCE every
