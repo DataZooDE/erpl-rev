@@ -212,13 +212,25 @@ longer has, and an upsert can never remove one. The replacement happens inside
 the commit transaction, so a reload that fails leaves the previous contents
 intact rather than an emptied table.
 
-With one guard. A cycle that produced **no staging table at all** does not
-truncate — it has not established that the source is empty, only that the read
-produced nothing, which is also what a short read or a connection dropped
-between packages looks like. An **empty** staging table does truncate: there the
-reader ran and the source really is empty, and `F` has to stay a reload when a
-source table is emptied. The refused case is visible as `rows_read = 0` on the
-run.
+**A reload will not empty a target by accident.** The reader creates its staging
+table before it selects anything, so an empty stage is what BOTH a genuinely
+empty source and a mistyped filter, a wrong client or a bad `extra` predicate
+look like. The rule is therefore three-way:
+
+| staged | target | what happens |
+|---|---|---|
+| rows | anything | the target is replaced by the staged rows |
+| no stage at all | anything | no truncate: the read produced nothing, which is also what a short read looks like |
+| empty stage | empty | truncate — nothing to lose |
+| empty stage | not empty | **refused**, naming the target and its row count |
+
+The refusal is deliberate: deleting a replica because a filter matched nothing
+is not recoverable, and re-running a reload is. When the source really has been
+emptied, set `allow_empty_reload` on the target and run it again:
+
+```bash
+erpl-rev sync create <target> --allow-empty-reload ...   # at registration
+```
 
 ### The quiet cycle
 
@@ -227,9 +239,11 @@ is not an optimisation: a target that does not move its floor when nothing
 changed re-reads an ever-widening range, until a micro-cadence target is
 scanning the whole table every tick.
 
-Its change log is provisioned all the same. A log-enabled target that has never
-had a change has an **empty** log rather than no log — a subscriber and the
-retention pass both read it as a fact instead of meeting "table does not exist".
+Its change log is provisioned all the same, from the first cycle that reaches
+the commit: a log-enabled target whose first cycle read nothing still ends with
+an **empty** log rather than no log. Before that first cycle there is no log
+table, and every reader treats its absence as "nothing has been logged yet"
+rather than as an error.
 
 > **Upgrade note.** Before this, `safety_secs` was stored, exposed on the CLI and on
 > the Delta tab, and read by nothing: the read was `chg_col > wm` with no overlap at

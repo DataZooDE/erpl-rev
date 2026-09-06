@@ -1031,16 +1031,19 @@ TEST_CASE("cycle: a scheduled reload runs once, then the target goes back to del
 
 TEST_CASE("cycle: a delta cycle does not touch the target's default load type",
           "[cycle]") {
+    // Set to 'D' and asserted 'D', which the production UPDATE also writes --
+    // so it could not fail. A pending one-shot 'L' is the state that actually
+    // distinguishes "a delta left it alone" from "a delta spent it".
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
     Setup(con);
-    Exec(con, "UPDATE _erpl_rev_delta_state SET load_type_default='D'");
+    Exec(con, "UPDATE _erpl_rev_delta_state SET load_type_default='L'");
 
     const auto b = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart);
     StageRows(con, b.stage_table);
     cycle::Commit(con, "zdelta_wm", b.run_id, {2});
 
-    CHECK(Scalar(con, "SELECT load_type_default FROM _erpl_rev_delta_state") == "D");
+    CHECK(Scalar(con, "SELECT load_type_default FROM _erpl_rev_delta_state") == "L");
 }
 
 TEST_CASE("cycle: the failure release is fenced too", "[cycle]") {

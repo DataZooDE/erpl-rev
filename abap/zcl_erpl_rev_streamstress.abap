@@ -22,7 +22,7 @@ CLASS zcl_erpl_rev_streamstress DEFINITION PUBLIC FINAL CREATE PUBLIC.
     CONSTANTS c_target TYPE string VALUE 'stress_sflight'.
     CONSTANTS c_run    TYPE char20 VALUE 'STRESS1'.
     DATA: mv_pass TYPE i, mv_fail TYPE i, mo TYPE REF TO if_oo_adt_classrun_out.
-    DATA: mv_cycle_err TYPE i, mv_last_err TYPE string.
+    DATA: mv_cycle_err TYPE i, mv_cycle_skip TYPE i, mv_last_err TYPE string.
     METHODS ok IMPORTING cond TYPE abap_bool what TYPE string detail TYPE string DEFAULT ''.
     METHODS cnt IMPORTING iv_sql TYPE string RETURNING VALUE(rv) TYPE i.
     METHODS scalar IMPORTING iv_sql TYPE string RETURNING VALUE(rv) TYPE string.
@@ -142,6 +142,9 @@ CLASS zcl_erpl_rev_streamstress IMPLEMENTATION.
     ok( cond = xsdbool( mv_cycle_err = 0 )
         what = 'every cycle ran'
         detail = |{ mv_cycle_err } cycle(s) failed, last: { mv_last_err }| ).
+    ok( cond = xsdbool( mv_cycle_skip = 0 )
+        what = 'no cycle was skipped for a held lease'
+        detail = |{ mv_cycle_skip } cycle(s) skipped| ).
 
     " --- what the generator actually committed -----------------------------
     SELECT COUNT(*) FROM zdelta_audit WHERE runid = @c_run INTO @DATA(lv_changes).
@@ -210,9 +213,13 @@ CLASS zcl_erpl_rev_streamstress IMPLEMENTATION.
     " delete, so a target key absent from SAP is legitimate EXACTLY when the
     " generator deleted it. A key that is in neither the source nor the
     " generator's audit was invented by the pipeline.
+    " count of target ROWS that match, not of target-audit PAIRS. The join
+    " counted pairs, and the audit holds one row per CHANGE, so a document
+    " changed five times contributed five matches: on an update-heavy workload
+    " the ratio ran into the hundreds of percent and the guard could never fire.
     DATA(lv_matched) = cnt(
-      |SELECT count(*) AS c FROM { iv_target } x JOIN stress_audit a ON | &&
-      |trim(a.keyval) = { key_expr( 'x' ) }| ).
+      |SELECT count(*) AS c FROM { iv_target } x WHERE EXISTS (| &&
+      |SELECT 1 FROM stress_audit a WHERE trim(a.keyval) = { key_expr( 'x' ) })| ).
     " A RATIO, not a zero test. Firing only when NOTHING matches meant that a
     " subset rendering differently -- one field padded another way -- left most
     " keys matching and reported the rest as phantoms: the engine indicted for
@@ -220,20 +227,23 @@ CLASS zcl_erpl_rev_streamstress IMPLEMENTATION.
     " Most target rows should match the audit; a workload that touches most of
     " the key space leaves little room for a legitimate shortfall.
     DATA(lv_ratio) = COND i( WHEN lv_rows = 0 THEN 100 ELSE lv_matched * 100 / lv_rows ).
-    IF lv_rows > 0 AND lv_ratio < 80.
-      ok( cond = abap_false what = |{ iv_label }: the audit oracle still matches the target's keys|
-          detail = |only { lv_ratio }% of target rows match an audit key -- rendering drifted| ).
-    ELSE.
-      DATA(lv_phantom) = cnt(
-        |SELECT count(*) AS c FROM { iv_target } x | &&
-        |WHERE NOT EXISTS (SELECT 1 FROM stress_truth t WHERE | &&
-        same_key( iv_a = 'x' iv_b = 't' ) && |) | &&
-        |AND NOT EXISTS (SELECT 1 FROM stress_audit a | &&
-        |WHERE trim(a.keyval) = { key_expr( 'x' ) })| ).
-      ok( cond   = xsdbool( lv_phantom = 0 )
-          what   = |{ iv_label }: no phantom rows|
-          detail = |{ lv_phantom } target key(s) the generator never wrote| ).
-    ENDIF.
+    " Reported, never branched on. Making it a branch meant that when the guard
+    " DID fire it skipped the phantom and missing anti-joins -- so a real engine
+    " defect was reported as a harness problem and the actual checks never ran.
+    " The oracle's health is a diagnostic printed beside the verdict, not a
+    " reason to withhold the verdict.
+    ok( cond   = xsdbool( lv_rows = 0 OR lv_ratio >= 80 )
+        what   = |{ iv_label }: the audit oracle still matches the target's keys|
+        detail = |only { lv_ratio }% of target rows match an audit key -- rendering drifted| ).
+    DATA(lv_phantom) = cnt(
+      |SELECT count(*) AS c FROM { iv_target } x | &&
+      |WHERE NOT EXISTS (SELECT 1 FROM stress_truth t WHERE | &&
+      same_key( iv_a = 'x' iv_b = 't' ) && |) | &&
+      |AND NOT EXISTS (SELECT 1 FROM stress_audit a | &&
+      |WHERE trim(a.keyval) = { key_expr( 'x' ) })| ).
+    ok( cond   = xsdbool( lv_phantom = 0 )
+        what   = |{ iv_label }: no phantom rows|
+        detail = |{ lv_phantom } target key(s) the generator never wrote| ).
 
     " STALE PAYLOAD. A key can be present and still wrong: delivered once on
     " its insert and never refreshed by any of the updates that followed.
@@ -288,6 +298,12 @@ CLASS zcl_erpl_rev_streamstress IMPLEMENTATION.
     IF rs-error IS NOT INITIAL.
       mv_cycle_err = mv_cycle_err + 1.
       mv_last_err  = |{ iv_target }: { rs-error }|.
+    ENDIF.
+    " A skipped cycle is not an error, but it is not a cycle either: the lease
+    " was held elsewhere and nothing was read. Counted separately so a run whose
+    " targets never actually cycled cannot read as a clean pass.
+    IF rs-skipped = abap_true.
+      mv_cycle_skip = mv_cycle_skip + 1.
     ENDIF.
   ENDMETHOD.
 

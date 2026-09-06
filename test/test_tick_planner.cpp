@@ -294,3 +294,56 @@ TEST_CASE("tick_planner: a trigger target is not starved by busier delta targets
     const auto p = PlanTick(t, {cdc}, Daemon(2), kNow);
     CHECK(Has(p, "trig"));
 }
+
+TEST_CASE("tick_planner: a long-waiting trigger target outranks a barely-late delta",
+          "[plan]") {
+    // The units half, on its own. The reserved-slot test above passes under BOTH
+    // the old row-count formula and the new seconds one, so it pins the
+    // reservation and says nothing about the conversion. Here the budget is 1 --
+    // no slot can be reserved -- and the CDC target has been waiting 300s with
+    // 3 shadow rows against a delta 10s past due. As a row count it scores 3 and
+    // loses; as seconds it scores 300 and wins.
+    std::vector<TargetRow> t{T("d0", "micro:1", kNow - 10)};
+    auto c = T("trig", "micro:1", kNow - 300);
+    c.method = "CDC";
+    t.push_back(c);
+
+    CdcRow cdc;
+    cdc.target = "trig";
+    cdc.status = "ACTIVE";
+    cdc.shadow_rows = 3;
+
+    const auto p = PlanTick(t, {cdc}, Daemon(1), kNow);
+    REQUIRE(p.cycles.size() == 1);
+    CHECK(p.cycles[0].target == "trig");
+}
+
+TEST_CASE("tick_planner: a reservation nobody can spend does not waste the slot",
+          "[plan]") {
+    // The slot is held for the trigger tier, but the CDC candidate may still be
+    // skipped for an unrelated reason -- here it carries a truncating load type
+    // and the full-load cap is already spent. The reservation was computed once,
+    // up front, so it stayed held for a candidate that could never take it and
+    // a worker went unused on every tick.
+    std::vector<TargetRow> t;
+    for (int i = 0; i < 4; ++i) t.push_back(T("d" + std::to_string(i), "micro:1", kNow - 600));
+
+    auto full = T("bigload", "nightly", kNow - 999999);
+    full.load_type_default = "L";
+    t.push_back(full);
+
+    auto c = T("trig", "micro:1", kNow - 300);
+    c.method = "CDC";
+    c.load_type_default = "L";     // also a full load; the cap is already spent
+    t.push_back(c);
+
+    CdcRow cdc;
+    cdc.target = "trig";
+    cdc.status = "ACTIVE";
+    cdc.shadow_rows = 5;
+
+    const auto p = PlanTick(t, {cdc}, Daemon(3, 0.34), kNow);
+    // Three workers, three cycles planned. The held slot goes back to the pool
+    // rather than being carried for a candidate that was never eligible.
+    CHECK(p.cycles.size() == 3);
+}

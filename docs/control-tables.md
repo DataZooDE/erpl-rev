@@ -54,9 +54,13 @@ measures nothing. `_commit_ts` is NULL where the method has no source clock — 
 counter watermark, or a snapshot row — so latency for those targets is honestly
 unmeasurable rather than reported as zero.
 
-The log table exists as soon as a log-enabled target does. A target that has
-never had a change has an **empty** log, not a missing one, so readers and the
-retention pass never have to special-case it.
+The log table appears on a target's **first successful cycle**, not at
+registration — both replication tiers provision it inside the transaction that
+first writes to it, so a target whose first cycle fails has none. Readers treat
+absence as "nothing has been logged yet": `sub advance` publishes nothing, the
+retention pass prunes nothing, and the latency view reports no samples. From
+that first cycle on it exists even when a cycle changes nothing, so an idle
+target has an empty log rather than a missing one.
 
 Two views are the reading surface: `erpl_rev_run_stats` (derived counts, rates and
 durations) and the per-target change logs.

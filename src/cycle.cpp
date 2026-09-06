@@ -658,7 +658,12 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
         //
         // After the log is provisioned, because the deletions have to be
         // recorded BEFORE the rows are gone.
-        if (load_plan.truncate_target && have_target && have_stage) {
+        // !keys.empty() is defensive, not the contract: register() refuses a
+        // keyless target now. Without it the anti-join renders as
+        // "WHERE NOT EXISTS (SELECT 1 FROM stg s WHERE )" and a reload of an
+        // older, keyless registration dies with a parser error where it used to
+        // complete.
+        if (load_plan.truncate_target && have_target && have_stage && !keys.empty()) {
             const std::string gone_where = " t WHERE NOT EXISTS (SELECT 1 FROM " + stage +
                                            " s WHERE " + key_join + ")";
             // What the reload actually removes: target keys the stage does not

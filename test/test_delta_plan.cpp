@@ -320,18 +320,16 @@ TEST_CASE("watermark: a reload of a DATE target reads today as well", "[wm]") {
     CHECK(reload.next_watermark == delta.next_watermark);
 }
 
-TEST_CASE("watermark: a reload ignores the floor for every kind", "[wm]") {
-    // Not a new rule -- apply_floor is already false for F -- but worth pinning
-    // next to the ceiling: a reload that read only part of the source and then
-    // truncated would be the same defect from the other end.
-    for (auto kind : {WmKind::Date, WmKind::Numts, WmKind::Datetime, WmKind::Int}) {
-        WatermarkSpec s;
-        s.kind = kind;
-        s.chg_col = "C";
-        s.time_col = "T";
-        s.wm_value = kind == WmKind::Date ? "20260901" : "20260901000000";
-        const auto b = ComputeBounds(s, kReadStart, /*full_reload=*/true);
-        INFO("kind " << static_cast<int>(kind));
-        CHECK_FALSE(b.ceiling_bounds_read);
-    }
+TEST_CASE("watermark: only DATE ever bounds the read, and a reload never does", "[wm]") {
+    // This asserted CHECK_FALSE(ceiling_bounds_read) across four kinds, which is
+    // the struct's default for three of them -- so three quarters of it could
+    // not fail, and it never looked at the floor its name promised. DATE is the
+    // only kind that sets the flag, so DATE is the only kind worth asserting on.
+    WatermarkSpec s;
+    s.kind = WmKind::Date;
+    s.chg_col = "BUDAT";
+    s.wm_value = "20260901";
+
+    CHECK(ComputeBounds(s, kReadStart).ceiling_bounds_read);
+    CHECK_FALSE(ComputeBounds(s, kReadStart, /*full_reload=*/true).ceiling_bounds_read);
 }

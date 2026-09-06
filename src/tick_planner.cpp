@@ -148,12 +148,23 @@ TickPlan PlanTick(const std::vector<TargetRow> &targets, const std::vector<CdcRo
     bool cdc_taken = false;
     int used = 0, fulls = 0;
 
+    // Candidates the reservation held back, in priority order, so an unspent
+    // reservation can be given back rather than wasted. The CDC candidate the
+    // slot was held for may still be skipped for an unrelated reason -- it can
+    // itself be a full load whose cap is spent -- and the held slot then went
+    // unused on every tick. Whether that happens is only knowable after the
+    // pass, so the release happens after it, not as a smarter pre-filter.
+    std::vector<const Candidate *> deferred;
+
     for (const auto &c : due) {
         if (used >= budget) break;
         if (c.full && fulls >= full_cap) continue;
         const bool is_cdc = c.t->method == "CDC";
         // Everything else stops one slot short until the reservation is spent.
-        if (!is_cdc && !cdc_taken && used >= budget - reserved) continue;
+        if (!is_cdc && !cdc_taken && used >= budget - reserved) {
+            deferred.push_back(&c);
+            continue;
+        }
 
         Cycle cy;
         cy.target = c.t->target;
@@ -167,6 +178,22 @@ TickPlan PlanTick(const std::vector<TargetRow> &targets, const std::vector<CdcRo
         ++used;
         if (c.full) ++fulls;
         if (is_cdc) cdc_taken = true;
+    }
+
+    // The reservation went unspent: give the slot back.
+    if (reserved && !cdc_taken) {
+        for (const auto *c : deferred) {
+            if (used >= budget) break;
+            if (c->full && fulls >= full_cap) continue;
+            Cycle cy;
+            cy.target = c->t->target;
+            cy.method = c->t->method;
+            cy.load_type = c->t->load_type_default.empty() ? "D" : c->t->load_type_default;
+            cy.worker = c->t->last_rows > kWorkerRowThreshold;
+            plan.cycles.push_back(cy);
+            ++used;
+            if (c->full) ++fulls;
+        }
     }
 
     return plan;
