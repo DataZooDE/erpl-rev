@@ -1854,9 +1854,38 @@ CLASS zcl_erpl_rev_util IMPLEMENTATION.
         rv = |{ t(2) }:{ t+2(2) }:{ t+4(2) }|.
       WHEN 'INT1' OR 'INT2' OR 'INT4' OR 'INT8'
            OR 'DEC' OR 'CURR' OR 'QUAN'.
+        " SIGN = LEFT and NUMBER = RAW, both load-bearing.
+        "
+        " A plain assignment renders a packed number with a TRAILING sign --
+        " "1234-" where every other system writes "-1234". So validation
+        " reported FAILED on any correct replica of a table holding a negative
+        " amount, which is most financial tables; and the runbook's remedy for
+        " FAILED is a destructive reload. A comparison that is wrong is worse
+        " than no comparison, because someone acts on it.
+        "
+        " NUMBER = RAW pins the decimal separator to a period regardless of the
+        " job user's notation. Otherwise the same data validates or not
+        " depending on who scheduled the job.
         DATA n TYPE string.
         n = <v>.
         CONDENSE n NO-GAPS.
+        " A packed number renders with a TRAILING sign -- "1234-" where every
+        " other system writes "-1234" -- so validation reported FAILED on any
+        " correct replica of a table holding a negative amount, which is most
+        " financial tables. The runbook's remedy for FAILED is a destructive
+        " reload, so a comparison that is wrong is worse than no comparison.
+        "
+        " Done by hand rather than with a SIGN = LEFT template: the value
+        " arrives through a generic field symbol, and a template cannot infer
+        " the decimals of a type it does not know.
+        IF n CS '-'.
+          REPLACE ALL OCCURRENCES OF '-' IN n WITH ``.
+          n = |-{ n }|.
+        ENDIF.
+        " And a comma decimal separator pinned to a period, or the same data
+        " validates or not depending on the notation of whoever scheduled the
+        " job.
+        REPLACE ALL OCCURRENCES OF ',' IN n WITH '.'.
         rv = n.
       WHEN 'RAW' OR 'LRAW' OR 'RSTR'.
         rv = |{ <v> }|.                       " xstring -> uppercase hex, whole

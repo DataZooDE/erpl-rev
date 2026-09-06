@@ -127,6 +127,12 @@ CLASS zcl_erpl_rev_clidrv IMPLEMENTATION.
   METHOD execute.
     CLEAR: ev_result, ev_error.
 
+    " Every branch, inside one TRY. A dump anywhere in here reaches the operator
+    " as "SAP server internal error" with no detail, and leaves the queue row
+    " claimed forever -- so the command can never be retried and never reports.
+    " Converting it to an error message is the difference between a diagnosable
+    " failure and a mute one.
+    TRY.
     CASE iv_verb.
       WHEN 'replicate'.
         DATA(ls_r) = zcl_erpl_rev_util=>replicate(
@@ -434,7 +440,14 @@ CLASS zcl_erpl_rev_clidrv IMPLEMENTATION.
         DATA(lv_vsrc) = COND string( WHEN ls_vs-source_from IS NOT INITIAL
                                      THEN ls_vs-source_from ELSE lv_vt ).
         DATA(lv_vn) = zcl_erpl_rev_delta=>jstr( iv_json = iv_params iv_key = 'sample_rows' ).
-        DATA(lv_vmax) = COND i( WHEN lv_vn IS INITIAL THEN 1000 ELSE CONV i( lv_vn ) ).
+        DATA(lv_vfull) = xsdbool( jstr( iv_json = iv_params iv_key = 'mode' ) = 'full' ).
+        " Guarded: --sample-rows is an operator's free text, and CONV i( 'all' )
+        " dumps the work process and orphans the queue row forever.
+        DATA lv_vmax TYPE i VALUE 1000.
+        IF lv_vn CO '0123456789' AND lv_vn IS NOT INITIAL.
+          lv_vmax = CONV i( lv_vn ).
+        ENDIF.
+        IF lv_vmax <= 0. lv_vmax = 1000. ENDIF.
 
         DATA(ls_vd) = zcl_erpl_rev_util=>describe_table( iv_tab = lv_vsrc iv_target = lv_vt ).
         IF ls_vd-error IS NOT INITIAL.
@@ -472,9 +485,20 @@ CLASS zcl_erpl_rev_clidrv IMPLEMENTATION.
             TRY.
                 CREATE DATA lo_vt TYPE TABLE OF (lv_vsrc).
                 ASSIGN lo_vt->* TO <vtab>.
-                SELECT (lv_vcols) FROM (lv_vsrc)
-                  ORDER BY (lv_vcols)
-                  INTO CORRESPONDING FIELDS OF TABLE @<vtab> UP TO @lv_vmax ROWS.
+                " --full means every row. The cap was applied regardless, so a
+                " full validation of any table over the sample size compared
+                " 1000 SAP rows against the whole replica and reported FAILED on
+                " the row-count difference -- the one verdict an operator acts
+                " on destructively.
+                IF lv_vfull = abap_true.
+                  SELECT (lv_vcols) FROM (lv_vsrc)
+                    ORDER BY (lv_vcols)
+                    INTO CORRESPONDING FIELDS OF TABLE @<vtab>.
+                ELSE.
+                  SELECT (lv_vcols) FROM (lv_vsrc)
+                    ORDER BY (lv_vcols)
+                    INTO CORRESPONDING FIELDS OF TABLE @<vtab> UP TO @lv_vmax ROWS.
+                ENDIF.
                 LOOP AT <vtab> ASSIGNING <vr>.
                   DATA(lv_fp) = ``.
                   LOOP AT ls_vd-fields INTO DATA(ls_vf2).
@@ -548,6 +572,9 @@ CLASS zcl_erpl_rev_clidrv IMPLEMENTATION.
       WHEN OTHERS.
         ev_error = |unknown verb '{ iv_verb }'|.
     ENDCASE.
+      CATCH cx_root INTO DATA(lx_verb).
+        ev_error = |{ iv_verb } failed: { lx_verb->get_text( ) }|.
+    ENDTRY.
   ENDMETHOD.
 
   METHOD finish.

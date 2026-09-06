@@ -280,7 +280,11 @@ FORM run_planned_cycles USING iv_plan TYPE string.
       CALL FUNCTION 'JOB_OPEN' EXPORTING jobname = lv_wjn
         IMPORTING jobcount = lv_wjc EXCEPTIONS OTHERS = 1.
       IF sy-subrc = 0.
-        SUBMIT z_erpl_rev_delta WITH p_tgt = lv_target WITH p_once = abap_true
+        " The load type travels with it. Without it a detached full load ran as
+        " a delta: the load never happened, the plan said it had, and the
+        " one-shot was never spent -- so the next tick detached it again.
+        SUBMIT z_erpl_rev_delta WITH p_tgt = lv_target WITH p_load = lv_load
+          WITH p_once = abap_true
           VIA JOB lv_wjn NUMBER lv_wjc AND RETURN.
         CALL FUNCTION 'JOB_CLOSE' EXPORTING jobcount = lv_wjc jobname = lv_wjn
                                             strtimmed = abap_true EXCEPTIONS OTHERS = 1.

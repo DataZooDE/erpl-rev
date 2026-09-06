@@ -21,6 +21,12 @@ SELECTION-SCREEN BEGIN OF BLOCK run WITH FRAME TITLE t_run.
   SELECTION-SCREEN BEGIN OF LINE.
   SELECTION-SCREEN COMMENT 1(28) c_tgt FOR FIELD p_tgt.
   PARAMETERS p_tgt TYPE string.
+  " The load type for a named target. The daemon detaches oversized cycles as
+  " their own job through this report, and without it every detached cycle ran
+  " as a delta -- so a scheduled full load never happened while the plan said it
+  " had, and the one-shot was never spent, which re-detached it on every tick
+  " forever.
+  PARAMETERS p_load TYPE char1 DEFAULT 'D'.
   SELECTION-SCREEN END OF LINE.
   SELECTION-SCREEN COMMENT /3(75) c_tgt2.
   SELECTION-SCREEN BEGIN OF LINE.
@@ -133,7 +139,9 @@ START-OF-SELECTION.
   ENDIF.
 
   IF p_tgt IS NOT INITIAL.
-    APPEND zcl_erpl_rev_delta=>run( p_tgt ) TO lt_run.
+    APPEND zcl_erpl_rev_delta=>run( iv_target = p_tgt
+                                    iv_load_type = COND string( WHEN p_load IS INITIAL
+                                                                THEN 'D' ELSE p_load ) ) TO lt_run.
     PERFORM show USING lt_run.
     RETURN.
   ENDIF.

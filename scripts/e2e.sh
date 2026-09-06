@@ -242,7 +242,7 @@ suite diff ZCL_ERPL_REV_DIFFTEST abap/zcl_erpl_rev_difftest.abap DIFF 4 "" \
   "every replicated cell equals the SAP source; corruption is detected"
 
 
-suite delta ZCL_ERPL_REV_DELTATEST abap/zcl_erpl_rev_deltatest.abap DELTA 1 "" \
+suite delta ZCL_ERPL_REV_DELTATEST abap/zcl_erpl_rev_deltatest.abap DELTA 51 "" \
   "watermark, snapshot delete, real change documents, orchestration"
 
 
@@ -508,14 +508,17 @@ echo "   mass run: portions cut by the server, persisted, and loaded"
 # A replica that is the right SIZE and the wrong CONTENT passes every count
 # check there is, which is why this compares canonical text per column.
 VD="$(cli sync validate t000_cli --yes 2>&1)" || fail "sync validate failed: $VD"
-grep -qiE "PASSED|compared" <<<"$VD" || fail "sync validate said nothing usable: $VD"
+# The VERDICT, not a word that appears either way. "compared" and "mismatched"
+# are both always in the JSON, so the old greps matched whatever happened --
+# nothing guarded this feature at all.
+grep -q '"verdict":"PASSED"' <<<"$VD" || fail "validate did not pass a clean target: $VD"
 VA="$(cli sql "SELECT CASE WHEN count(*) > 0 THEN 'AUDITED' ELSE 'NO_RECORD' END AS v FROM _erpl_rev_run_stats WHERE target='t000_cli' AND run_type='VALIDATE'" 2>&1)"
 grep -q AUDITED <<<"$VA" || fail "validate left no audit row: $VA"
 
 # ...and it must actually catch corruption, or it is a green light with no bulb.
 cli sql "UPDATE t000_cli SET mtext = 'corrupted-by-e2e' WHERE rowid = 0" >/dev/null 2>&1
 VC="$(cli sync validate t000_cli --yes 2>&1 || true)"
-grep -qiE "FAILED|mismatch" <<<"$VC" || fail "validate did not detect a changed cell: $VC"
+grep -q '"verdict":"FAILED"' <<<"$VC" || fail "validate did not detect a changed cell: $VC"
 echo "   sync validate: a clean target passes, a corrupted cell is caught"
 
 # unpark: a parked target needs a way back that is not raw SQL. Parking is what

@@ -211,11 +211,16 @@ int RunTop(Options o) {
     component |= CatchEvent([&](Event e) {
         if (e == Event::Character('q') || e == Event::Escape) { screen.Exit(); return true; }
         if (e == Event::Character('r')) { refresh(); return true; }
+        // Under the lock too. These read snap.rows.size() while the refresh
+        // thread may be replacing the vector -- the same race the render path
+        // was fixed for, missed on the branches that move the cursor.
         if (e == Event::ArrowDown || e == Event::Character('j')) {
+            std::lock_guard<std::mutex> g(snap_mx);
             if (selected + 1 < static_cast<int>(snap.rows.size())) ++selected;
             return true;
         }
         if (e == Event::ArrowUp || e == Event::Character('k')) {
+            std::lock_guard<std::mutex> g(snap_mx);
             if (selected > 0) --selected;
             return true;
         }

@@ -695,6 +695,10 @@ int main(int argc, char **argv) {
         // alive — not via the global's atexit destructor. DuckDB extensions
         // (e.g. MotherDuck) log from their own destructors, which segfaults if
         // it runs after their statics are gone during program exit.
+        // Before the handlers, which destroy the bridge. The metrics thread holds a
+        // reference to it and would keep serving scrapes against freed memory --
+        // a use-after-free on every shutdown with metrics enabled.
+        StopMetricsServer();
         ShutdownHandlers();
         return 0;
     } catch (const std::exception &e) {
