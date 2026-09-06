@@ -39,9 +39,20 @@ macros are `CREATE OR REPLACE`d on every open.
 | `_erpl_rev_delta_state` | target | method, source, keys, watermark, safety window, cadence, load type, backoff and parking, logging, transform, validation policy, lease and `active_run_id` |
 | `_erpl_rev_run_stats` | run | status, counts, duration, watermarks, load type, validation status, lag |
 | `_erpl_rev_cdc` | trigger target | dialect, mode, log/sequence names, position, status, shadow depth, tuning |
-| `_erpl_rev_daemon` | server (one row) | instance, heartbeat, tick interval, worker budget, stop flag, ticks |
+| `_erpl_rev_daemon` | server (one row) | instance, heartbeat, tick interval, worker budget, full-load share, stop flag, ticks |
 | `_erpl_rev_cli_cmd` | queued command | the CLI's queue, drained by the ABAP driver |
-| `_erpl_rev_log_<target>` | applied change | opt-in change log: `_seq`, `_op`, `_run_id`, `_changed_at`, `_commit_ts`, plus the target's own columns |
+| `_erpl_rev_log_<target>` | applied change | opt-in change log: `_seq`, `_op`, `_run_id`, `_commit_ts`, `_applied_at`, plus the target's own columns |
+
+`_commit_ts` is when the **source** says the row changed; `_applied_at` is when
+erpl-rev wrote it. Two columns, not one: the difference between them is the
+replication latency, and a single column filled from whichever clock was nearest
+measures nothing. `_commit_ts` is NULL where the method has no source clock — a
+counter watermark, or a snapshot row — so latency for those targets is honestly
+unmeasurable rather than reported as zero.
+
+The log table exists as soon as a log-enabled target does. A target that has
+never had a change has an **empty** log, not a missing one, so readers and the
+retention pass never have to special-case it.
 
 Two views are the reading surface: `erpl_rev_run_stats` (derived counts, rates and
 durations) and the per-target change logs.

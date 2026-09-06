@@ -206,6 +206,31 @@ Every run is one of four, selectable with `sync run --load-type`:
 `I` is for a target already populated from somewhere else — a restore, a migration,
 a parquet drop.
 
+**`F` replaces the target; it does not merge into it.** That is the point of a
+repair: the drift an operator runs `F` to fix is usually a row the source no
+longer has, and an upsert can never remove one. The replacement happens inside
+the commit transaction, so a reload that fails leaves the previous contents
+intact rather than an emptied table.
+
+With one guard. A cycle that produced **no staging table at all** does not
+truncate — it has not established that the source is empty, only that the read
+produced nothing, which is also what a short read or a connection dropped
+between packages looks like. An **empty** staging table does truncate: there the
+reader ran and the source really is empty, and `F` has to stay a reload when a
+source table is emptied. The refused case is visible as `rows_read = 0` on the
+run.
+
+### The quiet cycle
+
+A cycle that reads nothing still advances the watermark to its ceiling, and this
+is not an optimisation: a target that does not move its floor when nothing
+changed re-reads an ever-widening range, until a micro-cadence target is
+scanning the whole table every tick.
+
+Its change log is provisioned all the same. A log-enabled target that has never
+had a change has an **empty** log rather than no log — a subscriber and the
+retention pass both read it as a fact instead of meeting "table does not exist".
+
 > **Upgrade note.** Before this, `safety_secs` was stored, exposed on the CLI and on
 > the Delta tab, and read by nothing: the read was `chg_col > wm` with no overlap at
 > all. Existing targets will now re-deliver more rows on their first cycles. That is
