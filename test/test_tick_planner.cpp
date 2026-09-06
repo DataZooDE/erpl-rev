@@ -223,3 +223,49 @@ TEST_CASE("tick_planner: a blocked target is never planned", "[plan]") {
     t.status = "BLOCKED";
     CHECK_FALSE(Has(PlanTick({t}, {}, Daemon(), kNow), "drifted"));
 }
+
+TEST_CASE("tick_planner: equally overdue targets are planned in a stable order", "[plan]") {
+    // Ten targets that all became due at exactly the same moment -- the normal
+    // case for a set registered together on the same cadence. Ordering them by
+    // overdue-ness alone leaves ties unordered, so which four run this tick
+    // depended on the order the rows came out of the database. That makes a
+    // starved target impossible to diagnose and this planner's own tests
+    // non-reproducible.
+    std::vector<TargetRow> t;
+    for (int i = 0; i < 10; ++i) t.push_back(T("t" + std::to_string(i), "micro:1", kNow - 60));
+
+    const auto p = PlanTick(t, {}, Daemon(4), kNow);
+    REQUIRE(p.cycles.size() == 4);
+
+    std::vector<std::string> got;
+    for (const auto &c : p.cycles) got.push_back(c.target);
+    CHECK(got == std::vector<std::string>{"t0", "t1", "t2", "t3"});
+
+    // And the same answer whatever order the rows arrive in.
+    std::vector<TargetRow> reversed(t.rbegin(), t.rend());
+    const auto q = PlanTick(reversed, {}, Daemon(4), kNow);
+    std::vector<std::string> got2;
+    for (const auto &c : q.cycles) got2.push_back(c.target);
+    CHECK(got2 == got);
+}
+
+TEST_CASE("tick_planner: a single worker still runs full loads", "[plan]") {
+    // The share is a cap expressed as a fraction of the budget, so at one worker
+    // it floors to zero and the full load was never planned -- on any tick,
+    // forever. A share protects the deltas from a mass load taking EVERY slot;
+    // with one slot there is nothing to protect, and refusing to run the work at
+    // all is the worse failure.
+    auto f = T("full", "nightly", kNow - 999999);
+    f.load_type_default = "L";
+    const auto p = PlanTick({f}, {}, Daemon(1, 0.5), kNow);
+    CHECK(Has(p, "full"));
+}
+
+TEST_CASE("tick_planner: a zero share means the daemon runs no full loads", "[plan]") {
+    // The deliberate setting must survive the floor above: an operator who set
+    // the share to zero asked for full loads to be scheduled by hand.
+    auto f = T("full", "nightly", kNow - 999999);
+    f.load_type_default = "L";
+    const auto p = PlanTick({f}, {}, Daemon(4, 0.0), kNow);
+    CHECK_FALSE(Has(p, "full"));
+}

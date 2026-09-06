@@ -89,15 +89,30 @@ TickPlan PlanTick(const std::vector<TargetRow> &targets, const std::vector<CdcRo
         due.push_back({&t, overdue, IsFullLoad(t.load_type_default)});
     }
 
-    std::sort(due.begin(), due.end(),
-              [](const Candidate &a, const Candidate &b) { return a.overdue > b.overdue; });
+    // Most overdue first, then by NAME. The tiebreak is not cosmetic: a set of
+    // targets registered together is due at exactly the same instant, so ties
+    // are the normal case, and without a total order which of them ran this
+    // tick was decided by the order the rows left the database. A starved
+    // target is then unreproducible.
+    std::sort(due.begin(), due.end(), [](const Candidate &a, const Candidate &b) {
+        if (a.overdue != b.overdue) return a.overdue > b.overdue;
+        return a.t->target < b.t->target;
+    });
 
     // Budget. Full loads get at most their share, so a mass load that is days
     // overdue cannot take every slot and starve the micro-cadence deltas -- the
     // deltas are the ones with a latency promise attached.
     const int budget = std::max(1, daemon.max_workers);
+    // The share caps full loads so a mass load cannot take every slot. At one
+    // worker the fraction floors to zero, which does not protect the deltas --
+    // there is only one slot -- it just means the full load is never planned,
+    // on any tick, forever. So the cap is at least one whenever full loads are
+    // wanted at all; a share of zero still means zero, because that is an
+    // operator saying "I schedule those myself".
     const int full_cap =
-        std::max(0, static_cast<int>(std::floor(budget * daemon.full_load_share)));
+        daemon.full_load_share <= 0.0
+            ? 0
+            : std::max(1, static_cast<int>(std::floor(budget * daemon.full_load_share)));
     int used = 0, fulls = 0;
 
     for (const auto &c : due) {

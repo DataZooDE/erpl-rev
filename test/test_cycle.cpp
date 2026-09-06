@@ -10,6 +10,7 @@
 // watermark, and its orphaned stage free to discard.
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include <duckdb.hpp>
 
 #include <string>
@@ -666,4 +667,56 @@ TEST_CASE("cycle: an ordinary delta cycle never truncates", "[cycle]") {
     cycle::Commit(con, "zdelta_wm", b.run_id, {1});
 
     CHECK(Scalar(con, "SELECT count(*) FROM zdelta_wm") == "3");
+}
+
+// --- the fence, on its own ---------------------------------------------------
+//
+// The compare-and-swap that stores the watermark is the last thing standing
+// between a reclaimed cycle and a target it no longer owns. Inside Commit its
+// failing branch is only reachable by winning a race against another cycle
+// between the pre-check and the transaction -- so it was, in practice,
+// untested. As a named operation it is reachable directly.
+
+TEST_CASE("cycle: the fence stores the watermark for the run that owns the target", "[cycle]") {
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con);
+    Exec(con, "UPDATE _erpl_rev_delta_state SET active_run_id=77, status='RUNNING'");
+
+    cycle::AdvanceWatermarkFenced(con, "zdelta_wm", 77, "20260905130000", 5);
+
+    CHECK(Scalar(con, "SELECT wm_value FROM _erpl_rev_delta_state") == "20260905130000");
+    CHECK(Scalar(con, "SELECT status FROM _erpl_rev_delta_state") == "IDLE");
+    // Released, so the next cycle can claim it.
+    CHECK(Scalar(con, "SELECT active_run_id FROM _erpl_rev_delta_state").empty());
+    CHECK(Scalar(con, "SELECT rows_applied FROM _erpl_rev_delta_state") == "5");
+}
+
+TEST_CASE("cycle: the fence refuses a run that no longer owns the target", "[cycle]") {
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con);
+    const auto before = Scalar(con, "SELECT wm_value FROM _erpl_rev_delta_state");
+    // Reclaimed: run 77 did the work, run 78 owns the target now.
+    Exec(con, "UPDATE _erpl_rev_delta_state SET active_run_id=78, status='RUNNING'");
+
+    CHECK_THROWS_WITH(cycle::AdvanceWatermarkFenced(con, "zdelta_wm", 77, "20260905130000", 5),
+                      Catch::Matchers::ContainsSubstring("lost ownership"));
+
+    // The point of the throw: no watermark from a cycle that was displaced, and
+    // the new owner's claim is intact.
+    CHECK(Scalar(con, "SELECT wm_value FROM _erpl_rev_delta_state") == before);
+    CHECK(Scalar(con, "SELECT active_run_id FROM _erpl_rev_delta_state") == "78");
+}
+
+TEST_CASE("cycle: the fence refuses a target that is not registered at all", "[cycle]") {
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con);
+
+    // Zero rows updated for a different reason, and it must still be a throw:
+    // reporting SUCCESS for a watermark stored nowhere is the failure mode,
+    // whatever made the WHERE miss.
+    CHECK_THROWS_WITH(cycle::AdvanceWatermarkFenced(con, "no_such_target", 1, "20260905130000", 0),
+                      Catch::Matchers::ContainsSubstring("lost ownership"));
 }
