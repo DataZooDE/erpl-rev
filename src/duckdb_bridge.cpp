@@ -1078,7 +1078,13 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
             if (i) on += " AND ";
             on += "img." + kl[i] + " = " + cast_to("n." + kl[i], type_of(kl[i]));
         }
-        upsert_src = "(SELECT img.* FROM " + images + " img JOIN " + net_iu + " n ON " + on + ")";
+        // The op and the trigger timestamp come from the LOG, not the images --
+        // the images are only a source of values. Carried through so the change
+        // log can be written from one relation; ins_sql names its columns
+        // explicitly, so the extra ones cost it nothing.
+        upsert_src = "(SELECT img.*, n.\"_op\" AS __erpl_op" +
+                     (in_staging("_ts") ? std::string(", n.\"_ts\" AS __erpl_ts") : std::string()) +
+                     " FROM " + images + " img JOIN " + net_iu + " n ON " + on + ")";
     }
 
     // ...and the mirror race: a key the log says was inserted or updated, which
@@ -1163,7 +1169,7 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
     // as the apply -- a log that records changes the target never received is
     // worse than no log. _commit_ts comes from the trigger's own timestamp, so
     // the trigger tier's latency is measurable exactly like the watermark tier's.
-    std::string log_sql;
+    std::string log_sql, log_del_sql;
     {
         auto le = con.Query("SELECT count(*) FROM _erpl_rev_delta_state "
                             "WHERE target='" + target + "' AND coalesce(log_enabled,false)");
@@ -1176,11 +1182,13 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
             // read another, and the mismatch was invisible because the append is
             // skipped when the table is missing.
             const std::string logtab = cycle::ChangeLogName(target);
-            auto ex = con.Query("SELECT count(*) FROM duckdb_tables() WHERE table_name='" +
-                                logtab + "'");
-            const bool exists = !ex->HasError() && ex->RowCount() > 0 &&
-                                ex->GetValue(0, 0).GetValue<int64_t>() > 0;
-            if (exists) {
+            // PROVISION it, do not probe for it. This used to skip the append
+            // when the table was missing -- and nothing else in the tree creates
+            // a log for a trigger target, so a log-enabled CDC target had no log
+            // forever and every subscription on it published an empty stream and
+            // reported success. One provisioner, shared with the watermark tier.
+            cycle::EnsureChangeLog(con, target, dcols);
+            {
                 std::string cl, sl;
                 for (size_t i = 0; i < dcols.size(); ++i) {
                     if (i) { cl += ","; sl += ","; }
@@ -1189,7 +1197,22 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
                 }
                 if (!cl.empty()) {
                     const std::string src = keys_mode ? upsert_src : net_iu;
-                    // upper(_OP): the shadow log writes 'i'/'u'/'d' while every
+                    // The op and timestamp columns, spelled the way they
+                    // actually arrive. These read c."_OP" and c."_TS" in upper
+                    // case, while the shadow batch lands in DuckDB lower-cased
+                    // -- which every other statement here already assumes
+                    // (net_del filters on c."_op"). A quoted identifier is
+                    // case-sensitive, so the append referenced columns that do
+                    // not exist and failed on every single apply; the failure
+                    // was then swallowed as "best-effort", so a log-enabled
+                    // trigger target wrote nothing and reported success.
+                    const std::string op_src = keys_mode ? "c.__erpl_op" : "c.\"_op\"";
+                    const bool have_ts = keys_mode ? in_staging("_ts") : in_staging("_ts");
+                    const std::string ts_src =
+                        !have_ts ? std::string("NULL")
+                                 : (keys_mode ? std::string("c.__erpl_ts")
+                                              : std::string("c.\"_ts\""));
+                    // upper(): the shadow log writes 'i'/'u'/'d' while every
                     // reader of the change log -- the latency statistics, the
                     // stress harness, the subscription dedup -- filters on
                     // 'I'/'U'/'D'. A target replicated by both tiers otherwise
@@ -1199,11 +1222,34 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
                     // value like every other, and letting it cast into a
                     // TIMESTAMPTZ column picks up the server's session zone --
                     // the same two-hour error the watermark path was fixed for.
+                    const std::string commit_ts =
+                        have_ts ? "(try_strptime(CAST(" + ts_src +
+                                      " AS VARCHAR), '%Y%m%d%H%M%S') AT TIME ZONE 'UTC')"
+                                : "NULL";
                     log_sql = "INSERT INTO " + logtab + " (" + cl +
                               ", _seq, _op, _run_id, _commit_ts, _applied_at) SELECT " + sl +
-                              ", nextval('" + logtab + "_seq'), upper(c.\"_OP\"), 0, "
-                              "(try_strptime(c.\"_TS\", '%Y%m%d%H%M%S') AT TIME ZONE 'UTC'), "
-                              "now() FROM " + src + " c";
+                              ", nextval('" + logtab + "_seq'), upper(" + op_src + "), 0, " +
+                              commit_ts + ", now() FROM " + src + " c";
+
+                    // The deletes, which this never recorded at all: the append
+                    // only ever read the net-I/U side. A trigger target's whole
+                    // reason to exist is that it sees physical deletes, and they
+                    // were the one op its change log did not carry -- so every
+                    // subscriber kept rows the source had dropped.
+                    std::string kcl, ksl;
+                    for (size_t i = 0; i < kl.size(); ++i) {
+                        if (i) { kcl += ","; ksl += ","; }
+                        kcl += kl[i];
+                        ksl += cast_to("c." + kl[i], type_of(kl[i]));
+                    }
+                    log_del_sql = "INSERT INTO " + logtab + " (" + kcl +
+                                  ", _seq, _op, _run_id, _commit_ts, _applied_at) SELECT " + ksl +
+                                  ", nextval('" + logtab + "_seq'), 'D', 0, " +
+                                  (in_staging("_ts")
+                                       ? "(try_strptime(CAST(c.\"_ts\" AS VARCHAR), "
+                                         "'%Y%m%d%H%M%S') AT TIME ZONE 'UTC')"
+                                       : "NULL") +
+                                  ", now() FROM " + net_del + " c";
                 }
             }
         }
@@ -1215,15 +1261,17 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
         // del_iu removes every net-I/U key first; ins_sql then puts back only the
         // ones the re-read actually found. A key that vanished in between is
         // therefore deleted by construction, which is exactly what it should be.
-        if (!log_sql.empty()) {
-            auto lr = con.Query(log_sql);
-            // Best-effort: a log the shadow batch cannot satisfy (a column the
-            // re-read did not bring back) must not fail the apply itself.
-            // Best-effort by design, and silent rather than logged: duckdb_bridge
-            // deliberately has no logging dependency, and a failed append must
-            // not fail the apply. It shows up as a change log that stops growing,
-            // which the stress harness asserts on directly.
-            (void)lr->HasError();
+        // NOT best-effort any more. This used to swallow the error on the
+        // reasoning that a failed append must not fail the apply -- and the
+        // append then failed on every apply, for a misspelled column, for as
+        // long as the feature has existed, while every target reported success.
+        // A log that silently stops recording is worse than an apply that
+        // stops: the target stays right and the sink quietly goes wrong.
+        for (const auto &sql : {log_del_sql, log_sql}) {
+            if (sql.empty()) continue;
+            auto lr = con.Query(sql);
+            if (lr->HasError())
+                throw std::runtime_error("CDC: change-log append failed: " + lr->GetError());
         }
         if (!del_iu_sql.empty()) { Exec(con, del_iu_sql); Exec(con, ins_sql); }
         else if (keys_mode) {

@@ -27,6 +27,7 @@
 #include <duckdb.hpp>
 
 #include <string>
+#include <vector>
 
 #include "delta_plan.hpp"
 #include "load_type.hpp"
@@ -87,6 +88,15 @@ void AdvanceWatermarkFenced(duckdb::Connection &con, const std::string &target, 
 // Per-target change log. Named through the collision-safe token, because the
 // input is a customer-chosen target name.
 std::string ChangeLogName(const std::string &target);
+
+// Create the change log for `target` if it is missing, and widen it to carry
+// `cols` if the target has grown columns since. Both replication tiers call
+// this: the watermark cycle and the trigger apply. The trigger tier used to
+// have no provisioner at all -- it probed for the table and skipped the append
+// when it was absent -- so a log-enabled CDC target had no log, forever, and
+// said nothing.
+void EnsureChangeLog(duckdb::Connection &con, const std::string &target,
+                     const std::vector<std::string> &cols);
 
 // The stage a run writes into: named for the run, so an orphan identifies itself
 // and cleanup is a DROP over names that do not match an in-flight run.

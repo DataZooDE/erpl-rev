@@ -269,9 +269,27 @@ TEST_CASE("cycle: no log rows when the apply fails", "[cycle][log]") {
 
     REQUIRE_THROWS(cycle::Commit(con, "zdelta_wm", b.run_id, {1}));
     const std::string log = cycle::ChangeLogName("zdelta_wm");
-    const auto exists = Scalar(con, "SELECT count(*) FROM duckdb_tables() WHERE table_name='" +
-                                        log + "'");
-    if (exists == "1") CHECK(Scalar(con, "SELECT count(*) FROM " + log) == "0");
+    // Asserted unconditionally. This used to read `if (exists == "1") CHECK(...)`
+    // -- and since provisioning happens inside the transaction, a rolled-back
+    // commit leaves no log table, `exists` is "0", and the test checked
+    // nothing at all while reporting a pass.
+    CHECK(Scalar(con, "SELECT count(*) FROM duckdb_tables() WHERE table_name='" + log + "'")
+          == "0");
+
+    // And the case the name really promises: a log that already EXISTS, from an
+    // earlier good cycle, gains nothing from a failed one.
+    Exec(con, "DROP TABLE " + b.stage_table);
+    const auto good = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart);
+    StageRows(con, good.stage_table);
+    cycle::Commit(con, "zdelta_wm", good.run_id, {2});
+    const auto before = Scalar(con, "SELECT count(*) FROM " + log);
+    CHECK(before == "2");
+
+    const auto bad = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart + 600);
+    Exec(con, "CREATE TABLE " + bad.stage_table + "(id VARCHAR, v VARCHAR, changed_at VARCHAR)");
+    Exec(con, "INSERT INTO " + bad.stage_table + " VALUES ('nope','x','20260905110000')");
+    REQUIRE_THROWS(cycle::Commit(con, "zdelta_wm", bad.run_id, {1}));
+    CHECK(Scalar(con, "SELECT count(*) FROM " + log) == before);
 }
 
 TEST_CASE("cycle: logging off writes no log at all", "[cycle][log]") {
@@ -770,10 +788,13 @@ TEST_CASE("cycle: a cycle that reads nothing still advances the watermark", "[cy
     CHECK(Scalar(con, "SELECT count(*) FROM " + cycle::ChangeLogName("zdelta_wm")) == "0");
 }
 
-TEST_CASE("cycle: an empty stage table is not the same as no stage table", "[cycle]") {
-    // The reader created its stage and then had nothing to put in it. Same
-    // outcome as above -- and the stage must still be dropped, or the next
-    // cycle's orphan sweep is doing work that should never have been needed.
+TEST_CASE("cycle: an empty stage is dropped like any other", "[cycle]") {
+    // The reader created its stage and then had nothing to put in it. On a
+    // DELTA cycle that is indistinguishable from having created none -- the
+    // distinction only means something for a reload, which the F pair below
+    // covers. What is worth pinning here is the one thing only this case can
+    // say: an empty stage is still DROPPED, rather than left for the next
+    // cycle's orphan sweep to find.
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
     Setup(con, /*log_enabled=*/true);
@@ -980,4 +1001,37 @@ TEST_CASE("cycle: the orphan sweep does not reach a target whose name differs by
     CHECK(Scalar(con, "SELECT count(*) FROM duckdb_tables() WHERE table_name='axb__stg_9'")
           == "1");
     CHECK(b.run_id > 0);
+}
+
+TEST_CASE("cycle: a scheduled reload runs once, then the target goes back to delta",
+          "[cycle]") {
+    // load_type_default is what the tick planner hands the daemon, so a target
+    // left at 'F' or 'L' truncates and reloads on EVERY due tick, unattended --
+    // a repair or a seed turned into a permanent scheduled rewrite of the
+    // customer's table. Both load types are one-shot by meaning: L is "init and
+    // then delta", F is "repair this once".
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con);
+    Exec(con, "UPDATE _erpl_rev_delta_state SET load_type_default='L'");
+
+    const auto b = cycle::Begin(con, "zdelta_wm", LoadType::InitAndFull, kReadStart);
+    StageRows(con, b.stage_table);
+    cycle::Commit(con, "zdelta_wm", b.run_id, {2});
+
+    CHECK(Scalar(con, "SELECT load_type_default FROM _erpl_rev_delta_state") == "D");
+}
+
+TEST_CASE("cycle: a delta cycle does not touch the target's default load type",
+          "[cycle]") {
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con);
+    Exec(con, "UPDATE _erpl_rev_delta_state SET load_type_default='D'");
+
+    const auto b = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart);
+    StageRows(con, b.stage_table);
+    cycle::Commit(con, "zdelta_wm", b.run_id, {2});
+
+    CHECK(Scalar(con, "SELECT load_type_default FROM _erpl_rev_delta_state") == "D");
 }

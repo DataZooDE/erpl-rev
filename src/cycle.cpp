@@ -89,6 +89,57 @@ State LoadState(duckdb::Connection &con, const std::string &target) {
 
 }  // namespace
 
+// Provision the per-target change log: the table, its control columns and its
+// sequence, reconciled against the target's shape. Extracted because the CDC
+// tier had no provisioner at all -- it probed for the table and silently wrote
+// nothing when it was missing, so a log-enabled trigger target never got a log
+// and never noticed.
+void EnsureChangeLog(duckdb::Connection &con, const std::string &target,
+                     const std::vector<std::string> &cols) {
+    const std::string log = ChangeLogName(target);
+    // Provision the log ONCE, not on every commit. This block used to run
+    // its CREATE, five duckdb_columns() probes and a CREATE SEQUENCE every
+    // cycle: a flat ~40ms whatever the row count, which on a 1000-row
+    // cycle was six times the cost of the work itself. Measured by
+    // bench_cycle before anyone had to notice it in production.
+    const bool log_exists =
+        Scalar(con, "SELECT count(*) FROM duckdb_tables() WHERE table_name=" + Lit(log))
+        == "1";
+    if (log_exists) {
+        // Reconcile with the target. The log is created once from the
+        // target's shape, so a column the structure watchdog later adds
+        // exists on the target and not here -- and the next INSERT names
+        // it, fails, and that target never commits again. Cheap: a
+        // catalogue probe per column, only for logged targets.
+        for (const auto &c : cols) {
+            const auto have = Scalar(con, "SELECT count(*) FROM duckdb_columns() "
+                                          "WHERE table_name=" + Lit(log) +
+                                              " AND lower(column_name)=" + Lit(c));
+            if (have == "0") {
+                const auto type = Scalar(con, "SELECT data_type FROM duckdb_columns() "
+                                              "WHERE table_name=" + Lit(Lower(target)) +
+                                                  " AND lower(column_name)=" + Lit(c));
+                if (!type.empty())
+                    Exec(con, "ALTER TABLE " + log + " ADD COLUMN " + c + " " + type,
+                         "widen change log");
+            }
+        }
+    } else {
+        Exec(con, "CREATE TABLE " + log + " AS SELECT * FROM " + target + " LIMIT 0",
+             "create change log");
+        // _commit_ts is when the SOURCE says the row changed; _applied_at
+        // is when erpl-rev wrote it. Two columns, not one: the difference
+        // between them IS the replication latency, and a single column
+        // filled from whichever clock was nearest measures nothing.
+        for (const auto &c : {std::string("_seq BIGINT"), std::string("_op VARCHAR"),
+                              std::string("_run_id BIGINT"),
+                              std::string("_commit_ts TIMESTAMPTZ"),
+                              std::string("_applied_at TIMESTAMPTZ")})
+            Exec(con, "ALTER TABLE " + log + " ADD COLUMN " + c, "log column");
+        Exec(con, "CREATE SEQUENCE IF NOT EXISTS " + log + "_seq START 1", "log sequence");
+    }
+}
+
 void AdvanceWatermarkFenced(duckdb::Connection &con, const std::string &target,
                             long long run_id, const std::string &new_watermark,
                             long long rows_applied) {
@@ -431,11 +482,18 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
         spec.safety_secs = st.safety_secs;
         spec.safety_units = st.safety_units;
 
-        auto rt = con.Query("SELECT coalesce(load_type,'D') FROM _erpl_rev_run_stats WHERE run_id=" +
+        // Throw, do not default. The adjacent read of wm_to already refuses a
+        // missing stats row -- and this is the read that decides whether the
+        // target gets emptied, so it is the last one that should quietly guess.
+        // A missing row means the run was not opened by Begin(), and silently
+        // demoting F to D there turns a repair into a no-op the operator is
+        // told succeeded.
+        auto rt = con.Query("SELECT load_type FROM _erpl_rev_run_stats WHERE run_id=" +
                             std::to_string(run_id));
-        const std::string lt = rt->HasError() || rt->RowCount() == 0
-                                   ? "D"
-                                   : rt->GetValue(0, 0).ToString();
+        if (rt->HasError() || rt->RowCount() == 0 || rt->GetValue(0, 0).IsNull())
+            throw std::runtime_error("cycle: run " + std::to_string(run_id) +
+                                     " has no recorded load type; it was not opened by Begin()");
+        const std::string lt = rt->GetValue(0, 0).ToString();
         const auto plan = PlanLoad(ParseLoadType(lt));
         load_plan = plan;
 
@@ -560,49 +618,7 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
                 con.Query("ALTER TABLE " + target + " ADD PRIMARY KEY (" + kl + ")");
             }
         }
-        if (want_log) {
-            // Provision the log ONCE, not on every commit. This block used to run
-            // its CREATE, five duckdb_columns() probes and a CREATE SEQUENCE every
-            // cycle: a flat ~40ms whatever the row count, which on a 1000-row
-            // cycle was six times the cost of the work itself. Measured by
-            // bench_cycle before anyone had to notice it in production.
-            const bool log_exists =
-                Scalar(con, "SELECT count(*) FROM duckdb_tables() WHERE table_name=" + Lit(log))
-                == "1";
-            if (log_exists) {
-                // Reconcile with the target. The log is created once from the
-                // target's shape, so a column the structure watchdog later adds
-                // exists on the target and not here -- and the next INSERT names
-                // it, fails, and that target never commits again. Cheap: a
-                // catalogue probe per column, only for logged targets.
-                for (const auto &c : cols) {
-                    const auto have = Scalar(con, "SELECT count(*) FROM duckdb_columns() "
-                                                  "WHERE table_name=" + Lit(log) +
-                                                      " AND lower(column_name)=" + Lit(c));
-                    if (have == "0") {
-                        const auto type = Scalar(con, "SELECT data_type FROM duckdb_columns() "
-                                                      "WHERE table_name=" + Lit(Lower(target)) +
-                                                          " AND lower(column_name)=" + Lit(c));
-                        if (!type.empty())
-                            Exec(con, "ALTER TABLE " + log + " ADD COLUMN " + c + " " + type,
-                                 "widen change log");
-                    }
-                }
-            } else {
-                Exec(con, "CREATE TABLE " + log + " AS SELECT * FROM " + target + " LIMIT 0",
-                     "create change log");
-                // _commit_ts is when the SOURCE says the row changed; _applied_at
-                // is when erpl-rev wrote it. Two columns, not one: the difference
-                // between them IS the replication latency, and a single column
-                // filled from whichever clock was nearest measures nothing.
-                for (const auto &c : {std::string("_seq BIGINT"), std::string("_op VARCHAR"),
-                                      std::string("_run_id BIGINT"),
-                                      std::string("_commit_ts TIMESTAMPTZ"),
-                                      std::string("_applied_at TIMESTAMPTZ")})
-                    Exec(con, "ALTER TABLE " + log + " ADD COLUMN " + c, "log column");
-                Exec(con, "CREATE SEQUENCE IF NOT EXISTS " + log + "_seq START 1", "log sequence");
-            }
-        }
+        if (want_log) EnsureChangeLog(con, target, cols);
 
         // A reload REPLACES the target. Upserting without this left every row
         // the source had since deleted -- the drift an operator runs F to
@@ -759,6 +775,16 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
         // The fence. Inside the transaction, so losing the target here rolls
         // back the merge and the log with it.
         AdvanceWatermarkFenced(con, target, run_id, new_wm, res.ins + res.upd);
+
+        // A truncating load type is one-shot by meaning -- L is "init, then
+        // delta", F is "repair this once" -- but load_type_default is what the
+        // tick planner hands the daemon, so a target left at either truncated
+        // and reloaded on every due tick, unattended. Spent on success, in the
+        // same transaction, so a failed reload stays scheduled.
+        if (load_plan.truncate_target)
+            Exec(con, "UPDATE _erpl_rev_delta_state SET load_type_default='D' WHERE target=" +
+                          Lit(target) + " AND load_type_default IN ('F','L')",
+                 "spend the one-shot load type");
 
         Exec(con,
              "UPDATE _erpl_rev_run_stats SET status='SUCCESS', rows_read=" +

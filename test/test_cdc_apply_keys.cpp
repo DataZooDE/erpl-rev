@@ -11,6 +11,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "cycle.hpp"
 #include "duckdb_bridge.hpp"
 
 using namespace erpl_rev;
@@ -149,4 +150,29 @@ TEST_CASE("cdc_keys: image mode still works with no images table", "[bridge][cdc
     auto r = db.CdcApply("t", "ilog", {"id"});
     REQUIRE(r.applied);
     CHECK(db.Query("SELECT v FROM t WHERE id=1").rows[0] == R"({"v":"from-log"})");
+}
+
+TEST_CASE("cdc_keys: a log-enabled trigger target actually gets a change log",
+          "[bridge][cdc][keys]") {
+    // The trigger tier had no log provisioner at all. It probed for the table
+    // and, finding none, silently wrote nothing -- and nothing else in the tree
+    // creates a log for a CDC target, so a log-enabled trigger target had no
+    // log, forever, and said so nowhere. Every subscription on such a target
+    // published an empty stream and reported success.
+    DuckDbBridge db;
+    SetupKeysTarget(db);
+    db.Execute("INSERT INTO _erpl_rev_delta_state (target, method, source_from, keys, "
+               "log_enabled) VALUES ('t','CDC','T','id',true)");
+    db.Execute("INSERT INTO klog VALUES (1,'U',1),(4,'I',2),(2,'D',3)");
+    db.Execute("CREATE TABLE kimg(id INTEGER, v VARCHAR)");
+    db.Execute("INSERT INTO kimg VALUES (1,'new-a'),(4,'new-d')");
+
+    auto r = db.CdcApply("t", "klog", {"id"}, "kimg");
+    REQUIRE(r.applied);
+
+    const std::string log = cycle::ChangeLogName("t");
+    CHECK(db.Query("SELECT count(*) AS c FROM " + log).rows[0] == R"({"c":3})");
+    // The same alphabet the watermark tier writes, so one reader serves both.
+    CHECK(db.Query("SELECT count(*) AS c FROM " + log + " WHERE _op='D'").rows[0] ==
+          R"({"c":1})");
 }
