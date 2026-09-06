@@ -481,6 +481,12 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
         iv_truncate = abap_true
         iv_where    = lv_where
         iv_record   = abap_false      " the cycle is recorded by run() as one DELTA row
+        " No primary key on the stage. Building one is right for a full load,
+        " whose target keeps the index for the rest of its life; a delta stage is
+        " created, read exactly once by the merge, and dropped. Measured by
+        " P-STAGE-PK: the index never pays for itself and costs 37% of the cycle
+        " at 100k rows -- a fixed tax on the hot path of every streaming tick.
+        iv_build_pk = abap_false
         " Drift is about the TARGET, not the stage this cycle happens to be
         " filling. Without this the watchdog compared the DDIC field list against
         " a staging table that does not exist yet and quietly did nothing.

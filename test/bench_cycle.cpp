@@ -122,3 +122,61 @@ TEST_CASE("P-CYCLE: direct merge vs staged commit", "[bench][.]") {
                 "   updates run statistics and drops its staging table.)\n\n");
     SUCCEED();
 }
+
+// P-STAGE-PK: does building a PRIMARY KEY on the staging table pay for itself?
+//
+// The ingest path builds a PK on whatever it writes into (iv_build_pk defaults
+// on), which is right for a full load: the target keeps that index for the rest
+// of its life. A delta stage lives for one cycle and is read exactly once, by
+// the merge -- so the index is either bought back by a faster merge, or it is
+// pure cost on the hot path of every streaming tick.
+//
+// Nobody had measured it, and "it is probably fine" is how a fixed per-cycle
+// cost survives into a product whose promise is second-scale latency.
+TEST_CASE("P-STAGE-PK: a primary key on the delta stage", "[bench][.]") {
+    constexpr long long kBase = 1'000'000;
+
+    std::printf("\n  rows | no stage PK (ms) | stage PK (ms) |  of which build | verdict\n");
+    std::printf("-------+------------------+---------------+-----------------+---------\n");
+
+    for (long long n : {10LL, 100LL, 1'000LL, 10'000LL, 100'000LL}) {
+        duckdb::DuckDB db(nullptr);
+        duckdb::Connection con(db);
+        schema::Migrate(con, "bench");
+        Run(con, "INSERT INTO _erpl_rev_delta_state "
+                 "(target, method, source_from, keys, chg_col, wm_kind, wm_value, safety_secs, "
+                 " cadence, status, log_enabled) VALUES "
+                 "('t','WATERMARK','T','id','CHANGED_AT','NUMTS','20260101000000',120,"
+                 "'manual','IDLE',false)");
+
+        auto cycle_once = [&](bool with_pk) {
+            Seed(con, kBase);
+            Run(con, "UPDATE _erpl_rev_delta_state SET wm_value='20260101000000', "
+                     "status='IDLE', active_run_id=NULL");
+            auto b = cycle::Begin(con, "t", LoadType::Delta, 1788609600);
+            SeedChanges(con, b.stage_table, n);
+
+            double build = 0;
+            if (with_pk) {
+                const auto p0 = Clock::now();
+                Run(con, "ALTER TABLE " + b.stage_table + " ADD PRIMARY KEY (id)");
+                build = Ms(p0, Clock::now());
+            }
+            const auto t0 = Clock::now();
+            cycle::Commit(con, "t", b.run_id, {n});
+            return std::pair<double, double>{Ms(t0, Clock::now()), build};
+        };
+
+        const auto plain = cycle_once(false);
+        const auto keyed = cycle_once(true);
+        const double total_keyed = keyed.first + keyed.second;
+
+        std::printf("%6lld | %16.1f | %13.1f | %15.1f | %s\n", n, plain.first, total_keyed,
+                    keyed.second,
+                    total_keyed <= plain.first ? "PK pays" : "PK costs");
+    }
+    std::printf("\n  (1,000,000-row target. The 'stage PK' column includes the time to\n"
+                "   build the index, because a delta stage is created, indexed, read\n"
+                "   once and dropped -- so the build is part of the cycle, not setup.)\n\n");
+    SUCCEED();
+}
