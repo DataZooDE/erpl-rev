@@ -13,6 +13,8 @@ CLASS zcl_erpl_rev_deltatest DEFINITION PUBLIC FINAL CREATE PUBLIC.
     METHODS m3_changedoc.
     METHODS m4_orchestration.
     METHODS m5_sflight.
+    METHODS m7_monitor.
+    METHODS m8_validate.
     METHODS m6_stats.
 ENDCLASS.
 
@@ -41,6 +43,8 @@ CLASS zcl_erpl_rev_deltatest IMPLEMENTATION.
         m4_orchestration( ).
         m5_sflight( ).
         m6_stats( ).
+        m7_monitor( ).
+        m8_validate( ).
       CATCH cx_root INTO DATA(lx).
         mv_fail = mv_fail + 1.
         out->write( |DUMP: { lx->get_text( ) }| ).
@@ -67,14 +71,26 @@ CLASS zcl_erpl_rev_deltatest IMPLEMENTATION.
 
     DATA(r1) = zcl_erpl_rev_delta=>run( 'delta_wm' ).
     ok( cond = xsdbool( r1-error IS INITIAL ) what = 'M1 cycle ok' detail = r1-error ).
-    ok( cond = xsdbool( r1-rows = 4 ) what = 'M1 applied=4' detail = |{ r1-rows }| ).
+    " At least the four changed rows. NOT exactly four: the safety window pulls
+    " the floor back before the stored watermark, so recently-changed rows are
+    " deliberately re-read. That overlap is the whole point -- it is what stops a
+    " row that committed during the previous read from falling below the floor
+    " forever -- and the keyed merge absorbs the duplicates.
+    ok( cond = xsdbool( r1-rows >= 4 ) what = 'M1 reads at least the 4 changed rows'
+        detail = |{ r1-rows }| ).
     ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM delta_wm| ) = 11 ) what = 'M1 count=11' ).
     ok( cond = has( iv_sql = |SELECT name FROM delta_wm WHERE id='0000000001'| iv_sub = 'touched' )
         what = 'M1 updated row carries new value' ).
 
     " Idempotency: nothing changed in SAP -> next cycle applies 0, data identical.
     DATA(r2) = zcl_erpl_rev_delta=>run( 'delta_wm' ).
-    ok( cond = xsdbool( r2-rows = 0 ) what = 'M1 idempotent re-run applies 0' detail = |{ r2-rows }| ).
+    " Idempotence is about the RESULT, not the row count. A second cycle inside
+    " the safety window re-reads the same rows on purpose; what must not change
+    " is the target.
+    ok( cond = xsdbool( r2-error IS INITIAL ) what = 'M1 re-run succeeds' detail = r2-error ).
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM delta_wm| ) = 11 )
+        what = 'M1 idempotent re-run leaves the target unchanged'
+        detail = |{ r2-rows } rows re-read| ).
     ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM delta_wm| ) = 11 ) what = 'M1 count still 11' ).
   ENDMETHOD.
 
@@ -286,6 +302,89 @@ CLASS zcl_erpl_rev_deltatest IMPLEMENTATION.
     ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM erpl_rev_run_stats | &&
                              |WHERE is_success AND rows_applied > 0| ) >= 1 )
         what = 'C15 dashboard view derives rows_applied / is_success' ).
+  ENDMETHOD.
+
+  METHOD m7_monitor.
+    " The SAP-side monitor reads the SAME views the CLI, the TUI and the metrics
+    " endpoint read. Four surfaces over one definition of "healthy" -- a second
+    " query here would be a second opinion, and the two would disagree the first
+    " time either changed.
+    "
+    " This is the data half, which is where anything can be wrong. The screen
+    " hands it to result_to_alv and draws it.
+    DATA(ls_m) = zcl_erpl_rev_delta=>monitor_rows( ).
+    ok( cond = xsdbool( ls_m-error IS INITIAL )
+        what = 'monitor: the target view is readable from ABAP' detail = ls_m-error ).
+    ok( cond = xsdbool( ls_m-row_count > 0 )
+        what = 'monitor: it returns the registered targets'
+        detail = |{ ls_m-row_count } row(s)| ).
+    " The columns an operator acts on must be there, or the screen is a table of
+    " names with nothing to decide from.
+    ok( cond = xsdbool( ls_m-rows CS 'lag_seconds' AND ls_m-rows CS 'is_healthy' )
+        what = 'monitor: lag and health are in the row'
+        detail = substring( val = ls_m-rows len = nmin( val1 = 120 val2 = strlen( ls_m-rows ) ) ) ).
+
+    DATA(ls_h) = zcl_erpl_rev_delta=>monitor_health( ).
+    ok( cond = xsdbool( ls_h-error IS INITIAL AND ls_h-rows CS 'daemon_status' )
+        what = 'monitor: the health summary includes the daemon'
+        detail = |{ ls_h-error }| ).
+  ENDMETHOD.
+
+  METHOD m8_validate.
+    " Validation on a NEGATIVE amount.
+    "
+    " A packed number renders with a trailing sign in ABAP -- "1234-" -- and
+    " every other system writes "-1234". So a correct replica of any table
+    " holding a negative amount compared unequal and validation reported
+    " FAILED. That verdict is the one an operator acts on destructively: the
+    " runbook's remedy is a reload. A comparison that is wrong is worse than no
+    " comparison, because somebody believes it.
+    DATA ls_n TYPE zdelta_all.
+    CLEAR ls_n.
+    ls_n-client = sy-mandt.
+    ls_n-bukrs  = '1000'.
+    ls_n-belnr  = '9999999999'.
+    ls_n-gjahr  = '2026'.
+    ls_n-buzei  = '001'.
+    ls_n-dmbtr  = '-1234.56'.     " the value that used to break it
+    ls_n-wrbtr  = '-1.00'.
+    MODIFY zdelta_all FROM ls_n.
+    COMMIT WORK AND WAIT.
+
+    zcl_erpl_rev_util=>query( |DROP TABLE IF EXISTS val_neg| ).
+    zcl_erpl_rev_util=>replicate( iv_tab = 'ZDELTA_ALL' iv_target = 'val_neg'
+                                  iv_record = abap_false ).
+    zcl_erpl_rev_util=>query(
+      |DELETE FROM _erpl_rev_delta_state WHERE target='val_neg'| ).
+    zcl_erpl_rev_delta=>register( VALUE #(
+      target = 'val_neg' method = 'WATERMARK' source_from = 'ZDELTA_ALL'
+      keys = 'CLIENT,BUKRS,BELNR,GJAHR,BUZEI' chg_col = 'CHG_TSTAMP'
+      wm_kind = 'NUMTS' cadence = 'manual' ) ).
+
+    DATA lv_r TYPE string.
+    DATA lv_e TYPE string.
+    zcl_erpl_rev_clidrv=>execute(
+      EXPORTING iv_verb = 'validate' iv_params = '{"target":"val_neg","mode":"full"}'
+      IMPORTING ev_result = lv_r ev_error = lv_e ).
+    ok( cond = xsdbool( lv_e IS INITIAL ) what = 'validate: it ran' detail = lv_e ).
+    ok( cond = xsdbool( lv_r CS '"verdict":"PASSED"' )
+        what = 'validate: a correct replica holding a NEGATIVE amount passes'
+        detail = lv_r ).
+
+    " ...and it still catches a real difference, or the fix above would just be
+    " a validator that always says PASSED.
+    zcl_erpl_rev_util=>query( |UPDATE val_neg SET dmbtr = 0 WHERE belnr='9999999999'| ).
+    zcl_erpl_rev_clidrv=>execute(
+      EXPORTING iv_verb = 'validate' iv_params = '{"target":"val_neg","mode":"full"}'
+      IMPORTING ev_result = lv_r ev_error = lv_e ).
+    ok( cond = xsdbool( lv_r CS '"verdict":"FAILED"' )
+        what = 'validate: a changed cell is still caught'
+        detail = lv_r ).
+
+    DELETE FROM zdelta_all WHERE belnr = '9999999999'.
+    COMMIT WORK AND WAIT.
+    zcl_erpl_rev_util=>query( |DROP TABLE IF EXISTS val_neg| ).
+    zcl_erpl_rev_util=>query( |DELETE FROM _erpl_rev_delta_state WHERE target='val_neg'| ).
   ENDMETHOD.
 
 ENDCLASS.

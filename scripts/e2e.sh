@@ -80,6 +80,14 @@ on_server() {
 REMOTE_ENV=""
 [ -n "$REMOTE" ] && REMOTE_ENV="export SAP_HOST=$GWHOST SAP_PORT=50000 \
 SAP_CLIENT=001 SAP_USER=DEVELOPER SAP_PASSWORD=$(printf '%q' "$SAP_PASSWORD"); "
+# The same connection details for a LOCAL run. They used to be set only in the
+# remote case, so the CLI stages silently depended on the operator happening to
+# have a saved erpl-rev config -- and failed with an empty --user on any machine
+# that did not. The ABAP stages never noticed, because they go through erpl-adt.
+if [ -z "$REMOTE" ]; then
+  export SAP_HOST="${SAP_HOST:-localhost}" SAP_PORT="${SAP_PORT:-50000}" \
+         SAP_CLIENT="${SAP_CLIENT:-001}" SAP_USER="${SAP_USER:-DEVELOPER}"
+fi
 # The erpl-rev CLI, wherever the server is. `sql`/`sync`/`replicate` reach the
 # server through its loopback quack listener, so they must run on its host.
 cli() {
@@ -91,6 +99,11 @@ srv_kill() {
   else kill "$SRV" 2>/dev/null; fi
 }
 fail() { echo "E2E FAIL: $*" >&2; srv_kill; exit 1; }
+
+# Static gates first: they need no SAP, no build and no credentials, so a
+# violation should cost a second rather than a full e2e run.
+echo "== compliance (static) =="
+"$HERE/scripts/compliance-scan.sh" || fail "compliance scan"
 
 echo "== build =="
 if [ -n "$REMOTE" ]; then
@@ -130,6 +143,8 @@ fi
 # Isolate the DB: the server is now file-backed by default, so give e2e a fresh
 # throwaway file (removed around the run) — never the persistent default.
 E2E_DB="/tmp/erpl_e2e_$$.duckdb"
+# A per-run port, so two e2e runs on one machine do not fight over it.
+ERPL_REV_METRICS_PORT="${ERPL_REV_METRICS_PORT:-$(( 19000 + ($$ % 1000) ))}"
 on_server rm -f "$E2E_DB" "$E2E_DB".wal
 if [ -n "$REMOTE" ]; then
   # Detached, and its pid comes back so srv_kill can reach it. `ssh -n` keeps the
@@ -143,11 +158,53 @@ if [ -n "$REMOTE" ]; then
     || { ssh "$REMOTE" "cat /tmp/erpl_e2e_srv.log"; SRV=""; fail "server died on $REMOTE"; }
   echo "   server up on $REMOTE (pid $SRV), registered at gateway $GWHOST:3300"
 else
-  LD_LIBRARY_PATH="$RFC_LIB_DIR" "$LOCAL_BIN" --db "$E2E_DB" >/tmp/erpl_e2e_srv.log 2>&1 &
+  LD_LIBRARY_PATH="$RFC_LIB_DIR" "$LOCAL_BIN" --db "$E2E_DB" \
+      --metrics-port "$ERPL_REV_METRICS_PORT" >/tmp/erpl_e2e_srv.log 2>&1 &
   SRV=$!
   sleep 6
   ps -p "$SRV" >/dev/null || { cat /tmp/erpl_e2e_srv.log; fail "server died"; }
 fi
+
+
+# --- suite runner ------------------------------------------------------------
+# Every ABAP suite is one line in the table below: NAME|CLASS|file|marker|tag.
+# Selection is by environment, not by flags, because this script deliberately
+# refuses unknown flags:
+#
+#   ERPL_REV_E2E_ONLY='delta|cdc'   run only suites whose NAME or tag matches
+#   ERPL_REV_E2E_SKIP='soak|perf'   skip suites whose NAME or tag matches
+#
+# The marker convention is `<NAME> RESULT pass=<n> fail=0`. The assertion is
+# ALWAYS fail=0 plus an optional minimum pass count -- never an exact count.
+# Eight suites used to assert exact totals, so every added assertion inside a
+# suite meant hand-bumping a number here; those are the most rubber-stamped
+# lines in the file and the first to be "fixed" by making them match.
+ONLY="${ERPL_REV_E2E_ONLY:-}"
+# The default skip keeps the long lanes out of an ordinary run. But asking for a
+# suite BY NAME and being told "skipped" is a gate that silently runs nothing --
+# so an explicit ONLY beats the DEFAULT skip. An explicit SKIP still wins, which
+# is how a soak lane excludes one suite from the set it asked for.
+if [ -n "$ONLY" ]; then SKIP="${ERPL_REV_E2E_SKIP:-}"
+else SKIP="${ERPL_REV_E2E_SKIP:-@soak|@perf}"; fi
+
+suite() {  # NAME CLASS file marker-prefix min-pass tag description
+  local name="$1" cls="$2" file="$3" marker="$4" minpass="${5:-1}" tag="${6:-}" desc="${7:-}"
+  if [ -n "$ONLY" ] && ! printf '%s %s' "$name" "$tag" | grep -qiE "$ONLY"; then return 0; fi
+  if [ -n "$SKIP" ] &&   printf '%s %s' "$name" "$tag" | grep -qiE "$SKIP";  then
+    echo "== $name (skipped) =="; return 0
+  fi
+  echo "== $name =="
+  [ -n "$desc" ] && echo "   $desc"
+  run "$cls" "$file"
+  echo "$OUT" | grep -qE "$marker RESULT pass=[0-9]+ fail=0" \
+    || fail "$name ($OUT)"
+  local got
+  got=$(echo "$OUT" | grep -oE "$marker RESULT pass=[0-9]+" | grep -oE '[0-9]+$' | head -1)
+  if [ -n "$got" ] && [ "$got" -lt "$minpass" ]; then
+    fail "$name ran only $got assertions, expected at least $minpass"
+  fi
+  echo "   $name OK ($got assertions)"
+}
 
 run() {  # cls file -> $OUT (cleaned). Uses ABSOLUTE --file path.
   local cls="$1" file="$HERE/$2"
@@ -173,93 +230,57 @@ echo "$OUT" | grep -q 'affected=' || fail "ingest affected"
 on_server test -f /tmp/erpl_rev_sap_export.parquet || fail "parquet not written"
 echo "   ingest OK (parquet written, upsert verified)"
 
-echo "== Console E2E (arbitrary SQL -> arbitrary result column names) =="
-# Realistic console queries: count(*), unaliased arith/func/CASE, >30-char
-# expression name, colliding sanitized names, NULL, mixed types, unicode.
-# Catches the class of bug where DuckDB column names (count_star(), (1 + 2), ...)
-# are invalid ABAP component names and crash the RTTS structure build.
-run ZCL_ERPL_REV_CONSOLETEST abap/zcl_erpl_rev_consoletest.abap
-echo "$OUT" | grep -q 'CONSOLE RESULT pass=9 fail=0' || fail "console test ($OUT)"
-echo "   console OK (9/9 realistic queries, no dump)"
+suite console ZCL_ERPL_REV_CONSOLETEST abap/zcl_erpl_rev_consoletest.abap CONSOLE 9 "" \
+  "arbitrary SQL to arbitrary result column names, without a dump"
 
-echo "== SLT-like replication E2E (field selection + source filter) =="
-# Projection keeps only the chosen columns (keys auto-retained), the filter is
-# applied at the SAP source (only matching rows transferred), UPSERT dedups on
-# re-run, and a bad column / bad WHERE returns a clean error instead of a dump.
-run ZCL_ERPL_REV_SLTTEST abap/zcl_erpl_rev_slttest.abap
-echo "$OUT" | grep -q 'SLT RESULT pass=37 fail=0' || fail "slt test ($OUT)"
-echo "   slt OK (37/37: projection, source filter, key-retention, error-safety, value-help, display)"
 
-echo "== Data-identity E2E (replicated == SAP source, every cell) =="
-# Exhaustively compares the replicated DuckDB target against the SAP source:
-# SFLIGHT every row x every column (direct), ZWIDE_BSEG 3000 rows x 390 cols
-# (per-row md5), REPOSRC 200 rows x 34 cols (large multi-chunk RSTR DATA + blank
-# DATS), plus a negative control proving the compare detects a change.
-run ZCL_ERPL_REV_DIFFTEST abap/zcl_erpl_rev_difftest.abap
-echo "$OUT" | grep -q 'DIFF RESULT pass=4 fail=0' || fail "diff test ($OUT)"
-echo "   diff OK (SFLIGHT 94x14 + ZWIDE 3000x390 + REPOSRC 200x34 identical; corruption detected)"
+suite slt ZCL_ERPL_REV_SLTTEST abap/zcl_erpl_rev_slttest.abap SLT 37 "" \
+  "projection, source filter, key retention, error safety"
 
-echo "== Delta (incremental) E2E (watermark / snapshot / change-doc / insert-only / orchestration) =="
-# Proves delta against REAL SAP transactions: a direct Open SQL change to ZDELTA_WM
-# (watermark merge + idempotent re-run), a physical DELETE reflected only via the
-# snapshot anti-join, a real BAPI_MATERIAL_SAVEDATA (MM02) writing genuine CDHDR/CDPOS
-# picked up by the change-doc re-read + the insert-only 2-step, and the orchestration
-# lease/granularity-gate/due-catch-up. Needs the delta classes + ZDELTA_WM + the new
-# Z_DUCKDB_SNAPSHOT_MERGE FM deployed (scripts/deploy-abap.sh).
-run ZCL_ERPL_REV_DELTATEST abap/zcl_erpl_rev_deltatest.abap
-echo "$OUT" | grep -qE 'DELTA RESULT pass=[0-9]+ fail=0' || fail "delta test ($OUT)"
-echo "   delta OK (watermark+idempotent, snapshot delete, real material change-doc/insert-only, orchestration)"
+
+suite diff ZCL_ERPL_REV_DIFFTEST abap/zcl_erpl_rev_difftest.abap DIFF 4 "" \
+  "every replicated cell equals the SAP source; corruption is detected"
+
+
+suite delta ZCL_ERPL_REV_DELTATEST abap/zcl_erpl_rev_deltatest.abap DELTA 51 "" \
+  "watermark, snapshot delete, real change documents, orchestration"
+
 
 # Trigger-CDC (opt-in physical-delete tier, ADR-0004): provisions REAL HANA triggers
 # on the source via the server-generated DDL, physically deletes rows, and proves one
 # CDC cycle reflects the deletes in the DuckDB target; idempotent re-run; teardown
 # leaves no orphan objects. Needs ZCL_ERPL_REV_CDC[TEST] + the CDC FMs (mkfm).
-echo "== Trigger-CDC E2E (real HANA triggers, physical deletes) =="
-run ZCL_ERPL_REV_CDCTEST abap/zcl_erpl_rev_cdctest.abap
-echo "$OUT" | grep -qE 'CDC RESULT pass=[0-9]+ fail=0' || fail "cdc test ($OUT)"
-echo "   trigger-CDC OK (provision real triggers, capture physical deletes, idempotent, teardown)"
+suite cdc ZCL_ERPL_REV_CDCTEST abap/zcl_erpl_rev_cdctest.abap CDC 30 "" \
+  "real HANA triggers capture physical deletes; teardown leaves nothing"
 
-echo "== Partitioned full-load E2E (coordinator heap + workers + deferred PK) =="
-# Two workers append DISJOINT key ranges into one heap (iv_create=false,
-# iv_build_pk=false); the coordinator builds the PRIMARY KEY once. Proves the merge
-# + deferred-PK contract behind parallel background-job replication.
-run ZCL_ERPL_REV_PARTEST abap/zcl_erpl_rev_partest.abap
-echo "$OUT" | grep -q 'PARTITION RESULT pass=9 fail=0' || fail "partition test ($OUT)"
-echo "   partition OK (2 disjoint workers -> one heap, PK built once, count parity;"
-echo "                 auto partition-col pick + auto job-count recommend)"
 
-echo "== Report parallel-branch E2E (Z_ERPL_REV_REPLICATE, real background jobs) =="
-# SUBMITs the end-user report with the parallel checkbox set; the report auto-picks
-# the partition column (BELNR) and runs 4 background worker jobs into one target,
-# building the PK once. Needs the report + worker PROGs deployed (deploy-abap.sh)
-# and >=1 free batch WP. Reads the report's list from memory and asserts parity.
-run ZCL_ERPL_REV_REPLRUN abap/zcl_erpl_rev_replrun.abap
-echo "$OUT" | grep -q 'REPLRUN RESULT pass=6 fail=0' || fail "report parallel test ($OUT)"
-echo "   report parallel OK (auto BELNR partition, 4 jobs, verify + parity, worker job-log progress)"
+suite partition ZCL_ERPL_REV_PARTEST abap/zcl_erpl_rev_partest.abap PARTITION 9 "" \
+  "disjoint workers into one heap, PK built once"
 
-echo "== External-target E2E (stage-then-publish: parquet / dataset / attached catalog) =="
-# Replicate a SAP slice into a local DuckDB holding table, then publish it via one
-# DuckDB statement to: a parquet file, a partitioned parquet dataset, and a table in
-# an ATTACHed catalog (a 2nd DuckDB file = the same SQL path as postgres/ducklake/
-# bigquery/iceberg). Plus the end-user report (Z_ERPL_REV_REPLICATE) writing parquet.
-run ZCL_ERPL_REV_PUBTEST abap/zcl_erpl_rev_pubtest.abap
-echo "$OUT" | grep -q 'PUBTEST RESULT pass=6 fail=0' || fail "publish test ($OUT)"
-echo "   publish OK (parquet file + dataset, attached-catalog full+append, report->parquet)"
 
-echo "== CDS view source E2E (DDIF resolves CDS; NODE filtered, keys auto-detected) =="
-# Replicate a CDS view entity (ZERPL_C_FLIGHTS over SFLIGHT) through the normal path:
-# describe + auto keys + count/value parity + CDS->parquet + WITH PARAMETERS + F4.
-# Needs the DDLS fixtures (one-time, see deploy-abap.sh).
-run ZCL_ERPL_REV_CDSTEST abap/zcl_erpl_rev_cdstest.abap
-echo "$OUT" | grep -q 'CDS RESULT pass=8 fail=0' || fail "cds test ($OUT)"
-echo "   cds OK (describe/NODE-filter, auto keys, count+value parity, parquet, params, F4, is_cds)"
+suite replrun ZCL_ERPL_REV_REPLRUN abap/zcl_erpl_rev_replrun.abap REPLRUN 6 "" \
+  "the end-user report's parallel branch, with real background jobs"
 
-echo "== BW/native (ADBC) source E2E (HANA-view stand-in for a calc view) =="
-# replicate_native reads via ADBC native SQL; a HANA VIEW created in-test stands in
-# for a _SYS_BIC calc view (no BW on this box). Count + value parity + native->parquet.
-run ZCL_ERPL_REV_BWTEST abap/zcl_erpl_rev_bwtest.abap
-echo "$OUT" | grep -q 'BW RESULT pass=5 fail=0' || fail "bw test ($OUT)"
-echo "   bw OK (ADBC read -> DuckDB: view + parameterized SQLScript table function, parity, parquet)"
+
+suite publish ZCL_ERPL_REV_PUBTEST abap/zcl_erpl_rev_pubtest.abap PUBTEST 6 "" \
+  "parquet file and dataset, attached catalog full and append"
+
+
+suite watermark ZCL_ERPL_REV_WMTEST abap/zcl_erpl_rev_wmtest.abap WM 8 "" \
+  "the corrections: a late commit below the observed max is delivered, DATE never reads today, a DATS+TIMS pair survives midnight, load types I and F"
+
+suite daemon ZCL_ERPL_REV_DAEMONTEST abap/zcl_erpl_rev_daemontest.abap DAEMON 16 "@soak" \
+  "the daemon as a real background job: it ticks, it replicates with nobody calling run(), a second one refuses to start, and the stop flag ends it"
+
+suite stress ZCL_ERPL_REV_STREAMSTRESS abap/zcl_erpl_rev_streamstress.abap STRESS 14 "@soak" \
+  "a real change workload, then the two anti-joins: nothing lost, nothing invented, nothing stale"
+
+suite cds ZCL_ERPL_REV_CDSTEST abap/zcl_erpl_rev_cdstest.abap CDS 8 "" \
+  "CDS view entity as a source: keys, parity, parameters"
+
+
+suite bw ZCL_ERPL_REV_BWTEST abap/zcl_erpl_rev_bwtest.abap BW 5 "" \
+  "replicate_native over ADBC: a HANA view stands in for a calc view"
 
 # ---------------------------------------------------------------------------
 echo "== CLI E2E (operate the server from the shell) =="
@@ -347,6 +368,24 @@ fi
 cli sync run t000_cli --yes >/dev/null 2>&1 || fail "sync run failed"
 echo "   sync create/ls/run, and the granularity gate still applies"
 
+# Every register field must survive the QUEUE, which is the default CLI path.
+# It carried ten of fifteen: --log, --time-col, --safety-units,
+# --load-type-default and --allow-empty-reload existed on the command line, in
+# the server and in the schema, and did nothing at all -- no error either end.
+cli sync create t000_flags --method WATERMARK --source T000 --keys MANDT     --chg-col MANDT --wm-kind NUMTS --cadence manual     --log --allow-empty-reload --load-type-default L --safety-units 7 --yes     >/dev/null 2>&1 || fail "sync create with flags failed"
+# One expression, so a single grep cannot pass on one column while another was
+# dropped -- which is exactly what "grep -q true" over four columns would do.
+FLAGS="$(cli sql "SELECT CASE WHEN log_enabled AND allow_empty_reload AND load_type_default='L' AND safety_units=7 THEN 'ALL_FIELDS_ARRIVED' ELSE 'DROPPED' END AS v FROM _erpl_rev_delta_state WHERE target='t000_flags'" 2>&1)"
+grep -q "ALL_FIELDS_ARRIVED" <<<"$FLAGS" || fail "the queue dropped register fields: $FLAGS"
+
+# ...and a re-registration that does not mention them must LEAVE THEM ALONE.
+# Registering wrote all three unconditionally, so changing a cadence silently
+# turned off a target's change log and cancelled its pending seed.
+cli sync create t000_flags --method WATERMARK --source T000 --keys MANDT     --chg-col MANDT --wm-kind NUMTS --cadence hourly --yes >/dev/null 2>&1   || fail "re-registration failed"
+KEPT="$(cli sql "SELECT CASE WHEN log_enabled AND allow_empty_reload AND load_type_default='L' AND cadence='hourly' THEN 'ALL_KEPT' ELSE 'CLOBBERED' END AS v FROM _erpl_rev_delta_state WHERE target='t000_flags'" 2>&1)"
+grep -q "ALL_KEPT" <<<"$KEPT" || fail "re-registration clobbered unmentioned fields: $KEPT"
+echo "   every register field survives the queue, and a re-registration keeps them"
+
 # 7. The driver: parameters as data, no generated ABAP, no authorisation.
 #    Deploy it first -- setup ships it, but this suite deploys via deploy-abap.sh.
 adt object create --type CLAS/OC --name ZCL_ERPL_REV_CLIDRV --package '$TMP' \
@@ -400,6 +439,132 @@ LEFT="$(adt search 'ZCL_ERPL_REV_CLI_*' 2>/dev/null | grep -c 'ZCL_ERPL_REV_CLI_
 [ "$LEFT" -eq 0 ] || fail "$LEFT temporary CLI class(es) leaked into SAP"
 echo "   no temporary classes left behind"
 
+# 8. The operator verbs.
+#
+# The engine behind these was unit-tested from the day it was written and could
+# not be invoked: no CLI verb reached publish::Advance, publish::Retain or the
+# daemon's control row, so subscriptions, retention and "is the daemon alive"
+# were reachable only by hand-written SQL. The flag tables existed and were
+# consulted by nothing. This is the lane that makes each verb a reachable path
+# rather than a tested function.
+echo "== operator verbs =="
+
+# daemon status: reads the singleton row through the driver.
+DST="$(cli daemon status --yes 2>&1)"
+grep -qE '"status"|instance_id|STOPPED|RUNNING' <<<"$DST"   || fail "daemon status returned nothing usable: $DST"
+
+# daemon stop is what an operator presses; it must reach the flag the daemon
+# reads at the top of every tick.
+DSP="$(cli daemon stop --yes 2>&1)" || fail "daemon stop failed: $DSP"
+STOPPED="$(cli sql "SELECT CASE WHEN stop THEN 'FLAG_SET' ELSE 'NOT_SET' END AS v                     FROM _erpl_rev_daemon WHERE id=1" 2>&1)"
+grep -q FLAG_SET <<<"$STOPPED" || fail "daemon stop did not set the flag: $STOPPED"
+cli sql "UPDATE _erpl_rev_daemon SET stop=false WHERE id=1" >/dev/null 2>&1
+
+# A subscription over a target that has a change log, end to end: create,
+# advance, and the sink actually receives the rows.
+cli sql "DROP TABLE IF EXISTS ops_sink" >/dev/null 2>&1
+cli sql "CREATE TABLE ops_sink AS SELECT * FROM t000_cli LIMIT 0" >/dev/null 2>&1
+SC="$(cli sub create ops_s1 --target t000_cli --sink "TABLE:ops_sink:APPEND" --yes 2>&1)" || fail "sub create failed: $SC"
+SUBS="$(cli sub ls --yes 2>&1)"
+grep -q ops_s1 <<<"$SUBS" || fail "sub ls does not list the subscription: $SUBS"
+SA="$(cli sub advance ops_s1 --yes 2>&1)" || fail "sub advance failed: $SA"
+OFF="$(cli sql "SELECT CASE WHEN \"offset\" >= 0 THEN 'ADVANCED' ELSE 'NO' END AS v                 FROM _erpl_rev_subscription WHERE name='ops_s1'" 2>&1)"
+grep -q ADVANCED <<<"$OFF" || fail "the subscription offset was not advanced: $OFF"
+
+# retain prunes the change log; with no window everything behind the slowest
+# subscriber goes.
+RT="$(cli retain --target t000_cli --window-days 0 --yes 2>&1)" || fail "retain failed: $RT"
+echo "   daemon status/stop, sub create/ls/advance, retain -- all through the queue"
+
+# set-wm: an operator moving a target's position back so a window re-delivers.
+# It writes engine state deliberately, so it audits a run of its own -- a
+# watermark that moved with no record of who moved it is the hardest kind of
+# replication question to answer later.
+WM0="$(cli sql "SELECT wm_value AS v FROM _erpl_rev_delta_state WHERE target='t000_cli'" 2>&1)"
+SW="$(cli sync set-wm t000_cli --wm-value 20200101000000 --yes 2>&1)"   || fail "sync set-wm failed: $SW"
+WM1="$(cli sql "SELECT CASE WHEN wm_value='20200101000000' THEN 'MOVED' ELSE 'NOT_MOVED' END AS v                 FROM _erpl_rev_delta_state WHERE target='t000_cli'" 2>&1)"
+grep -q MOVED <<<"$WM1" || fail "set-wm did not move the watermark: $WM1 (was $WM0)"
+AUD="$(cli sql "SELECT CASE WHEN count(*) > 0 THEN 'AUDITED' ELSE 'NO_RECORD' END AS v                 FROM _erpl_rev_run_stats WHERE target='t000_cli' AND run_type='SET_WM'" 2>&1)"
+grep -q AUDITED <<<"$AUD" || fail "set-wm left no audit row: $AUD"
+
+# preview: the first rows of a target, through the SAME path a subscriber reads,
+# so what an operator is shown cannot diverge from what is published.
+PV="$(cli sync preview t000_cli --rows 1 --yes 2>&1)" || fail "sync preview failed: $PV"
+grep -qE '[{]|MANDT|mandt' <<<"$PV" || fail "sync preview returned no rows: $PV"
+echo "   sync set-wm (audited) and sync preview"
+
+# mass: the server cuts the portions and PERSISTS them before any worker starts,
+# which is what makes a mass load restartable rather than merely parallel.
+cli sql "DROP TABLE IF EXISTS t000_mass" >/dev/null 2>&1
+MR="$(cli mass run --target t000_mass --source T000 --split records --part-col MANDT --limit-rows 1 --yes 2>&1)" || fail "mass run failed: $MR"
+grep -qE "portion" <<<"$MR" || fail "mass run reported no portions: $MR"
+MP="$(cli sql "SELECT CASE WHEN count(*) > 1 THEN 'PERSISTED' ELSE 'NONE' END AS v FROM _erpl_rev_portion WHERE target='t000_mass'" 2>&1)"
+grep -q PERSISTED <<<"$MP" || fail "the portion list was not persisted: $MP"
+MRW="$(cli sql "SELECT CASE WHEN count(*) > 0 THEN 'LOADED' ELSE 'EMPTY' END AS v FROM t000_mass" 2>&1)"
+grep -q LOADED <<<"$MRW" || fail "mass run moved no rows: $MRW"
+echo "   mass run: portions cut by the server, persisted, and loaded"
+
+# validate: compare what was replicated against the SAP source, cell by cell.
+# A replica that is the right SIZE and the wrong CONTENT passes every count
+# check there is, which is why this compares canonical text per column.
+VD="$(cli sync validate t000_cli --yes 2>&1)" || fail "sync validate failed: $VD"
+# The VERDICT, not a word that appears either way. "compared" and "mismatched"
+# are both always in the JSON, so the old greps matched whatever happened --
+# nothing guarded this feature at all.
+grep -q '"verdict":"PASSED"' <<<"$VD" || fail "validate did not pass a clean target: $VD"
+VA="$(cli sql "SELECT CASE WHEN count(*) > 0 THEN 'AUDITED' ELSE 'NO_RECORD' END AS v FROM _erpl_rev_run_stats WHERE target='t000_cli' AND run_type='VALIDATE'" 2>&1)"
+grep -q AUDITED <<<"$VA" || fail "validate left no audit row: $VA"
+
+# ...and it must actually catch corruption, or it is a green light with no bulb.
+cli sql "UPDATE t000_cli SET mtext = 'corrupted-by-e2e' WHERE rowid = 0" >/dev/null 2>&1
+VC="$(cli sync validate t000_cli --yes 2>&1 || true)"
+grep -q '"verdict":"FAILED"' <<<"$VC" || fail "validate did not detect a changed cell: $VC"
+echo "   sync validate: a clean target passes, a corrupted cell is caught"
+
+# unpark: a parked target needs a way back that is not raw SQL. Parking is what
+# stops a broken target hammering SAP; without an unpark it is a one-way door.
+cli sql "UPDATE _erpl_rev_delta_state SET parked_until = now() + INTERVAL '1 hour', fail_count = 9, park_reason = 'e2e' WHERE target='t000_cli'" >/dev/null 2>&1
+UP="$(cli sync unpark t000_cli --yes 2>&1)" || fail "sync unpark failed: $UP"
+UPV="$(cli sql "SELECT CASE WHEN parked_until IS NULL AND coalesce(fail_count,0)=0 THEN 'RELEASED' ELSE 'STILL_PARKED' END AS v FROM _erpl_rev_delta_state WHERE target='t000_cli'" 2>&1)"
+grep -q RELEASED <<<"$UPV" || fail "unpark did not release the target: $UPV"
+echo "   sync unpark releases a parked target and clears its backoff"
+
+# The Prometheus endpoint, scraped for real. A metrics surface that is only
+# unit-tested is a page nobody has ever fetched.
+# Local only. In remote mode the server runs on another host and the port is
+# loopback-bound there, so curling it from here fails unconditionally -- a lane
+# that cannot pass is not a test, it is a broken build.
+if [ -z "$REMOTE" ] && command -v curl >/dev/null 2>&1; then
+  MET="$(curl -s --max-time 5 "http://127.0.0.1:${ERPL_REV_METRICS_PORT}/metrics" 2>&1 || true)"
+  grep -q "# TYPE erpl_rev_target_lag_seconds gauge" <<<"$MET"     || fail "the metrics endpoint served no target gauge: $(head -c 300 <<<"$MET")"
+  grep -q "erpl_rev_daemon_up" <<<"$MET" || fail "no daemon gauge in the exposition"
+  # A target registered earlier in this run must appear, or the exposition is
+  # a static page rather than a view of the system.
+  grep -q 'erpl_rev_target_healthy{target="t000_cli"}' <<<"$MET"     || fail "the scrape does not reflect the registered targets"
+  echo "   prometheus endpoint scraped: per-target gauges and the daemon heartbeat"
+else
+  echo "   prometheus endpoint skipped (no curl)"
+fi
+
+# The monitor, rendered for real. --once draws one frame through the same
+# element tree the live display uses, so what a script sees is what an operator
+# sees -- a second formatter would drift from the first.
+# Same reason: `top` reads the server's database over its loopback listener.
+if [ -n "$REMOTE" ]; then
+  echo "   top --once skipped (remote server)"
+else
+TOP="$(cli top --once 2>&1 || true)"
+grep -q "TARGET" <<<"$TOP" || fail "top --once drew no table: $(head -c 300 <<<"$TOP")"
+grep -q "t000_cli" <<<"$TOP" || fail "top --once does not show the registered targets: $TOP"
+grep -qE "daemon (RUNNING|STOPPED)" <<<"$TOP" || fail "top --once shows no daemon state: $TOP"
+echo "   top --once renders the targets and the daemon state"
+fi
+
+# cdc status on a target that is not a trigger target must say so, not crash.
+CS="$(cli cdc status --target t000_cli --yes 2>&1 || true)"
+grep -qiE "not a registered trigger target|no registration" <<<"$CS"   || fail "cdc status on a non-CDC target gave no usable message: $CS"
+echo "   cdc status on a non-CDC target reports it cleanly"
+
 srv_kill; sleep 1
 on_server rm -f "$E2E_DB" "$E2E_DB".wal /tmp/erpl_taxi.parquet
 # ldd and the SDK path are this box's; a remote binary is a different platform's
@@ -425,5 +590,8 @@ if [ "$RFC_BACKEND" = proto ] && [ -z "$REMOTE" ]; then
     echo "   RFC backend linked statically; no RFC shared object at all"
   fi
 fi
+
+suite footprint ZCL_ERPL_REV_FOOTPRINT abap/zcl_erpl_rev_footprint.abap FOOTPRINT 14 "" \
+  "the delivered package contains exactly the documented objects, and nothing else"
 
 echo "== E2E PASSED =="

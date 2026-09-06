@@ -1,4 +1,5 @@
 #include "sap_setup.hpp"
+#include "rfc_contract.hpp"
 
 #ifndef _WIN32
 #include <fcntl.h>
@@ -389,11 +390,10 @@ Plan MakePlan(const Diagnosis &d, const Options &o) {
 }
 
 const std::vector<std::string> &FunctionModuleNames() {
-    static const std::vector<std::string> kNames = {
-        "Z_DUCKDB_QUERY", "Z_DUCKDB_INGEST", "Z_DUCKDB_SNAPSHOT_MERGE",
-        "Z_DUCKDB_CDC_PLAN", "Z_DUCKDB_CDC_APPLY", "Z_DUCKDB_OPEN",
-        "Z_DUCKDB_FETCH", "Z_DUCKDB_CLOSE",
-    };
+    // Read from the contract rather than repeated here. doctor verifying a set
+    // of names the server does not actually register is worse than not
+    // verifying: it reports health that does not exist.
+    static const std::vector<std::string> kNames = GeneratedFmNames();
     return kNames;
 }
 

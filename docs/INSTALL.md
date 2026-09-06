@@ -53,7 +53,8 @@ level with your domain profile.)
 ### 1b. Without filesystem access (upload via SAP)
 Use **`ARCHIVFILE_CLIENT_TO_SERVER`** (SE37) to upload both files to the server's
 `DIR_TRANS` subfolders (data + cofiles), then import via **STMS** as in 1a. (This is
-the same path the Theobald transports document.)
+the standard path for importing a transport onto a system you have no shell access
+to, and the one other SAP add-ons document.)
 
 ## 2. Post-import setup (run once)
 1. Run classrun **`ZCL_ERPL_REV_SETUP`**: creates the type-T **`ERPL_REV`**

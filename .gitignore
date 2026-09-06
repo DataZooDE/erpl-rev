@@ -18,3 +18,4 @@ dev_rfc.log
 
 # agent-crew run artifacts (multi-agent review transcripts)
 .crew/
+.adt.creds

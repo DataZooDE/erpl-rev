@@ -1,7 +1,9 @@
 #include "rfc_metadata.hpp"
+#include "rfc_contract.hpp"
 #include "sap_uc.hpp"
 
 #include <cstring>
+#include <stdexcept>
 
 namespace erpl_rev {
 
@@ -24,152 +26,55 @@ void AddParam(RFC_FUNCTION_DESC_HANDLE desc, const char *name, RFCTYPE type,
         throw_rfc(std::string("RfcAddParameter(") + name + ")", info);
 }
 
+RFCTYPE SdkType(RfcParamType t) {
+    switch (t) {
+        case RfcParamType::Char:    return RFCTYPE_CHAR;
+        case RfcParamType::String:  return RFCTYPE_STRING;
+        case RfcParamType::XString: return RFCTYPE_XSTRING;
+    }
+    return RFCTYPE_STRING;
+}
+
+// Build (once, cached) the descriptor for one FM straight from the contract, so
+// the descriptor and the FM zcl_erpl_rev_mkfm generates cannot drift apart --
+// which used to be a call-time failure on a customer system, not a build error.
+RFC_FUNCTION_DESC_HANDLE DescFor(const char *fm_name) {
+    const RfcFm *fm = FindFm(fm_name);
+    if (!fm) throw std::runtime_error(std::string("no RFC contract entry for ") + fm_name);
+
+    RFC_ERROR_INFO info;
+    auto uname = std2uc(fm_name);
+    RFC_FUNCTION_DESC_HANDLE desc = RfcCreateFunctionDesc(uname.data(), &info);
+    if (!desc) throw_rfc(std::string("RfcCreateFunctionDesc(") + fm_name + ")", info);
+    for (const auto &p : fm->params)
+        AddParam(desc, p.name, SdkType(p.type),
+                 p.dir == RfcDir::Import ? RFC_IMPORT : RFC_EXPORT,
+                 p.nuc_len, p.uc_len, p.optional);
+    return desc;
+}
+
 } // namespace
 
-RFC_FUNCTION_DESC_HANDLE BuildPingDesc() {
-    static RFC_FUNCTION_DESC_HANDLE desc = nullptr;
-    if (desc) return desc;
-    // STFC_CONNECTION: standard FM present in every backend (CHAR(255) params).
-    RFC_ERROR_INFO info;
-    auto uname = std2uc("STFC_CONNECTION");
-    desc = RfcCreateFunctionDesc(uname.data(), &info);
-    if (!desc) throw_rfc("RfcCreateFunctionDesc(STFC_CONNECTION)", info);
-    AddParam(desc, "REQUTEXT", RFCTYPE_CHAR, RFC_IMPORT, 255, 510, true);
-    AddParam(desc, "ECHOTEXT", RFCTYPE_CHAR, RFC_EXPORT, 255, 510);
-    AddParam(desc, "RESPTEXT", RFCTYPE_CHAR, RFC_EXPORT, 255, 510);
-    return desc;
-}
 
-RFC_FUNCTION_DESC_HANDLE BuildQueryDesc() {
-    static RFC_FUNCTION_DESC_HANDLE desc = nullptr;
-    if (desc) return desc;
-    RFC_ERROR_INFO info;
-    auto uname = std2uc("Z_DUCKDB_QUERY");
-    desc = RfcCreateFunctionDesc(uname.data(), &info);
-    if (!desc) throw_rfc("RfcCreateFunctionDesc(Z_DUCKDB_QUERY)", info);
-    AddParam(desc, "IV_SQL",       RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
-    AddParam(desc, "EV_COLUMNS",   RFCTYPE_STRING, RFC_EXPORT);
-    AddParam(desc, "EV_ROWS",      RFCTYPE_STRING, RFC_EXPORT);
-    AddParam(desc, "EV_ROW_COUNT", RFCTYPE_STRING, RFC_EXPORT);
-    AddParam(desc, "EV_ERROR",     RFCTYPE_STRING, RFC_EXPORT);
-    return desc;
-}
+// One cached descriptor per FM. The SDK does not copy these, so they must
+// outlive every call -- hence the function-local statics.
+#define ERPL_DESC(fn, name)                                   \
+    RFC_FUNCTION_DESC_HANDLE fn() {                           \
+        static RFC_FUNCTION_DESC_HANDLE d = DescFor(name);    \
+        return d;                                             \
+    }
 
-RFC_FUNCTION_DESC_HANDLE BuildIngestDesc() {
-    static RFC_FUNCTION_DESC_HANDLE desc = nullptr;
-    if (desc) return desc;
-    RFC_ERROR_INFO info;
-    auto uname = std2uc("Z_DUCKDB_INGEST");
-    desc = RfcCreateFunctionDesc(uname.data(), &info);
-    if (!desc) throw_rfc("RfcCreateFunctionDesc(Z_DUCKDB_INGEST)", info);
-    AddParam(desc, "IV_TARGET",        RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
-    AddParam(desc, "IV_MODE",          RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
-    AddParam(desc, "IV_KEYS",          RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
-    AddParam(desc, "IV_PARQUET_OUT",   RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
-    AddParam(desc, "IV_INIT_SQL",      RFCTYPE_STRING,  RFC_IMPORT, 0, 0, true);
-    AddParam(desc, "IV_DDL",           RFCTYPE_STRING,  RFC_IMPORT, 0, 0, true);
-    AddParam(desc, "IV_DATA",          RFCTYPE_STRING,  RFC_IMPORT, 0, 0, true);
-    AddParam(desc, "IV_XDATA",         RFCTYPE_XSTRING, RFC_IMPORT, 0, 0, true);
-    AddParam(desc, "IV_OP_COL",        RFCTYPE_STRING,  RFC_IMPORT, 0, 0, true);
-    AddParam(desc, "EV_ROWS_AFFECTED", RFCTYPE_STRING,  RFC_EXPORT);
-    AddParam(desc, "EV_ERROR",         RFCTYPE_STRING, RFC_EXPORT);
-    return desc;
-}
+ERPL_DESC(BuildPingDesc,          "STFC_CONNECTION")
+ERPL_DESC(BuildQueryDesc,         "Z_DUCKDB_QUERY")
+ERPL_DESC(BuildIngestDesc,        "Z_DUCKDB_INGEST")
+ERPL_DESC(BuildSnapshotMergeDesc, "Z_DUCKDB_SNAPSHOT_MERGE")
+ERPL_DESC(BuildCdcPlanDesc,       "Z_DUCKDB_CDC_PLAN")
+ERPL_DESC(BuildCdcApplyDesc,      "Z_DUCKDB_CDC_APPLY")
+ERPL_DESC(BuildOpenDesc,          "Z_DUCKDB_OPEN")
+ERPL_DESC(BuildFetchDesc,         "Z_DUCKDB_FETCH")
+ERPL_DESC(BuildCloseDesc,         "Z_DUCKDB_CLOSE")
+ERPL_DESC(BuildPlanDesc,          "Z_DUCKDB_PLAN")
 
-RFC_FUNCTION_DESC_HANDLE BuildSnapshotMergeDesc() {
-    static RFC_FUNCTION_DESC_HANDLE desc = nullptr;
-    if (desc) return desc;
-    RFC_ERROR_INFO info;
-    auto uname = std2uc("Z_DUCKDB_SNAPSHOT_MERGE");
-    desc = RfcCreateFunctionDesc(uname.data(), &info);
-    if (!desc) throw_rfc("RfcCreateFunctionDesc(Z_DUCKDB_SNAPSHOT_MERGE)", info);
-    AddParam(desc, "IV_TARGET",  RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
-    AddParam(desc, "IV_STAGING", RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
-    AddParam(desc, "IV_KEYS",    RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
-    AddParam(desc, "EV_INS",     RFCTYPE_STRING, RFC_EXPORT);
-    AddParam(desc, "EV_UPD",     RFCTYPE_STRING, RFC_EXPORT);
-    AddParam(desc, "EV_DEL",     RFCTYPE_STRING, RFC_EXPORT);
-    AddParam(desc, "EV_ERROR",   RFCTYPE_STRING, RFC_EXPORT);
-    return desc;
-}
-
-RFC_FUNCTION_DESC_HANDLE BuildCdcPlanDesc() {
-    static RFC_FUNCTION_DESC_HANDLE desc = nullptr;
-    if (desc) return desc;
-    RFC_ERROR_INFO info;
-    auto uname = std2uc("Z_DUCKDB_CDC_PLAN");
-    desc = RfcCreateFunctionDesc(uname.data(), &info);
-    if (!desc) throw_rfc("RfcCreateFunctionDesc(Z_DUCKDB_CDC_PLAN)", info);
-    AddParam(desc, "IV_TARGET",   RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
-    AddParam(desc, "IV_SOURCE",   RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
-    AddParam(desc, "IV_KEYS",     RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
-    AddParam(desc, "IV_MODE",     RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
-    AddParam(desc, "IV_PLATFORM", RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
-    AddParam(desc, "IV_ACTION",   RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
-    AddParam(desc, "EV_PLAN",     RFCTYPE_STRING, RFC_EXPORT);
-    AddParam(desc, "EV_ERROR",    RFCTYPE_STRING, RFC_EXPORT);
-    return desc;
-}
-
-RFC_FUNCTION_DESC_HANDLE BuildCdcApplyDesc() {
-    static RFC_FUNCTION_DESC_HANDLE desc = nullptr;
-    if (desc) return desc;
-    RFC_ERROR_INFO info;
-    auto uname = std2uc("Z_DUCKDB_CDC_APPLY");
-    desc = RfcCreateFunctionDesc(uname.data(), &info);
-    if (!desc) throw_rfc("RfcCreateFunctionDesc(Z_DUCKDB_CDC_APPLY)", info);
-    AddParam(desc, "IV_TARGET",  RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
-    AddParam(desc, "IV_STAGING", RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
-    AddParam(desc, "IV_KEYS",    RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
-    AddParam(desc, "EV_INS",     RFCTYPE_STRING, RFC_EXPORT);
-    AddParam(desc, "EV_UPD",     RFCTYPE_STRING, RFC_EXPORT);
-    AddParam(desc, "EV_DEL",     RFCTYPE_STRING, RFC_EXPORT);
-    AddParam(desc, "EV_PRUNE",   RFCTYPE_STRING, RFC_EXPORT);
-    AddParam(desc, "EV_APPLIED", RFCTYPE_STRING, RFC_EXPORT);
-    AddParam(desc, "EV_ERROR",   RFCTYPE_STRING, RFC_EXPORT);
-    return desc;
-}
-
-RFC_FUNCTION_DESC_HANDLE BuildOpenDesc() {
-    static RFC_FUNCTION_DESC_HANDLE desc = nullptr;
-    if (desc) return desc;
-    RFC_ERROR_INFO info;
-    auto uname = std2uc("Z_DUCKDB_OPEN");
-    desc = RfcCreateFunctionDesc(uname.data(), &info);
-    if (!desc) throw_rfc("RfcCreateFunctionDesc(Z_DUCKDB_OPEN)", info);
-    AddParam(desc, "IV_SQL",     RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
-    AddParam(desc, "EV_HANDLE",  RFCTYPE_STRING, RFC_EXPORT);
-    AddParam(desc, "EV_COLUMNS", RFCTYPE_STRING, RFC_EXPORT);
-    AddParam(desc, "EV_ERROR",   RFCTYPE_STRING, RFC_EXPORT);
-    return desc;
-}
-
-RFC_FUNCTION_DESC_HANDLE BuildFetchDesc() {
-    static RFC_FUNCTION_DESC_HANDLE desc = nullptr;
-    if (desc) return desc;
-    RFC_ERROR_INFO info;
-    auto uname = std2uc("Z_DUCKDB_FETCH");
-    desc = RfcCreateFunctionDesc(uname.data(), &info);
-    if (!desc) throw_rfc("RfcCreateFunctionDesc(Z_DUCKDB_FETCH)", info);
-    AddParam(desc, "IV_HANDLE",    RFCTYPE_STRING,  RFC_IMPORT, 0, 0, true);
-    AddParam(desc, "IV_PAGE_ROWS", RFCTYPE_STRING,  RFC_IMPORT, 0, 0, true);
-    AddParam(desc, "EV_XDATA",     RFCTYPE_XSTRING, RFC_EXPORT);
-    AddParam(desc, "EV_FETCHED",   RFCTYPE_STRING,  RFC_EXPORT);
-    AddParam(desc, "EV_DONE",      RFCTYPE_STRING,  RFC_EXPORT);
-    AddParam(desc, "EV_ERROR",     RFCTYPE_STRING,  RFC_EXPORT);
-    return desc;
-}
-
-RFC_FUNCTION_DESC_HANDLE BuildCloseDesc() {
-    static RFC_FUNCTION_DESC_HANDLE desc = nullptr;
-    if (desc) return desc;
-    RFC_ERROR_INFO info;
-    auto uname = std2uc("Z_DUCKDB_CLOSE");
-    desc = RfcCreateFunctionDesc(uname.data(), &info);
-    if (!desc) throw_rfc("RfcCreateFunctionDesc(Z_DUCKDB_CLOSE)", info);
-    AddParam(desc, "IV_HANDLE", RFCTYPE_STRING, RFC_IMPORT, 0, 0, true);
-    AddParam(desc, "EV_ERROR",  RFCTYPE_STRING, RFC_EXPORT);
-    return desc;
-}
+#undef ERPL_DESC
 
 } // namespace erpl_rev

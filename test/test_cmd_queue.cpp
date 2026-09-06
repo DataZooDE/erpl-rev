@@ -10,6 +10,7 @@
 
 #include "commands.hpp"
 #include "db_client.hpp"
+#include "load_type.hpp"
 
 using namespace erpl_rev;
 using Catch::Matchers::ContainsSubstring;
@@ -170,4 +171,70 @@ TEST_CASE("each sync subcommand has its own flag set", "[args]") {
     // ls / show / run read no flags of their own.
     CHECK(cmd::UnknownFlag({"ls", "--every", "5"}, "sync ls") == "--every");
     CHECK(cmd::UnknownFlag({"ls"}, "sync ls").empty());
+}
+
+// ---------------------------------------------------------------------------
+// --load-type: three separate failure modes, not one
+//
+// UnknownFlag validates flag NAMES against a per-subcommand whitelist. It never
+// looks at a value -- so `sync run --load-type Z` sails past it. Asserting on
+// UnknownFlag alone would have "proved" validation that does not exist.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("args: sync run accepts --load-type", "[args]") {
+    CHECK(cmd::UnknownFlag({"run", "ZDELTA_WM", "--load-type", "I"}, "sync run").empty());
+}
+
+TEST_CASE("args: an unknown flag on sync run is still refused", "[args]") {
+    CHECK(cmd::UnknownFlag({"run", "ZDELTA_WM", "--lod-type", "I"}, "sync run") == "--lod-type");
+}
+
+TEST_CASE("args: an unknown SUBCOMMAND is a different failure from an unknown flag",
+          "[args]") {
+    // Nothing is registered for "sync frobnicate", so every flag reads as
+    // unknown -- which is why the subcommand has to be rejected on its own,
+    // before its flags are judged.
+    CHECK(cmd::UnknownFlag({"frobnicate", "--load-type", "I"}, "sync frobnicate") ==
+          "--load-type");
+}
+
+TEST_CASE("args: an invalid --load-type VALUE is caught by the type, not the whitelist",
+          "[args]") {
+    // The whitelist passes it...
+    CHECK(cmd::UnknownFlag({"run", "T", "--load-type", "Z"}, "sync run").empty());
+    // ...so this is the only thing that stops a silently wrong run.
+    CHECK_FALSE(erpl_rev::IsValidLoadTypeCode("Z"));
+}
+
+// ---------------------------------------------------------------------------
+// The operations verbs. Each is a subcommand, so each has the same three
+// failure modes -- and the whitelist only ever catches the middle one.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("args: the daemon verbs take their own flags", "[args]") {
+    CHECK(cmd::UnknownFlag({"start", "--tick", "2"}, "daemon start").empty());
+    CHECK(cmd::UnknownFlag({"start", "--ticks", "2"}, "daemon start") == "--ticks");
+}
+
+TEST_CASE("args: subscription and mass verbs", "[args]") {
+    CHECK(cmd::UnknownFlag({"create", "s1", "--target", "t", "--sink", "PARQUET:/o:FULL"},
+                           "sub create").empty());
+    CHECK(cmd::UnknownFlag({"run", "--split", "records", "--limit-rows", "1000000"},
+                           "mass run").empty());
+    CHECK(cmd::UnknownFlag({"run", "--restart", "42"}, "mass run").empty());
+    CHECK(cmd::UnknownFlag({"run", "--splt", "records"}, "mass run") == "--splt");
+}
+
+TEST_CASE("args: cdc and retain verbs", "[args]") {
+    CHECK(cmd::UnknownFlag({"repair", "--all"}, "cdc repair").empty());
+    CHECK(cmd::UnknownFlag({"reactivate", "--all", "--reconcile"}, "cdc reactivate").empty());
+    CHECK(cmd::UnknownFlag({"--target", "t", "--window-days", "7"}, "retain").empty());
+}
+
+TEST_CASE("args: set-wm and preview", "[args]") {
+    CHECK(cmd::UnknownFlag({"set-wm", "t", "--wm-value", "20260101000000"},
+                           "sync set-wm").empty());
+    CHECK(cmd::UnknownFlag({"preview", "t", "--rows", "20"}, "sync preview").empty());
+    // A value-taking flag with no value must not swallow the next subcommand.
+    CHECK(cmd::UnknownFlag({"preview", "t", "--rows"}, "sync preview").empty());
 }

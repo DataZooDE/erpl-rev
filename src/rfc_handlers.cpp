@@ -1,8 +1,20 @@
 #include "rfc_handlers.hpp"
+#include "cycle.hpp"
+#include "drift.hpp"
+#include "load_type.hpp"
+#include "metrics.hpp"
+#include "publish.hpp"
+#include "tick_planner.hpp"
 #include "rfc_metadata.hpp"
 #include "sap_uc.hpp"
 #include "duckdb_bridge.hpp"
 #include "cdc_dialect.hpp"
+#include <algorithm>
+#include <map>
+#include <set>
+#include "cdc_status.hpp"
+#include "split_planner.hpp"
+#include "validation.hpp"
 #include "json_util.hpp"
 #include "logging.hpp"
 #include "erpl_rev_telemetry.hpp"
@@ -81,6 +93,21 @@ std::vector<std::string> SplitCsv(const std::string &s) {
 }
 
 // Build a JSON array string from the row JSON objects.
+// A SQL string literal, quotes doubled. The target and the watermark reach here
+// from an operator's command line.
+std::string SqlLit(const std::string &v) {
+    std::string q = "'";
+    for (char c : v) { if (c == '\'') q += "''"; else q += c; }
+    return q + "'";
+}
+
+// Run a statement, or say which one failed. A silent statement inside a
+// transaction is how a partial write gets reported as success.
+void Exec(duckdb::Connection &con, const std::string &sql) {
+    auto r = con.Query(sql);
+    if (r->HasError()) throw std::runtime_error(r->GetError());
+}
+
 std::string RowsToJsonArray(const std::vector<std::string> &rows) {
     std::string out = "[";
     for (size_t i = 0; i < rows.size(); i++) { if (i) out += ","; out += rows[i]; }
@@ -95,12 +122,24 @@ std::string ReplaceAll(std::string s, const std::string &from, const std::string
     while ((p = s.find(from, p)) != std::string::npos) { s.replace(p, from.size(), to); p += to.size(); }
     return s;
 }
+std::string LowerOf(std::string s) {
+    for (char &c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
 std::string UpperOf(std::string s) {
     for (char &c : s) if (c >= 'a' && c <= 'z') c = char(c - 'a' + 'A');
     return s;
 }
 CdcMode CdcModeOf(const std::string &m) {
-    return UpperOf(m) == "FULL_IUD" ? CdcMode::FullIud : CdcMode::DeleteOnly;
+    const auto u = UpperOf(m);
+    // FULL_IUD is the pre-rename spelling. It stays accepted permanently: it is a
+    // stored value on every system provisioned before the rename, and a mode the
+    // dialect does not recognise would silently fall back to DELETE_ONLY -- i.e.
+    // stop capturing inserts and updates.
+    if (u == "IMAGE_IUD" || u == "FULL_IUD") return CdcMode::ImageIud;
+    if (u == "KEYS_IUD") return CdcMode::KeysIud;
+    return CdcMode::DeleteOnly;
 }
 // A JSON array of plain (escaped, quoted) strings.
 std::string JsonStrArray(const std::vector<std::string> &v) {
@@ -122,6 +161,9 @@ std::string ColumnsToJson(const std::vector<QueryColumn> &cols) {
 }
 
 } // namespace
+
+extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE, RFC_FUNCTION_HANDLE,
+                                    RFC_ERROR_INFO *);
 
 void InstallHandlers(const std::string &db_path, const std::string &init_sql) {
     g_bridge = std::make_unique<DuckDbBridge>(db_path, init_sql);   // empty path => in-memory
@@ -145,11 +187,13 @@ void InstallHandlers(const std::string &db_path, const std::string &init_sql) {
         throw_rfc("RfcInstallServerFunction(Z_DUCKDB_CDC_PLAN)", info);
     if (RfcInstallServerFunction(nullptr, BuildCdcApplyDesc(), ZCdcApplyImpl, &info) != RFC_OK)
         throw_rfc("RfcInstallServerFunction(Z_DUCKDB_CDC_APPLY)", info);
+    if (RfcInstallServerFunction(nullptr, BuildPlanDesc(), ZPlanImpl, &info) != RFC_OK)
+        throw_rfc("RfcInstallServerFunction(Z_DUCKDB_PLAN)", info);
 
     log::get().Debug("rfc", "handlers installed",
                      {{"functions", "STFC_CONNECTION,Z_DUCKDB_QUERY,Z_DUCKDB_INGEST,"
                                     "Z_DUCKDB_SNAPSHOT_MERGE,Z_DUCKDB_CDC_PLAN,Z_DUCKDB_CDC_APPLY,"
-                                    "Z_DUCKDB_OPEN,Z_DUCKDB_FETCH,Z_DUCKDB_CLOSE", true},
+                                    "Z_DUCKDB_OPEN,Z_DUCKDB_FETCH,Z_DUCKDB_CLOSE,Z_DUCKDB_PLAN", true},
                       {"db", db_path.empty() ? ":memory:" : db_path}});
 }
 
@@ -168,6 +212,13 @@ void StopQuackServer(const std::string &listen) {
     std::lock_guard<std::mutex> lk(g_mtx);
     g_bridge->StopQuack(listen);
 }
+
+bool StartMetricsServer(int port, std::string &error) {
+    if (!g_bridge) { error = "no database open"; return false; }
+    return metrics::server::Start(*g_bridge, port, error);
+}
+
+void StopMetricsServer() { metrics::server::Stop(); }
 
 void StartTunnelForward(const std::string &import_sql) {
     std::lock_guard<std::mutex> lk(g_mtx);
@@ -351,10 +402,10 @@ extern "C" RFC_RC SAP_API ZCdcPlanImpl(RFC_CONNECTION_HANDLE,
         spec.source = src;
         spec.keys = SplitCsv(ks);
         spec.mode = CdcModeOf(md);
-        // FULL_IUD logs the full row image: take the column set from the (seeded)
+        // IMAGE_IUD logs the full row image: take the column set from the (seeded)
         // DuckDB target and upper-case it to the SAP/HANA column names the triggers
         // reference (replicate lower-cases on the way in).
-        if (spec.mode == CdcMode::FullIud) {
+        if (spec.mode == CdcMode::ImageIud) {
             QueryResult tc = g_bridge->Query("SELECT * FROM " + target + " LIMIT 0");
             for (auto &c : tc.columns) spec.columns.push_back(UpperOf(c.name));
         }
@@ -380,6 +431,11 @@ extern "C" RFC_RC SAP_API ZCdcPlanImpl(RFC_CONNECTION_HANDLE,
         js += ",\"read_sql\":"       + json::QuoteString(read);
         js += ",\"read_from\":"      + json::QuoteString(plan.read_from);
         js += ",\"prune_sql\":"      + json::QuoteString(plan.prune_sql);
+        // The executor needs these to run a KEYS_IUD cycle: which mode it is in,
+        // what to re-read from, and which keys need re-reading.
+        js += ",\"mode\":"           + json::QuoteString(md);
+        js += ",\"source\":"         + json::QuoteString(src);
+        js += ",\"netkeys_sql\":"    + json::QuoteString(plan.netkeys_sql);
         js += "}";
         SetString(funcHandle, "EV_PLAN", js);
         SetString(funcHandle, "EV_ERROR", "");
@@ -402,9 +458,13 @@ extern "C" RFC_RC SAP_API ZCdcApplyImpl(RFC_CONNECTION_HANDLE,
         std::string target  = GetString(funcHandle, "IV_TARGET");
         std::string staging = GetString(funcHandle, "IV_STAGING");
         std::string keys    = GetString(funcHandle, "IV_KEYS");
+        // Empty unless this is a KEYS_IUD cycle, whose shadow log carries keys
+        // only and whose row values come from a re-read of the source.
+        std::string images  = GetString(funcHandle, "IV_IMAGES");
         log::get().Info("rfc", "Z_DUCKDB_CDC_APPLY",
-                        {{"target", target}, {"staging", staging}, {"keys", keys}});
-        CdcApplyResult r = g_bridge->CdcApply(target, staging, SplitCsv(keys));
+                        {{"target", target}, {"staging", staging}, {"keys", keys},
+                         {"images", images}});
+        CdcApplyResult r = g_bridge->CdcApply(target, staging, SplitCsv(keys), images);
         SetString(funcHandle, "EV_INS",     std::to_string(r.ins));
         SetString(funcHandle, "EV_UPD",     std::to_string(r.upd));
         SetString(funcHandle, "EV_DEL",     std::to_string(r.del));
@@ -417,6 +477,778 @@ extern "C" RFC_RC SAP_API ZCdcApplyImpl(RFC_CONNECTION_HANDLE,
     } catch (const std::exception &e) {
         _tc.fail("cdc_error");
         log::get().Error("rfc", "Z_DUCKDB_CDC_APPLY failed", {{"error", e.what()}});
+        SetString(funcHandle, "EV_ERROR", e.what());
+    }
+    return RFC_OK;
+}
+
+
+
+// A scalar out of a flat JSON object. IV_PARAMS is written by our own ABAP, so
+// this only has to handle what we send: quoted strings and bare numbers. It is
+// deliberately not a general parser -- the JSON here is an internal wire format,
+// not user input.
+std::string JsonField(const std::string &json, const std::string &key) {
+    const std::string needle = "\"" + key + "\"";
+    auto at = json.find(needle);
+    if (at == std::string::npos) return {};
+    at = json.find(':', at + needle.size());
+    if (at == std::string::npos) return {};
+    ++at;
+    while (at < json.size() && std::isspace(static_cast<unsigned char>(json[at]))) ++at;
+    if (at >= json.size()) return {};
+    if (json[at] == '"') {
+        std::string out;
+        for (++at; at < json.size() && json[at] != '"'; ++at) {
+            if (json[at] == '\\' && at + 1 < json.size()) ++at;
+            out += json[at];
+        }
+        return out;
+    }
+    std::string out;
+    while (at < json.size() && json[at] != ',' && json[at] != '}' &&
+           !std::isspace(static_cast<unsigned char>(json[at])))
+        out += json[at++];
+    return out;
+}
+
+// The ARRAY token for a key, brackets included, or empty.
+//
+// JsonField stops at the first ',' or '}' for a non-string value, so asking it
+// for an array returns the first fragment of one. That is the third time in this
+// codebase a scalar extractor has been pointed at a structured value -- the ABAP
+// side needed the same split, and the command queue's result reader had it too.
+// Different language, same shape: the scalar version is always the one already
+// in reach.
+std::string JsonArray(const std::string &json, const std::string &key) {
+    const std::string needle = "\"" + key + "\"";
+    auto at = json.find(needle);
+    if (at == std::string::npos) return {};
+    at = json.find('[', at + needle.size());
+    if (at == std::string::npos) return {};
+    int depth = 0;
+    for (auto i = at; i < json.size(); ++i) {
+        if (json[i] == '[') ++depth;
+        else if (json[i] == ']' && --depth == 0) return json.substr(at, i - at + 1);
+    }
+    return {};
+}
+
+// The tick plan, as JSON. Reads the three control tables the planner needs and
+// hands the pure function its rows, so the daemon and the batch tick get the
+// same answer from the same code.
+std::string PlanTickJson(duckdb::Connection &con) {
+    std::vector<plan::TargetRow> targets;
+    auto tr = con.Query(
+        "SELECT target, method, cadence, status, coalesce(load_type_default,'D'), "
+        "coalesce(one_shot_spent,false) AS one_shot_spent, "
+        "coalesce(epoch(last_run_ts),0), coalesce(epoch(lease_ts),0), "
+        "coalesce(epoch(parked_until),0), coalesce(fail_count,0), "
+        "coalesce(max_cycle_secs,3600), coalesce(rows_applied,0) "
+        "FROM _erpl_rev_delta_state");
+    if (tr->HasError()) throw std::runtime_error("plan: state read failed: " + tr->GetError());
+    for (size_t i = 0; i < tr->RowCount(); ++i) {
+        plan::TargetRow t;
+        t.target = tr->GetValue(0, i).ToString();
+        t.method = tr->GetValue(1, i).ToString();
+        t.cadence = tr->GetValue(2, i).ToString();
+        t.status = tr->GetValue(3, i).ToString();
+        t.load_type_default = tr->GetValue(4, i).ToString();
+        t.one_shot_spent = tr->GetValue(5, i).GetValue<bool>();
+        t.last_run_epoch = tr->GetValue(6, i).GetValue<double>();
+        t.lease_epoch = tr->GetValue(7, i).GetValue<double>();
+        t.parked_until_epoch = tr->GetValue(8, i).GetValue<double>();
+        t.fail_count = static_cast<int>(tr->GetValue(9, i).GetValue<int64_t>());
+        t.max_cycle_secs = static_cast<int>(tr->GetValue(10, i).GetValue<int64_t>());
+        t.last_rows = tr->GetValue(11, i).GetValue<int64_t>();
+        targets.push_back(t);
+    }
+
+    std::vector<plan::CdcRow> cdc;
+    auto cr = con.Query("SELECT target, status, coalesce(shadow_rows,0) FROM _erpl_rev_cdc");
+    if (!cr->HasError())
+        for (size_t i = 0; i < cr->RowCount(); ++i) {
+            plan::CdcRow c;
+            c.target = cr->GetValue(0, i).ToString();
+            c.status = cr->GetValue(1, i).ToString();
+            c.shadow_rows = cr->GetValue(2, i).GetValue<int64_t>();
+            cdc.push_back(c);
+        }
+
+    plan::DaemonRow d;
+    auto dr = con.Query("SELECT coalesce(tick_secs,2), coalesce(max_workers,2), "
+                        "coalesce(full_load_share,0.5), coalesce(stop,false) "
+                        "FROM _erpl_rev_daemon LIMIT 1");
+    if (!dr->HasError() && dr->RowCount() > 0) {
+        d.tick_secs = static_cast<int>(dr->GetValue(0, 0).GetValue<int64_t>());
+        d.max_workers = static_cast<int>(dr->GetValue(1, 0).GetValue<int64_t>());
+        d.full_load_share = dr->GetValue(2, 0).GetValue<double>();
+        d.stop = dr->GetValue(3, 0).GetValue<bool>();
+    }
+
+    const auto p = plan::PlanTick(targets, cdc, d, static_cast<double>(std::time(nullptr)));
+    std::string out = "{\"stop\":" + std::string(p.stop ? "true" : "false") +
+                      ",\"sleep_secs\":" + std::to_string(p.sleep_secs) + ",\"cycles\":[";
+    for (size_t i = 0; i < p.cycles.size(); ++i) {
+        if (i) out += ",";
+        out += "{\"target\":" + json::QuoteString(p.cycles[i].target) +
+               ",\"method\":" + json::QuoteString(p.cycles[i].method) +
+               ",\"load_type\":" + json::QuoteString(p.cycles[i].load_type) +
+               ",\"worker\":" + (p.cycles[i].worker ? "true" : "false") + "}";
+    }
+    return out + "]}";
+}
+
+// --- Planning ---------------------------------------------------------------
+// One FM, many actions, because the alternative is a new stub (and a new upgrade
+// event on every installed system) per decision the server needs to make.
+// Everything travels as JSON in IV_PARAMS / EV_PLAN, so the signature never
+// changes again.
+//
+// BEGIN_CYCLE and CYCLE_COMMIT are the cycle contract: the server decides the
+// read bounds and owns the commit, ABAP reads and stages. Note the reply carries
+// VALUES -- a floor, a ceiling, a column name -- never SQL text, so the driver's
+// "parameters are only ever read as values" posture holds here too.
+extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE,
+                                    RFC_FUNCTION_HANDLE funcHandle,
+                                    RFC_ERROR_INFO *) {
+    RfcCallScope _tc("plan");
+    try {
+        const std::string action = UpperOf(GetString(funcHandle, "IV_ACTION"));
+        const std::string target = GetString(funcHandle, "IV_TARGET");
+        const std::string params = GetString(funcHandle, "IV_PARAMS");
+        log::get().Info("rfc", "Z_DUCKDB_PLAN",
+                        {{"action", action}, {"target", target}});
+
+        auto con = g_bridge->Connect();
+        std::string plan;
+
+        if (action == "BEGIN_CYCLE") {
+            const auto lt = ParseLoadType(JsonField(params, "load_type").empty()
+                                              ? "D" : JsonField(params, "load_type"));
+            const auto b = cycle::Begin(con, target, lt,
+                                        static_cast<int64_t>(std::time(nullptr)),
+                                        JsonField(params, "sap_now"));
+            plan = std::string("{") +
+                   "\"run_id\":" + std::to_string(b.run_id) + "," +
+                   "\"stage\":" + json::QuoteString(b.stage_table) + "," +
+                   "\"source_from\":" + json::QuoteString(b.source_from) + "," +
+                   "\"keys\":" + json::QuoteString(b.keys) + "," +
+                   "\"chg_col\":" + json::QuoteString(b.chg_col) + "," +
+                   "\"time_col\":" + json::QuoteString(b.time_col) + "," +
+                   "\"has_floor\":" + (b.bounds.has_floor ? "true" : "false") + "," +
+                   "\"floor\":" + json::QuoteString(b.bounds.floor) + "," +
+                   "\"has_ceiling\":" + (b.bounds.has_ceiling ? "true" : "false") + "," +
+                   "\"ceiling_bounds_read\":" +
+                       (b.bounds.ceiling_bounds_read ? "true" : "false") + "," +
+                   "\"ceiling\":" + json::QuoteString(b.bounds.ceiling) + "," +
+                   "\"as_of_date\":" + json::QuoteString(b.bounds.as_of_date) + "," +
+                   "\"read_rows\":" + (b.plan.read_rows ? "true" : "false") + "," +
+                   "\"truncate\":" + (b.plan.truncate_target ? "true" : "false") +
+                   "}";
+        } else if (action == "CYCLE_COMMIT") {
+            cycle::CommitCounts c;
+            const auto rr = JsonField(params, "rows_read");
+            if (!rr.empty()) c.rows_read = std::atoll(rr.c_str());
+            const auto r = cycle::Commit(con, target,
+                                         std::atoll(JsonField(params, "run_id").c_str()), c);
+            plan = std::string("{") +
+                   "\"ins\":" + std::to_string(r.ins) + "," +
+                   "\"upd\":" + std::to_string(r.upd) + "," +
+                   "\"del\":" + std::to_string(r.del) + "," +
+                   "\"logged\":" + std::to_string(r.logged) + "," +
+                   "\"wm\":" + json::QuoteString(r.new_watermark) +
+                   "}";
+        } else if (action == "CDC_APPLY") {
+            // The KEYS_IUD apply. It is an action rather than a parameter on
+            // Z_DUCKDB_CDC_APPLY because that FM's interface cannot be extended
+            // on a live system: the metadata updates, the generated include does
+            // not, and the caller fails to compile against a parameter the
+            // catalogue says exists.
+            const auto staging = JsonField(params, "staging");
+            const auto keys    = JsonField(params, "keys");
+            const auto images  = JsonField(params, "images");
+            CdcApplyResult r = g_bridge->CdcApply(target, staging, SplitCsv(keys), images);
+            plan = std::string("{") +
+                   "\"ins\":" + std::to_string(r.ins) + "," +
+                   "\"upd\":" + std::to_string(r.upd) + "," +
+                   "\"del\":" + std::to_string(r.del) + "," +
+                   "\"prune\":" + std::to_string(r.prune_bound) + "," +
+                   "\"applied\":" + (r.applied ? "true" : "false") +
+                   "}";
+        } else if (action == "DRIFT") {
+            // The DDIC field list arrives as JSON on the first package of a
+            // replication, so this costs no round trip of its own.
+            drift::Schema ddic;
+            {
+                size_t at = 0;
+                while ((at = params.find("{", at)) != std::string::npos) {
+                    const auto end = params.find("}", at);
+                    if (end == std::string::npos) break;
+                    const auto obj = params.substr(at, end - at + 1);
+                    drift::Field f;
+                    f.name = JsonField(obj, "name");
+                    f.datatype = JsonField(obj, "datatype");
+                    const auto len = JsonField(obj, "length");
+                    const auto dec = JsonField(obj, "decimals");
+                    if (!len.empty()) f.length = std::atoi(len.c_str());
+                    if (!dec.empty()) f.decimals = std::atoi(dec.c_str());
+                    if (!f.name.empty()) ddic.push_back(f);
+                    at = end + 1;
+                }
+            }
+
+            drift::Schema have;
+            {
+                auto r = con.Query("SELECT column_name, data_type FROM duckdb_columns() "
+                                   "WHERE lower(table_name)=lower('" + target + "')");
+                if (!r->HasError())
+                    for (size_t i = 0; i < r->RowCount(); ++i) {
+                        drift::Field f;
+                        f.name = r->GetValue(0, i).ToString();
+                        // The target's DuckDB type is compared through the same
+                        // mapping the DDIC side uses, so a difference means a real
+                        // difference and not a spelling one.
+                        f.datatype = r->GetValue(1, i).ToString();
+                        have.push_back(f);
+                    }
+            }
+
+            // A target that does not exist yet is not drift -- it is a first load.
+            if (have.empty()) {
+                plan = "{\"blocked\":false,\"new_target\":true}";
+            } else {
+                // Compare on names only when the target was built from these very
+                // fields: DuckDB reports its own type names, so a type-level diff
+                // here would flag every column on every run.
+                drift::Schema ddic_names, have_names;
+                for (const auto &f : ddic) ddic_names.push_back({f.name, "", 0, 0});
+                for (const auto &f : have) have_names.push_back({f.name, "", 0, 0});
+                const auto d = drift::Diff(ddic_names, have_names);
+
+                std::string alters;
+                for (const auto &f : d.added) {
+                    for (const auto &orig : ddic)
+                        if (orig.name == f.name) {
+                            auto r = con.Query("ALTER TABLE " + target + " ADD COLUMN " +
+                                               f.name + " " + drift::DuckType(orig));
+                            if (!r->HasError()) alters += (alters.empty() ? "" : ",") +
+                                                          json::QuoteString(f.name);
+                        }
+                }
+                if (d.blocked)
+                    con.Query("UPDATE _erpl_rev_delta_state SET status='BLOCKED' "
+                              "WHERE target='" + target + "'");
+                plan = std::string("{\"blocked\":") + (d.blocked ? "true" : "false") +
+                       ",\"added\":[" + alters + "]" +
+                       ",\"detail\":" + json::QuoteString(drift::Explain(d)) + "}";
+            }
+        } else if (action == "TICK") {
+            plan = PlanTickJson(con);
+        } else if (action == "SUBS") {
+            // Subscriptions. The publish and the offset advance are one
+            // transaction, and that transaction happens HERE -- a round trip
+            // through SAP for an operation touching no SAP data could not be
+            // atomic with it. The command queue carries the request; the work
+            // is server-side.
+            const auto op = JsonField(params, "op");
+            if (op == "create") {
+                CreateSubscription(con, JsonField(params, "name"), target,
+                                   JsonField(params, "sink"));
+                plan = "{\"created\":" + json::QuoteString(JsonField(params, "name")) + "}";
+            } else if (op == "advance") {
+                const auto r = Advance(con, JsonField(params, "name"));
+                plan = "{\"published\":" + std::to_string(r.published) + ",\"offset\":" +
+                       std::to_string(r.new_offset) + "}";
+            } else if (op == "ls") {
+                // Through the bridge, so the rows come back in the same JSON
+                // shape every other read uses rather than a second rendering.
+                QueryResult qr = g_bridge->Query(
+                    "SELECT name, target, sink_spec, \"offset\", status "
+                    "FROM _erpl_rev_subscription ORDER BY name");
+                plan = "{\"subscriptions\":" + RowsToJsonArray(qr.rows) + "}";
+            } else {
+                throw std::runtime_error("SUBS: unknown op '" + op + "'. Known: create, "
+                                         "advance, ls.");
+            }
+        } else if (action == "CDC_PROBE") {
+            // What to ASK the database. The server owns the dialect, so the
+            // probe SQL and the expected object list come from one place; ABAP
+            // runs the three statements and posts the names back to CDC_STATUS.
+            // Two round trips rather than one because the catalogue lives in
+            // HANA and the registry lives here, and neither can see the other.
+            // The registration, read the same way CDC_PLAN reads it.
+            CdcState cst = g_bridge->CdcGet(target);
+            if (cst.source.empty() || cst.keys.empty())
+                throw std::runtime_error("CDC_PROBE: " + target + " is not a registered "
+                                         "trigger target");
+            CdcSpec spec;
+            spec.source = cst.source;
+            spec.keys = SplitCsv(cst.keys);
+            spec.mode = CdcModeOf(cst.mode.empty() ? "DELETE_ONLY" : cst.mode);
+            if (spec.mode == CdcMode::ImageIud) {
+                QueryResult tc = g_bridge->Query("SELECT * FROM " + target + " LIMIT 0");
+                for (auto &c : tc.columns) spec.columns.push_back(UpperOf(c.name));
+            }
+            auto dia_p = MakeDialect(cst.platform.empty() ? "HANA" : cst.platform);
+            const CdcDialect &dia = *dia_p;
+            const auto plan_ddl = dia.Plan(spec);
+            std::string trigs;
+            for (size_t i = 0; i < plan_ddl.trigger_names.size(); ++i) {
+                if (i) trigs += ",";
+                trigs += json::QuoteString(plan_ddl.trigger_names[i]);
+            }
+            plan = "{\"tables_sql\":" + json::QuoteString(dia.ProbeTablesSql()) +
+                   ",\"sequences_sql\":" + json::QuoteString(dia.ProbeSequencesSql()) +
+                   ",\"triggers_sql\":" + json::QuoteString(dia.ProbeTriggersSql()) +
+                   ",\"log_table\":" + json::QuoteString(plan_ddl.log_table) +
+                   ",\"seq_name\":" + json::QuoteString(plan_ddl.seq_name) +
+                   ",\"triggers\":[" + trigs + "]}";
+        } else if (action == "CDC_STATUS") {
+            // The verdict, from what the database actually reported. Status is
+            // DERIVED here, never a stored enum trusted on its own: a trigger
+            // dropped out of band by a system copy, a transport or a DBA is
+            // invisible to the registry and silently captures nothing.
+            auto names = [&](const char *key) {
+                std::vector<std::string> out;
+                const auto arr = JsonField(params, key);
+                size_t at = 0;
+                while (at < arr.size()) {
+                    const auto b = arr.find('"', at);
+                    if (b == std::string::npos) break;
+                    const auto e = arr.find('"', b + 1);
+                    if (e == std::string::npos) break;
+                    out.push_back(arr.substr(b + 1, e - b - 1));
+                    at = e + 1;
+                }
+                return out;
+            };
+            cdc::Probe have;
+            have.tables = names("tables");
+            have.sequences = names("sequences");
+            have.enabled_triggers = names("enabled_triggers");
+            have.disabled_triggers = names("disabled_triggers");
+
+            cdc::Expected want;
+            want.log_table = JsonField(params, "log_table");
+            want.seq_name = JsonField(params, "seq_name");
+            want.triggers = names("triggers");
+
+            CdcState cs = g_bridge->CdcGet(target);
+            const bool deactivated = cs.status == "DISABLED";
+            const auto res = cdc::Derive(want, have, deactivated);
+            const auto name = cdc::StatusName(res.status);
+
+            // Persisted, so the tick planner and the operator see the same
+            // answer. An INCONSISTENT trigger set must not keep cycling: the
+            // position would advance past changes that were never captured.
+            g_bridge->CdcSetStatus(target, name);
+
+            std::string miss;
+            for (size_t i = 0; i < res.missing.size(); ++i) {
+                if (i) miss += ",";
+                miss += json::QuoteString(res.missing[i]);
+            }
+            plan = "{\"status\":" + json::QuoteString(name) + ",\"explain\":" +
+                   json::QuoteString(cdc::Explain(res)) + ",\"missing\":[" + miss + "]}";
+        } else if (action == "CDC_REPAIR") {
+            // ONLY the missing objects. Re-running the whole provision DDL
+            // would recreate the shadow table and reset the position,
+            // discarding every change captured since -- a "repair" that loses
+            // exactly the data it was run to protect.
+            CdcState cst = g_bridge->CdcGet(target);
+            if (cst.source.empty() || cst.keys.empty())
+                throw std::runtime_error("CDC_REPAIR: " + target + " is not a registered "
+                                         "trigger target");
+            CdcSpec spec;
+            spec.source = cst.source;
+            spec.keys = SplitCsv(cst.keys);
+            spec.mode = CdcModeOf(cst.mode.empty() ? "DELETE_ONLY" : cst.mode);
+            if (spec.mode == CdcMode::ImageIud) {
+                QueryResult tc = g_bridge->Query("SELECT * FROM " + target + " LIMIT 0");
+                for (auto &c : tc.columns) spec.columns.push_back(UpperOf(c.name));
+            }
+            auto dia_r = MakeDialect(cst.platform.empty() ? "HANA" : cst.platform);
+            const auto full = dia_r->Plan(spec);
+
+            auto names2 = [&](const char *key) {
+                std::vector<std::string> out;
+                const auto arr = JsonField(params, key);
+                size_t at = 0;
+                while (at < arr.size()) {
+                    const auto b = arr.find('"', at);
+                    if (b == std::string::npos) break;
+                    const auto e = arr.find('"', b + 1);
+                    if (e == std::string::npos) break;
+                    out.push_back(arr.substr(b + 1, e - b - 1));
+                    at = e + 1;
+                }
+                return out;
+            };
+            cdc::Probe have;
+            have.tables = names2("tables");
+            have.sequences = names2("sequences");
+            have.enabled_triggers = names2("enabled_triggers");
+            have.disabled_triggers = names2("disabled_triggers");
+            cdc::Expected want;
+            want.log_table = full.log_table;
+            want.seq_name = full.seq_name;
+            want.triggers = full.trigger_names;
+
+            const auto st_r = cdc::Derive(want, have, false);
+            const auto ddl = cdc::RepairPlan(st_r, full.provision_ddl);
+            std::string arr;
+            for (size_t i = 0; i < ddl.size(); ++i) {
+                if (i) arr += ",";
+                arr += json::QuoteString(ddl[i]);
+            }
+            plan = "{\"ddl\":[" + arr + "],\"count\":" + std::to_string(ddl.size()) + "}";
+        } else if (action == "SPLIT") {
+            // Cut a mass load into portions, and PERSIST them before any worker
+            // starts -- that is what makes the run restartable. ABAP supplies
+            // the facts it alone has (the histogram, the fiscal ranges, the
+            // bytes per row); the server decides every boundary, so one code
+            // path cuts every strategy.
+            split::SplitRequest req;
+            const auto strat = JsonField(params, "strategy");
+            // The strategy names the operator types, mapped here rather than in
+            // ABAP: the server decides every boundary, so it also owns what the
+            // strategy words mean.
+            const std::string sname = strat.empty() ? "records" : LowerOf(strat);
+            if (sname == "records")      req.strategy = split::Strategy::Records;
+            else if (sname == "size")    req.strategy = split::Strategy::Size;
+            else if (sname == "time")    req.strategy = split::Strategy::Time;
+            else if (sname == "fiscal")  req.strategy = split::Strategy::Fiscal;
+            else if (sname == "list")    req.strategy = split::Strategy::List;
+            else if (sname == "key")     req.strategy = split::Strategy::Key;
+            else throw std::runtime_error("SPLIT: unknown strategy '" + strat +
+                                          "'. Known: records, size, time, fiscal, list, key.");
+            req.part_col = JsonField(params, "part_col");
+            req.user_where = JsonField(params, "where");
+            const auto lr = JsonField(params, "limit_rows");
+            const auto lm = JsonField(params, "limit_mb");
+            const auto bpr = JsonField(params, "bytes_per_row");
+            if (!lr.empty()) req.limit_rows = std::atoll(lr.c_str());
+            if (!lm.empty()) req.limit_mb = std::atoll(lm.c_str());
+            if (!bpr.empty()) req.bytes_per_row = std::atoll(bpr.c_str());
+            req.range_min = JsonField(params, "range_min");
+            req.range_max = JsonField(params, "range_max");
+            const auto tot = JsonField(params, "total_rows");
+            if (!tot.empty()) req.total_rows = std::atoll(tot.c_str());
+            req.time_unit = JsonField(params, "time_unit");
+            req.time_from = JsonField(params, "time_from");
+            req.time_to = JsonField(params, "time_to");
+            {
+                // The histogram: {"bucket":"...","rows":N} objects.
+                size_t at = 0;
+                const auto h = JsonArray(params, "histogram");
+                while ((at = h.find("{", at)) != std::string::npos) {
+                    const auto end = h.find("}", at);
+                    if (end == std::string::npos) break;
+                    const auto obj = h.substr(at, end - at + 1);
+                    split::Bucket b;
+                    b.value = JsonField(obj, "bucket");
+                    const auto n = JsonField(obj, "rows");
+                    b.rows = n.empty() ? 0 : std::atoll(n.c_str());
+                    if (!b.value.empty()) req.histogram.push_back(b);
+                    at = end + 1;
+                }
+            }
+            const auto portions = split::PlanSplit(req);
+            // Say WHY, not just "none". A split that produces nothing is always
+            // a missing input, and which one is the entire question.
+            if (portions.empty()) {
+                std::string why = "SPLIT produced no portions for " + target + " (strategy " +
+                                  sname + ")";
+                if ((req.strategy == split::Strategy::Records ||
+                     req.strategy == split::Strategy::Size) && req.histogram.empty() &&
+                    req.range_min.empty())
+                    why += ": no histogram and no partition bounds -- pass --part-col";
+                else if (req.strategy == split::Strategy::Records && req.limit_rows <= 0)
+                    why += ": --limit-rows is required";
+                else if (req.strategy == split::Strategy::Size && req.limit_mb <= 0)
+                    why += ": --limit-mb is required";
+                else if (req.strategy == split::Strategy::Time)
+                    why += ": a time range is required";
+                throw std::runtime_error(why);
+            }
+
+            // Persisted first, in one transaction: a portion list that exists
+            // only in the caller's memory cannot be restarted after a crash,
+            // which is the whole reason to split rather than stream.
+            Exec(con, "BEGIN");
+            try {
+                Exec(con, "CREATE TABLE IF NOT EXISTS _erpl_rev_portion ("
+                          "target VARCHAR, run_id BIGINT, portion_no INTEGER, "
+                          "predicate VARCHAR, est_rows BIGINT, status VARCHAR DEFAULT 'PENDING', "
+                          "attempts INTEGER DEFAULT 0, started_ts TIMESTAMPTZ, "
+                          "finished_ts TIMESTAMPTZ, rows_done BIGINT)");
+                Exec(con, "DELETE FROM _erpl_rev_portion WHERE target=" + SqlLit(target) +
+                              " AND status <> 'DONE'");
+                for (const auto &p : portions)
+                    Exec(con, "INSERT INTO _erpl_rev_portion "
+                              "(target, run_id, portion_no, predicate, est_rows, status) VALUES (" +
+                              SqlLit(target) + ",0," + std::to_string(p.portion_no) + "," +
+                              SqlLit(p.predicate) + "," + std::to_string(p.est_rows) +
+                              ",'PENDING')");
+                Exec(con, "COMMIT");
+            } catch (...) {
+                Exec(con, "ROLLBACK");
+                throw;
+            }
+
+            std::string arr;
+            for (size_t i = 0; i < portions.size(); ++i) {
+                if (i) arr += ",";
+                arr += "{\"portion_no\":" + std::to_string(portions[i].portion_no) +
+                       ",\"predicate\":" + json::QuoteString(portions[i].predicate) +
+                       ",\"est_rows\":" + std::to_string(portions[i].est_rows) + "}";
+            }
+            // A flat predicate array alongside the detailed one: the driver
+            // needs the predicates in order and nothing else, and parsing
+            // objects out of a nested array in ABAP is how the repair DDL got
+            // mangled twice.
+            std::string preds;
+            for (size_t i = 0; i < portions.size(); ++i) {
+                if (i) preds += ",";
+                preds += json::QuoteString(portions[i].predicate);
+            }
+            plan = "{\"portions\":[" + arr + "],\"predicates\":[" + preds +
+                   "],\"count\":" + std::to_string(portions.size()) + "}";
+        } else if (action == "VALIDATE") {
+            // The DuckDB half of a two-sided comparison. ABAP renders the SAP
+            // side with fingerprint_cell and sends its per-key fingerprints;
+            // here the same rows are rendered from the replica with the
+            // matching expressions, and the two are compared.
+            //
+            // Canonical TEXT per column, not a row count: a replica that is the
+            // right size and the wrong content passes every count check there
+            // is. FLTP is excluded because binary floating point does not
+            // round-trip through decimal text and would report mismatches on
+            // correct data.
+            validation::Policy pol;
+            const auto mode = JsonField(params, "mode");
+            pol.mode = mode == "full" ? validation::Mode::Full : validation::Mode::Sample;
+            const auto sr = JsonField(params, "sample_rows");
+            if (!sr.empty()) pol.sample_rows = std::atoll(sr.c_str());
+
+            std::vector<validation::Field> fields;
+            {
+                const auto arr = JsonArray(params, "fields");
+                size_t at = 0;
+                while ((at = arr.find("{", at)) != std::string::npos) {
+                    const auto end = arr.find("}", at);
+                    if (end == std::string::npos) break;
+                    const auto obj = arr.substr(at, end - at + 1);
+                    validation::Field f;
+                    f.name = JsonField(obj, "name");
+                    f.datatype = JsonField(obj, "datatype");
+                    const auto len = JsonField(obj, "length");
+                    const auto dec = JsonField(obj, "decimals");
+                    if (!len.empty()) f.length = std::atoi(len.c_str());
+                    if (!dec.empty()) f.decimals = std::atoi(dec.c_str());
+                    if (!f.name.empty() && validation::IsComparable(f)) fields.push_back(f);
+                    at = end + 1;
+                }
+            }
+            if (fields.empty())
+                throw std::runtime_error("VALIDATE: no comparable columns for " + target);
+
+            // The registered keys, so both sides pair rows by identity.
+            std::vector<std::string> vkeys;
+            {
+                auto kr = con.Query("SELECT coalesce(keys,'') FROM _erpl_rev_delta_state "
+                                    "WHERE target=" + SqlLit(target));
+                if (!kr->HasError() && kr->RowCount() > 0)
+                    vkeys = SplitCsv(kr->GetValue(0, 0).ToString());
+            }
+            const auto vplan = validation::BuildPlan(pol, target, fields, vkeys);
+            QueryResult ours = g_bridge->Query(vplan.sql);
+
+            // Paired by KEY, not by position.
+            //
+            // Positional comparison assumed two engines given the same ORDER BY
+            // produce the same sequence. They need not -- collation, NULL
+            // placement and numeric-versus-text ordering all differ between
+            // HANA and DuckDB -- and a single misalignment reports every row
+            // after it as wrong, or worse, lines two genuinely different sets
+            // up index for index and reports PASSED.
+            // Multiplicity, not one fingerprint per key. A map collapsed
+            // duplicates, so a double-applied load -- the same key twice in the
+            // replica -- paired against its single source row and PASSED. That
+            // used to be caught by the row-count check this comparison
+            // replaced, so the rewrite quietly removed the only guard.
+            std::map<std::string, std::vector<std::string>> mine;
+            for (const auto &row : ours.rows)
+                mine[JsonField(row, "k")].push_back(JsonField(row, "fp"));
+
+            long long compared = 0, mismatched = 0;
+            std::string first_bad;
+            std::set<std::string> seen;
+            {
+                const auto arr = JsonArray(params, "rows");
+                size_t at = 0;
+                while ((at = arr.find("{", at)) != std::string::npos) {
+                    const auto end2 = arr.find("}", at);
+                    if (end2 == std::string::npos) break;
+                    const auto obj = arr.substr(at, end2 - at + 1);
+                    at = end2 + 1;
+                    const auto k = JsonField(obj, "k");
+                    if (k.empty()) continue;
+                    ++compared;
+                    seen.insert(k);
+                    const auto it = mine.find(k);
+                    if (it == mine.end() || it->second.empty()) {
+                        // In SAP, absent from the replica: a lost row, which is
+                        // the failure this whole product exists to prevent.
+                        ++mismatched;
+                        if (first_bad.empty()) first_bad = k + " (missing from the replica)";
+                    } else {
+                        // Consume one occurrence, so a key present twice in the
+                        // replica and once at the source leaves a leftover that
+                        // the reverse pass reports.
+                        auto &fps = it->second;
+                        const auto want = JsonField(obj, "fp");
+                        auto f = std::find(fps.begin(), fps.end(), want);
+                        if (f == fps.end()) {
+                            ++mismatched;
+                            if (first_bad.empty()) first_bad = k;
+                            fps.erase(fps.begin());
+                        } else {
+                            fps.erase(f);
+                        }
+                    }
+                }
+            }
+            // ...and the other direction, in BOTH modes when neither side was
+            // capped. A replica holding rows the source does not -- deletes that
+            // never propagated, the flagship failure of any replicator -- was
+            // caught by the row-count check until the keyed rewrite dropped it.
+            // Anything left in `mine` after the pass above is exactly that.
+            const bool capped = pol.mode != validation::Mode::Full &&
+                                (static_cast<long long>(ours.rows.size()) >= pol.sample_rows ||
+                                 compared >= pol.sample_rows);
+            if (!capped) {
+                for (const auto &kv : mine) {
+                    for (size_t n = 0; n < kv.second.size(); ++n) {
+                        ++mismatched;
+                        if (first_bad.empty())
+                            first_bad = kv.first + " (in the replica, not at the source)";
+                    }
+                }
+            }
+
+            // A comparison of nothing is not a pass. An empty or unparseable
+            // payload from the source side would otherwise report
+            // compared=0, mismatched=0 -> PASSED, which is the most confident
+            // possible way to say nothing was checked.
+            if (compared == 0 && !ours.rows.empty()) {
+                ++mismatched;
+                if (first_bad.empty())
+                    first_bad = "the source returned no rows while the replica has " +
+                                std::to_string(ours.rows.size());
+            }
+
+            // Recorded like any other run: a validation nobody can find later
+            // did not happen as far as an auditor is concerned.
+            Exec(con, "INSERT INTO _erpl_rev_run_stats "
+                      "(run_id, target, source, run_type, method, status, rows_read, "
+                      "validation_status) VALUES (nextval('_erpl_rev_run_seq')," +
+                      SqlLit(target) + "," + SqlLit(target) + ",'VALIDATE','OPERATOR'," +
+                      SqlLit(mismatched == 0 ? "SUCCESS" : "ERROR") + "," +
+                      std::to_string(compared) + "," +
+                      SqlLit(mismatched == 0 ? "PASSED" : "FAILED") + ")");
+
+            plan = "{\"compared\":" + std::to_string(compared) + ",\"mismatched\":" +
+                   std::to_string(mismatched) + ",\"verdict\":" +
+                   json::QuoteString(mismatched == 0 ? "PASSED" : "FAILED") +
+                   ",\"first_mismatch\":" + json::QuoteString(first_bad) + "}";
+        } else if (action == "UNPARK") {
+            // Parking is what stops a broken target hammering SAP; without a way
+            // back it is a one-way door that only raw SQL can open. Clearing the
+            // failure count too, because a target the operator has just fixed
+            // should not resume at the far end of an exponential backoff.
+            auto up = con.Query("UPDATE _erpl_rev_delta_state SET parked_until=NULL, "
+                                "park_reason=NULL, fail_count=0, "
+                                "status=CASE WHEN coalesce(status,'')='BLOCKED' THEN 'IDLE' "
+                                "ELSE status END WHERE target=" + SqlLit(target));
+            if (up->HasError())
+                throw std::runtime_error("UNPARK failed: " + up->GetError());
+            const auto n = up->RowCount() > 0 && !up->GetValue(0, 0).IsNull()
+                               ? up->GetValue(0, 0).GetValue<int64_t>()
+                               : 0;
+            if (n == 0)
+                throw std::runtime_error("UNPARK: no delta registration for " + target);
+            plan = "{\"unparked\":" + json::QuoteString(target) + "}";
+        } else if (action == "SET_WM") {
+            // An operator moving the position, deliberately -- to re-deliver a
+            // window after a downstream loss, or to adopt a position after a
+            // restore. It writes engine state on purpose, so it records a run of
+            // its own: a watermark that moved with no record of who moved it is
+            // the hardest kind of replication question to answer afterwards.
+            const auto to = JsonField(params, "wm_value");
+            if (to.empty()) throw std::runtime_error("SET_WM: wm_value is required");
+            auto before = con.Query("SELECT coalesce(wm_value,'') FROM _erpl_rev_delta_state "
+                                    "WHERE target=" + SqlLit(target));
+            if (before->HasError() || before->RowCount() == 0)
+                throw std::runtime_error("SET_WM: no delta registration for " + target);
+            const auto from = before->GetValue(0, 0).ToString();
+
+            Exec(con, "BEGIN");
+            try {
+                Exec(con, "UPDATE _erpl_rev_delta_state SET wm_value=" + SqlLit(to) +
+                              " WHERE target=" + SqlLit(target));
+                Exec(con, "INSERT INTO _erpl_rev_run_stats "
+                          "(run_id, target, source, run_type, method, status, wm_from, wm_to) "
+                          "VALUES (nextval('_erpl_rev_run_seq')," + SqlLit(target) + "," +
+                          SqlLit(target) + ",'SET_WM','OPERATOR','SUCCESS'," + SqlLit(from) +
+                          "," + SqlLit(to) + ")");
+                Exec(con, "COMMIT");
+            } catch (...) {
+                Exec(con, "ROLLBACK");
+                throw;
+            }
+            plan = "{\"wm_from\":" + json::QuoteString(from) + ",\"wm_to\":" +
+                   json::QuoteString(to) + "}";
+        } else if (action == "PREVIEW") {
+            // The first rows of a target, read through the SAME path a
+            // subscriber reads -- the transform view when one is registered, the
+            // table otherwise. Reading the table directly here would let an
+            // operator approve output that is not what gets published.
+            const auto n = JsonField(params, "rows");
+            const long long rows = n.empty() ? 20 : std::atoll(n.c_str());
+            auto xf = con.Query("SELECT coalesce(xform_view,'') FROM _erpl_rev_delta_state "
+                                "WHERE target=" + SqlLit(target));
+            std::string from_rel = target;
+            if (!xf->HasError() && xf->RowCount() > 0) {
+                const auto v = xf->GetValue(0, 0).ToString();
+                if (!v.empty()) from_rel = v;
+            }
+            QueryResult qr = g_bridge->Query("SELECT * FROM " + from_rel + " LIMIT " +
+                                             std::to_string(rows));
+            plan = "{\"rows\":" + RowsToJsonArray(qr.rows) + "}";
+        } else if (action == "RETAIN") {
+            // Prune the change log to the slowest subscriber, or to the window
+            // when nothing is subscribed.
+            const auto w = JsonField(params, "window_secs");
+            const long long window = w.empty() ? 0 : std::atoll(w.c_str());
+            const long long pruned = Retain(con, target, window);
+            plan = "{\"pruned\":" + std::to_string(pruned) + "}";
+        } else {
+            throw std::runtime_error(
+                "unknown plan action '" + action +
+                "'. Known: BEGIN_CYCLE, CYCLE_COMMIT, TICK, CDC_APPLY, DRIFT, SUBS, "
+                "RETAIN, SET_WM, PREVIEW, CDC_PROBE, CDC_STATUS, CDC_REPAIR, SPLIT, VALIDATE, UNPARK.");
+        }
+
+        SetString(funcHandle, "EV_PLAN", plan);
+        SetString(funcHandle, "EV_ERROR", "");
+    } catch (const std::exception &e) {
+        // Never let an exception cross the RFC boundary: ABAP gets a clean
+        // EV_ERROR, which is the convention every other handler follows.
+        _tc.fail("plan_error");
+        log::get().Error("rfc", "Z_DUCKDB_PLAN failed", {{"error", e.what()}});
+        SetString(funcHandle, "EV_PLAN", "");
         SetString(funcHandle, "EV_ERROR", e.what());
     }
     return RFC_OK;

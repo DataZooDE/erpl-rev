@@ -14,6 +14,7 @@
 #include "abap_codegen.hpp"
 #include "abap_skeletons.hpp"
 #include "commands.hpp"
+#include "load_type.hpp"
 #include "db_client.hpp"
 #include "json_util.hpp"
 
@@ -46,18 +47,59 @@ std::string UnknownFlag(const std::vector<std::string> &args, const std::string 
         {"--method", true},   {"--source", true},  {"--keys", true},
         {"--chg-col", true},  {"--wm-kind", true}, {"--wm-value", true},
         {"--cadence", true},  {"--extra", true},   {"--safety-secs", true},
+        {"--time-col", true}, {"--safety-units", true},
+        {"--log", false},     {"--no-log", false},
+        {"--load-type-default", true},
+        {"--allow-empty-reload", false}, {"--no-allow-empty-reload", false},
     };
     static const Spec kSyncSchedule[] = {
         {"--every", true}, {"--remove", false},
     };
+    // `run` selects which of the four load types the cycle is. Note the value is
+    // NOT validated here -- this table only knows flag names -- so the caller
+    // checks it against load_type.hpp before anything contacts SAP.
+    static const Spec kSyncRun[] = {
+        {"--load-type", true},
+    };
+    static const Spec kSyncSetWm[]  = { {"--wm-value", true} };
+    static const Spec kSyncPreview[] = { {"--rows", true} };
+    static const Spec kSyncValidate[] = { {"--full", false}, {"--sample-rows", true} };
+    static const Spec kDaemon[]     = { {"--tick", true}, {"--workers", true} };
+    static const Spec kSub[]        = { {"--target", true}, {"--sink", true},
+                                        {"--dedup-keys", true} };
+    static const Spec kMass[]       = { {"--split", true}, {"--limit-rows", true},
+                                        {"--target", true}, {"--source", true},
+                                        {"--limit-mb", true}, {"--time-unit", true},
+                                        {"--part-col", true}, {"--restart", true},
+                                        {"--jobs", true}, {"--server-group", true} };
+    static const Spec kCdc[]        = { {"--target", true}, {"--all", false},
+                                        {"--mode", true}, {"--reconcile", false} };
+    static const Spec kRetain[]     = { {"--target", true}, {"--window-days", true} };
 
     const Spec *known = nullptr;
     size_t count = 0;
     if (sub == "replicate")           { known = kReplicate;    count = std::size(kReplicate); }
     else if (sub == "sync create")    { known = kSyncCreate;   count = std::size(kSyncCreate); }
     else if (sub == "sync schedule")  { known = kSyncSchedule; count = std::size(kSyncSchedule); }
-    // ls / show / run / run-due read no flags of their own; count stays 0, so
-    // any `--word` at all is unknown -- which is the right answer for them.
+    else if (sub == "sync run" || sub == "sync run-due")
+                                      { known = kSyncRun;      count = std::size(kSyncRun); }
+    else if (sub == "sync set-wm")    { known = kSyncSetWm;    count = std::size(kSyncSetWm); }
+    else if (sub == "sync preview")   { known = kSyncPreview;  count = std::size(kSyncPreview); }
+    else if (sub == "sync validate") { known = kSyncValidate; count = std::size(kSyncValidate); }
+    // unpark takes a target and nothing else, so any flag is unknown.
+    else if (sub == "sync unpark")   { known = nullptr;      count = 0; }
+    else if (sub.rfind("daemon", 0) == 0) { known = kDaemon; count = std::size(kDaemon); }
+    else if (sub.rfind("sub", 0) == 0)    { known = kSub;    count = std::size(kSub); }
+    else if (sub == "retain")             { known = kRetain; count = std::size(kRetain); }
+    else if (sub.rfind("cdc", 0) == 0)    { known = kCdc;    count = std::size(kCdc); }
+    else if (sub.rfind("mass", 0) == 0)   { known = kMass;   count = std::size(kMass); }
+    else if (sub.rfind("daemon", 0) == 0)  { known = kDaemon;  count = std::size(kDaemon); }
+    else if (sub.rfind("sub", 0) == 0)     { known = kSub;     count = std::size(kSub); }
+    else if (sub.rfind("mass", 0) == 0)    { known = kMass;    count = std::size(kMass); }
+    else if (sub.rfind("cdc", 0) == 0)     { known = kCdc;     count = std::size(kCdc); }
+    else if (sub.rfind("retain", 0) == 0)  { known = kRetain;  count = std::size(kRetain); }
+    // ls / show read no flags of their own; count stays 0, so any `--word` at
+    // all is unknown -- which is the right answer for them.
 
     for (size_t i = 0; i < args.size(); i++) {
         if (args[i].rfind("--", 0) != 0) continue;   // a positional, e.g. the target
@@ -123,19 +165,18 @@ bool CommandResult(Options &o, long long id, std::string &status,
             "SELECT status, coalesce(result,'') AS result, coalesce(error,'') AS error "
             "FROM _erpl_rev_cli_cmd WHERE cmd_id = " + std::to_string(id));
         if (r.rows.empty()) return false;
-        const std::string &row = r.rows[0];
-        auto pick = [&](const char *k) {
-            const std::string n = std::string("\"") + k + "\":";
-            const auto p = row.find(n);
-            if (p == std::string::npos) return std::string();
-            auto q = row.find('"', p + n.size());
-            if (q == std::string::npos) return std::string();
-            const auto e = row.find('"', q + 1);
-            return e == std::string::npos ? std::string() : row.substr(q + 1, e - q - 1);
-        };
-        status = pick("status");
-        result = pick("result");
-        error = pick("error");
+        // ParseRows, not a hand-rolled scan. The previous one took the first '"'
+        // after the key and the next '"' after that, so a result value
+        // containing an escaped quote was cut at the first one. Harmless while
+        // every result was a plain sentence; it truncated every operator
+        // command whose result is JSON to three characters.
+        const auto parsed = json::ParseRows("[" + r.rows[0] + "]");
+        if (parsed.empty()) return false;
+        for (const auto &c : parsed[0]) {
+            if (c.key == "status") status = c.value;
+            else if (c.key == "result") result = c.value;
+            else if (c.key == "error") error = c.value;
+        }
         return !status.empty();
     } catch (...) {
         return false;
@@ -317,8 +358,29 @@ static int SyncCreate(Options &o, const std::string &target) {
     st.wm_value    = Field(o, "--wm-value");
     st.cadence     = Field(o, "--cadence", "nightly");
     st.extra       = Field(o, "--extra");
+    st.time_col    = Field(o, "--time-col");
     const std::string safety = Field(o, "--safety-secs");
     if (!safety.empty()) st.safety_secs = std::atoll(safety.c_str());
+    const std::string units = Field(o, "--safety-units");
+    if (!units.empty()) st.safety_units = std::atoll(units.c_str());
+    // Tri-state: --log, --no-log, or neither. "Neither" has to survive all the
+    // way to the server as NULL, or every registration asserts the flag and a
+    // re-registration for an unrelated reason turns a target's change log off.
+    auto tri = [&](const char *on, const char *off) -> std::string {
+        if (HasFlag(o, on)) return "true";
+        if (HasFlag(o, off)) return "false";
+        return "";
+    };
+    st.log_enabled        = tri("--log", "--no-log");
+    st.allow_empty_reload = tri("--allow-empty-reload", "--no-allow-empty-reload");
+    st.load_type_default  = Field(o, "--load-type-default");
+    if (!st.load_type_default.empty() && st.load_type_default != "D" &&
+        st.load_type_default != "F" && st.load_type_default != "I" &&
+        st.load_type_default != "L") {
+        std::fprintf(stderr,
+                     "erpl-rev sync create: --load-type-default must be D, F, I or L.\n");
+        return 2;
+    }
 
     if (st.method.empty() || st.source_from.empty() || st.keys.empty()) {
         std::fprintf(stderr,
@@ -329,11 +391,16 @@ static int SyncCreate(Options &o, const std::string &target) {
     if (!o.print_abap && !o.dry_run && (o.queue_only || DriverAvailable(o))) {
         if (const int rc = ConsentGate(o, "Register sync job '" + st.target + "' on " + o.host))
             return rc;
-        const std::string j = BuildParams({
-            {"target", st.target}, {"method", st.method}, {"source_from", st.source_from},
-            {"keys", st.keys}, {"chg_col", st.chg_col}, {"wm_kind", st.wm_kind},
-            {"wm_value", st.wm_value}, {"cadence", st.cadence}, {"extra", st.extra},
-            {"safety_secs", std::to_string(st.safety_secs)}});
+        // Rendered from the SAME list as the generated-ABAP path, so the two
+        // writers of this surface cannot drift again. Backticks are the ABAP
+        // literal form; the queue carries plain values.
+        // The RAW form, from the same list the generated-ABAP path renders. This
+        // used to take the rendered ABAP and strip the backticks back off to
+        // recover the value it had started with -- which works only while every
+        // rendering is trivially reversible, and a tri-state flag is not.
+        std::vector<std::pair<std::string, std::string>> kv;
+        for (const auto &f : abapgen::RegisterFields(st)) kv.push_back({f.name, f.raw});
+        const std::string j = BuildParams(kv);
         return RunViaDriver(o, "sync_register", j);
     }
     const std::string nonce = abapgen::MakeNonce();
@@ -361,13 +428,27 @@ static int SyncCreate(Options &o, const std::string &target) {
 }
 
 static int SyncRun(Options &o, const std::string &target) {
+    // The flag whitelist above passes any value through, so this is the only
+    // thing between `--load-type Z` and a run that quietly does the wrong thing.
+    // Checked before the consent gate: a typo should cost an error, not a
+    // password prompt and a wrong job.
+    std::string load_type = Field(o, "--load-type");
+    if (!load_type.empty()) {
+        if (!IsValidLoadTypeCode(load_type)) {
+            std::fprintf(stderr, "erpl-rev sync run: %s\n",
+                         [&] { try { ParseLoadType(load_type); } catch (const std::exception &e) {
+                                   return std::string(e.what()); } return std::string(); }().c_str());
+            return 2;
+        }
+        load_type = LoadTypeCode(ParseLoadType(load_type));
+    }
     if (!o.print_abap && !o.dry_run && (o.queue_only || DriverAvailable(o))) {
         if (const int rc = ConsentGate(o, target.empty()
                                               ? "Run every due sync job on " + o.host
                                               : "Run sync job '" + target + "' on " + o.host))
             return rc;
         return RunViaDriver(o, "sync_run",
-                            BuildParams({{"target", target}}));
+                            BuildParams({{"target", target}, {"load_type", load_type}}));
     }
     const std::string nonce = abapgen::MakeNonce();
     const std::string src = abapgen::RenderSyncRun(target, nonce);
@@ -463,6 +544,11 @@ static int SyncSchedule(Options &o) {
     return 1;
 }
 
+int SyncSetWm(Options &o, const std::string &target);
+int SyncPreview(Options &o, const std::string &target);
+int SyncValidate(Options &o, const std::string &target);
+int SyncUnpark(Options &o, const std::string &target);
+
 int RunSync(Options o) {
     const std::string sub = o.args.empty() ? "" : o.args.front();
     const std::string arg = o.args.size() > 1 && o.args[1].rfind("--", 0) != 0
@@ -483,6 +569,10 @@ int RunSync(Options o) {
         if (sub == "run")           return SyncRun(o, arg);
         if (sub == "run-due")       return SyncRun(o, "");
         if (sub == "schedule")      return SyncSchedule(o);
+        if (sub == "set-wm")        return SyncSetWm(o, arg);
+        if (sub == "preview")       return SyncPreview(o, arg);
+        if (sub == "validate")      return SyncValidate(o, arg);
+        if (sub == "unpark")        return SyncUnpark(o, arg);
     } catch (const abapgen::UnsafeValue &e) {
         std::fprintf(stderr, "erpl-rev: %s\n", e.what());
         return 2;
@@ -491,8 +581,178 @@ int RunSync(Options o) {
         return 1;
     }
     std::fprintf(stderr,
-                 "erpl-rev sync: expected ls, show, create, rm, run, run-due or schedule.\n");
+                 "erpl-rev sync: expected ls, show, create, run, run-due, schedule, "
+                 "set-wm, preview, validate or unpark.\n");
     return 2;
+}
+
+int SyncSetWm(Options &o, const std::string &target) {
+    const std::string wm = Field(o, "--wm-value");
+    if (target.empty() || wm.empty()) {
+        std::fprintf(stderr, "erpl-rev sync set-wm <target> --wm-value V\n"
+                             "  Moves the target's position. The next cycle re-reads from "
+                             "there.\n");
+        return 2;
+    }
+    if (const int rc = ConsentGate(o, "Set the watermark of '" + target + "' to " + wm)) return rc;
+    return RunViaDriver(o, "set_wm", BuildParams({{"target", target}, {"wm_value", wm}}));
+}
+
+int SyncPreview(Options &o, const std::string &target) {
+    if (target.empty()) {
+        std::fprintf(stderr, "erpl-rev sync preview <target> [--rows N]\n");
+        return 2;
+    }
+    return RunViaDriver(o, "preview",
+                        BuildParams({{"target", target}, {"rows", Field(o, "--rows", "20")}}));
+}
+
+int SyncValidate(Options &o, const std::string &target) {
+    if (target.empty()) {
+        std::fprintf(stderr, "erpl-rev sync validate <target> [--full] [--sample-rows N]\n"
+                             "  Compares the replica against SAP cell by cell. A replica that "
+                             "is the\n  right size and the wrong content passes every count "
+                             "check there is.\n");
+        return 2;
+    }
+    return RunViaDriver(o, "validate", BuildParams({
+        {"target", target},
+        {"mode", HasFlag(o, "--full") ? "full" : "sample"},
+        {"sample_rows", Field(o, "--sample-rows", "1000")}}));
+}
+
+int SyncUnpark(Options &o, const std::string &target) {
+    if (target.empty()) {
+        std::fprintf(stderr, "erpl-rev sync unpark <target>\n"
+                             "  Releases a parked target and clears its backoff.\n");
+        return 2;
+    }
+    return RunViaDriver(o, "unpark", BuildParams({{"target", target}}));
+}
+
+// ---------------------------------------------------------------------------
+// daemon | sub | retain -- the operator verbs
+//
+// The engine behind these has been unit-tested since it was written and could
+// not be invoked: no verb reached publish::Advance, publish::Retain or the
+// daemon's control row, so subscriptions, retention and "is the daemon alive"
+// were reachable only by hand-written SQL. The flag tables for them existed and
+// were consulted by nothing, and the tests asserting on those tables passed
+// while proving nothing about a reachable path.
+// ---------------------------------------------------------------------------
+
+int RunDaemon(Options o) {
+    const std::string sub = o.args.empty() ? "" : o.args[0];
+    if (const int rc = RefuseUnknownFlags(o, "daemon " + sub)) return rc;
+    const auto cfg = cli::ReadConfig();
+    cli::ResolveConn(o, cfg, !o.queue_only && !o.non_interactive && cli::IsTty());
+
+    if (sub == "start") {
+        const std::string tick = Field(o, "--tick"), workers = Field(o, "--workers");
+        return RunViaDriver(o, "daemon_start",
+                            BuildParams({{"tick_secs", tick}, {"max_workers", workers}}));
+    }
+    if (sub == "stop")   return RunViaDriver(o, "daemon_stop", BuildParams({}));
+    if (sub == "status") return RunViaDriver(o, "daemon_status", BuildParams({}));
+
+    std::fprintf(stderr, "erpl-rev daemon: expected start, stop or status.\n");
+    return 2;
+}
+
+int RunSub(Options o) {
+    const std::string sub = o.args.empty() ? "" : o.args[0];
+    const std::string name = o.args.size() > 1 ? o.args[1] : "";
+    if (const int rc = RefuseUnknownFlags(o, "sub " + sub)) return rc;
+    const auto cfg = cli::ReadConfig();
+    cli::ResolveConn(o, cfg, !o.queue_only && !o.non_interactive && cli::IsTty());
+
+    if (sub == "create") {
+        const std::string target = Field(o, "--target"), sink = Field(o, "--sink");
+        if (name.empty() || target.empty() || sink.empty()) {
+            std::fprintf(stderr, "erpl-rev sub create <name> --target T --sink SPEC\n"
+                                 "  SPEC is PARQUET:/path:FULL or TABLE:name:APPEND.\n");
+            return 2;
+        }
+        return RunViaDriver(o, "subs", BuildParams({{"op", "create"}, {"name", name},
+                                                    {"target", target}, {"sink", sink}}));
+    }
+    if (sub == "advance") {
+        if (name.empty()) { std::fprintf(stderr, "erpl-rev sub advance <name>\n"); return 2; }
+        return RunViaDriver(o, "subs", BuildParams({{"op", "advance"}, {"name", name}}));
+    }
+    if (sub == "ls") return RunViaDriver(o, "subs", BuildParams({{"op", "ls"}}));
+
+    std::fprintf(stderr, "erpl-rev sub: expected create, advance or ls.\n");
+    return 2;
+}
+
+int RunMass(Options o) {
+    const std::string sub = o.args.empty() ? "" : o.args[0];
+    if (const int rc = RefuseUnknownFlags(o, "mass " + sub)) return rc;
+    const auto cfg = cli::ReadConfig();
+    cli::ResolveConn(o, cfg, !o.queue_only && !o.non_interactive && cli::IsTty());
+
+    if (sub != "run") {
+        std::fprintf(stderr, "erpl-rev mass run --target T --source S --part-col C "
+                             "[--split STRATEGY]\n"
+                             "  STRATEGY is records (default), size, time, fiscal, list or key.\n");
+        return 2;
+    }
+    const std::string target = Field(o, "--target"), source = Field(o, "--source");
+    if (target.empty() || source.empty()) {
+        std::fprintf(stderr, "erpl-rev mass run: --target and --source are required.\n");
+        return 2;
+    }
+    if (const int rc = ConsentGate(o, "Mass load '" + source + "' into '" + target + "'"))
+        return rc;
+    return RunViaDriver(o, "mass_run", BuildParams({
+        {"target", target}, {"source", source},
+        {"strategy", Field(o, "--split", "records")},
+        {"part_col", Field(o, "--part-col")},
+        {"limit_rows", Field(o, "--limit-rows", "100000")},
+        {"limit_mb", Field(o, "--limit-mb")},
+        {"time_unit", Field(o, "--time-unit")}}));
+}
+
+int RunCdc(Options o) {
+    const std::string sub = o.args.empty() ? "" : o.args[0];
+    if (const int rc = RefuseUnknownFlags(o, "cdc " + sub)) return rc;
+    const auto cfg = cli::ReadConfig();
+    cli::ResolveConn(o, cfg, !o.queue_only && !o.non_interactive && cli::IsTty());
+
+    const std::string target = Field(o, "--target");
+    if ((sub == "status" || sub == "repair") && target.empty()) {
+        std::fprintf(stderr, "erpl-rev cdc %s --target T\n", sub.c_str());
+        return 2;
+    }
+    if (sub == "status")
+        return RunViaDriver(o, "cdc_status", BuildParams({{"target", target}}));
+    if (sub == "repair") {
+        if (const int rc = ConsentGate(o, "Recreate the missing trigger objects of '" +
+                                              target + "'"))
+            return rc;
+        return RunViaDriver(o, "cdc_repair", BuildParams({{"target", target}}));
+    }
+    std::fprintf(stderr, "erpl-rev cdc: expected status or repair.\n");
+    return 2;
+}
+
+int RunRetain(Options o) {
+    if (const int rc = RefuseUnknownFlags(o, "retain")) return rc;
+    const auto cfg = cli::ReadConfig();
+    cli::ResolveConn(o, cfg, !o.queue_only && !o.non_interactive && cli::IsTty());
+
+    const std::string target = Field(o, "--target");
+    if (target.empty()) {
+        std::fprintf(stderr, "erpl-rev retain --target T [--window-days N]\n");
+        return 2;
+    }
+    // Days on the command line, seconds on the wire: an operator thinks in days
+    // and the engine's window is a duration.
+    const std::string days = Field(o, "--window-days", "0");
+    const long long secs = std::atoll(days.c_str()) * 86400;
+    return RunViaDriver(o, "retain",
+                        BuildParams({{"target", target}, {"window_secs", std::to_string(secs)}}));
 }
 
 // ---------------------------------------------------------------------------

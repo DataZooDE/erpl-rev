@@ -10,15 +10,12 @@
 #include <thread>
 #include <vector>
 
+#include "temp_path.hpp"
+
 using namespace erpl_rev;
 
-// Portable temp path: under the OS temp dir, with forward slashes. DuckDB accepts
-// '/' on every platform (and it sidesteps backslash escaping in SQL literals);
-// std::remove accepts it too. Replaces hardcoded "/tmp/…" so the tests run on
-// Windows as well as Linux/macOS.
-static std::string TmpPath(const std::string &name) {
-    return (std::filesystem::temp_directory_path() / name).generic_string();
-}
+// Shared with the other tests that need a real file on disk.
+using erpl_rev_test::TmpPath;
 
 // Absolute path to the sample parquet, injected by CMake (ERPL_REV_DATA_DIR),
 // so the test is independent of the working directory it's launched from.

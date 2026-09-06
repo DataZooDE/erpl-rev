@@ -11,6 +11,7 @@
 //   ERPL_REV_GWSERV      (default 3300)   -- sapgw00 on A4H
 #include "rfc_handlers.hpp"
 #include "duckdb_bridge.hpp"
+#include "metrics.hpp"
 #include "logging.hpp"
 #ifdef _WIN32
 #include <windows.h>    // GetCurrentProcessId
@@ -108,11 +109,13 @@ bool ListenIsLoopback(const std::string &listen) {
 // Parsed command-line options. *_set marks "seen on the command line" so the
 // resolver can apply CLI-over-env precedence without conflating an explicit
 // empty value with "unset".
-enum class Verb { Serve, Setup, Doctor, Sql, Sync, Replicate };
+enum class Verb { Serve, Setup, Doctor, Sql, Sync, Replicate, Daemon, Sub, Retain, Cdc, Mass, Top };
 
 // Verbs whose flags are parsed by the cmd module.
 inline bool IsCmdVerb(Verb v) {
-    return v == Verb::Sql || v == Verb::Sync || v == Verb::Replicate;
+    return v == Verb::Sql || v == Verb::Sync || v == Verb::Replicate ||
+           v == Verb::Daemon || v == Verb::Sub || v == Verb::Retain ||
+           v == Verb::Cdc || v == Verb::Mass || v == Verb::Top;
 }
 
 struct Cli {
@@ -122,6 +125,7 @@ struct Cli {
     std::string quack_listen;
     bool quack_listen_set = false;
     std::string quack_token;
+    int metrics_port = 0;
     bool quack_token_set = false;
     std::string db_path;
     bool db_set = false;
@@ -242,6 +246,12 @@ Cli ParseArgs(int argc, char **argv) {
         else if (v == "sql")    { c.verb = Verb::Sql;    first = 2; }
         else if (v == "sync")   { c.verb = Verb::Sync;   first = 2; }
         else if (v == "replicate") { c.verb = Verb::Replicate; first = 2; }
+        else if (v == "daemon") { c.verb = Verb::Daemon; first = 2; }
+        else if (v == "sub")    { c.verb = Verb::Sub;    first = 2; }
+        else if (v == "retain") { c.verb = Verb::Retain; first = 2; }
+        else if (v == "cdc")    { c.verb = Verb::Cdc;    first = 2; }
+        else if (v == "mass")   { c.verb = Verb::Mass;   first = 2; }
+        else if (v == "top")    { c.verb = Verb::Top;    first = 2; }
         else {
             std::fprintf(stderr, "erpl-rev: unknown command '%s'\n"
                                  "Commands: serve (default), setup, doctor, sql, sync, replicate. "
@@ -288,6 +298,11 @@ Cli ParseArgs(int argc, char **argv) {
         // parsed further down by setup::ParseOption into a different struct.
         // Without the verb guard these branches would swallow them first and
         // silently break both verbs.
+        } else if (c.verb == Verb::Serve && key == "--metrics-port") {
+            // Prometheus exposition, off unless asked for. Loopback only: a
+            // replication server that opens a metrics port on every interface
+            // by default is an exposure nobody requested.
+            c.metrics_port = std::atoi(take_value().c_str());
         } else if (c.verb == Verb::Serve && key == "--gwhost") {
             c.gwhost = take_value();
             c.gwhost_set = true;
@@ -332,7 +347,10 @@ Cli ParseArgs(int argc, char **argv) {
             while (++i < argc) c.cmd.args.push_back(argv[i]);
         } else if (IsCmdVerb(c.verb) && !a.empty() && a[0] != '-') {
             c.cmd.args.push_back(a);
-        } else if ((c.verb == Verb::Sync || c.verb == Verb::Replicate) &&
+        } else if ((c.verb == Verb::Sync || c.verb == Verb::Replicate ||
+                    c.verb == Verb::Daemon || c.verb == Verb::Sub ||
+                    c.verb == Verb::Retain || c.verb == Verb::Cdc ||
+                    c.verb == Verb::Mass || c.verb == Verb::Top) &&
                    a.rfind("--", 0) == 0) {
             // sync and replicate mirror a five-tab SAP selection screen. Rather
             // than redeclare thirty flags here, their words are collected and
@@ -424,6 +442,12 @@ int main(int argc, char **argv) {
     if (cli.verb == Verb::Sql)       return cmd::RunSql(cli.cmd);
     if (cli.verb == Verb::Sync)      return cmd::RunSync(cli.cmd);
     if (cli.verb == Verb::Replicate) return cmd::RunReplicate(cli.cmd);
+    if (cli.verb == Verb::Daemon)    return cmd::RunDaemon(cli.cmd);
+    if (cli.verb == Verb::Sub)       return cmd::RunSub(cli.cmd);
+    if (cli.verb == Verb::Retain)    return cmd::RunRetain(cli.cmd);
+    if (cli.verb == Verb::Cdc)       return cmd::RunCdc(cli.cmd);
+    if (cli.verb == Verb::Mass)      return cmd::RunMass(cli.cmd);
+    if (cli.verb == Verb::Top)       return cmd::RunTop(cli.cmd);
 
     // Two surfaces, because this process almost never runs on a terminal. The
     // banner is for the operator who starts it by hand; the log line is for the
@@ -602,6 +626,20 @@ int main(int argc, char **argv) {
         // Optionally expose this same in-process DuckDB to remote DuckDB clients
         // over the network via the quack extension. Treated as best-effort: if it
         // can't start (e.g. offline, engine < 1.5.3), keep serving RFC.
+        // Metrics before quack: if the port is taken, the operator finds out at
+        // startup rather than the first time a scrape returns nothing.
+        if (cli.metrics_port > 0) {
+            std::string merr;
+            if (StartMetricsServer(cli.metrics_port, merr))
+                log::get().Info("metrics", "prometheus endpoint listening",
+                                {{"url", "http://127.0.0.1:" +
+                                             std::to_string(cli.metrics_port) + "/metrics"}});
+            else
+                // Reported, never fatal: failing to expose metrics must not stop
+                // replication.
+                log::get().Warn("metrics", "prometheus endpoint not started", {{"error", merr}});
+        }
+
         if (quack_enabled) {
             const bool allow_other = !ListenIsLoopback(quack_listen);
             try {
@@ -657,6 +695,13 @@ int main(int argc, char **argv) {
         // alive — not via the global's atexit destructor. DuckDB extensions
         // (e.g. MotherDuck) log from their own destructors, which segfaults if
         // it runs after their statics are gone during program exit.
+        // Before the handlers, which destroy the bridge. The metrics thread holds a
+        // reference to it and would keep serving scrapes against freed memory --
+        // a use-after-free on every shutdown with metrics enabled.
+        // A guard, not two statements on the happy path: main's catch returns
+        // without unwinding to here, and the metrics thread would then keep
+        // serving scrapes against a bridge destroyed at exit.
+        StopMetricsServer();
         ShutdownHandlers();
         return 0;
     } catch (const std::exception &e) {
@@ -667,6 +712,12 @@ int main(int argc, char **argv) {
         // Routine per-request errors are deliberately left unannotated: this
         // process runs for weeks, and a link on every error line becomes noise.
         log::get().Error("server", datazoo::IssueHint(kBanner).substr(1));
+        // Tear down here too. This path returns without unwinding to the normal
+        // shutdown, so the metrics thread would outlive the bridge it holds a
+        // reference to and keep serving scrapes against destroyed memory --
+        // the same use-after-free the success path was fixed for, on the branch
+        // taken precisely when things have gone wrong.
+        StopMetricsServer();
         return 1;
     }
 }

@@ -82,6 +82,75 @@ CLASS zcl_erpl_rev_cdctest IMPLEMENTATION.
     ok( cond = xsdbool( line_exists( lt_due[ table_line = 'cdc_wm' ] ) )
         what = 'CDC run_due runs the active target' ).
 
+    " --- status is DERIVED from the catalogue, not from the registry ---------
+    "
+    " A trigger dropped out of band -- a system copy, a transport, a DBA -- is
+    " invisible to the registry: the target keeps reporting ACTIVE and captures
+    " nothing, and nobody finds out until rows are missing. So the status is
+    " probed from the database and compared against the expected object list.
+    "
+    " Driven through the command driver's own entry point, which is exactly what
+    " `erpl-rev cdc status` queues -- the CLI adds argument parsing and nothing
+    " else, so this covers the whole mechanism.
+    DATA lv_res TYPE string.
+    DATA lv_err TYPE string.
+    zcl_erpl_rev_clidrv=>execute( EXPORTING iv_verb = 'cdc_status'
+                                            iv_params = '{"target":"cdc_wm"}'
+                                  IMPORTING ev_result = lv_res ev_error = lv_err ).
+    ok( cond = xsdbool( lv_err IS INITIAL AND lv_res CS 'ACTIVE' )
+        what = 'CDC status: a healthy trigger set reads ACTIVE'
+        detail = |{ lv_err }{ lv_res }| ).
+
+    " Drop one trigger behind the registry's back and ask again.
+    DATA(lv_pj) = zcl_erpl_rev_delta=>plan_json( iv_action = 'CDC_PROBE'
+                                                 iv_target = 'cdc_wm' ).
+    DATA(lv_tn) = zcl_erpl_rev_delta=>jarr( iv_json = lv_pj-json iv_key = 'triggers' ).
+    REPLACE ALL OCCURRENCES OF `[` IN lv_tn WITH ``.
+    REPLACE ALL OCCURRENCES OF `]` IN lv_tn WITH ``.
+    REPLACE ALL OCCURRENCES OF `"` IN lv_tn WITH ``.
+    SPLIT lv_tn AT ',' INTO TABLE DATA(lt_tn).
+    READ TABLE lt_tn INTO DATA(lv_first) INDEX 1.
+    DATA(lv_de) = zcl_erpl_rev_cdc=>repair_exec( |DROP TRIGGER "{ lv_first }"| ).
+    ok( cond = xsdbool( lv_de IS INITIAL )
+        what = 'CDC status: a trigger was dropped out of band' detail = lv_de ).
+
+    zcl_erpl_rev_clidrv=>execute( EXPORTING iv_verb = 'cdc_status'
+                                            iv_params = '{"target":"cdc_wm"}'
+                                  IMPORTING ev_result = lv_res ev_error = lv_err ).
+    ok( cond = xsdbool( lv_res CS 'INCONSISTENT' AND lv_res CS lv_first )
+        what = 'CDC status: the missing trigger is detected AND named'
+        detail = |{ lv_err }{ lv_res }| ).
+
+    " Repair recreates only what is missing. If it re-ran the whole provision
+    " DDL it would recreate the shadow table and reset the position, discarding
+    " every change captured since -- a repair that loses what it was run to
+    " protect. So the position must survive it.
+    DATA(lv_pos0) = zcl_erpl_rev_delta=>scalar(
+      |SELECT position AS c FROM _erpl_rev_cdc WHERE target='cdc_wm'| ).
+    zcl_erpl_rev_clidrv=>execute( EXPORTING iv_verb = 'cdc_repair'
+                                            iv_params = '{"target":"cdc_wm"}'
+                                  IMPORTING ev_result = lv_res ev_error = lv_err ).
+    ok( cond = xsdbool( lv_err IS INITIAL ) what = 'CDC repair ran' detail = |{ lv_err }{ lv_res }| ).
+
+    " Read the STORED status, without asking for a fresh derivation.
+    "
+    " This used to call cdc_status again, which re-probed and re-persisted --
+    " so the assertion passed whether or not repair had updated anything, and
+    " it hid the real gap: repair left the target INCONSISTENT and the tick
+    " planner went on skipping it. The operator is told the repair worked and
+    " replication stays stopped.
+    DATA(lv_stored) = zcl_erpl_rev_delta=>scalar(
+      |SELECT count(*) AS c FROM _erpl_rev_cdc | &&
+      |WHERE target='cdc_wm' AND status='ACTIVE'| ).
+    ok( cond = xsdbool( lv_stored = 1 )
+        what = 'CDC repair: it left the target ACTIVE, so the planner runs it again'
+        detail = |stored status rows matching ACTIVE: { lv_stored }| ).
+    DATA(lv_pos1) = zcl_erpl_rev_delta=>scalar(
+      |SELECT position AS c FROM _erpl_rev_cdc WHERE target='cdc_wm'| ).
+    ok( cond = xsdbool( lv_pos0 = lv_pos1 )
+        what = 'CDC repair: the position was NOT reset'
+        detail = |before { lv_pos0 }, after { lv_pos1 }| ).
+
     " Teardown: drop trigger + log + sequence (trigger first, so ZDELTA_WM stays usable).
     DATA(lv_te) = zcl_erpl_rev_cdc=>teardown( 'cdc_wm' ).
     ok( cond = xsdbool( lv_te IS INITIAL ) what = 'CDC teardown ok (no orphan objects)' detail = lv_te ).

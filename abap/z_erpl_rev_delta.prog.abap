@@ -21,6 +21,12 @@ SELECTION-SCREEN BEGIN OF BLOCK run WITH FRAME TITLE t_run.
   SELECTION-SCREEN BEGIN OF LINE.
   SELECTION-SCREEN COMMENT 1(28) c_tgt FOR FIELD p_tgt.
   PARAMETERS p_tgt TYPE string.
+  " The load type for a named target. The daemon detaches oversized cycles as
+  " their own job through this report, and without it every detached cycle ran
+  " as a delta -- so a scheduled full load never happened while the plan said it
+  " had, and the one-shot was never spent, which re-detached it on every tick
+  " forever.
+  PARAMETERS p_load TYPE char1 DEFAULT 'D'.
   SELECTION-SCREEN END OF LINE.
   SELECTION-SCREEN COMMENT /3(75) c_tgt2.
   SELECTION-SCREEN BEGIN OF LINE.
@@ -40,6 +46,22 @@ SELECTION-SCREEN BEGIN OF BLOCK run WITH FRAME TITLE t_run.
   PARAMETERS p_dur TYPE i DEFAULT 600 MODIF ID lop.
   SELECTION-SCREEN END OF LINE.
 SELECTION-SCREEN END OF BLOCK run.
+
+" ── Monitor ───────────────────────────────────────────────────────────────────
+" What ops looks at when the phone rings: one row per target, worst first, with
+" the reason it is worst. Reads the SAME views the CLI, the TUI and the metrics
+" endpoint read -- four surfaces over one definition of "healthy", rather than
+" four queries that disagree the first time any of them changes.
+"
+" On this report rather than a new one: E-FOOTPRINT asserts the delivered object
+" list exactly, and a monitor is not worth spending a report and a transaction
+" code out of a fixed budget when ops already runs this program.
+SELECTION-SCREEN BEGIN OF BLOCK mon WITH FRAME TITLE t_mon.
+  SELECTION-SCREEN BEGIN OF LINE.
+  PARAMETERS p_mon AS CHECKBOX.
+  SELECTION-SCREEN COMMENT 4(60) c_mon FOR FIELD p_mon.
+  SELECTION-SCREEN END OF LINE.
+SELECTION-SCREEN END OF BLOCK mon.
 
 " ── Schedule a periodic background job ────────────────────────────────────────
 SELECTION-SCREEN BEGIN OF BLOCK sch WITH FRAME TITLE t_sch.
@@ -71,6 +93,8 @@ INITIALIZATION.
   c_sched = 'Install / re-time the job'.
   c_min   = 'Every (minutes, min 1)'.
   c_unsch = 'Remove the job'.
+  t_mon   = 'Monitor'.
+  c_mon   = 'Show every target: lag, health, and why it is unhealthy'.
 
 " The loop interval/duration only apply to "Keep ticking".
 AT SELECTION-SCREEN OUTPUT.
@@ -109,8 +133,15 @@ START-OF-SELECTION.
   " this job -- already running on a schedule -- picks it up. See issue #85.
   PERFORM drain_cli.
 
+  IF p_mon = abap_true.
+    PERFORM monitor.
+    RETURN.
+  ENDIF.
+
   IF p_tgt IS NOT INITIAL.
-    APPEND zcl_erpl_rev_delta=>run( p_tgt ) TO lt_run.
+    APPEND zcl_erpl_rev_delta=>run( iv_target = p_tgt
+                                    iv_load_type = COND string( WHEN p_load IS INITIAL
+                                                                THEN 'D' ELSE p_load ) ) TO lt_run.
     PERFORM show USING lt_run.
     RETURN.
   ENDIF.
@@ -134,6 +165,12 @@ START-OF-SELECTION.
 *&---------------------------------------------------------------------*
 FORM drain_cli.
   DATA(lt_cmd) = zcl_erpl_rev_clidrv=>drain( ).
+
+  " Daemon starter. This job already runs every minute and already drains the
+  " CLI queue, so it is also the cheapest place to notice that the streaming
+  " daemon is gone -- after a system restart, or a cancelled job -- and put it
+  " back. A dedicated watchdog job would cost another slot to do the same thing.
+  PERFORM restart_daemon_if_stale.
   LOOP AT lt_cmd INTO DATA(ls_cmd).
     WRITE: / |cli { ls_cmd-cmd_id } { ls_cmd-verb } { ls_cmd-status } | &&
              |{ ls_cmd-result }{ ls_cmd-error }|.
@@ -165,4 +202,94 @@ FORM show USING it_run TYPE zcl_erpl_rev_delta=>tt_run.
     ENDIF.
   ENDLOOP.
   ULINE.
+ENDFORM.
+
+
+*&---------------------------------------------------------------------*
+*& Re-submit Z_ERPL_REV_DAEMON when its heartbeat has gone stale.
+*&
+*& "Stale" is judged against the daemon's own tick interval, read from the
+*& same row, so a deliberately slow tick is not mistaken for a dead daemon.
+*& The daemon itself claims the row atomically, so a race here is harmless:
+*& the loser reports the winner and exits.
+*&---------------------------------------------------------------------*
+FORM restart_daemon_if_stale.
+  DATA lv_rows TYPE string.
+  DATA lv_err  TYPE string.
+
+  CALL FUNCTION 'Z_DUCKDB_QUERY' DESTINATION 'ERPL_REV'
+    EXPORTING iv_sql = |SELECT count(*) AS c FROM _erpl_rev_daemon | &&
+                       |WHERE id=1 AND status='RUNNING' | &&
+                       |AND (heartbeat_ts IS NULL | &&
+                       |     OR heartbeat_ts < now() - INTERVAL '1' MINUTE)|
+    IMPORTING ev_rows = lv_rows ev_error = lv_err
+    EXCEPTIONS communication_failure = 1 system_failure = 2 OTHERS = 3.
+  IF sy-subrc <> 0 OR lv_err IS NOT INITIAL.
+    RETURN.   " server unreachable: nothing useful to do from here
+  ENDIF.
+  IF lv_rows NS '"c":1'.
+    RETURN.   " either not running, or running and healthy
+  ENDIF.
+
+  DATA lv_jobname TYPE tbtcjob VALUE 'ERPL_REV_DAEMON'.
+  DATA lv_jobcount TYPE tbtcjob-jobcount.
+  CALL FUNCTION 'JOB_OPEN'
+    EXPORTING jobname = lv_jobname
+    IMPORTING jobcount = lv_jobcount
+    EXCEPTIONS OTHERS = 1.
+  IF sy-subrc <> 0. RETURN. ENDIF.
+
+  SUBMIT z_erpl_rev_daemon VIA JOB lv_jobname NUMBER lv_jobcount AND RETURN.
+
+  CALL FUNCTION 'JOB_CLOSE'
+    EXPORTING jobname = lv_jobname jobcount = lv_jobcount strtimmed = abap_true
+    EXCEPTIONS OTHERS = 1.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& The monitor screen.
+*&
+*& Health first, because it answers "is anything wrong" before the eye
+*& reaches the table, then one ALV row per target ordered worst-first.
+*& The data comes from zcl_erpl_rev_delta=>monitor_rows, which is the same
+*& call the e2e asserts on -- the screen adds no logic of its own.
+*&---------------------------------------------------------------------*
+FORM monitor.
+  DATA(ls_h) = zcl_erpl_rev_delta=>monitor_health( ).
+  IF ls_h-error IS NOT INITIAL.
+    MESSAGE |monitor: { ls_h-error }| TYPE 'I'.
+    RETURN.
+  ENDIF.
+  WRITE: / 'erpl-rev monitor'.
+  WRITE: / ls_h-rows.
+  SKIP.
+
+  DATA(ls_t) = zcl_erpl_rev_delta=>monitor_rows( ).
+  IF ls_t-error IS NOT INITIAL.
+    MESSAGE |monitor: { ls_t-error }| TYPE 'I'.
+    RETURN.
+  ENDIF.
+  IF ls_t-row_count = 0.
+    WRITE: / 'no registered targets'.
+    RETURN.
+  ENDIF.
+
+  " result_to_alv builds a typed table from the result's own columns, so the
+  " grid follows the view rather than a hand-maintained field catalogue that
+  " would go stale the moment a column is added.
+  DATA(lr_tab) = zcl_erpl_rev_util=>result_to_alv( ls_t ).
+  FIELD-SYMBOLS <mon> TYPE STANDARD TABLE.
+  ASSIGN lr_tab->* TO <mon>.
+  IF <mon> IS NOT ASSIGNED. RETURN. ENDIF.
+
+  DATA lo_alv TYPE REF TO cl_salv_table.
+  TRY.
+      cl_salv_table=>factory( IMPORTING r_salv_table = lo_alv
+                              CHANGING  t_table      = <mon> ).
+      lo_alv->get_functions( )->set_all( ).
+      lo_alv->get_columns( )->set_optimize( abap_true ).
+      lo_alv->display( ).
+    CATCH cx_root INTO DATA(lx_alv).
+      MESSAGE |monitor: { lx_alv->get_text( ) }| TYPE 'I'.
+  ENDTRY.
 ENDFORM.

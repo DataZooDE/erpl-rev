@@ -25,7 +25,15 @@ CLASS zcl_erpl_rev_deltadrv DEFINITION PUBLIC FINAL CREATE PUBLIC.
     "! Update one ZDELTA_WM row (bumps VAL + NAME + CHANGED_AT = now).
     CLASS-METHODS touch_wm IMPORTING iv_id TYPE csequence.
     "! Insert one new ZDELTA_WM row (CHANGED_AT = now).
-    CLASS-METHODS insert_wm IMPORTING iv_id TYPE csequence.
+    "! Insert one ZDELTA_WM row, optionally with its change timestamp offset
+    "! from now. A NEGATIVE offset is what a late commit looks like from the
+    "! outside: a value below what a cycle has already observed, becoming
+    "! visible only after that cycle read. That is the D1 case, constructed
+    "! rather than raced -- a test that has to win a race to go red is a gate
+    "! that passes by luck on a quiet system.
+    CLASS-METHODS insert_wm
+      IMPORTING iv_id          TYPE csequence
+                iv_offset_secs TYPE i DEFAULT 0.
     "! Physically delete one ZDELTA_WM row.
     CLASS-METHODS delete_wm IMPORTING iv_id TYPE csequence.
 
@@ -83,6 +91,19 @@ CLASS zcl_erpl_rev_deltadrv DEFINITION PUBLIC FINAL CREATE PUBLIC.
     "! a clean baseline before/after the change-doc scenario.
     CLASS-METHODS synth_cd_purge IMPORTING iv_objectclas TYPE cdhdr-objectclas.
 
+    "! Seed ZDELTA_D with one row dated yesterday and one dated today, so the
+    "! complete-day rule has something on both sides of the boundary to prove
+    "! itself against.
+    CLASS-METHODS seed_dates.
+
+    "! Seed ZDELTA_DT across the day boundary -- 23:59:59 and 00:00:00 -- which
+    "! is where a DATS+TIMS comparison loses rows if the parentheses or the zero
+    "! padding in the generated predicate are wrong.
+    CLASS-METHODS seed_datetimes.
+
+    "! Touch every ZDELTA_ALL row, maintaining all strategy columns at once.
+    CLASS-METHODS touch_all.
+
 ENDCLASS.
 
 CLASS zcl_erpl_rev_deltadrv IMPLEMENTATION.
@@ -125,7 +146,12 @@ CLASS zcl_erpl_rev_deltadrv IMPLEMENTATION.
     ls-id = iv_id.
     ls-name = |inserted|.
     ls-val = 1.
-    ls-changed_at = now_ts( ).
+    IF iv_offset_secs = 0.
+      ls-changed_at = now_ts( ).
+    ELSE.
+      GET TIME STAMP FIELD DATA(lv_now).
+      ls-changed_at = cl_abap_tstmp=>add( tstmp = lv_now secs = iv_offset_secs ).
+    ENDIF.
     INSERT zdelta_wm FROM @ls.
     COMMIT WORK AND WAIT.
   ENDMETHOD.
@@ -301,6 +327,39 @@ CLASS zcl_erpl_rev_deltadrv IMPLEMENTATION.
   METHOD synth_cd_purge.
     DELETE FROM cdhdr WHERE objectclas = @iv_objectclas.   "#EC CI_NOFIRST
     DELETE FROM cdpos WHERE objectclas = @iv_objectclas.   "#EC CI_NOFIRST
+    COMMIT WORK AND WAIT.
+  ENDMETHOD.
+
+
+  METHOD touch_all.
+    GET TIME STAMP FIELD DATA(lv_ts).
+    UPDATE zdelta_all SET chg_tstamp = @lv_ts, chg_dats = @sy-datum,
+                          chg_date2 = @sy-datum, chg_time = @sy-uzeit,
+                          chg_counter = chg_counter + 1.
+    COMMIT WORK AND WAIT.
+  ENDMETHOD.
+
+  METHOD seed_dates.
+    DELETE FROM zdelta_d.
+    DATA lt TYPE STANDARD TABLE OF zdelta_d.
+    APPEND VALUE #( client = sy-mandt id = 'D_YESTER'
+                    name = 'a complete day' changed_on = sy-datum - 1 ) TO lt.
+    APPEND VALUE #( client = sy-mandt id = 'D_TODAY'
+                    name = 'today, still open' changed_on = sy-datum ) TO lt.
+    MODIFY zdelta_d FROM TABLE lt.
+    COMMIT WORK AND WAIT.
+  ENDMETHOD.
+
+  METHOD seed_datetimes.
+    DELETE FROM zdelta_dt.
+    DATA lt TYPE STANDARD TABLE OF zdelta_dt.
+    " The two values a lexical pair comparison gets wrong if the parentheses or
+    " the zero padding are not right.
+    APPEND VALUE #( client = sy-mandt id = 'DT_EOD'   name = 'end of yesterday'
+                    changed_on = sy-datum - 1 changed_at = '235959' ) TO lt.
+    APPEND VALUE #( client = sy-mandt id = 'DT_MID'   name = 'midnight'
+                    changed_on = sy-datum - 1 changed_at = '000000' ) TO lt.
+    MODIFY zdelta_dt FROM TABLE lt.
     COMMIT WORK AND WAIT.
   ENDMETHOD.
 
