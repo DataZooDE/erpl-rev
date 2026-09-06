@@ -127,6 +127,10 @@ TEST_CASE("cycle: a stale run id is refused and changes nothing", "[cycle]") {
     const auto second = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart + 60);
 
     REQUIRE_THROWS(cycle::Commit(con, "zdelta_wm", first.run_id, {2}));
+    // A failed commit records the failure, so the run stops being "in flight"
+    // and its stage becomes sweepable.
+    CHECK(Scalar(con, "SELECT status FROM _erpl_rev_run_stats WHERE run_id=" +
+                          std::to_string(first.run_id)) == "ERROR");
     CHECK(Scalar(con, "SELECT wm_value FROM _erpl_rev_delta_state") == "20260905100000");
     CHECK(Scalar(con, "SELECT count(*) FROM zdelta_wm") == "2");
     CHECK(Scalar(con, "SELECT active_run_id FROM _erpl_rev_delta_state") ==
@@ -177,11 +181,15 @@ TEST_CASE("cycle: begin discards a previous run's orphaned stage", "[cycle]") {
     Setup(con);
 
     const auto dead = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart);
-    StageRows(con, dead.stage_table);   // ... and then nothing commits it
-    // The run is over -- the process died and something (a restart, an operator)
-    // marked it so. Only then is its stage an orphan.
-    Exec(con, "UPDATE _erpl_rev_run_stats SET status='ERROR' WHERE run_id=" +
-                  std::to_string(dead.run_id));
+    StageRows(con, dead.stage_table);   // ... and then the process dies
+
+    // Deliberately NOT marking the run finished by hand. The earlier version of
+    // this test did, and in doing so executed a statement no production path
+    // executes -- which hid the fact that nothing ever leaves RUNNING, so every
+    // dead cycle pinned its stage forever. Age it instead, which is exactly what
+    // really happens.
+    Exec(con, "UPDATE _erpl_rev_run_stats SET ts = now() - INTERVAL '2' HOUR "
+              "WHERE run_id=" + std::to_string(dead.run_id));
 
     const auto next = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart + 60);
     CHECK(next.run_id != dead.run_id);
@@ -441,4 +449,32 @@ TEST_CASE("cycle: a first cycle is all-or-nothing, target creation included",
     REQUIRE_THROWS(cycle::Commit(con, "newt", b.run_id, {1}));
     // The target must not exist: nothing was committed, so nothing is visible.
     CHECK(Scalar(con, "SELECT count(*) FROM duckdb_tables() WHERE table_name='newt'") == "0");
+}
+
+TEST_CASE("cycle: the change log follows the target when drift adds a column",
+          "[cycle][log]") {
+    // The log is created once from the target's shape. When the structure
+    // watchdog later appends a column to the target, the next commit names that
+    // column in its log INSERT -- and without reconciling, the statement fails
+    // and the target never commits again. A logged target would be permanently
+    // wedged by the very feature meant to keep it current.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con, /*log_enabled=*/true);
+
+    auto b = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart);
+    StageRows(con, b.stage_table);
+    cycle::Commit(con, "zdelta_wm", b.run_id, {2});
+
+    // Drift: a new source column appears and is added to the target.
+    Exec(con, "ALTER TABLE zdelta_wm ADD COLUMN zznew VARCHAR");
+
+    b = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart + 60);
+    Exec(con, "CREATE TABLE " + b.stage_table +
+                  "(id INTEGER, v VARCHAR, changed_at VARCHAR, zznew VARCHAR)");
+    Exec(con, "INSERT INTO " + b.stage_table + " VALUES (4,'d','20260905113000','new')");
+    REQUIRE_NOTHROW(cycle::Commit(con, "zdelta_wm", b.run_id, {1}));
+
+    const auto log = cycle::ChangeLogName("zdelta_wm");
+    CHECK(Scalar(con, "SELECT zznew FROM " + log + " WHERE id=4") == "new");
 }

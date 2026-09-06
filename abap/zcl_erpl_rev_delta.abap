@@ -449,7 +449,11 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
         iv_mode     = 'INSERT'
         iv_truncate = abap_true
         iv_where    = lv_where
-        iv_record   = abap_false ).   " the cycle is recorded by run() as one DELTA row
+        iv_record   = abap_false      " the cycle is recorded by run() as one DELTA row
+        " Drift is about the TARGET, not the stage this cycle happens to be
+        " filling. Without this the watchdog compared the DDIC field list against
+        " a staging table that does not exist yet and quietly did nothing.
+        iv_drift_target = is_state-target ).
       IF r-error IS NOT INITIAL.
         rs-error = r-error.
         RETURN.

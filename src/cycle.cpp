@@ -56,6 +56,7 @@ std::string Lower(const std::string &s) {
 struct State {
     std::string method, source_from, keys, chg_col, time_col, wm_kind, wm_value;
     long long safety_secs = 120, safety_units = 0;
+    long long max_cycle_secs = 3600;
     bool log_enabled = false;
 };
 
@@ -63,7 +64,8 @@ State LoadState(duckdb::Connection &con, const std::string &target) {
     auto r = con.Query(
         "SELECT method, source_from, keys, coalesce(chg_col,''), coalesce(wm_kind,'NUMTS'), "
         "coalesce(wm_value,''), coalesce(safety_secs,120), coalesce(time_col,''), "
-        "coalesce(safety_units,0), coalesce(log_enabled,false) "
+        "coalesce(safety_units,0), coalesce(log_enabled,false), "
+        "coalesce(max_cycle_secs,3600) "
         "FROM _erpl_rev_delta_state WHERE target=" + Lit(target));
     if (r->HasError()) throw std::runtime_error("cycle: state read failed: " + r->GetError());
     if (r->RowCount() == 0) throw std::runtime_error("cycle: no delta registration for " + target);
@@ -78,6 +80,7 @@ State LoadState(duckdb::Connection &con, const std::string &target) {
     s.time_col = r->GetValue(7, 0).ToString();
     s.safety_units = r->GetValue(8, 0).GetValue<int64_t>();
     s.log_enabled = r->GetValue(9, 0).GetValue<bool>();
+    s.max_cycle_secs = r->GetValue(10, 0).GetValue<int64_t>();
     return s;
 }
 
@@ -137,6 +140,21 @@ BeginResult Begin(duckdb::Connection &con, const std::string &target, LoadType l
     out.run_id = std::stoll(Scalar(con, "SELECT nextval('_erpl_rev_run_seq')"));
     out.stage_table = StageName(target, out.run_id);
 
+    // Retire runs that are no longer alive, BEFORE deciding what is an orphan.
+    //
+    // The sweep below treats a RUNNING statistics row as proof its stage is in
+    // use. Nothing else ever moves a row out of RUNNING -- only a successful
+    // Commit does -- so without this every crashed or failed cycle would pin its
+    // stage forever: roughly 1800 leaked tables an hour on a 2-second tick with
+    // one failing target. A row older than the target's own cycle budget belongs
+    // to a run that is not coming back.
+    Exec(con,
+         "UPDATE _erpl_rev_run_stats SET status='ABANDONED', "
+         "error_text=coalesce(error_text,'no completion recorded; run presumed dead') "
+         "WHERE target=" + Lit(target) + " AND status='RUNNING' AND ts < now() - INTERVAL '" +
+             std::to_string(st.max_cycle_secs > 0 ? st.max_cycle_secs : 3600) + "' SECOND",
+         "retire stale runs");
+
     // Drop what a DEAD run left behind -- and only that.
     //
     // The stage of a run that is still going is not an orphan. A healthy cycle
@@ -194,10 +212,17 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
     // between the two.
     const auto active = Scalar(con, "SELECT coalesce(active_run_id,-1) FROM _erpl_rev_delta_state "
                                     "WHERE target=" + Lit(target));
-    if (active != std::to_string(run_id))
+    if (active != std::to_string(run_id)) {
+        // Record the outcome before refusing. A run that is turned away here is
+        // just as dead as one that fails mid-transaction, and leaving its row
+        // RUNNING would pin its staging table forever.
+        con.Query("UPDATE _erpl_rev_run_stats SET status='ERROR', "
+                  "error_text='target reclaimed by run " + active +
+                  "' WHERE run_id=" + std::to_string(run_id) + " AND status='RUNNING'");
         throw std::runtime_error(
             "cycle: run " + std::to_string(run_id) + " no longer owns " + target +
             " (active run is " + active + "); refusing to commit a reclaimed cycle");
+    }
 
     CommitResult res;
     const bool have_stage =
@@ -365,7 +390,26 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
             const bool log_exists =
                 Scalar(con, "SELECT count(*) FROM duckdb_tables() WHERE table_name=" + Lit(log))
                 == "1";
-            if (!log_exists) {
+            if (log_exists) {
+                // Reconcile with the target. The log is created once from the
+                // target's shape, so a column the structure watchdog later adds
+                // exists on the target and not here -- and the next INSERT names
+                // it, fails, and that target never commits again. Cheap: a
+                // catalogue probe per column, only for logged targets.
+                for (const auto &c : cols) {
+                    const auto have = Scalar(con, "SELECT count(*) FROM duckdb_columns() "
+                                                  "WHERE table_name=" + Lit(log) +
+                                                      " AND lower(column_name)=" + Lit(c));
+                    if (have == "0") {
+                        const auto type = Scalar(con, "SELECT data_type FROM duckdb_columns() "
+                                                      "WHERE table_name=" + Lit(Lower(target)) +
+                                                          " AND lower(column_name)=" + Lit(c));
+                        if (!type.empty())
+                            Exec(con, "ALTER TABLE " + log + " ADD COLUMN " + c + " " + type,
+                                 "widen change log");
+                    }
+                }
+            } else {
                 Exec(con, "CREATE TABLE " + log + " AS SELECT * FROM " + target + " LIMIT 0",
                      "create change log");
                 // _commit_ts is when the SOURCE says the row changed; _applied_at
@@ -514,6 +558,11 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
         Exec(con, "COMMIT", "commit");
     } catch (...) {
         con.Query("ROLLBACK");
+        // Outside the rolled-back transaction on purpose: the run DID happen and
+        // DID fail, and that has to survive the rollback. Otherwise the row stays
+        // RUNNING forever and its staging table is never swept.
+        con.Query("UPDATE _erpl_rev_run_stats SET status='ERROR' WHERE run_id=" +
+                  std::to_string(run_id) + " AND status='RUNNING'");
         throw;
     }
     return res;

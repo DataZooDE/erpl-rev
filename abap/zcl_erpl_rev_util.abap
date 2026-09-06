@@ -154,6 +154,12 @@ CLASS zcl_erpl_rev_util DEFINITION PUBLIC FINAL CREATE PUBLIC.
                 iv_key_cols   TYPE string DEFAULT ''
                 ii_progress   TYPE REF TO zif_erpl_rev_progress OPTIONAL
                 iv_record     TYPE abap_bool DEFAULT abap_true
+                " Which table the structure watchdog should judge. Defaults to
+                " iv_target, which is right for a full load. A delta cycle writes
+                " into <target>__stg_<run>, so it must pass the REAL target here
+                " -- otherwise drift is asked about a staging table that does not
+                " exist yet, and silently never fires.
+                iv_drift_target TYPE csequence OPTIONAL
       RETURNING VALUE(rs)     TYPE ty_repl.
 
     "! Partitioned PARALLEL full-load. The coordinator (re)creates the heap target,
@@ -887,7 +893,15 @@ CLASS zcl_erpl_rev_util IMPLEMENTATION.
         DATA lv_drift TYPE string.
         CALL FUNCTION 'Z_DUCKDB_PLAN' DESTINATION c_dest
           EXPORTING iv_action = 'DRIFT'
-                    iv_target = CONV string( iv_target )
+                    " The REAL target, not whatever this call happens to be writing into.
+          " A delta cycle stages into <target>__stg_<run>, so asking DRIFT about
+          " iv_target compared the source's DDIC list against a staging table
+          " that does not exist yet -- schema drift was dead on the entire
+          " watermark path, and a new source column was silently dropped from
+          " every replicated row forever.
+          iv_target = COND string( WHEN iv_drift_target IS NOT INITIAL
+                                   THEN CONV string( iv_drift_target )
+                                   ELSE CONV string( iv_target ) )
                     iv_params = fields_json( ls_desc-fields )
           IMPORTING ev_plan   = lv_drift
           EXCEPTIONS OTHERS   = 1.
