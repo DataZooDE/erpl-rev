@@ -100,6 +100,24 @@ CLASS zcl_erpl_rev_delta DEFINITION PUBLIC FINAL CREATE PUBLIC.
                 iv_key    TYPE string
       RETURNING VALUE(rv) TYPE string.
 
+    "! The STRINGS of a JSON array, unescaped, as a table.
+    "!
+    "! Splitting the raw token on a separator does not work for the values that
+    "! need it most: a CREATE TRIGGER body is full of commas and quoted
+    "! identifiers, so a naive split produces fragments that are not SQL. This
+    "! walks the array honouring backslash escapes.
+    CLASS-METHODS jarr_items
+      IMPORTING iv_json TYPE string
+                iv_key  TYPE string
+      RETURNING VALUE(rt) TYPE string_table.
+
+    "! One JSON ARRAY token out of a flat object, returned verbatim including
+    "! its brackets. jstr stops at the first quote and cannot carry a list.
+    CLASS-METHODS jarr
+      IMPORTING iv_json   TYPE string
+                iv_key    TYPE string
+      RETURNING VALUE(rv) TYPE string.
+
     "! Read the full config+state row for a target ('' target => not registered).
     CLASS-METHODS state
       IMPORTING iv_target    TYPE csequence
@@ -343,6 +361,50 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       |wm_value=coalesce(excluded.wm_value, _erpl_rev_delta_state.wm_value)|.
     DATA(ls) = zcl_erpl_rev_util=>query( lv_sql ).
     rv_error = ls-error.
+  ENDMETHOD.
+
+  METHOD jarr_items.
+    DATA(lv_arr) = jarr( iv_json = iv_json iv_key = iv_key ).
+    DATA(lv_len) = strlen( lv_arr ).
+    DATA lv_i TYPE i VALUE 0.
+    DATA lv_in TYPE abap_bool VALUE abap_false.
+    DATA lv_cur TYPE string.
+    WHILE lv_i < lv_len.
+      DATA(lv_c) = lv_arr+lv_i(1).
+      IF lv_in = abap_false.
+        IF lv_c = `"`. lv_in = abap_true. CLEAR lv_cur. ENDIF.
+      ELSE.
+        IF lv_c = `\`.   " one backslash: inside backticks it is literal
+          " An escape: take the NEXT character literally, mapping the two that
+          " actually occur in generated DDL.
+          lv_i = lv_i + 1.
+          IF lv_i < lv_len.
+            DATA(lv_n) = lv_arr+lv_i(1).
+            CASE lv_n.
+              WHEN 'n'. lv_cur = lv_cur && cl_abap_char_utilities=>newline.
+              WHEN 't'. lv_cur = lv_cur && cl_abap_char_utilities=>horizontal_tab.
+              WHEN OTHERS. lv_cur = lv_cur && lv_n.
+            ENDCASE.
+          ENDIF.
+        ELSEIF lv_c = `"`.
+          APPEND lv_cur TO rt.
+          lv_in = abap_false.
+        ELSE.
+          lv_cur = lv_cur && lv_c.
+        ENDIF.
+      ENDIF.
+      lv_i = lv_i + 1.
+    ENDWHILE.
+  ENDMETHOD.
+
+  METHOD jarr.
+    " Everything between the key's opening bracket and its matching close. The
+    " arrays here are flat lists of strings, so the first ']' ends it.
+    " Greedy to the LAST ']', because a generated DDL string can contain one.
+    " A lazy match stops inside the payload and truncates the array.
+    DATA(lv_pat) = `"` && iv_key && `"\s*:\s*(\[.*\])`.
+    FIND PCRE lv_pat IN iv_json SUBMATCHES rv.
+    IF sy-subrc <> 0. rv = `[]`. ENDIF.
   ENDMETHOD.
 
   METHOD state.

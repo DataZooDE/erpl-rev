@@ -86,6 +86,7 @@ std::string UnknownFlag(const std::vector<std::string> &args, const std::string 
     else if (sub.rfind("daemon", 0) == 0) { known = kDaemon; count = std::size(kDaemon); }
     else if (sub.rfind("sub", 0) == 0)    { known = kSub;    count = std::size(kSub); }
     else if (sub == "retain")             { known = kRetain; count = std::size(kRetain); }
+    else if (sub.rfind("cdc", 0) == 0)    { known = kCdc;    count = std::size(kCdc); }
     else if (sub.rfind("daemon", 0) == 0)  { known = kDaemon;  count = std::size(kDaemon); }
     else if (sub.rfind("sub", 0) == 0)     { known = kSub;     count = std::size(kSub); }
     else if (sub.rfind("mass", 0) == 0)    { known = kMass;    count = std::size(kMass); }
@@ -649,6 +650,29 @@ int RunSub(Options o) {
     if (sub == "ls") return RunViaDriver(o, "subs", BuildParams({{"op", "ls"}}));
 
     std::fprintf(stderr, "erpl-rev sub: expected create, advance or ls.\n");
+    return 2;
+}
+
+int RunCdc(Options o) {
+    const std::string sub = o.args.empty() ? "" : o.args[0];
+    if (const int rc = RefuseUnknownFlags(o, "cdc " + sub)) return rc;
+    const auto cfg = cli::ReadConfig();
+    cli::ResolveConn(o, cfg, !o.queue_only && !o.non_interactive && cli::IsTty());
+
+    const std::string target = Field(o, "--target");
+    if ((sub == "status" || sub == "repair") && target.empty()) {
+        std::fprintf(stderr, "erpl-rev cdc %s --target T\n", sub.c_str());
+        return 2;
+    }
+    if (sub == "status")
+        return RunViaDriver(o, "cdc_status", BuildParams({{"target", target}}));
+    if (sub == "repair") {
+        if (const int rc = ConsentGate(o, "Recreate the missing trigger objects of '" +
+                                              target + "'"))
+            return rc;
+        return RunViaDriver(o, "cdc_repair", BuildParams({{"target", target}}));
+    }
+    std::fprintf(stderr, "erpl-rev cdc: expected status or repair.\n");
     return 2;
 }
 

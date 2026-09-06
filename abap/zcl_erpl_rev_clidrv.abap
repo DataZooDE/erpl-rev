@@ -18,6 +18,16 @@
 "!     tick -- needing no ADT call, and so no SAP authorisation, from the CLI.
 CLASS zcl_erpl_rev_clidrv DEFINITION PUBLIC FINAL CREATE PUBLIC.
   PUBLIC SECTION.
+    "! Run one queued command by name. Public so a test can drive the exact
+    "! path a CLI verb takes: the CLI parses arguments and queues; drain claims
+    "! the row and calls this. Testing the verb without the parser is testing
+    "! the whole mechanism.
+    CLASS-METHODS execute
+      IMPORTING iv_verb        TYPE string
+                iv_params      TYPE string
+      EXPORTING ev_result      TYPE string
+                ev_error       TYPE string.
+
     INTERFACES if_oo_adt_classrun.
 
     TYPES: BEGIN OF ty_done,
@@ -40,11 +50,7 @@ CLASS zcl_erpl_rev_clidrv DEFINITION PUBLIC FINAL CREATE PUBLIC.
     "! Claim the oldest pending command, returning its fields as one JSON row.
     CLASS-METHODS claim
       RETURNING VALUE(rs) TYPE zcl_erpl_rev_util=>ty_query.
-    CLASS-METHODS execute
-      IMPORTING iv_verb        TYPE string
-                iv_params      TYPE string
-      EXPORTING ev_result      TYPE string
-                ev_error       TYPE string.
+
     CLASS-METHODS finish
       IMPORTING iv_id     TYPE string
                 iv_result TYPE string
@@ -242,6 +248,89 @@ CLASS zcl_erpl_rev_clidrv IMPLEMENTATION.
             ev_error = |JOB_CLOSE failed subrc { sy-subrc }|.
           ELSE.
             ev_result = |daemon submitted as { lv_djn }/{ lv_djc }|.
+          ENDIF.
+        ENDIF.
+
+      WHEN 'cdc_status' OR 'cdc_repair'.
+        " Two round trips, because the catalogue lives in HANA and the registry
+        " lives in DuckDB and neither can see the other. The server says what to
+        " ask; ABAP asks the database; the server derives the verdict.
+        DATA(lv_ct) = jstr( iv_json = iv_params iv_key = 'target' ).
+        DATA(ls_pr) = zcl_erpl_rev_delta=>plan_json(
+          iv_action = 'CDC_PROBE' iv_target = lv_ct ).
+        IF ls_pr-error IS NOT INITIAL.
+          ev_error = ls_pr-error.
+        ELSE.
+          DATA(lv_tj) = zcl_erpl_rev_cdc=>probe_names(
+                          zcl_erpl_rev_delta=>jstr( iv_json = ls_pr-json
+                                                    iv_key = 'tables_sql' ) ).
+          DATA(lv_sj) = zcl_erpl_rev_cdc=>probe_names(
+                          zcl_erpl_rev_delta=>jstr( iv_json = ls_pr-json
+                                                    iv_key = 'sequences_sql' ) ).
+          DATA(lv_gj) = zcl_erpl_rev_cdc=>probe_names(
+                          zcl_erpl_rev_delta=>jstr( iv_json = ls_pr-json
+                                                    iv_key = 'triggers_sql' ) ).
+          IF lv_tj IS INITIAL OR lv_sj IS INITIAL OR lv_gj IS INITIAL.
+            " A probe that could not run is not an empty catalogue. Deriving a
+            " status from it would mark a healthy target INCONSISTENT.
+            ev_error = |CDC probe failed: the catalogue could not be read|.
+          ELSE.
+            " The triggers come back as "<name>:<IS_VALID>"; split them into the
+            " enabled and disabled sets the derivation compares against.
+            DATA lv_en TYPE string VALUE `[`.
+            DATA lv_di TYPE string VALUE `[`.
+            SPLIT lv_gj AT ',' INTO TABLE DATA(lt_tg).
+            LOOP AT lt_tg INTO DATA(lv_tg).
+              REPLACE ALL OCCURRENCES OF `[` IN lv_tg WITH ``.
+              REPLACE ALL OCCURRENCES OF `]` IN lv_tg WITH ``.
+              REPLACE ALL OCCURRENCES OF `"` IN lv_tg WITH ``.
+              IF lv_tg IS INITIAL. CONTINUE. ENDIF.
+              SPLIT lv_tg AT ':' INTO DATA(lv_nm) DATA(lv_fl).
+              IF lv_fl = 'TRUE' OR lv_fl = 'true' OR lv_fl = 'X'.
+                IF lv_en <> `[`. lv_en = lv_en && `,`. ENDIF.
+                lv_en = lv_en && `"` && lv_nm && `"`.
+              ELSE.
+                IF lv_di <> `[`. lv_di = lv_di && `,`. ENDIF.
+                lv_di = lv_di && `"` && lv_nm && `"`.
+              ENDIF.
+            ENDLOOP.
+            lv_en = lv_en && `]`.
+            lv_di = lv_di && `]`.
+
+            DATA(lv_sp) = |\{"tables":{ lv_tj },"sequences":{ lv_sj },| &&
+                          |"enabled_triggers":{ lv_en },"disabled_triggers":{ lv_di },| &&
+                          |"log_table":"{ zcl_erpl_rev_delta=>jstr( iv_json = ls_pr-json iv_key = 'log_table' ) }",| &&
+                          |"seq_name":"{ zcl_erpl_rev_delta=>jstr( iv_json = ls_pr-json iv_key = 'seq_name' ) }",| &&
+                          |"triggers":{ zcl_erpl_rev_delta=>jarr( iv_json = ls_pr-json iv_key = 'triggers' ) }\}|.
+            DATA(ls_st) = zcl_erpl_rev_delta=>plan_json(
+              iv_action = 'CDC_STATUS' iv_target = lv_ct iv_params = lv_sp ).
+            ev_error  = ls_st-error.
+            ev_result = ls_st-json.
+
+            " repair re-creates ONLY what the probe found missing. Re-running the
+            " whole provision DDL would recreate the shadow table and reset the
+            " position, discarding every change captured since.
+            IF iv_verb = 'cdc_repair' AND ev_error IS INITIAL.
+              DATA(ls_rp) = zcl_erpl_rev_delta=>plan_json(
+                iv_action = 'CDC_REPAIR' iv_target = lv_ct iv_params = lv_sp ).
+              IF ls_rp-error IS NOT INITIAL.
+                ev_error = ls_rp-error.
+              ELSE.
+                " Parsed, not split. A CREATE TRIGGER body is full of commas
+                " and quoted identifiers, so splitting the raw array on a
+                " separator produces fragments that are not SQL.
+                DATA(lt_ddl) = zcl_erpl_rev_delta=>jarr_items( iv_json = ls_rp-json
+                                                               iv_key = 'ddl' ).
+                LOOP AT lt_ddl INTO DATA(lv_one).
+                  IF lv_one IS INITIAL. CONTINUE. ENDIF.
+                  DATA(lv_er) = zcl_erpl_rev_cdc=>repair_exec( lv_one ).
+                  IF lv_er IS NOT INITIAL. ev_error = lv_er. EXIT. ENDIF.
+                ENDLOOP.
+                IF ev_error IS INITIAL.
+                  ev_result = |repaired { lines( lt_ddl ) } object(s)|.
+                ENDIF.
+              ENDIF.
+            ENDIF.
           ENDIF.
         ENDIF.
 

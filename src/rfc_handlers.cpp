@@ -8,6 +8,7 @@
 #include "sap_uc.hpp"
 #include "duckdb_bridge.hpp"
 #include "cdc_dialect.hpp"
+#include "cdc_status.hpp"
 #include "json_util.hpp"
 #include "logging.hpp"
 #include "erpl_rev_telemetry.hpp"
@@ -730,6 +731,138 @@ extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE,
                 throw std::runtime_error("SUBS: unknown op '" + op + "'. Known: create, "
                                          "advance, ls.");
             }
+        } else if (action == "CDC_PROBE") {
+            // What to ASK the database. The server owns the dialect, so the
+            // probe SQL and the expected object list come from one place; ABAP
+            // runs the three statements and posts the names back to CDC_STATUS.
+            // Two round trips rather than one because the catalogue lives in
+            // HANA and the registry lives here, and neither can see the other.
+            // The registration, read the same way CDC_PLAN reads it.
+            CdcState cst = g_bridge->CdcGet(target);
+            if (cst.source.empty() || cst.keys.empty())
+                throw std::runtime_error("CDC_PROBE: " + target + " is not a registered "
+                                         "trigger target");
+            CdcSpec spec;
+            spec.source = cst.source;
+            spec.keys = SplitCsv(cst.keys);
+            spec.mode = CdcModeOf(cst.mode.empty() ? "DELETE_ONLY" : cst.mode);
+            if (spec.mode == CdcMode::ImageIud) {
+                QueryResult tc = g_bridge->Query("SELECT * FROM " + target + " LIMIT 0");
+                for (auto &c : tc.columns) spec.columns.push_back(UpperOf(c.name));
+            }
+            auto dia_p = MakeDialect(cst.platform.empty() ? "HANA" : cst.platform);
+            const CdcDialect &dia = *dia_p;
+            const auto plan_ddl = dia.Plan(spec);
+            std::string trigs;
+            for (size_t i = 0; i < plan_ddl.trigger_names.size(); ++i) {
+                if (i) trigs += ",";
+                trigs += json::QuoteString(plan_ddl.trigger_names[i]);
+            }
+            plan = "{\"tables_sql\":" + json::QuoteString(dia.ProbeTablesSql()) +
+                   ",\"sequences_sql\":" + json::QuoteString(dia.ProbeSequencesSql()) +
+                   ",\"triggers_sql\":" + json::QuoteString(dia.ProbeTriggersSql()) +
+                   ",\"log_table\":" + json::QuoteString(plan_ddl.log_table) +
+                   ",\"seq_name\":" + json::QuoteString(plan_ddl.seq_name) +
+                   ",\"triggers\":[" + trigs + "]}";
+        } else if (action == "CDC_STATUS") {
+            // The verdict, from what the database actually reported. Status is
+            // DERIVED here, never a stored enum trusted on its own: a trigger
+            // dropped out of band by a system copy, a transport or a DBA is
+            // invisible to the registry and silently captures nothing.
+            auto names = [&](const char *key) {
+                std::vector<std::string> out;
+                const auto arr = JsonField(params, key);
+                size_t at = 0;
+                while (at < arr.size()) {
+                    const auto b = arr.find('"', at);
+                    if (b == std::string::npos) break;
+                    const auto e = arr.find('"', b + 1);
+                    if (e == std::string::npos) break;
+                    out.push_back(arr.substr(b + 1, e - b - 1));
+                    at = e + 1;
+                }
+                return out;
+            };
+            cdc::Probe have;
+            have.tables = names("tables");
+            have.sequences = names("sequences");
+            have.enabled_triggers = names("enabled_triggers");
+            have.disabled_triggers = names("disabled_triggers");
+
+            cdc::Expected want;
+            want.log_table = JsonField(params, "log_table");
+            want.seq_name = JsonField(params, "seq_name");
+            want.triggers = names("triggers");
+
+            CdcState cs = g_bridge->CdcGet(target);
+            const bool deactivated = cs.status == "DISABLED";
+            const auto res = cdc::Derive(want, have, deactivated);
+            const auto name = cdc::StatusName(res.status);
+
+            // Persisted, so the tick planner and the operator see the same
+            // answer. An INCONSISTENT trigger set must not keep cycling: the
+            // position would advance past changes that were never captured.
+            g_bridge->CdcSetStatus(target, name);
+
+            std::string miss;
+            for (size_t i = 0; i < res.missing.size(); ++i) {
+                if (i) miss += ",";
+                miss += json::QuoteString(res.missing[i]);
+            }
+            plan = "{\"status\":" + json::QuoteString(name) + ",\"explain\":" +
+                   json::QuoteString(cdc::Explain(res)) + ",\"missing\":[" + miss + "]}";
+        } else if (action == "CDC_REPAIR") {
+            // ONLY the missing objects. Re-running the whole provision DDL
+            // would recreate the shadow table and reset the position,
+            // discarding every change captured since -- a "repair" that loses
+            // exactly the data it was run to protect.
+            CdcState cst = g_bridge->CdcGet(target);
+            if (cst.source.empty() || cst.keys.empty())
+                throw std::runtime_error("CDC_REPAIR: " + target + " is not a registered "
+                                         "trigger target");
+            CdcSpec spec;
+            spec.source = cst.source;
+            spec.keys = SplitCsv(cst.keys);
+            spec.mode = CdcModeOf(cst.mode.empty() ? "DELETE_ONLY" : cst.mode);
+            if (spec.mode == CdcMode::ImageIud) {
+                QueryResult tc = g_bridge->Query("SELECT * FROM " + target + " LIMIT 0");
+                for (auto &c : tc.columns) spec.columns.push_back(UpperOf(c.name));
+            }
+            auto dia_r = MakeDialect(cst.platform.empty() ? "HANA" : cst.platform);
+            const auto full = dia_r->Plan(spec);
+
+            auto names2 = [&](const char *key) {
+                std::vector<std::string> out;
+                const auto arr = JsonField(params, key);
+                size_t at = 0;
+                while (at < arr.size()) {
+                    const auto b = arr.find('"', at);
+                    if (b == std::string::npos) break;
+                    const auto e = arr.find('"', b + 1);
+                    if (e == std::string::npos) break;
+                    out.push_back(arr.substr(b + 1, e - b - 1));
+                    at = e + 1;
+                }
+                return out;
+            };
+            cdc::Probe have;
+            have.tables = names2("tables");
+            have.sequences = names2("sequences");
+            have.enabled_triggers = names2("enabled_triggers");
+            have.disabled_triggers = names2("disabled_triggers");
+            cdc::Expected want;
+            want.log_table = full.log_table;
+            want.seq_name = full.seq_name;
+            want.triggers = full.trigger_names;
+
+            const auto st_r = cdc::Derive(want, have, false);
+            const auto ddl = cdc::RepairPlan(st_r, full.provision_ddl);
+            std::string arr;
+            for (size_t i = 0; i < ddl.size(); ++i) {
+                if (i) arr += ",";
+                arr += json::QuoteString(ddl[i]);
+            }
+            plan = "{\"ddl\":[" + arr + "],\"count\":" + std::to_string(ddl.size()) + "}";
         } else if (action == "SET_WM") {
             // An operator moving the position, deliberately -- to re-deliver a
             // window after a downstream loss, or to adopt a position after a
@@ -788,7 +921,7 @@ extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE,
             throw std::runtime_error(
                 "unknown plan action '" + action +
                 "'. Known: BEGIN_CYCLE, CYCLE_COMMIT, TICK, CDC_APPLY, DRIFT, SUBS, "
-                "RETAIN, SET_WM, PREVIEW.");
+                "RETAIN, SET_WM, PREVIEW, CDC_PROBE, CDC_STATUS, CDC_REPAIR.");
         }
 
         SetString(funcHandle, "EV_PLAN", plan);

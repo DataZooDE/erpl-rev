@@ -1,5 +1,25 @@
 CLASS zcl_erpl_rev_cdc DEFINITION PUBLIC FINAL CREATE PUBLIC.
   PUBLIC SECTION.
+    "! Runs a catalogue probe and returns the first column of every row as a
+    "! JSON array of strings. Used only for the ZCDC_* catalogue queries the
+    "! server hands over, which return one or two name columns.
+    "!
+    "! A second column, when the statement selects one, is treated as a
+    "! true/false flag and appended as "<name>:<flag>" -- HANA's trigger probe
+    "! reports IS_VALID that way, and an invalid trigger is present in the
+    "! catalogue while firing nothing, which looks healthy and captures nothing.
+    CLASS-METHODS probe_names
+      IMPORTING iv_sql TYPE string
+      RETURNING VALUE(rv_json) TYPE string.
+
+    "! Runs one DDL statement natively. Public so the command driver can apply
+    "! a repair plan the server computed -- only the missing objects, never the
+    "! whole provision DDL, which would recreate the shadow table and reset the
+    "! position.
+    CLASS-METHODS repair_exec
+      IMPORTING iv_sql TYPE string
+      RETURNING VALUE(rv_error) TYPE string.
+
     " Thin executor for the opt-in trigger-CDC delta tier (epic #17 / ADR-0004).
     " It makes ZERO CDC decisions: the server (Z_DUCKDB_CDC_PLAN / Z_DUCKDB_CDC_APPLY)
     " generates every piece of SQL and owns all state; this class only
@@ -210,6 +230,55 @@ CLASS zcl_erpl_rev_cdc IMPLEMENTATION.
     rs-del     = to_int( lv_del ).
     rs-prune   = to_int( lv_pru ).
     rs-applied = xsdbool( lv_app = 'X' ).
+  ENDMETHOD.
+
+  METHOD probe_names.
+    TYPES: BEGIN OF ty_row,
+             c1 TYPE string,
+             c2 TYPE string,
+           END OF ty_row.
+    DATA lt TYPE STANDARD TABLE OF ty_row WITH EMPTY KEY.
+    DATA lo_res TYPE REF TO cl_sql_result_set.
+
+    rv_json = `[]`.
+    TRY.
+        lo_res = NEW cl_sql_statement( )->execute_query( iv_sql ).
+        DATA(lt_md) = lo_res->get_metadata( ).
+        DATA(lv_cols) = lines( lt_md ).
+        GET REFERENCE OF lt INTO DATA(lr).
+        IF lv_cols = 1.
+          " One column: bind a one-field structure, or ADBC rejects the shape.
+          TYPES: BEGIN OF ty_one, c1 TYPE string, END OF ty_one.
+          DATA lt1 TYPE STANDARD TABLE OF ty_one WITH EMPTY KEY.
+          GET REFERENCE OF lt1 INTO DATA(lr1).
+          lo_res->set_param_table( lr1 ).
+          lo_res->next_package( ).
+          lo_res->close( ).
+          LOOP AT lt1 INTO DATA(ls1).
+            IF rv_json = `[]`. rv_json = `[`. ELSE. rv_json = rv_json && `,`. ENDIF.
+            rv_json = rv_json && `"` && ls1-c1 && `"`.
+          ENDLOOP.
+          IF rv_json <> `[]`. rv_json = rv_json && `]`. ENDIF.
+        ELSE.
+          lo_res->set_param_table( lr ).
+          lo_res->next_package( ).
+          lo_res->close( ).
+          LOOP AT lt INTO DATA(ls).
+            IF rv_json = `[]`. rv_json = `[`. ELSE. rv_json = rv_json && `,`. ENDIF.
+            rv_json = rv_json && `"` && ls-c1 && `:` && ls-c2 && `"`.
+          ENDLOOP.
+          IF rv_json <> `[]`. rv_json = rv_json && `]`. ENDIF.
+        ENDIF.
+      CATCH cx_root.
+        " A probe that cannot run is not an empty catalogue. Returning [] would
+        " read as "every object is missing" and mark a healthy target
+        " INCONSISTENT, so say nothing rather than something false.
+        rv_json = ``.
+    ENDTRY.
+  ENDMETHOD.
+
+  METHOD repair_exec.
+    rv_error = exec_native( iv_sql = iv_sql iv_ddl = abap_true ).
   ENDMETHOD.
 
   METHOD exec_native.

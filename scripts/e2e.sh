@@ -247,7 +247,7 @@ suite delta ZCL_ERPL_REV_DELTATEST abap/zcl_erpl_rev_deltatest.abap DELTA 1 "" \
 # on the source via the server-generated DDL, physically deletes rows, and proves one
 # CDC cycle reflects the deletes in the DuckDB target; idempotent re-run; teardown
 # leaves no orphan objects. Needs ZCL_ERPL_REV_CDC[TEST] + the CDC FMs (mkfm).
-suite cdc ZCL_ERPL_REV_CDCTEST abap/zcl_erpl_rev_cdctest.abap CDC 1 "" \
+suite cdc ZCL_ERPL_REV_CDCTEST abap/zcl_erpl_rev_cdctest.abap CDC 30 "" \
   "real HANA triggers capture physical deletes; teardown leaves nothing"
 
 

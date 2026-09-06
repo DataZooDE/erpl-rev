@@ -91,6 +91,22 @@ std::string SqlLit(const std::string &s) {
 
 // The trigger-CDC state-machine transition guard.
 bool AllowedCdcTransition(const std::string &from, const std::string &to) {
+    // INCONSISTENT and ERROR are OBSERVATIONS, not steps in the lifecycle, and
+    // they are reachable from anywhere.
+    //
+    // The lifecycle guard used to refuse them, which made the trigger tier
+    // unable to record what the catalogue actually said: a trigger dropped out
+    // of band left the target ACTIVE, `cdc status` threw "illegal transition
+    // ACTIVE -> INCONSISTENT", and the target went on cycling and capturing
+    // nothing. A status derived from probing the database cannot be constrained
+    // by a state machine that assumes only this program changes it -- the whole
+    // reason to probe is that something else did.
+    if (to == "INCONSISTENT" || to == "ERROR") return true;
+    // ...and a target observed broken must be able to come back once it is
+    // repaired or re-provisioned.
+    if (from == "INCONSISTENT" || from == "ERROR")
+        return to == "ACTIVE" || to == "SEEDED" || to == "PROVISIONED" || to == "DISABLED";
+
     if (from == "PROVISIONED") return to == "SEEDED" || to == "DISABLED";
     if (from == "SEEDED")      return to == "ACTIVE" || to == "DISABLED";
     if (from == "ACTIVE")      return to == "ACTIVE" || to == "DISABLED";
