@@ -374,6 +374,7 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
     // begin; for a counter it is cut from the rows actually staged, which is
     // knowable only now.
     std::string new_wm = st.wm_value;
+    LoadPlan load_plan;
     {
         wm::WatermarkSpec spec;
         spec.kind = wm::ParseKind(st.wm_kind.empty() ? "NUMTS" : st.wm_kind);
@@ -389,6 +390,7 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
                                    ? "D"
                                    : rt->GetValue(0, 0).ToString();
         const auto plan = PlanLoad(ParseLoadType(lt));
+        load_plan = plan;
 
         if (plan.advance_watermark || plan.seed_watermark) {
             if (spec.kind == wm::WmKind::Int) {
@@ -450,6 +452,22 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
                 con.Query("ALTER TABLE " + target + " ADD PRIMARY KEY (" + kl + ")");
             }
         }
+        // A reload REPLACES the target. Upserting without this left every row the
+        // source had since deleted -- which is the drift an operator runs F to
+        // repair, so the repair reported success and fixed nothing. Inside the
+        // transaction, so a failure leaves the old contents intact rather than
+        // an emptied target.
+        if (load_plan.truncate_target && have_target) {
+            const auto before = Scalar(con, "SELECT count(*) FROM " + target);
+            Exec(con, "DELETE FROM " + target, "truncate target for reload");
+            const long long had = before.empty() ? 0 : std::stoll(before);
+            const long long staged =
+                have_stage ? std::stoll(Scalar(con, "SELECT count(*) FROM " + stage)) : 0;
+            // Rows that were in the target and are not coming back: what the
+            // reload actually removed, rather than a field that was always zero.
+            res.del = had > staged ? had - staged : 0;
+        }
+
         if (want_log) {
             // Provision the log ONCE, not on every commit. This block used to run
             // its CREATE, five duckdb_columns() probes and a CREATE SEQUENCE every

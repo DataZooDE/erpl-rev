@@ -341,7 +341,10 @@ TEST_CASE("cycle: a repair run does not move the watermark", "[cycle]") {
     StageRows(con, b.stage_table);
     cycle::Commit(con, "zdelta_wm", b.run_id, {2});
 
-    CHECK(Scalar(con, "SELECT count(*) FROM zdelta_wm") == "3");        // data repaired
+    // A repair is a real reload: the target is replaced by what the run staged,
+    // so the row that the reload did not carry is correctly gone. Only the
+    // watermark stays where it was -- that is this case's subject.
+    CHECK(Scalar(con, "SELECT count(*) FROM zdelta_wm") == "2");
     CHECK(Scalar(con, "SELECT wm_value FROM _erpl_rev_delta_state") == "20260905100000");
 }
 
@@ -620,4 +623,47 @@ TEST_CASE("cycle: the watermark never moves backwards, whatever the clock does",
     cycle::Commit(con, "zdelta_wm", b.run_id, {0});
 
     CHECK(Scalar(con, "SELECT wm_value FROM _erpl_rev_delta_state") == after);
+}
+
+TEST_CASE("cycle: F is a real reload -- source deletions disappear from the target",
+          "[cycle]") {
+    // The repair an operator runs BECAUSE the target drifted. Upserting without
+    // truncating leaves every row the source has since deleted, which is exactly
+    // the drift they were trying to fix -- so F "succeeded" and changed nothing
+    // about the problem.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con);
+    // The target has a row the source no longer has.
+    Exec(con, "INSERT INTO zdelta_wm VALUES (99,'deleted-at-source','20260905090000')");
+    CHECK(Scalar(con, "SELECT count(*) FROM zdelta_wm") == "3");
+
+    const auto b = cycle::Begin(con, "zdelta_wm", LoadType::Full, kReadStart);
+    CHECK(b.plan.truncate_target);
+    Exec(con, "CREATE TABLE " + b.stage_table + "(id INTEGER, v VARCHAR, changed_at VARCHAR)");
+    Exec(con, "INSERT INTO " + b.stage_table + " VALUES (1,'a','20260905110000'),"
+              "(2,'b','20260905110000')");
+    const auto r = cycle::Commit(con, "zdelta_wm", b.run_id, {2});
+
+    CHECK(Scalar(con, "SELECT count(*) FROM zdelta_wm") == "2");
+    CHECK(Scalar(con, "SELECT count(*) FROM zdelta_wm WHERE id=99") == "0");
+    CHECK(r.del == 1);   // reported, not silently zero
+    // ...and a repair still does not move the delta position.
+    CHECK(Scalar(con, "SELECT wm_value FROM _erpl_rev_delta_state") == "20260905100000");
+}
+
+TEST_CASE("cycle: an ordinary delta cycle never truncates", "[cycle]") {
+    // The other half of the same rule: D must leave rows it did not read alone,
+    // or every delta cycle would empty the target down to its own batch.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con);
+
+    const auto b = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart);
+    CHECK_FALSE(b.plan.truncate_target);
+    Exec(con, "CREATE TABLE " + b.stage_table + "(id INTEGER, v VARCHAR, changed_at VARCHAR)");
+    Exec(con, "INSERT INTO " + b.stage_table + " VALUES (3,'c','20260905110000')");
+    cycle::Commit(con, "zdelta_wm", b.run_id, {1});
+
+    CHECK(Scalar(con, "SELECT count(*) FROM zdelta_wm") == "3");
 }
