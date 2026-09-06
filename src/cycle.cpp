@@ -458,7 +458,18 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
     }
     res.new_watermark = new_wm;
 
-    const bool want_log = st.log_enabled && will_merge;
+    // Provisioning the log and appending to it are separate decisions. The log
+    // used to be created only by a cycle that had rows to append, so a
+    // log-enabled target that had been quiet since registration had no log
+    // table at all -- and a subscriber, or retention, met "table does not
+    // exist" rather than an empty log. An empty log is a fact every reader can
+    // handle; a missing one is an error every reader has to special-case.
+    // The log is created from the TARGET's shape, so it needs a target and
+    // nothing else -- in particular not a stage, which a quiet cycle has none
+    // of. (The column reconcile below iterates the stage's columns and is
+    // simply a no-op when there are none.)
+    const bool want_log = st.log_enabled && have_target;
+    const bool append_log = want_log && will_merge;
     const std::string log = ChangeLogName(target);
 
     Exec(con, "BEGIN", "begin");
@@ -478,7 +489,14 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
         // repair, so the repair reported success and fixed nothing. Inside the
         // transaction, so a failure leaves the old contents intact rather than
         // an emptied target.
-        if (load_plan.truncate_target && have_target) {
+        // ...but only when the reader actually produced a stage. A reload whose
+        // read returned nothing at all -- a short read that reported success, a
+        // connection that dropped between packages -- would otherwise empty the
+        // customer's target and report SUCCESS. Leaving the previous contents
+        // in place is recoverable and visible in rows_read; deleting them is
+        // neither. An EMPTY stage is different: the reader ran and the source
+        // really is empty, and that is a reload the operator asked for.
+        if (load_plan.truncate_target && have_target && have_stage) {
             const auto before = Scalar(con, "SELECT count(*) FROM " + target);
             Exec(con, "DELETE FROM " + target, "truncate target for reload");
             const long long had = before.empty() ? 0 : std::stoll(before);
@@ -531,7 +549,9 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
                     Exec(con, "ALTER TABLE " + log + " ADD COLUMN " + c, "log column");
                 Exec(con, "CREATE SEQUENCE IF NOT EXISTS " + log + "_seq START 1", "log sequence");
             }
+        }
 
+        if (append_log) {
             // Derived before the merge: 'U' if the key is already in the target,
             // 'I' otherwise. That is the engine's verdict about what it is about
             // to do, not the source's claim about what happened.

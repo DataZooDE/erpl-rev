@@ -236,8 +236,24 @@ TEST_CASE("cycle: the change log records one row per applied change", "[cycle][l
     CHECK(Scalar(con, "SELECT _commit_ts = (try_strptime('20260905110500','%Y%m%d%H%M%S') "
                       "AT TIME ZONE 'UTC') FROM " + log + " WHERE id=3") == "true");
     CHECK_FALSE(Scalar(con, "SELECT _applied_at FROM " + log + " WHERE id=3").empty());
-    // Monotonic within the transaction that wrote them.
-    CHECK(Scalar(con, "SELECT count(DISTINCT _seq) FROM " + log) == "2");
+    // Monotonic, which is what a subscription reader orders by -- and what
+    // "count(DISTINCT _seq) == 2" did NOT establish: two distinct numbers are
+    // distinct in either order, so a reversed or randomly assigned sequence
+    // passed that assertion while making every offset-based reader wrong.
+    // Compared in SQL, not by string: _seq is a number, and "10" sorts before
+    // "9" as text.
+    CHECK(Scalar(con, "SELECT (SELECT _seq FROM " + log + " WHERE id=2) < "
+                      "(SELECT _seq FROM " + log + " WHERE id=3)") == "true");
+
+    // And monotonic ACROSS cycles, not just within one: the next cycle's rows
+    // must all sort after this cycle's, or a reader that stopped at the last
+    // seq it saw would skip them.
+    const auto b2 = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart + 600);
+    Exec(con, "CREATE TABLE " + b2.stage_table + "(id INTEGER, v VARCHAR, changed_at VARCHAR)");
+    Exec(con, "INSERT INTO " + b2.stage_table + " VALUES (4,'d','20260905115900')");
+    cycle::Commit(con, "zdelta_wm", b2.run_id, {1});
+    CHECK(Scalar(con, "SELECT (SELECT min(_seq) FROM " + log + " WHERE id=4) > "
+                      "(SELECT max(_seq) FROM " + log + " WHERE id<>4)") == "true");
 }
 
 TEST_CASE("cycle: no log rows when the apply fails", "[cycle][log]") {
@@ -719,4 +735,95 @@ TEST_CASE("cycle: the fence refuses a target that is not registered at all", "[c
     // whatever made the WHERE miss.
     CHECK_THROWS_WITH(cycle::AdvanceWatermarkFenced(con, "no_such_target", 1, "20260905130000", 0),
                       Catch::Matchers::ContainsSubstring("lost ownership"));
+}
+
+// --- the empty batch ---------------------------------------------------------
+//
+// The commonest cycle in production, by a wide margin: a micro-cadence target
+// where nothing changed. It had no test at all, and it is the one cycle whose
+// watermark advance matters most -- a quiet target that does not advance its
+// floor re-reads an ever-widening range until it is reading the whole table.
+
+TEST_CASE("cycle: a cycle that reads nothing still advances the watermark", "[cycle]") {
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con, /*log_enabled=*/true);
+
+    const auto b = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart);
+    // No stage table: the reader found nothing and created none.
+    const auto r = cycle::Commit(con, "zdelta_wm", b.run_id, {0});
+
+    CHECK(r.ins == 0);
+    CHECK(r.upd == 0);
+    CHECK(r.logged == 0);
+    // The point. Standing still here means the next cycle re-reads from the old
+    // floor, and the range grows with every quiet tick.
+    CHECK(Scalar(con, "SELECT wm_value FROM _erpl_rev_delta_state") ==
+          b.bounds.next_watermark);
+    CHECK(Scalar(con, "SELECT count(*) FROM zdelta_wm") == "2");
+    CHECK(Scalar(con, "SELECT status FROM _erpl_rev_delta_state") == "IDLE");
+    CHECK(Scalar(con, "SELECT active_run_id FROM _erpl_rev_delta_state").empty());
+    CHECK(Scalar(con, "SELECT status FROM _erpl_rev_run_stats WHERE run_id=" +
+                          std::to_string(b.run_id)) == "SUCCESS");
+    // Nothing changed, so the log must record nothing -- an empty cycle that
+    // wrote a row would make every subscriber's offset move for no data.
+    CHECK(Scalar(con, "SELECT count(*) FROM " + cycle::ChangeLogName("zdelta_wm")) == "0");
+}
+
+TEST_CASE("cycle: an empty stage table is not the same as no stage table", "[cycle]") {
+    // The reader created its stage and then had nothing to put in it. Same
+    // outcome as above -- and the stage must still be dropped, or the next
+    // cycle's orphan sweep is doing work that should never have been needed.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con, /*log_enabled=*/true);
+
+    const auto b = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart);
+    Exec(con, "CREATE TABLE " + b.stage_table + "(id INTEGER, v VARCHAR, changed_at VARCHAR)");
+    const auto r = cycle::Commit(con, "zdelta_wm", b.run_id, {0});
+
+    CHECK(r.ins == 0);
+    CHECK(r.upd == 0);
+    CHECK(Scalar(con, "SELECT wm_value FROM _erpl_rev_delta_state") == b.bounds.next_watermark);
+    CHECK(Scalar(con, "SELECT count(*) FROM zdelta_wm") == "2");
+    CHECK(Scalar(con, "SELECT count(*) FROM duckdb_tables() WHERE table_name=" +
+                      std::string("'") + b.stage_table + "'") == "0");
+}
+
+TEST_CASE("cycle: a full load that read nothing at all does not empty the target",
+          "[cycle]") {
+    // F truncates before it loads, and that is what the operator asked for. But
+    // a read that produced no staging table at all did not decide the source is
+    // empty -- it produced nothing: a short read that reported success, a
+    // connection dropped between packages. Truncating on that evidence deletes
+    // the customer's replicated table and reports SUCCESS. Keeping the previous
+    // contents is recoverable and visible as rows_read=0; deleting them is not.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con);
+
+    const auto b = cycle::Begin(con, "zdelta_wm", LoadType::Full, kReadStart);
+    const auto r = cycle::Commit(con, "zdelta_wm", b.run_id, {0});
+
+    CHECK(Scalar(con, "SELECT count(*) FROM zdelta_wm") == "2");
+    CHECK(r.del == 0);
+}
+
+TEST_CASE("cycle: a full load from a genuinely empty source does empty the target",
+          "[cycle]") {
+    // The other half, and the reason the rule above is about the STAGE rather
+    // than about the row count: here the reader ran, created its stage and
+    // found nothing. The source is empty, so the replica must be too --
+    // otherwise F silently stops being a reload the moment a table is
+    // truncated at the source.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con);
+
+    const auto b = cycle::Begin(con, "zdelta_wm", LoadType::Full, kReadStart);
+    Exec(con, "CREATE TABLE " + b.stage_table + "(id INTEGER, v VARCHAR, changed_at VARCHAR)");
+    const auto r = cycle::Commit(con, "zdelta_wm", b.run_id, {0});
+
+    CHECK(Scalar(con, "SELECT count(*) FROM zdelta_wm") == "0");
+    CHECK(r.del == 2);
 }

@@ -13,6 +13,8 @@
 #include <catch2/catch_test_macros.hpp>
 #include <duckdb.hpp>
 
+#include <cstdlib>
+
 #include "control_schema.hpp"
 #include "cycle.hpp"
 #include "publish.hpp"
@@ -139,6 +141,32 @@ TEST_CASE("subscription: a failed publish leaves the offset unmoved", "[publish]
     CHECK(Scalar(con, "SELECT \"offset\" FROM _erpl_rev_subscription WHERE name='broken'") == "0");
 }
 
+TEST_CASE("subscription: a parquet sink that cannot be written leaves the offset unmoved",
+          "[publish]") {
+    // The same guarantee as above, on the OTHER sink path. A table sink fails
+    // inside DuckDB's catalogue; a parquet sink fails in the filesystem, at COPY
+    // time, and nothing in the code makes the two share a failure route -- so
+    // covering only the table sink left the file path free to advance an offset
+    // past rows that were never written to a file anybody can read.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    SetupLog(con);
+    CreateSubscription(con, "brokenfile", "t",
+                       "PARQUET:/nonexistent-erpl-rev-dir/does/not/exist/out.parquet:FULL");
+
+    CHECK_THROWS(Advance(con, "brokenfile"));
+    CHECK(Scalar(con, "SELECT \"offset\" FROM _erpl_rev_subscription WHERE name='brokenfile'") ==
+          "0");
+
+    // And it is recoverable: pointed somewhere writable, the same subscription
+    // delivers the rows it never lost.
+    Exec(con, "UPDATE _erpl_rev_subscription SET sink_spec='PARQUET:" +
+                  std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
+                  "/erpl_rev_pubfail.parquet:FULL' WHERE name='brokenfile'");
+    const auto r = Advance(con, "brokenfile");
+    CHECK(r.published == 5);
+}
+
 TEST_CASE("subscription: key deduplication keeps the last write per key", "[publish]") {
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
@@ -198,10 +226,31 @@ TEST_CASE("retention: rows are kept until every subscription has passed them",
 TEST_CASE("retention: a target with no subscriptions keeps only the window",
           "[publish]") {
     // Otherwise an unsubscribed log grows without bound.
+    //
+    // This asserted only that a ZERO window deletes everything -- which says
+    // nothing about a window, and left the case the name promises untested:
+    // that with no subscriber the window is the ONLY thing holding rows back.
     duckdb::DuckDB db(nullptr);
     duckdb::Connection con(db);
     SetupLog(con);
-    CHECK(Retain(con, "t", 0) == 5);
+    const std::string log = cycle::ChangeLogName("t");
+
+    // Inside the window, nothing goes, subscriber or not.
+    CHECK(Retain(con, "t", 3600) == 0);
+    CHECK(Scalar(con, "SELECT count(*) FROM " + log) == "5");
+
+    // Age two rows out of it, and exactly those two go -- not all five, and not
+    // none. A retention that deleted by count or ignored the window would pass
+    // the old assertion and fail this one.
+    Exec(con, "UPDATE " + log + " SET _applied_at = now() - INTERVAL '2 hours' WHERE _seq <= 2");
+    CHECK(Retain(con, "t", 3600) == 2);
+    CHECK(Scalar(con, "SELECT count(*) FROM " + log) == "3");
+    CHECK(Scalar(con, "SELECT min(_seq) FROM " + log) == "3");
+
+    // And with the window closed, the rest follows: nothing is subscribed, so
+    // nothing is holding them.
+    CHECK(Retain(con, "t", 0) == 3);
+    CHECK(Scalar(con, "SELECT count(*) FROM " + log) == "0");
 }
 
 TEST_CASE("retention: the window protects recent rows", "[publish]") {
