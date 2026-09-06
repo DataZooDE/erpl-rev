@@ -109,13 +109,13 @@ bool ListenIsLoopback(const std::string &listen) {
 // Parsed command-line options. *_set marks "seen on the command line" so the
 // resolver can apply CLI-over-env precedence without conflating an explicit
 // empty value with "unset".
-enum class Verb { Serve, Setup, Doctor, Sql, Sync, Replicate, Daemon, Sub, Retain, Cdc, Mass };
+enum class Verb { Serve, Setup, Doctor, Sql, Sync, Replicate, Daemon, Sub, Retain, Cdc, Mass, Top };
 
 // Verbs whose flags are parsed by the cmd module.
 inline bool IsCmdVerb(Verb v) {
     return v == Verb::Sql || v == Verb::Sync || v == Verb::Replicate ||
            v == Verb::Daemon || v == Verb::Sub || v == Verb::Retain ||
-           v == Verb::Cdc || v == Verb::Mass;
+           v == Verb::Cdc || v == Verb::Mass || v == Verb::Top;
 }
 
 struct Cli {
@@ -251,6 +251,7 @@ Cli ParseArgs(int argc, char **argv) {
         else if (v == "retain") { c.verb = Verb::Retain; first = 2; }
         else if (v == "cdc")    { c.verb = Verb::Cdc;    first = 2; }
         else if (v == "mass")   { c.verb = Verb::Mass;   first = 2; }
+        else if (v == "top")    { c.verb = Verb::Top;    first = 2; }
         else {
             std::fprintf(stderr, "erpl-rev: unknown command '%s'\n"
                                  "Commands: serve (default), setup, doctor, sql, sync, replicate. "
@@ -349,7 +350,7 @@ Cli ParseArgs(int argc, char **argv) {
         } else if ((c.verb == Verb::Sync || c.verb == Verb::Replicate ||
                     c.verb == Verb::Daemon || c.verb == Verb::Sub ||
                     c.verb == Verb::Retain || c.verb == Verb::Cdc ||
-                    c.verb == Verb::Mass) &&
+                    c.verb == Verb::Mass || c.verb == Verb::Top) &&
                    a.rfind("--", 0) == 0) {
             // sync and replicate mirror a five-tab SAP selection screen. Rather
             // than redeclare thirty flags here, their words are collected and
@@ -446,6 +447,7 @@ int main(int argc, char **argv) {
     if (cli.verb == Verb::Retain)    return cmd::RunRetain(cli.cmd);
     if (cli.verb == Verb::Cdc)       return cmd::RunCdc(cli.cmd);
     if (cli.verb == Verb::Mass)      return cmd::RunMass(cli.cmd);
+    if (cli.verb == Verb::Top)       return cmd::RunTop(cli.cmd);
 
     // Two surfaces, because this process almost never runs on a terminal. The
     // banner is for the operator who starts it by hand; the log line is for the

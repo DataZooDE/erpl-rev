@@ -213,6 +213,7 @@ find_package(OpenSSL REQUIRED)
 # comes from the vcpkg static triplet, so the single-file bundle gains no new
 # runtime .so/.dylib/.dll and DuckDB stays the only bundled library.
 find_package(ZLIB REQUIRED)
+find_package(ftxui CONFIG REQUIRED)
 
 # The ABAP objects `erpl-rev setup` deploys, compiled into the binary: a PyPI
 # install has no checkout to read them from.
@@ -278,6 +279,8 @@ add_library(erpl_rev_core OBJECT
   src/validation.cpp
   src/publish.cpp
   src/metrics.cpp
+  src/tui_model.cpp
+  src/cmd_top.cpp
   src/cdc_status.cpp
   src/portion.cpp
   src/cds_delta.cpp
@@ -313,7 +316,8 @@ target_compile_definitions(erpl_rev_core PUBLIC
 # omission was invisible; on Windows they exist only inside the vcpkg imported
 # targets, and the build stopped at the first #include.
 target_link_libraries(erpl_rev_core PUBLIC
-  posthog_telemetry datazoo_banner OpenSSL::Crypto ZLIB::ZLIB)
+  posthog_telemetry datazoo_banner OpenSSL::Crypto ZLIB::ZLIB
+  ftxui::screen ftxui::dom ftxui::component)
 set_target_properties(erpl_rev_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # --- Server ------------------------------------------------------------------
@@ -370,6 +374,7 @@ if(TRUE)  # tests always build; DuckDB is in-tree
     test/test_publish.cpp
     test/test_stats_views.cpp
     test/test_metrics.cpp
+    test/test_tui_model.cpp
     test/test_cdc_status.cpp
     test/test_portion.cpp
     test/test_cds_delta.cpp

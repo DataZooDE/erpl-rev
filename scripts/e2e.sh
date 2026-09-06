@@ -540,6 +540,15 @@ else
   echo "   prometheus endpoint skipped (no curl)"
 fi
 
+# The monitor, rendered for real. --once draws one frame through the same
+# element tree the live display uses, so what a script sees is what an operator
+# sees -- a second formatter would drift from the first.
+TOP="$(cli top --once 2>&1 || true)"
+grep -q "TARGET" <<<"$TOP" || fail "top --once drew no table: $(head -c 300 <<<"$TOP")"
+grep -q "t000_cli" <<<"$TOP" || fail "top --once does not show the registered targets: $TOP"
+grep -qE "daemon (RUNNING|STOPPED)" <<<"$TOP" || fail "top --once shows no daemon state: $TOP"
+echo "   top --once renders the targets and the daemon state"
+
 # cdc status on a target that is not a trigger target must say so, not crash.
 CS="$(cli cdc status --target t000_cli --yes 2>&1 || true)"
 grep -qiE "not a registered trigger target|no registration" <<<"$CS"   || fail "cdc status on a non-CDC target gave no usable message: $CS"

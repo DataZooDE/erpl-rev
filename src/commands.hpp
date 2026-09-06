@@ -73,6 +73,7 @@ int RunSub(Options o);      // create | advance | ls
 int RunRetain(Options o);   // prune a target's change log
 int RunCdc(Options o);      // status | repair
 int RunMass(Options o);     // run --split
+int RunTop(Options o);      // the replication monitor
 int RunReplicate(Options o);
 
 } // namespace erpl_rev::cmd
