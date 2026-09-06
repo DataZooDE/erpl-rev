@@ -44,7 +44,12 @@ double CadenceSeconds(const std::string &cadence) {
 // left at either would otherwise truncate and reload on every due tick.
 std::string EffectiveLoadType(const TargetRow &t) {
     const std::string want = t.load_type_default.empty() ? "D" : t.load_type_default;
-    if ((want == "F" || want == "L") && t.one_shot_spent) return "D";
+    // I belongs here as much as F and L. It is "adopt a position, transfer
+    // nothing" -- a once-per-target action by definition -- and left undemoted
+    // it planned on every tick forever: the read is skipped, the watermark is
+    // re-seeded to the new ceiling, and the run is recorded SUCCESS with zero
+    // rows. A permanently empty target with a green dashboard.
+    if ((want == "F" || want == "L" || want == "I") && t.one_shot_spent) return "D";
     return want;
 }
 

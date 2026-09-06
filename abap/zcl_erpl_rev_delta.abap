@@ -314,7 +314,7 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       |{ lv_log },{ lv_lt },{ lv_aer },'IDLE') | &&
       |ON CONFLICT (target) DO UPDATE SET method=excluded.method, source_from=excluded.source_from, | &&
       |keys=excluded.keys, chg_col=excluded.chg_col, time_col=excluded.time_col, | &&
-      |wm_kind=excluded.wm_kind, wm_value=excluded.wm_value, | &&
+      |wm_kind=excluded.wm_kind, | &&
       |safety_secs=excluded.safety_secs, safety_units=excluded.safety_units, | &&
       |cadence=excluded.cadence, extra=excluded.extra, | &&
       |log_enabled=coalesce(excluded.log_enabled, _erpl_rev_delta_state.log_enabled), | &&
@@ -327,7 +327,20 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       " type: saying 'L' again means "seed it again", while a registration that
       " never mentions the load type must leave a spent one spent.
       |one_shot_spent=CASE WHEN excluded.load_type_default IS NOT NULL | &&
-      |                    THEN false ELSE _erpl_rev_delta_state.one_shot_spent END|.
+      |                    THEN false ELSE _erpl_rev_delta_state.one_shot_spent END, | &&
+      " BLOCKED needs an exit, and re-registering is it: the operator has just
+      " restated what the target should be, and the validations above ran
+      " against that. Without this a blocked target is invisible forever and
+      " the only cure is hand-written SQL.
+      |status=CASE WHEN coalesce(_erpl_rev_delta_state.status,'')='BLOCKED' | &&
+      |            THEN 'IDLE' ELSE _erpl_rev_delta_state.status END, | &&
+      |last_error=CASE WHEN coalesce(_erpl_rev_delta_state.status,'')='BLOCKED' | &&
+      |                THEN NULL ELSE _erpl_rev_delta_state.last_error END, | &&
+      " wm_value is ENGINE state once a cycle has run -- the ownership rule
+      " above -- so registration seeds it and never overwrites it. It was
+      " excluded.wm_value unconditionally, which silently rewound a live
+      " target's watermark on any re-registration.
+      |wm_value=coalesce(excluded.wm_value, _erpl_rev_delta_state.wm_value)|.
     DATA(ls) = zcl_erpl_rev_util=>query( lv_sql ).
     rv_error = ls-error.
   ENDMETHOD.
@@ -396,11 +409,17 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       WHEN iv_error IS NOT INITIAL
       THEN |, active_run_id = NULL|
       ELSE |, fail_count = 0, active_run_id = NULL| ).
+    " BLOCKED is never downgraded here. A blocked target that is somehow reached
+    " again -- an in-flight cycle finishing, a manual run -- must not be handed
+    " back to the planner by its own error path, or the outage this status
+    " exists to stop simply resumes.
+    DATA(lv_guard) = COND string( WHEN iv_status = 'BLOCKED' THEN ``
+                                  ELSE | AND coalesce(status,'') <> 'BLOCKED'| ).
     zcl_erpl_rev_util=>query(
       |UPDATE _erpl_rev_delta_state SET status='{ q( iv_status ) }', | &&
       |last_error={ COND string( WHEN iv_error IS INITIAL THEN 'NULL' ELSE |'{ q( iv_error ) }'| ) }| &&
       |{ lv_fail } | &&
-      |WHERE target='{ q( iv_target ) }'| ).
+      |WHERE target='{ q( iv_target ) }'{ lv_guard }| ).
   ENDMETHOD.
 
   METHOD run.
@@ -420,13 +439,24 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
     " executor's business. Kept here so an older server cannot silently drop the
     " parameter on the floor and run an ordinary cycle while reporting a repair.
     "
-    " Released as IDLE, not ERROR: an operator typing the wrong load type is not
-    " a target failure, and 'ERROR' increments fail_count, engages the backoff
-    " and eventually parks a target that is working perfectly.
+    " Released as BLOCKED, and that is the whole point.
+    "
+    " It was released as IDLE, on the reasoning that an operator typo is not a
+    " target failure. True, and it produced a REPLICATION OUTAGE. A refused
+    " target's last_run_ts never moves, so its overdue grows without bound; the
+    " planner sorts by overdue and the budget is max_workers (two by default),
+    " so one or two mis-registered targets permanently occupied the entire
+    " budget and no healthy target was ever planned again -- with status IDLE,
+    " fail_count 0 and no run-statistics row to show for it.
+    "
+    " Whatever refuses a target has to remove it from the due set on the same
+    " tick. BLOCKED is the status the planner already skips. It is also not a
+    " failure count: this is a registration that cannot run, not a run that
+    " failed, and the operator fixes it by re-registering.
     IF iv_load_type <> 'D' AND ls_state-method <> 'WATERMARK'.
       rs-error = |load type { iv_load_type } is not implemented for method | &&
                  |{ ls_state-method }; only WATERMARK targets support one|.
-      release( iv_target = iv_target iv_status = 'IDLE' iv_error = rs-error ).
+      release( iv_target = iv_target iv_status = 'BLOCKED' iv_error = rs-error ).
       RETURN.
     ENDIF.
 

@@ -256,8 +256,58 @@ FORM run_planned_cycles USING iv_plan TYPE string.
     FIND PCRE '"load_type"\s*:\s*"([^"]*)"' IN lv_obj SUBMATCHES lv_load.
     IF lv_load IS INITIAL. lv_load = 'D'. ENDIF.
 
-    " Each cycle still takes the per-target lease, so a target already running
-    " elsewhere is skipped there rather than run twice.
-    zcl_erpl_rev_delta=>run( iv_target = lv_target iv_load_type = lv_load ).
+    " The plan's own size decision, honoured.
+    "
+    " PlanTick computes `worker` from the previous cycle's row count and renders
+    " it, and nothing parsed it -- so every cycle ran inline and serially on the
+    " tick thread, INCLUDING the ones the planner had marked too big to run
+    " there. Those are precisely the cycles that hold the thread long enough to
+    " stall the heartbeat and the stop read, which is how a second daemon comes
+    " to be submitted over a live one.
+    "
+    " Structurally the same defect as run_due(), which the comment above
+    " celebrates removing: a server-side decision that existed, was tested, and
+    " governed nothing.
+    DATA lv_worker TYPE string.
+    CLEAR lv_worker.
+    FIND PCRE '"worker"\s*:\s*(true|false)' IN lv_obj SUBMATCHES lv_worker.
+
+    IF lv_worker = 'true'.
+      " Its own background job, through the existing per-target report -- no new
+      " SAP object, which the footprint gate requires.
+      DATA lv_wjn TYPE tbtcjob-jobname VALUE 'ERPL_REV_CYCLE'.
+      DATA lv_wjc TYPE tbtcjob-jobcount.
+      CALL FUNCTION 'JOB_OPEN' EXPORTING jobname = lv_wjn
+        IMPORTING jobcount = lv_wjc EXCEPTIONS OTHERS = 1.
+      IF sy-subrc = 0.
+        SUBMIT z_erpl_rev_delta WITH p_tgt = lv_target WITH p_once = abap_true
+          VIA JOB lv_wjn NUMBER lv_wjc AND RETURN.
+        CALL FUNCTION 'JOB_CLOSE' EXPORTING jobcount = lv_wjc jobname = lv_wjn
+                                            strtimmed = abap_true EXCEPTIONS OTHERS = 1.
+      ELSE.
+        " Could not detach it: better to run it here than to skip it, but say so.
+        WRITE: / |DAEMON WORKER submit failed for { lv_target }, running inline|.
+        zcl_erpl_rev_delta=>run( iv_target = lv_target iv_load_type = lv_load ).
+      ENDIF.
+    ELSE.
+      " Each cycle still takes the per-target lease, so a target already running
+      " elsewhere is skipped there rather than run twice.
+      zcl_erpl_rev_delta=>run( iv_target = lv_target iv_load_type = lv_load ).
+    ENDIF.
+
+    " Beat BETWEEN cycles, not only at the end of the tick. A tick with several
+    " inline cycles used to go silent for its whole duration, and the singleton
+    " guard reads staleness as three ticks -- so a slow tick, not a dead daemon,
+    " was enough to let a second one claim the row.
+    PERFORM beat.
   ENDLOOP.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+FORM beat.
+  DATA lv_r TYPE string.
+  DATA lv_e TYPE string.
+  DATA(lv_sql) = |UPDATE _erpl_rev_daemon SET heartbeat_ts=now() | &&
+                 |WHERE id=1 AND instance_id='{ gv_instance }'|.
+  PERFORM q USING lv_sql CHANGING lv_r lv_e.
 ENDFORM.

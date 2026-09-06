@@ -407,3 +407,44 @@ TEST_CASE("tick_planner: an upgraded target that was already seeded stays a delt
     REQUIRE(p.cycles.size() == 1);
     CHECK(p.cycles[0].load_type == "D");
 }
+
+TEST_CASE("tick_planner: a refused target does not starve the healthy ones", "[plan]") {
+    // The property, not the mechanism. A target that is refused every tick
+    // never moves its last_run_ts, so its overdue grows without bound -- and
+    // the planner sorts by overdue against a budget of max_workers. Two
+    // mis-registered targets therefore occupied the entire budget forever and
+    // no healthy target was planned again: a total replication outage from one
+    // operator typo, with status IDLE, fail_count 0 and no run-statistics row.
+    //
+    // Whatever refuses a target must take it out of the due set. This asserts
+    // the consequence rather than the status value, so it keeps meaning
+    // something if the mechanism changes.
+    std::vector<TargetRow> t;
+    for (int i = 0; i < 2; ++i) {
+        auto bad = T("bad" + std::to_string(i), "micro:1", kNow - 999999);   // wildly overdue
+        bad.method = "SNAPSHOT";
+        bad.load_type_default = "F";
+        bad.status = "BLOCKED";     // what a refusal leaves behind
+        t.push_back(bad);
+    }
+    auto good = T("healthy", "micro:1", kNow - 10);
+    t.push_back(good);
+
+    const auto p = PlanTick(t, {}, Daemon(2), kNow);
+    CHECK(Has(p, "healthy"));
+    CHECK_FALSE(Has(p, "bad0"));
+    CHECK_FALSE(Has(p, "bad1"));
+}
+
+TEST_CASE("tick_planner: load type I is not planned forever", "[plan]") {
+    // I is "adopt a position, transfer nothing" -- once per target by
+    // definition. Undemoted it planned on every tick: the read is skipped, the
+    // watermark is re-seeded to the new ceiling, and the run is recorded
+    // SUCCESS with zero rows. A permanently empty target reporting green.
+    auto t = T("adopted", "micro:1", kNow - 600);
+    t.load_type_default = "I";
+
+    CHECK(PlanTick({t}, {}, Daemon(2), kNow).cycles[0].load_type == "I");
+    t.one_shot_spent = true;
+    CHECK(PlanTick({t}, {}, Daemon(2), kNow).cycles[0].load_type == "D");
+}

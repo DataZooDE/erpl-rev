@@ -213,9 +213,19 @@ BeginResult Begin(duckdb::Connection &con, const std::string &target, LoadType l
         //
         // BLOCKED is the status the planner already skips, and it is the honest
         // one: this is a registration that cannot run, not a run that failed.
-        con.Query("UPDATE _erpl_rev_delta_state SET status='BLOCKED', "
-                  "last_error='load type " + std::string(LoadTypeCode(load_type)) +
-                  " is not implemented for method " + st.method + "' WHERE target=" + Lit(target));
+        // Lit(), and the result is checked. The method was concatenated bare
+        // into a literal, so a stored method containing a quote broke the
+        // statement -- and the failure was discarded, dropping the target back
+        // into the starvation loop this write exists to end.
+        auto blk = con.Query(
+            "UPDATE _erpl_rev_delta_state SET status='BLOCKED', last_error=" +
+            Lit("load type " + std::string(LoadTypeCode(load_type)) +
+                " is not implemented for method " + st.method) +
+            " WHERE target=" + Lit(target));
+        if (blk->HasError())
+            throw std::runtime_error("cycle: could not block " + target + " after refusing load "
+                                     "type " + std::string(LoadTypeCode(load_type)) + ": " +
+                                     blk->GetError());
         throw std::runtime_error("cycle: load type " + std::string(LoadTypeCode(load_type)) +
                                  " is not implemented for method " + st.method + "; only " +
                                  "WATERMARK targets support one. " + target +
@@ -991,9 +1001,9 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
         // different lifetimes -- and every defect in this area came from that.
         // Registration says what the operator wants; this records that it has
         // been done.
-        if (replaced || will_create)
+        if (replaced || will_create || load_plan.seed_watermark)
             Exec(con, "UPDATE _erpl_rev_delta_state SET one_shot_spent=true WHERE target=" +
-                          Lit(target) + " AND load_type_default IN ('F','L')" +
+                          Lit(target) + " AND load_type_default IN ('F','L','I')" +
                           " AND load_type_default=" + Lit(run_load_type),
                  "spend the one-shot load type");
 
