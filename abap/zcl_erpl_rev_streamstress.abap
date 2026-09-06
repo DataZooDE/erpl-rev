@@ -156,13 +156,20 @@ CLASS zcl_erpl_rev_streamstress IMPLEMENTATION.
         what   = |{ iv_label }: the change log captured the workload|
         detail = |{ lv_log }| ).
 
+    " ONE SAMPLE PER CHANGE, at its first apply -- the same definition the
+    " server's latency view uses. The safety overlap re-reads recent rows on
+    " purpose, so a change is logged several times with ever-later apply times;
+    " counting every log row measures the overlap window rather than the
+    " pipeline, and reported this five times slower than it is.
     DATA(lv_stats) = scalar(
       |SELECT count(*) AS n, | &&
-      |round(quantile_disc(epoch(_applied_at)-epoch(_commit_ts),0.50),2) AS p50, | &&
-      |round(quantile_disc(epoch(_applied_at)-epoch(_commit_ts),0.95),2) AS p95, | &&
-      |round(quantile_disc(epoch(_applied_at)-epoch(_commit_ts),0.99),2) AS p99, | &&
-      |round(max(epoch(_applied_at)-epoch(_commit_ts)),2) AS worst | &&
-      |FROM _erpl_rev_log_{ iv_target } WHERE _commit_ts IS NOT NULL| ).
+      |round(quantile_disc(lat,0.50),2) AS p50, | &&
+      |round(quantile_disc(lat,0.95),2) AS p95, | &&
+      |round(quantile_disc(lat,0.99),2) AS p99, | &&
+      |round(max(lat),2) AS worst FROM (| &&
+      |SELECT epoch(min(_applied_at))-epoch(_commit_ts) AS lat | &&
+      |FROM _erpl_rev_log_{ iv_target } WHERE _commit_ts IS NOT NULL | &&
+      |GROUP BY belnr, _commit_ts)| ).
     out_line( |{ iv_label } latency { lv_stats }| ).
 
     DATA(lv_ops) = scalar(
