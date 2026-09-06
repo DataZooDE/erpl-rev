@@ -123,7 +123,9 @@ TEST_CASE("cycle: a stale run id is refused and changes nothing", "[cycle]") {
 
     const auto first = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart);
     StageRows(con, first.stage_table);
-    // A second cycle reclaims the target (as the planner would after a stale lease).
+    // The first cycle's lease ages out -- it really is gone -- so a second cycle
+    // may reclaim the target. That is the only circumstance in which it may.
+    Exec(con, "UPDATE _erpl_rev_delta_state SET lease_ts = now() - INTERVAL '2' HOUR");
     const auto second = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart + 60);
 
     REQUIRE_THROWS(cycle::Commit(con, "zdelta_wm", first.run_id, {2}));
@@ -167,10 +169,14 @@ TEST_CASE("cycle: begin leaves a LIVE cycle's stage alone", "[cycle]") {
     const auto live = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart);
     StageRows(con, live.stage_table);          // ...still being written
 
-    const auto next = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart + 60);
+    // A second Begin must be REFUSED, not granted. The earlier version of this
+    // test asserted the opposite -- it documented ownership theft as correct
+    // behaviour, which is how the missing compare-and-swap survived review.
+    REQUIRE_THROWS(cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart + 60));
     CHECK(Scalar(con, "SELECT count(*) FROM duckdb_tables() WHERE table_name='" +
                           live.stage_table + "'") == "1");
-    CHECK(next.run_id != live.run_id);
+    // ...and the live cycle can still commit, because nothing took it.
+    REQUIRE_NOTHROW(cycle::Commit(con, "zdelta_wm", live.run_id, {2}));
 }
 
 TEST_CASE("cycle: begin discards a previous run's orphaned stage", "[cycle]") {
@@ -190,6 +196,9 @@ TEST_CASE("cycle: begin discards a previous run's orphaned stage", "[cycle]") {
     // really happens.
     Exec(con, "UPDATE _erpl_rev_run_stats SET ts = now() - INTERVAL '2' HOUR "
               "WHERE run_id=" + std::to_string(dead.run_id));
+    // The lease ages with it -- both are evidence of the same dead cycle, and
+    // the claim will not be granted while either still looks alive.
+    Exec(con, "UPDATE _erpl_rev_delta_state SET lease_ts = now() - INTERVAL '2' HOUR");
 
     const auto next = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart + 60);
     CHECK(next.run_id != dead.run_id);
@@ -477,4 +486,91 @@ TEST_CASE("cycle: the change log follows the target when drift adds a column",
 
     const auto log = cycle::ChangeLogName("zdelta_wm");
     CHECK(Scalar(con, "SELECT zznew FROM " + log + " WHERE id=4") == "new");
+}
+
+TEST_CASE("cycle: a NULL key component does not duplicate on every cycle", "[cycle]") {
+    // `t.k = s.k` is UNKNOWN when either side is NULL, so a NULL-keyed row never
+    // matches its own copy in the target: the merge inserts it again, the log
+    // records it as an insert again, and the row multiplies once per cycle --
+    // forever, because the safety overlap keeps re-reading it.
+    //
+    // A NULL key is nearly always a modelling mistake, but it must not corrupt
+    // the target when it happens.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    schema::Migrate(con, "test");
+    Exec(con, "CREATE TABLE nk(bukrs VARCHAR, belnr VARCHAR, v VARCHAR)");
+    Exec(con, "INSERT INTO nk VALUES ('1000', NULL, 'first')");
+    Exec(con, "INSERT INTO _erpl_rev_delta_state "
+              "(target, method, source_from, keys, chg_col, wm_kind, wm_value, safety_secs, "
+              " cadence, status) VALUES "
+              "('nk','WATERMARK','NK','bukrs,belnr','CHANGED_AT','NUMTS','20260905100000',120,"
+              "'manual','IDLE')");
+
+    for (int cycle_no = 0; cycle_no < 3; ++cycle_no) {
+        const auto b = cycle::Begin(con, "nk", LoadType::Delta, kReadStart + cycle_no * 60);
+        Exec(con, "CREATE TABLE " + b.stage_table + "(bukrs VARCHAR, belnr VARCHAR, v VARCHAR)");
+        Exec(con, "INSERT INTO " + b.stage_table + " VALUES ('1000', NULL, 'updated')");
+        cycle::Commit(con, "nk", b.run_id, {1});
+    }
+
+    // One source row, one target row -- not four.
+    CHECK(Scalar(con, "SELECT count(*) FROM nk") == "1");
+    CHECK(Scalar(con, "SELECT v FROM nk") == "updated");
+}
+
+TEST_CASE("cycle: a NULL key that MATCHES is logged as an update, not an insert",
+          "[cycle][log]") {
+    // With null-safe matching a NULL key can genuinely match an existing row.
+    // Deriving _op by testing that key column for NULL would then call every
+    // such match an insert -- so a replay of the log would insert rows the
+    // target already had.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    schema::Migrate(con, "test");
+    Exec(con, "CREATE TABLE nk2(bukrs VARCHAR, belnr VARCHAR, v VARCHAR, changed_at VARCHAR)");
+    Exec(con, "INSERT INTO nk2 VALUES ('1000', NULL, 'first', '20260905100000')");
+    Exec(con, "INSERT INTO _erpl_rev_delta_state "
+              "(target, method, source_from, keys, chg_col, wm_kind, wm_value, safety_secs, "
+              " cadence, status, log_enabled) VALUES "
+              "('nk2','WATERMARK','NK2','bukrs,belnr','CHANGED_AT','NUMTS','20260905100000',120,"
+              "'manual','IDLE',true)");
+
+    const auto b = cycle::Begin(con, "nk2", LoadType::Delta, kReadStart);
+    Exec(con, "CREATE TABLE " + b.stage_table +
+                  "(bukrs VARCHAR, belnr VARCHAR, v VARCHAR, changed_at VARCHAR)");
+    Exec(con, "INSERT INTO " + b.stage_table + " VALUES ('1000', NULL, 'updated', "
+              "'20260905113000')");
+    cycle::Commit(con, "nk2", b.run_id, {1});
+
+    CHECK(Scalar(con, "SELECT _op FROM " + cycle::ChangeLogName("nk2")) == "U");
+}
+
+TEST_CASE("cycle: a failed commit counts against the target, a lost race does not",
+          "[cycle]") {
+    // fail_count is what the planner's backoff and parking read. Nothing
+    // incremented it, so both were dead code and a broken target retried at full
+    // micro cadence forever.
+    //
+    // The distinction matters: a cycle that lost a race to another cycle is not
+    // evidence the TARGET is broken, and backing it off would punish a healthy
+    // target for being popular.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con);
+
+    // A commit that genuinely fails: the stage cannot merge into the target.
+    auto b = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart);
+    Exec(con, "CREATE TABLE " + b.stage_table + "(id VARCHAR, v VARCHAR, changed_at VARCHAR)");
+    Exec(con, "INSERT INTO " + b.stage_table + " VALUES ('not-an-int','x','20260905110000')");
+    REQUIRE_THROWS(cycle::Commit(con, "zdelta_wm", b.run_id, {1}));
+    CHECK(Scalar(con, "SELECT fail_count FROM _erpl_rev_delta_state") == "1");
+
+    // A cycle that merely lost the target does not count against it.
+    b = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart + 60);
+    StageRows(con, b.stage_table);
+    Exec(con, "UPDATE _erpl_rev_delta_state SET active_run_id=" +
+                  std::to_string(b.run_id + 999) + " WHERE target='zdelta_wm'");
+    REQUIRE_THROWS(cycle::Commit(con, "zdelta_wm", b.run_id, {2}));
+    CHECK(Scalar(con, "SELECT fail_count FROM _erpl_rev_delta_state") == "1");
 }

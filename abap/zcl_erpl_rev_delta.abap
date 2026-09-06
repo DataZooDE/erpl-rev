@@ -282,9 +282,24 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
   ENDMETHOD.
 
   METHOD release.
+    " A failed cycle INCREMENTS fail_count, and that is what makes the planner's
+    " backoff and parking exist at all. Nothing incremented it before: the column
+    " was created with DEFAULT 0 and reset on success, so the delay never grew,
+    " a target was never parked, and a broken one retried at the full micro
+    " cadence forever -- hammering SAP for as long as it stayed broken. The
+    " planner's backoff tests were passing against behaviour no runtime path
+    " could reach.
+    "
+    " active_run_id is cleared here too: an errored cycle no longer owns the
+    " target, and leaving the token set would block every later claim.
+    DATA(lv_fail) = COND string(
+      WHEN iv_status = 'ERROR'
+      THEN |, fail_count = coalesce(fail_count,0) + 1, active_run_id = NULL|
+      ELSE |, fail_count = 0, active_run_id = NULL| ).
     zcl_erpl_rev_util=>query(
       |UPDATE _erpl_rev_delta_state SET status='{ q( iv_status ) }', | &&
-      |last_error={ COND string( WHEN iv_error IS INITIAL THEN 'NULL' ELSE |'{ q( iv_error ) }'| ) } | &&
+      |last_error={ COND string( WHEN iv_error IS INITIAL THEN 'NULL' ELSE |'{ q( iv_error ) }'| ) }| &&
+      |{ lv_fail } | &&
       |WHERE target='{ q( iv_target ) }'| ).
   ENDMETHOD.
 

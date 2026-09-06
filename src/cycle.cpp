@@ -194,10 +194,38 @@ BeginResult Begin(duckdb::Connection &con, const std::string &target, LoadType l
              Lit(out.bounds.next_watermark) + "," + std::to_string(skew) + ")",
          "open stats row");
 
-    Exec(con,
-         "UPDATE _erpl_rev_delta_state SET status='RUNNING', lease_ts=now(), active_run_id=" +
-             std::to_string(out.run_id) + " WHERE target=" + Lit(target),
-         "claim target");
+    // Claim by COMPARE-AND-SWAP, not by assignment.
+    //
+    // An unconditional UPDATE let a manual `sync run`, a second daemon, or a
+    // batch tick take a target from a cycle that was perfectly healthy -- and
+    // since a cycle can legitimately read for far longer than any lease
+    // (the ingest pipe waits up to an hour), "the lease looks old" is not
+    // evidence the cycle is gone. The first cycle then did all of its work and
+    // was refused at commit.
+    //
+    // A target is claimable only when nobody owns it, or when the owner's lease
+    // has aged past that target's whole cycle budget.
+    {
+        auto claim = con.Query(
+            "UPDATE _erpl_rev_delta_state SET status='RUNNING', lease_ts=now(), active_run_id=" +
+            std::to_string(out.run_id) + " WHERE target=" + Lit(target) +
+            " AND (active_run_id IS NULL OR lease_ts IS NULL OR lease_ts < now() - INTERVAL '" +
+            std::to_string(st.max_cycle_secs > 0 ? st.max_cycle_secs : 3600) + "' SECOND)");
+        if (claim->HasError())
+            throw std::runtime_error("cycle: claim failed: " + claim->GetError());
+        const auto got = claim->RowCount() > 0 && !claim->GetValue(0, 0).IsNull()
+                             ? claim->GetValue(0, 0).GetValue<int64_t>()
+                             : 0;
+        if (got == 0) {
+            // Undo what this run already recorded, so a refused Begin leaves no
+            // trace to clean up later.
+            con.Query("DELETE FROM _erpl_rev_run_stats WHERE run_id=" +
+                      std::to_string(out.run_id));
+            throw std::runtime_error(
+                "cycle: " + target + " is already owned by a running cycle; "
+                "not starting a second one");
+        }
+    }
 
     return out;
 }
@@ -219,20 +247,35 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
         con.Query("UPDATE _erpl_rev_run_stats SET status='ERROR', "
                   "error_text='target reclaimed by run " + active +
                   "' WHERE run_id=" + std::to_string(run_id) + " AND status='RUNNING'");
+        // Not a fail_count bump: this run lost a race, the TARGET is not broken,
+        // and backing off a healthy target because another cycle beat it to it
+        // would be exactly the wrong response.
         throw std::runtime_error(
             "cycle: run " + std::to_string(run_id) + " no longer owns " + target +
             " (active run is " + active + "); refusing to commit a reclaimed cycle");
     }
 
     CommitResult res;
+    // The try opens HERE, not at BEGIN. Real work happens before the transaction
+    // -- describing the tables, counting, computing the watermark -- and a
+    // failure in any of it used to escape uncaught, leaving the run RUNNING
+    // forever (so its stage was never swept) and never counting against the
+    // target (so backoff never engaged). Which is exactly how a broken target
+    // retried at full cadence indefinitely.
+    try {
     const bool have_stage =
         Scalar(con, "SELECT count(*) FROM duckdb_tables() WHERE table_name=" + Lit(stage)) == "1";
 
     const auto keys = SplitCsv(st.keys);
+    // IS NOT DISTINCT FROM, not "=". Plain equality is UNKNOWN when either side
+    // is NULL, so a NULL-keyed row never matches its own copy in the target: the
+    // merge inserts it again and the log records another insert, once per cycle,
+    // forever -- because the safety overlap keeps re-reading it. A NULL key is
+    // nearly always a modelling mistake, but it must not corrupt the target.
     std::string key_join;
     for (size_t i = 0; i < keys.size(); ++i) {
         if (i) key_join += " AND ";
-        key_join += "t." + keys[i] + " = s." + keys[i];
+        key_join += "t." + keys[i] + " IS NOT DISTINCT FROM s." + keys[i];
     }
 
     // A first-ever cycle has no target yet: the delta engine is documented as
@@ -370,7 +413,7 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
     const std::string log = ChangeLogName(target);
 
     Exec(con, "BEGIN", "begin");
-    try {
+    {
         if (have_stage && !have_target) {
             Exec(con, "CREATE TABLE " + target + " AS SELECT * FROM " + stage, "create target");
             if (!keys.empty()) {
@@ -437,7 +480,7 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
             std::string left_on;
             for (size_t i = 0; i < keys.size(); ++i) {
                 if (i) left_on += " AND ";
-                left_on += "t." + keys[i] + " = s." + keys[i];
+                left_on += "t." + keys[i] + " IS NOT DISTINCT FROM s." + keys[i];
             }
             // The source's change time, parsed from the change column. SAP writes
             // timestamps as YYYYMMDDHHMMSS(.fffffff), which is not a format any
@@ -505,10 +548,15 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
             auto r = con.Query(
                 "INSERT INTO " + log + " (" + collist +
                 ", _seq, _op, _run_id, _commit_ts, _applied_at) SELECT " + sellist +
-                ", nextval('" + log + "_seq'), CASE WHEN t." + keys[0] +
-                " IS NULL THEN 'I' ELSE 'U' END, " + std::to_string(run_id) +
-                ", " + commit_ts + ", now() FROM " + stage + " s LEFT JOIN " + target +
-                " t ON " + left_on);
+                ", nextval('" + log + "_seq'), "
+                // A literal marker from the joined side, not a key column. With
+                // null-safe matching a genuinely-NULL key can MATCH, and testing
+                // that key for NULL would then report an update as an insert.
+                // __erpl_matched is 1 exactly when the join found a row.
+                "CASE WHEN t.__erpl_matched IS NULL THEN 'I' ELSE 'U' END, " +
+                std::to_string(run_id) + ", " + commit_ts + ", now() FROM " + stage +
+                " s LEFT JOIN (SELECT *, 1 AS __erpl_matched FROM " + target + ") t ON " +
+                left_on);
             if (r->HasError())
                 throw std::runtime_error("cycle: change-log append failed: " + r->GetError());
             res.logged = res.ins + res.upd;
@@ -556,13 +604,21 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
 
         if (have_stage) Exec(con, "DROP TABLE " + stage, "drop stage");
         Exec(con, "COMMIT", "commit");
+        }
     } catch (...) {
+        // Harmless when no transaction was open -- the failure may have happened
+        // before BEGIN.
         con.Query("ROLLBACK");
         // Outside the rolled-back transaction on purpose: the run DID happen and
         // DID fail, and that has to survive the rollback. Otherwise the row stays
         // RUNNING forever and its staging table is never swept.
         con.Query("UPDATE _erpl_rev_run_stats SET status='ERROR' WHERE run_id=" +
                   std::to_string(run_id) + " AND status='RUNNING'");
+        // This one IS the target failing, so it counts: the planner's backoff
+        // reads fail_count, and without the increment a target that fails every
+        // cycle retries at full cadence forever.
+        con.Query("UPDATE _erpl_rev_delta_state SET fail_count = coalesce(fail_count,0) + 1, "
+                  "status='ERROR', active_run_id=NULL WHERE target=" + Lit(target));
         throw;
     }
     return res;
