@@ -205,3 +205,47 @@ TEST_CASE("control_schema: a fresh file gets the same shape as a migrated one", 
     for (size_t i = 0; i < a->RowCount(); ++i)
         CHECK(a->GetValue(0, i).ToString() == b->GetValue(0, i).ToString());
 }
+
+TEST_CASE("migrate: v8 does not re-seed a target that was already seeded",
+          "[schema]") {
+    // The hazard in splitting a column: v8 adds one_shot_spent defaulting to
+    // false, and an existing database has targets whose one-shot load type was
+    // already consumed. If "not spent" were the wrong reading of those rows,
+    // every previously seeded target would truncate and reload on its next tick
+    // after an upgrade -- a silent mass reload triggered by installing a binary.
+    //
+    // It is the right reading, and this pins WHY: before v8 the engine recorded
+    // a spend by rewriting load_type_default to 'D'. So a spent target already
+    // says 'D' and stays a delta; only a target still carrying 'F' or 'L' had
+    // not run, and those are exactly the ones that should still seed.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    schema::Migrate(con, "test");
+
+    auto exec = [&](const std::string &sql) {
+        auto r = con.Query(sql);
+        INFO(sql);
+        REQUIRE_FALSE(r->HasError());
+    };
+    // A pre-v8 database's two shapes, written the way the old code wrote them.
+    exec("INSERT INTO _erpl_rev_delta_state (target, method, source_from, keys, "
+         "load_type_default) VALUES ('already_seeded','WATERMARK','A','id','D')");
+    exec("INSERT INTO _erpl_rev_delta_state (target, method, source_from, keys, "
+         "load_type_default) VALUES ('still_pending','WATERMARK','B','id','L')");
+
+    // Re-running the migration list is a no-op, which is what an upgrade does.
+    schema::Migrate(con, "test");
+
+    auto one = [&](const std::string &sql) {
+        auto r = con.Query(sql);
+        REQUIRE_FALSE(r->HasError());
+        return r->GetValue(0, 0).ToString();
+    };
+    CHECK(one("SELECT one_shot_spent FROM _erpl_rev_delta_state "
+              "WHERE target='already_seeded'") == "false");
+    // ...and it does not matter that it is false, because its intent is 'D'.
+    CHECK(one("SELECT load_type_default FROM _erpl_rev_delta_state "
+              "WHERE target='already_seeded'") == "D");
+    CHECK(one("SELECT load_type_default FROM _erpl_rev_delta_state "
+              "WHERE target='still_pending'") == "L");
+}

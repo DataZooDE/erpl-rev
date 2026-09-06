@@ -391,3 +391,19 @@ TEST_CASE("tick_planner: a spent seed no longer counts against the full-load sha
     const auto p = PlanTick(t, {}, Daemon(3, 0.0), kNow);   // no full loads allowed at all
     CHECK(p.cycles.size() == 3);
 }
+
+TEST_CASE("tick_planner: an upgraded target that was already seeded stays a delta",
+          "[plan]") {
+    // The planner half of the same upgrade question. A database migrated to v8
+    // has one_shot_spent=false on every row, including targets seeded long ago
+    // -- so the planner must not read "not spent" as "seed it again". It does
+    // not, because a spent target's INTENT was already rewritten to 'D' by the
+    // old code, and intent is what the planner starts from.
+    auto seeded = T("seeded_before_upgrade", "micro:1", kNow - 600);
+    seeded.load_type_default = "D";      // what the old spend left behind
+    seeded.one_shot_spent = false;       // what v8 defaults it to
+
+    const auto p = PlanTick({seeded}, {}, Daemon(2), kNow);
+    REQUIRE(p.cycles.size() == 1);
+    CHECK(p.cycles[0].load_type == "D");
+}
