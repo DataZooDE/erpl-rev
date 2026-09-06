@@ -273,7 +273,13 @@ BeginResult Begin(duckdb::Connection &con, const std::string &target, LoadType l
                  " AND table_name NOT IN (SELECT " +
                  Lit(Lower(sqlname::UniqueToken(target)) + "__stg_") +
                  " || CAST(run_id AS VARCHAR) FROM _erpl_rev_run_stats "
-                 "WHERE status='RUNNING')");
+                 // Scoped to THIS target. Run ids are global, so without it the
+                 // live runs of every other target were also excluded -- which
+                 // errs toward leaking an orphan rather than dropping a live
+                 // stage, but it made the exclusion mean something other than
+                 // what it says, and paired with the LIKE wildcard above it took
+                 // both bugs to produce the failure.
+                 "WHERE status='RUNNING' AND target=" + Lit(target) + ")");
              if (!r->HasError())
                  for (size_t i = 0; i < r->RowCount(); ++i)
                      v.push_back(r->GetValue(0, i).ToString());

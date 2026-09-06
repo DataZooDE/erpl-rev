@@ -22,13 +22,18 @@ CLASS zcl_erpl_rev_streamstress DEFINITION PUBLIC FINAL CREATE PUBLIC.
     CONSTANTS c_target TYPE string VALUE 'stress_sflight'.
     CONSTANTS c_run    TYPE char20 VALUE 'STRESS1'.
     DATA: mv_pass TYPE i, mv_fail TYPE i, mo TYPE REF TO if_oo_adt_classrun_out.
+    DATA: mv_cycle_err TYPE i, mv_last_err TYPE string.
     METHODS ok IMPORTING cond TYPE abap_bool what TYPE string detail TYPE string DEFAULT ''.
     METHODS cnt IMPORTING iv_sql TYPE string RETURNING VALUE(rv) TYPE i.
     METHODS scalar IMPORTING iv_sql TYPE string RETURNING VALUE(rv) TYPE string.
     METHODS register IMPORTING iv_target TYPE string iv_kind TYPE string
-                               iv_col TYPE string iv_tcol TYPE string.
+                               iv_col TYPE string iv_tcol TYPE string
+                               iv_units TYPE i DEFAULT 0.
     METHODS report IMPORTING iv_target TYPE string iv_label TYPE string iv_sap TYPE int8.
     METHODS load_oracles.
+    METHODS wait_for_job IMPORTING iv_name TYPE tbtcjob-jobname iv_count TYPE tbtcjob-jobcount
+                         RETURNING VALUE(rv_status) TYPE btcstatus.
+    METHODS cycle IMPORTING iv_target TYPE string.
     METHODS key_expr IMPORTING iv_alias TYPE string RETURNING VALUE(rv) TYPE string.
     METHODS same_key IMPORTING iv_a TYPE string iv_b TYPE string RETURNING VALUE(rv) TYPE string.
     METHODS out_line IMPORTING iv_text TYPE string.
@@ -88,30 +93,55 @@ CLASS zcl_erpl_rev_streamstress IMPLEMENTATION.
     " measurements of four different things.
     register( iv_target = 'str_numts' iv_kind = 'NUMTS'    iv_col = 'CHG_TSTAMP' iv_tcol = '' ).
     register( iv_target = 'str_dt'    iv_kind = 'DATETIME' iv_col = 'CHG_DATE2'  iv_tcol = 'CHG_TIME' ).
-    register( iv_target = 'str_int'   iv_kind = 'INT'      iv_col = 'CHG_COUNTER' iv_tcol = '' ).
+    " A counter kind ignores safety_secs -- there is no clock to subtract from --
+    " and uses safety_units instead. Registered with zero, the watermark jumped
+    " to exactly max(staged), so any counter allocated before but committed
+    " after the read fell below the next floor and was lost. That is real loss,
+    " caused by the harness's own registration, and it would have sent someone
+    " hunting a bug in the engine. Sized to the burst: one second of changes.
+    register( iv_target = 'str_int'   iv_kind = 'INT'      iv_col = 'CHG_COUNTER' iv_tcol = ''
+              iv_units = lv_rate ).
 
     " --- replicate while it runs ------------------------------------------
+    " Cycle until the generator's JOB is finished, not until a counter says so.
+    " The loop used to add 2 to a nominal clock per iteration while each
+    " iteration also ran three real cycles, so the elapsed time and the budget
+    " were unrelated -- and if the generator committed anything after the last
+    " cycle, the oracles below would report the engine's correct behaviour as
+    " loss. The job's terminal status is the only thing that says the workload
+    " is over.
     DATA(lv_cycles) = 0.
-    DATA(lv_secs)   = 0.
-    WHILE lv_secs < lv_dur + 10.
-      zcl_erpl_rev_delta=>run( iv_target = 'str_numts' ).
-      zcl_erpl_rev_delta=>run( iv_target = 'str_dt' ).
-      zcl_erpl_rev_delta=>run( iv_target = 'str_int' ).
+    DATA lv_status TYPE btcstatus.
+    DO 300 TIMES.
+      cycle( 'str_numts' ).
+      cycle( 'str_dt' ).
+      cycle( 'str_int' ).
       lv_cycles = lv_cycles + 1.
+      lv_status = wait_for_job( iv_name = lv_jn iv_count = lv_jc ).
+      IF lv_status = 'F' OR lv_status = 'A'. EXIT. ENDIF.
       WAIT UP TO 2 SECONDS.
-      lv_secs = lv_secs + 2.
-    ENDWHILE.
-    out->write( |{ lv_cycles } cycles per strategy at a 2s tick| ).
+    ENDDO.
+    out->write( |{ lv_cycles } cycles per strategy, generator status { lv_status }| ).
+    ok( cond = xsdbool( lv_status = 'F' )
+        what = 'the generator ran to completion'
+        detail = |status { lv_status } (F=finished, A=aborted)| ).
 
     " --- settle ------------------------------------------------------------
     " The cycle ceiling is read_start minus the safety window, so a change
     " committed in the workload's final second is deliberately NOT eligible
-    " until a cycle starts a safety window later. Without this wait the
-    " anti-joins below would report the engine's correct behaviour as loss.
+    " until a cycle starts a safety window later. Only now that the workload is
+    " provably over does a fixed wait mean anything.
     WAIT UP TO 10 SECONDS.
-    zcl_erpl_rev_delta=>run( iv_target = 'str_numts' ).
-    zcl_erpl_rev_delta=>run( iv_target = 'str_dt' ).
-    zcl_erpl_rev_delta=>run( iv_target = 'str_int' ).
+    cycle( 'str_numts' ).
+    cycle( 'str_dt' ).
+    cycle( 'str_int' ).
+
+    " A cycle that never ran is not data loss, and the oracle must be able to
+    " tell the two apart -- it could not, because every run()'s error and
+    " skipped flag were thrown away.
+    ok( cond = xsdbool( mv_cycle_err = 0 )
+        what = 'every cycle ran'
+        detail = |{ mv_cycle_err } cycle(s) failed, last: { mv_last_err }| ).
 
     " --- what the generator actually committed -----------------------------
     SELECT COUNT(*) FROM zdelta_audit WHERE runid = @c_run INTO @DATA(lv_changes).
@@ -150,6 +180,7 @@ CLASS zcl_erpl_rev_streamstress IMPLEMENTATION.
       time_col    = iv_tcol
       wm_kind     = iv_kind
       safety_secs = 5
+      safety_units = iv_units
       cadence     = 'manual' ) ).
     " The change log is the latency instrument: without it there is nothing to
     " measure after the fact.
@@ -182,13 +213,16 @@ CLASS zcl_erpl_rev_streamstress IMPLEMENTATION.
     DATA(lv_matched) = cnt(
       |SELECT count(*) AS c FROM { iv_target } x JOIN stress_audit a ON | &&
       |trim(a.keyval) = { key_expr( 'x' ) }| ).
-    IF lv_matched = 0 AND lv_rows > 0.
-      " Say so instead of reporting every row as a phantom: an audit key that
-      " no longer renders the way the target's key columns do is a broken
-      " oracle, and a broken oracle that fails LOUDLY beats one that indicts
-      " the engine.
+    " A RATIO, not a zero test. Firing only when NOTHING matches meant that a
+    " subset rendering differently -- one field padded another way -- left most
+    " keys matching and reported the rest as phantoms: the engine indicted for
+    " an oracle problem, which is the exact thing this guard exists to prevent.
+    " Most target rows should match the audit; a workload that touches most of
+    " the key space leaves little room for a legitimate shortfall.
+    DATA(lv_ratio) = COND i( WHEN lv_rows = 0 THEN 100 ELSE lv_matched * 100 / lv_rows ).
+    IF lv_rows > 0 AND lv_ratio < 80.
       ok( cond = abap_false what = |{ iv_label }: the audit oracle still matches the target's keys|
-          detail = |no target row matches any audit keyval -- key rendering drifted| ).
+          detail = |only { lv_ratio }% of target rows match an audit key -- rendering drifted| ).
     ELSE.
       DATA(lv_phantom) = cnt(
         |SELECT count(*) AS c FROM { iv_target } x | &&
@@ -205,9 +239,16 @@ CLASS zcl_erpl_rev_streamstress IMPLEMENTATION.
     " its insert and never refreshed by any of the updates that followed.
     " Neither anti-join above can see that, and it is the failure a customer
     " notices last.
+    " Every payload column the generator maintains, not just DMBTR: a pipeline
+    " that carried one column and dropped another would pass a single-column
+    " check while replicating rubbish.
     DATA(lv_stale) = cnt(
       |SELECT count(*) AS c FROM stress_truth t JOIN { iv_target } x ON | &&
-      same_key( iv_a = 'x' iv_b = 't' ) && | WHERE x.dmbtr IS DISTINCT FROM t.dmbtr| ).
+      same_key( iv_a = 'x' iv_b = 't' ) &&
+      | WHERE x.dmbtr IS DISTINCT FROM t.dmbtr | &&
+      |OR x.sgtxt IS DISTINCT FROM t.sgtxt | &&
+      |OR x.chg_counter IS DISTINCT FROM t.chg_counter | &&
+      |OR x.chg_tstamp IS DISTINCT FROM t.chg_tstamp| ).
     ok( cond   = xsdbool( lv_stale = 0 )
         what   = |{ iv_label }: no stale payload|
         detail = |{ lv_stale } row(s) carry an older value than SAP does| ).
@@ -229,7 +270,7 @@ CLASS zcl_erpl_rev_streamstress IMPLEMENTATION.
       |round(max(lat),2) AS worst FROM (| &&
       |SELECT epoch(min(_applied_at))-epoch(_commit_ts) AS lat | &&
       |FROM _erpl_rev_log_{ iv_target } WHERE _commit_ts IS NOT NULL | &&
-      |GROUP BY belnr, _commit_ts)| ).
+      |GROUP BY { key_expr( '' ) }, _commit_ts)| ).
     out_line( |{ iv_label } latency { lv_stats }| ).
 
     DATA(lv_ops) = scalar(
@@ -237,6 +278,27 @@ CLASS zcl_erpl_rev_streamstress IMPLEMENTATION.
       |count(*) FILTER (WHERE _op='U') AS u | &&
       |FROM _erpl_rev_log_{ iv_target }| ).
     out_line( |{ iv_label } applied  { lv_ops } rows={ lv_rows }| ).
+  ENDMETHOD.
+
+  METHOD cycle.
+    " One cycle, with its verdict kept. run() reports an error and a skipped
+    " flag; both used to be discarded, so a cycle that never executed arrived at
+    " the anti-joins as N missing keys with nothing to say it had not run.
+    DATA(rs) = zcl_erpl_rev_delta=>run( iv_target = iv_target ).
+    IF rs-error IS NOT INITIAL.
+      mv_cycle_err = mv_cycle_err + 1.
+      mv_last_err  = |{ iv_target }: { rs-error }|.
+    ENDIF.
+  ENDMETHOD.
+
+  METHOD wait_for_job.
+    " The job's own status, from the job table. SUBMIT ... strtimmed asks for an
+    " immediate start and promises nothing, and nothing here ever looked at the
+    " job again.
+    SELECT SINGLE status FROM tbtco
+      WHERE jobname = @iv_name AND jobcount = @iv_count
+      INTO @rv_status.
+    IF sy-subrc <> 0. rv_status = '?'. ENDIF.
   ENDMETHOD.
 
   METHOD load_oracles.
@@ -261,8 +323,13 @@ CLASS zcl_erpl_rev_streamstress IMPLEMENTATION.
     " operator is spelled with backtick literals rather than escaped inside
     " one: || in a template is a syntax error, and \|\| is unreadable.
     DATA(lc) = ` || '/' || `.
-    rv = |{ iv_alias }.bukrs| && lc && |{ iv_alias }.belnr| && lc &&
-         |{ iv_alias }.gjahr| && lc && |{ iv_alias }.buzei|.
+    " An empty alias renders bare column names, for a statement with only one
+    " relation in scope -- the latency query, which used to group by BELNR alone
+    " and so collapsed every distinct change sharing a document number into one
+    " sample.
+    DATA(lp) = COND string( WHEN iv_alias IS INITIAL THEN `` ELSE |{ iv_alias }.| ).
+    rv = |{ lp }bukrs| && lc && |{ lp }belnr| && lc &&
+         |{ lp }gjahr| && lc && |{ lp }buzei|.
   ENDMETHOD.
 
   METHOD same_key.
