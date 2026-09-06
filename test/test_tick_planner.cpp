@@ -361,3 +361,33 @@ TEST_CASE("tick_planner: a target blocked by an impossible load type stops being
     const auto p = PlanTick({t}, {}, Daemon(2), kNow);
     CHECK_FALSE(Has(p, "bad"));
 }
+
+TEST_CASE("tick_planner: a spent one-shot load type falls back to delta", "[plan]") {
+    // The two halves, combined where they belong. load_type_default is what the
+    // operator asked for and stays that way; one_shot_spent is what the engine
+    // recorded. Sharing one column meant the engine crossed out the operator's
+    // value, and a re-registration or a manual run could then cancel or consume
+    // a seed nobody meant to touch.
+    auto t = T("seeded", "micro:1", kNow - 600);
+    t.load_type_default = "L";
+
+    CHECK(PlanTick({t}, {}, Daemon(2), kNow).cycles[0].load_type == "L");
+
+    t.one_shot_spent = true;
+    CHECK(PlanTick({t}, {}, Daemon(2), kNow).cycles[0].load_type == "D");
+}
+
+TEST_CASE("tick_planner: a spent seed no longer counts against the full-load share",
+          "[plan]") {
+    // It is a delta now, so it must not be capped as a full load -- otherwise a
+    // seeded target keeps competing for the reserved full-load slots forever.
+    std::vector<TargetRow> t;
+    for (int i = 0; i < 3; ++i) {
+        auto s = T("s" + std::to_string(i), "micro:1", kNow - 600);
+        s.load_type_default = "L";
+        s.one_shot_spent = true;
+        t.push_back(s);
+    }
+    const auto p = PlanTick(t, {}, Daemon(3, 0.0), kNow);   // no full loads allowed at all
+    CHECK(p.cycles.size() == 3);
+}

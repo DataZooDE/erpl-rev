@@ -484,6 +484,7 @@ std::string PlanTickJson(duckdb::Connection &con) {
     std::vector<plan::TargetRow> targets;
     auto tr = con.Query(
         "SELECT target, method, cadence, status, coalesce(load_type_default,'D'), "
+        "coalesce(one_shot_spent,false) AS one_shot_spent, "
         "coalesce(epoch(last_run_ts),0), coalesce(epoch(lease_ts),0), "
         "coalesce(epoch(parked_until),0), coalesce(fail_count,0), "
         "coalesce(max_cycle_secs,3600), coalesce(rows_applied,0) "
@@ -496,12 +497,13 @@ std::string PlanTickJson(duckdb::Connection &con) {
         t.cadence = tr->GetValue(2, i).ToString();
         t.status = tr->GetValue(3, i).ToString();
         t.load_type_default = tr->GetValue(4, i).ToString();
-        t.last_run_epoch = tr->GetValue(5, i).GetValue<double>();
-        t.lease_epoch = tr->GetValue(6, i).GetValue<double>();
-        t.parked_until_epoch = tr->GetValue(7, i).GetValue<double>();
-        t.fail_count = static_cast<int>(tr->GetValue(8, i).GetValue<int64_t>());
-        t.max_cycle_secs = static_cast<int>(tr->GetValue(9, i).GetValue<int64_t>());
-        t.last_rows = tr->GetValue(10, i).GetValue<int64_t>();
+        t.one_shot_spent = tr->GetValue(5, i).GetValue<bool>();
+        t.last_run_epoch = tr->GetValue(6, i).GetValue<double>();
+        t.lease_epoch = tr->GetValue(7, i).GetValue<double>();
+        t.parked_until_epoch = tr->GetValue(8, i).GetValue<double>();
+        t.fail_count = static_cast<int>(tr->GetValue(9, i).GetValue<int64_t>());
+        t.max_cycle_secs = static_cast<int>(tr->GetValue(10, i).GetValue<int64_t>());
+        t.last_rows = tr->GetValue(11, i).GetValue<int64_t>();
         targets.push_back(t);
     }
 

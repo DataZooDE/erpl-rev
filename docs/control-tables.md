@@ -76,6 +76,30 @@ retention pass prunes nothing, and the latency view reports no samples. From
 that first cycle on it exists even when a cycle changes nothing, so an idle
 target has an empty log rather than a missing one.
 
+### Who writes what
+
+`_erpl_rev_delta_state` holds two kinds of column, and they have different
+owners. Mixing them is where several defects came from.
+
+**Intent** — what the operator asked for: `method`, `source_from`, `keys`,
+`chg_col`, `time_col`, `wm_kind`, `safety_secs`, `safety_units`, `cadence`,
+`extra`, `log_enabled`, `load_type_default`, `allow_empty_reload`. Written only
+by registration. `sync create` is create-or-update, so re-running it on an
+existing target updates it — and a field the command line does not mention is
+left as it was, rather than reset to a default.
+
+**Engine state** — what replication has since done: `wm_value`, `status`,
+`last_run_ts`, `fail_count`, `parked_until`, `active_run_id`, `rows_applied`,
+`one_shot_spent`, `last_error`. Each has exactly one writer, and registration is
+not it.
+
+`load_type_default` and `one_shot_spent` are the clearest case: the first is the
+operator saying "seed this target" (`L`) or "repair it once" (`F`); the second is
+the engine recording that it has done so. They were one column, and the engine
+crossed out the operator's value — so a re-registration for an unrelated reason
+cancelled a pending seed, and a manual `sync run --load-type F` consumed one.
+The planner combines them: a one-shot type that has been spent plans as `D`.
+
 Two views are the reading surface: `erpl_rev_run_stats` (derived counts, rates and
 durations) and the per-target change logs.
 

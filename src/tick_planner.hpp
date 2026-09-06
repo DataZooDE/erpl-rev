@@ -21,7 +21,12 @@ struct TargetRow {
     std::string method;             // WATERMARK | CHANGEDOC | INSERT_ONLY | SNAPSHOT | CDC
     std::string cadence;            // micro:<s> | hourly | nightly | manual
     std::string status;             // IDLE | RUNNING | BLOCKED | ERROR
-    std::string load_type_default;  // F | I | L | D
+    std::string load_type_default;  // F | I | L | D -- registration intent
+    // The engine's half: set by Commit once a one-shot type has actually run.
+    // Kept separate because the two have different owners and different
+    // lifetimes, and sharing one column produced two defects that each needed
+    // their own fix.
+    bool one_shot_spent = false;
     double last_run_epoch = 0;
     double lease_epoch = 0;
     double parked_until_epoch = 0;

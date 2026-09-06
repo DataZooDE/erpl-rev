@@ -1038,7 +1038,11 @@ TEST_CASE("cycle: a scheduled reload runs once, then the target goes back to del
     StageRows(con, b.stage_table);
     cycle::Commit(con, "zdelta_wm", b.run_id, {2});
 
-    CHECK(Scalar(con, "SELECT load_type_default FROM _erpl_rev_delta_state") == "D");
+    // The operator's stated intent is left alone; the ENGINE records that it
+    // has run. The two used to be one column, which is where both defects in
+    // this area came from. The planner combines them.
+    CHECK(Scalar(con, "SELECT load_type_default FROM _erpl_rev_delta_state") == "L");
+    CHECK(Scalar(con, "SELECT one_shot_spent FROM _erpl_rev_delta_state") == "true");
 }
 
 TEST_CASE("cycle: a delta cycle does not touch the target's default load type",
@@ -1153,6 +1157,7 @@ TEST_CASE("cycle: a manual repair does not consume a scheduled seed", "[cycle]")
     cycle::Commit(con, "zdelta_wm", b.run_id, {2});
 
     CHECK(Scalar(con, "SELECT load_type_default FROM _erpl_rev_delta_state") == "L");
+    CHECK(Scalar(con, "SELECT one_shot_spent FROM _erpl_rev_delta_state") == "false");
 }
 
 TEST_CASE("cycle: a scheduled seed is consumed by the run it scheduled", "[cycle]") {
@@ -1166,7 +1171,7 @@ TEST_CASE("cycle: a scheduled seed is consumed by the run it scheduled", "[cycle
     StageRows(con, b.stage_table);
     cycle::Commit(con, "zdelta_wm", b.run_id, {2});
 
-    CHECK(Scalar(con, "SELECT load_type_default FROM _erpl_rev_delta_state") == "D");
+    CHECK(Scalar(con, "SELECT one_shot_spent FROM _erpl_rev_delta_state") == "true");
 }
 
 TEST_CASE("cycle: a load type the method cannot honour is refused before anything is claimed",

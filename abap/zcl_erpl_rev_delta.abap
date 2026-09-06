@@ -264,7 +264,22 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
                  |method { is_state-method }; only WATERMARK targets support one|.
       RETURN.
     ENDIF.
-    " Every column of the state row is written here. A field added to ty_state but
+    " `sync create` is CREATE-OR-UPDATE: re-running it on an existing target
+    " updates it, and that is deliberate -- it is what makes registration
+    " idempotent and scriptable.
+    "
+    " The rule that makes it safe: registration writes INTENT and never engine
+    " state. Intent is what the operator asked for -- method, source, keys,
+    " cadence, the flags. Engine state is what replication has since done:
+    " wm_value after the first cycle, status, fail_count, active_run_id,
+    " one_shot_spent, rows_applied. Those have exactly one writer each, and it
+    " is not this method.
+    "
+    " Three defects came from that rule being implicit rather than stated. Any
+    " column added below must be intent; anything else belongs to the engine and
+    " is written where the engine decides it.
+    "
+    " And every column of intent is written here. A field added to ty_state but
     " forgotten in this statement is not a compile error and not a runtime error:
     " it simply arrives at the server as empty, and the feature that needed it
     " does nothing. time_col was exactly that -- a DATETIME target registered
@@ -306,7 +321,13 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       |load_type_default=coalesce(excluded.load_type_default, | &&
       |                           _erpl_rev_delta_state.load_type_default), | &&
       |allow_empty_reload=coalesce(excluded.allow_empty_reload, | &&
-      |                            _erpl_rev_delta_state.allow_empty_reload)|.
+      |                            _erpl_rev_delta_state.allow_empty_reload), | &&
+      " one_shot_spent is the ENGINE's column and registration does not set it.
+      " It is only CLEARED here, and only when this call actually states a load
+      " type: saying 'L' again means "seed it again", while a registration that
+      " never mentions the load type must leave a spent one spent.
+      |one_shot_spent=CASE WHEN excluded.load_type_default IS NOT NULL | &&
+      |                    THEN false ELSE _erpl_rev_delta_state.one_shot_spent END|.
     DATA(ls) = zcl_erpl_rev_util=>query( lv_sql ).
     rv_error = ls-error.
   ENDMETHOD.

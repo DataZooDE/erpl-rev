@@ -143,6 +143,22 @@ const std::vector<Migration> &Migrations() {
         "SELECT 1",
     }},
 
+    // v8 -- one_shot_spent: the ENGINE's half of a one-shot load type.
+    //
+    // load_type_default had two owners with different lifetimes. Registration
+    // said what the operator wanted; the engine crossed it out after running it
+    // once, by overwriting the operator's value with 'D'. Two writers on one
+    // column produced both of this area's defects -- a re-registration
+    // cancelling a pending seed, and a manual run consuming a scheduled one --
+    // and each fix had to teach one more writer to be careful.
+    //
+    // Now load_type_default is registration intent and nothing writes it but
+    // register(); one_shot_spent is engine state and nothing writes it but
+    // Commit. The planner reads both and combines them.
+    {8, "delta state: the engine-owned half of a one-shot load type", {
+        "SELECT 1",
+    }},
+
     };
     // clang-format on
     return kMigrations;
@@ -201,6 +217,9 @@ void ApplyColumnAdds(duckdb::Connection &con, int version) {
     } else if (version == 7) {
         AddColumnIfMissing(con, "_erpl_rev_delta_state", "allow_empty_reload",
                            "BOOLEAN DEFAULT false");
+    } else if (version == 8) {
+        AddColumnIfMissing(con, "_erpl_rev_delta_state", "one_shot_spent",
+                           "BOOLEAN DEFAULT false");
     }
 }
 
@@ -239,9 +258,18 @@ void Migrate(duckdb::Connection &con, const std::string &binary_version) {
         for (const auto &stmt : m.sql)
             if (stmt != "SELECT 1") Exec(con, stmt, m.name);
         ApplyColumnAdds(con, m.version);
+        // Quoted properly. These are our own strings, not customer input -- but
+        // the first migration name written with an apostrophe in it broke every
+        // Migrate() call in the suite at once, which is a silly way to find out
+        // that a literal was being concatenated raw.
+        auto lit = [](const std::string &v) {
+            std::string q = "'";
+            for (char c : v) { if (c == '\'') q += "''"; else q += c; }
+            return q + "'";
+        };
         Exec(con,
              "INSERT INTO _erpl_rev_schema_version (version, name, binary_version) VALUES (" +
-                 std::to_string(m.version) + ", '" + m.name + "', '" + binary_version + "')",
+                 std::to_string(m.version) + ", " + lit(m.name) + ", " + lit(binary_version) + ")",
              "record version");
     }
 }

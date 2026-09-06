@@ -986,8 +986,13 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
         // does not, so the seed silently became a repair and the target was
         // never seeded. Comparing the two needs no extra plumbing: the daemon
         // runs the default, so they match; an operator overriding it does not.
+        // The ENGINE's half. This used to overwrite load_type_default with 'D',
+        // which meant the engine and registration wrote one column with
+        // different lifetimes -- and every defect in this area came from that.
+        // Registration says what the operator wants; this records that it has
+        // been done.
         if (replaced || will_create)
-            Exec(con, "UPDATE _erpl_rev_delta_state SET load_type_default='D' WHERE target=" +
+            Exec(con, "UPDATE _erpl_rev_delta_state SET one_shot_spent=true WHERE target=" +
                           Lit(target) + " AND load_type_default IN ('F','L')" +
                           " AND load_type_default=" + Lit(run_load_type),
                  "spend the one-shot load type");

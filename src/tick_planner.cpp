@@ -38,6 +38,16 @@ double CadenceSeconds(const std::string &cadence) {
     return 0.0;   // manual, or unknown: never due on its own
 }
 
+// What this target should actually run: its registered intent, unless that
+// intent was one-shot and the engine has already spent it. F and L are one-shot
+// by meaning -- L is "init, then delta", F is "repair this once" -- so a target
+// left at either would otherwise truncate and reload on every due tick.
+std::string EffectiveLoadType(const TargetRow &t) {
+    const std::string want = t.load_type_default.empty() ? "D" : t.load_type_default;
+    if ((want == "F" || want == "L") && t.one_shot_spent) return "D";
+    return want;
+}
+
 TickPlan PlanTick(const std::vector<TargetRow> &targets, const std::vector<CdcRow> &cdc,
                   const DaemonRow &daemon, double now_epoch) {
     TickPlan plan;
@@ -106,7 +116,7 @@ TickPlan PlanTick(const std::vector<TargetRow> &targets, const std::vector<CdcRo
             overdue = since - needed;
         }
 
-        due.push_back({&t, overdue, IsFullLoad(t.load_type_default)});
+        due.push_back({&t, overdue, IsFullLoad(EffectiveLoadType(t))});
     }
 
     // Most overdue first, then by NAME. The tiebreak is not cosmetic: a set of
@@ -169,7 +179,7 @@ TickPlan PlanTick(const std::vector<TargetRow> &targets, const std::vector<CdcRo
         Cycle cy;
         cy.target = c.t->target;
         cy.method = c.t->method;
-        cy.load_type = c.t->load_type_default.empty() ? "D" : c.t->load_type_default;
+        cy.load_type = EffectiveLoadType(*c.t);
         // Size decides inline vs worker: the plan is where that is known, because
         // it is the only place holding the previous cycle's row count.
         cy.worker = c.t->last_rows > kWorkerRowThreshold;
@@ -188,7 +198,7 @@ TickPlan PlanTick(const std::vector<TargetRow> &targets, const std::vector<CdcRo
             Cycle cy;
             cy.target = c->t->target;
             cy.method = c->t->method;
-            cy.load_type = c->t->load_type_default.empty() ? "D" : c->t->load_type_default;
+            cy.load_type = EffectiveLoadType(*c->t);
             cy.worker = c->t->last_rows > kWorkerRowThreshold;
             plan.cycles.push_back(cy);
             ++used;
