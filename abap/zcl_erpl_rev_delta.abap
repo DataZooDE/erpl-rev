@@ -326,6 +326,18 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       rs-skipped = abap_true.
       RETURN.
     ENDIF.
+    " Only the watermark tier implements a load type. Everywhere else the
+    " parameter was dropped on the floor: run( 'x', 'F' ) against a SNAPSHOT,
+    " CHANGEDOC or INSERT_ONLY target ran an ordinary cycle and reported
+    " success, so an operator believed a repair had happened while the drift
+    " they were chasing was still there. Refuse instead of pretending.
+    IF iv_load_type <> 'D' AND ls_state-method <> 'WATERMARK'.
+      rs-error = |load type { iv_load_type } is not implemented for method | &&
+                 |{ ls_state-method }; only WATERMARK targets support one|.
+      release( iv_target = iv_target iv_status = 'ERROR' iv_error = rs-error ).
+      RETURN.
+    ENDIF.
+
     GET TIME STAMP FIELD DATA(lv_t0).
     CASE ls_state-method.
       WHEN 'WATERMARK'.   rs = run_watermark( is_state = ls_state iv_load_type = CONV string( iv_load_type ) ).

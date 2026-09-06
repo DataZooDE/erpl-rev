@@ -140,7 +140,7 @@ void EnsureChangeLog(duckdb::Connection &con, const std::string &target,
     }
 }
 
-void AdvanceWatermarkFenced(duckdb::Connection &con, const std::string &target,
+void FinishCycleFenced(duckdb::Connection &con, const std::string &target,
                             long long run_id, const std::string &new_watermark,
                             long long rows_applied) {
     auto up = con.Query("UPDATE _erpl_rev_delta_state SET wm_value=" + Lit(new_watermark) +
@@ -780,7 +780,7 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
 
         // The fence. Inside the transaction, so losing the target here rolls
         // back the merge and the log with it.
-        AdvanceWatermarkFenced(con, target, run_id, new_wm, res.ins + res.upd);
+        FinishCycleFenced(con, target, run_id, new_wm, res.ins + res.upd);
 
         // A truncating load type is one-shot by meaning -- L is "init, then
         // delta", F is "repair this once" -- but load_type_default is what the

@@ -717,7 +717,7 @@ TEST_CASE("cycle: the fence stores the watermark for the run that owns the targe
     Setup(con);
     Exec(con, "UPDATE _erpl_rev_delta_state SET active_run_id=77, status='RUNNING'");
 
-    cycle::AdvanceWatermarkFenced(con, "zdelta_wm", 77, "20260905130000", 5);
+    cycle::FinishCycleFenced(con, "zdelta_wm", 77, "20260905130000", 5);
 
     CHECK(Scalar(con, "SELECT wm_value FROM _erpl_rev_delta_state") == "20260905130000");
     CHECK(Scalar(con, "SELECT status FROM _erpl_rev_delta_state") == "IDLE");
@@ -734,7 +734,7 @@ TEST_CASE("cycle: the fence refuses a run that no longer owns the target", "[cyc
     // Reclaimed: run 77 did the work, run 78 owns the target now.
     Exec(con, "UPDATE _erpl_rev_delta_state SET active_run_id=78, status='RUNNING'");
 
-    CHECK_THROWS_WITH(cycle::AdvanceWatermarkFenced(con, "zdelta_wm", 77, "20260905130000", 5),
+    CHECK_THROWS_WITH(cycle::FinishCycleFenced(con, "zdelta_wm", 77, "20260905130000", 5),
                       Catch::Matchers::ContainsSubstring("lost ownership"));
 
     // The point of the throw: no watermark from a cycle that was displaced, and
@@ -751,7 +751,7 @@ TEST_CASE("cycle: the fence refuses a target that is not registered at all", "[c
     // Zero rows updated for a different reason, and it must still be a throw:
     // reporting SUCCESS for a watermark stored nowhere is the failure mode,
     // whatever made the WHERE miss.
-    CHECK_THROWS_WITH(cycle::AdvanceWatermarkFenced(con, "no_such_target", 1, "20260905130000", 0),
+    CHECK_THROWS_WITH(cycle::FinishCycleFenced(con, "no_such_target", 1, "20260905130000", 0),
                       Catch::Matchers::ContainsSubstring("lost ownership"));
 }
 

@@ -70,8 +70,17 @@ BeginResult Begin(duckdb::Connection &con, const std::string &target, LoadType l
 CommitResult Commit(duckdb::Connection &con, const std::string &target, long long run_id,
                     const CommitCounts &counts);
 
-// The fence, as one named operation: store the new watermark and release the
-// target, but ONLY while this run still owns it.
+// The fence, as one named operation: FINISH the cycle -- store the new
+// watermark, release the target (status IDLE, active_run_id NULL), reset the
+// failure count and record rows_applied -- but ONLY while this run still owns
+// it.
+//
+// Named for all of that rather than for the watermark alone: a caller reaching
+// for "advance the watermark" would silently release a target they still hold.
+//
+// MUST be called inside an open transaction. Its throw is the rollback signal
+// for the whole commit; called outside one it releases the target while the
+// merge that should have accompanied it is already durable.
 //
 // It is separate from Commit so it can be tested for the case that matters and
 // is otherwise unreachable -- the target reclaimed by another cycle -- without
@@ -82,7 +91,7 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
 // swallowing it is precisely the silent outcome fencing exists to prevent: the
 // stage merged, the log appended, SUCCESS reported, and a watermark that was
 // never stored.
-void AdvanceWatermarkFenced(duckdb::Connection &con, const std::string &target, long long run_id,
+void FinishCycleFenced(duckdb::Connection &con, const std::string &target, long long run_id,
                             const std::string &new_watermark, long long rows_applied);
 
 // Per-target change log. Named through the collision-safe token, because the

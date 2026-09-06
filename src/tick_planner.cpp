@@ -7,6 +7,10 @@
 namespace erpl_rev {
 namespace plan {
 
+// A trigger target with no cadence of its own is treated as due every tick: the
+// tier exists to react to rows appearing, not to a clock.
+constexpr double kDefaultCdcInterval = 2.0;
+
 namespace {
 
 // Beyond this many consecutive failures the delay stops doubling. Without a cap
@@ -73,7 +77,23 @@ TickPlan PlanTick(const std::vector<TargetRow> &targets, const std::vector<CdcRo
             // cycle would advance the position past changes never captured.
             if (c->status != "ACTIVE" && c->status != "SEEDED") continue;
             if (c->shadow_rows <= 0) continue;
-            overdue = static_cast<double>(c->shadow_rows);
+            // Expressed in SECONDS, like every other candidate's. It used to be
+            // the raw row count, and the two were then sorted against each
+            // other -- so a trigger target with three pending rows lost to any
+            // delta target four seconds late, and on a budget smaller than the
+            // candidate set the whole trigger tier could be starved
+            // indefinitely while its shadow table grew.
+            //
+            // The conversion is the one the tier already implies: a trigger
+            // target's work is due the moment a row appears, so its lateness is
+            // how long it has been waiting -- time since its last cycle, with a
+            // floor of one interval so a target with pending rows is never
+            // ranked as "not yet due".
+            const double interval = CadenceSeconds(t.cadence) > 0 ? CadenceSeconds(t.cadence)
+                                                                  : kDefaultCdcInterval;
+            const double since =
+                t.last_run_epoch <= 0 ? interval : now_epoch - t.last_run_epoch;
+            overdue = since > interval ? since : interval;
         } else {
             const double interval = CadenceSeconds(t.cadence);
             if (interval <= 0) continue;   // manual
@@ -113,11 +133,27 @@ TickPlan PlanTick(const std::vector<TargetRow> &targets, const std::vector<CdcRo
         daemon.full_load_share <= 0.0
             ? 0
             : std::max(1, static_cast<int>(std::floor(budget * daemon.full_load_share)));
+    // One slot held for the trigger tier, when it has work and there is more
+    // than one slot to hold it from. Putting the two tiers on the same scale
+    // (above) makes the comparison honest; it does not stop a genuinely late
+    // delta target from outranking a trigger target that has been waiting one
+    // second -- and with several busy micro-cadence targets and a small budget,
+    // "outranks" becomes "starves indefinitely" while the shadow table grows.
+    // A trigger target's work is not deferrable the way a delta's is: the delta
+    // re-reads the same window next tick, the shadow rows just accumulate.
+    const bool cdc_waiting =
+        std::any_of(due.begin(), due.end(),
+                    [](const Candidate &c) { return c.t->method == "CDC"; });
+    const int reserved = (budget >= 2 && cdc_waiting) ? 1 : 0;
+    bool cdc_taken = false;
     int used = 0, fulls = 0;
 
     for (const auto &c : due) {
         if (used >= budget) break;
         if (c.full && fulls >= full_cap) continue;
+        const bool is_cdc = c.t->method == "CDC";
+        // Everything else stops one slot short until the reservation is spent.
+        if (!is_cdc && !cdc_taken && used >= budget - reserved) continue;
 
         Cycle cy;
         cy.target = c.t->target;
@@ -130,6 +166,7 @@ TickPlan PlanTick(const std::vector<TargetRow> &targets, const std::vector<CdcRo
 
         ++used;
         if (c.full) ++fulls;
+        if (is_cdc) cdc_taken = true;
     }
 
     return plan;

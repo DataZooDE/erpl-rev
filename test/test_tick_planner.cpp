@@ -269,3 +269,28 @@ TEST_CASE("tick_planner: a zero share means the daemon runs no full loads", "[pl
     const auto p = PlanTick({f}, {}, Daemon(4, 0.0), kNow);
     CHECK_FALSE(Has(p, "full"));
 }
+
+TEST_CASE("tick_planner: a trigger target is not starved by busier delta targets",
+          "[plan]") {
+    // `overdue` was a row count for a CDC target and seconds-past-due for
+    // everything else, and the two were sorted against each other. A trigger
+    // target with three pending shadow rows therefore sorted below any delta
+    // target four seconds late -- so on a budget smaller than the candidate
+    // set, with several busy micro-cadence targets, the trigger tier never got
+    // a slot and its shadow table grew without bound. Comparing a count with a
+    // duration is not a tiebreak problem; it is a units problem.
+    std::vector<TargetRow> t;
+    for (int i = 0; i < 6; ++i) t.push_back(T("d" + std::to_string(i), "micro:1", kNow - 600));
+
+    auto c = T("trig", "micro:1", kNow - 1);
+    c.method = "CDC";
+    t.push_back(c);
+
+    CdcRow cdc;
+    cdc.target = "trig";
+    cdc.status = "ACTIVE";
+    cdc.shadow_rows = 3;
+
+    const auto p = PlanTick(t, {cdc}, Daemon(2), kNow);
+    CHECK(Has(p, "trig"));
+}

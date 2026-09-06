@@ -12,7 +12,9 @@
 #include <catch2/catch_test_macros.hpp>
 #include <duckdb.hpp>
 
+#include <algorithm>
 #include <chrono>
+#include <vector>
 #include <cstdio>
 #include <string>
 
@@ -123,60 +125,99 @@ TEST_CASE("P-CYCLE: direct merge vs staged commit", "[bench][.]") {
     SUCCEED();
 }
 
-// P-STAGE-PK: does building a PRIMARY KEY on the staging table pay for itself?
+// P-STAGE-PK: what building a PRIMARY KEY on the staging table costs.
 //
 // The ingest path builds a PK on whatever it writes into (iv_build_pk defaults
 // on), which is right for a full load: the target keeps that index for the rest
-// of its life. A delta stage lives for one cycle and is read exactly once, by
-// the merge -- so the index is either bought back by a faster merge, or it is
-// pure cost on the hot path of every streaming tick.
+// of its life. A delta stage lives for one cycle and is dropped.
 //
-// Nobody had measured it, and "it is probably fine" is how a fixed per-cycle
-// cost survives into a product whose promise is second-scale latency.
+// Read the result as a COST, not as a comparison. In Commit the stage is only
+// ever the driving side -- the pre-counts are `FROM stage s WHERE [NOT] EXISTS
+// (... target ...)`, the log append is `FROM stage s LEFT JOIN target`, and the
+// merge is `MERGE INTO target USING stage` -- so every keyed lookup hits the
+// target, which has its own PK. The join predicate is `IS NOT DISTINCT FROM`,
+// which an ART index does not serve anyway. A stage-side index therefore cannot
+// be consulted by any statement here, and this benchmark cannot show one paying
+// off; what it measures is what an index nothing queries costs to build.
+//
+// Each arm is repeated and reported as a MEDIAN, over three batch shapes:
+// update-only (every staged key already in the target), insert-heavy (none of
+// them), and mixed. A single unwarmed sample per arm is what the first version
+// of this reported, and the small-row rows were inside its noise.
 TEST_CASE("P-STAGE-PK: a primary key on the delta stage", "[bench][.]") {
     constexpr long long kBase = 1'000'000;
+    constexpr int kReps = 5;
 
-    std::printf("\n  rows | no stage PK (ms) | stage PK (ms) |  of which build | verdict\n");
-    std::printf("-------+------------------+---------------+-----------------+---------\n");
+    struct Shape { const char *name; long long first_id; };
+    // first_id decides the overlap with a target holding ids [0, kBase):
+    // 0 means every staged key already exists, kBase means none do.
+    const Shape shapes[] = {{"update-only", 0}, {"insert-heavy", kBase}, {"mixed", 0}};
 
-    for (long long n : {10LL, 100LL, 1'000LL, 10'000LL, 100'000LL}) {
-        duckdb::DuckDB db(nullptr);
-        duckdb::Connection con(db);
-        schema::Migrate(con, "bench");
-        Run(con, "INSERT INTO _erpl_rev_delta_state "
-                 "(target, method, source_from, keys, chg_col, wm_kind, wm_value, safety_secs, "
-                 " cadence, status, log_enabled) VALUES "
-                 "('t','WATERMARK','T','id','CHANGED_AT','NUMTS','20260101000000',120,"
-                 "'manual','IDLE',false)");
+    std::printf("\n        shape |   rows | no stage PK (ms) | stage PK (ms) | of which build\n");
+    std::printf("--------------+--------+------------------+---------------+---------------\n");
 
-        auto cycle_once = [&](bool with_pk) {
-            Seed(con, kBase);
-            Run(con, "UPDATE _erpl_rev_delta_state SET wm_value='20260101000000', "
-                     "status='IDLE', active_run_id=NULL");
-            auto b = cycle::Begin(con, "t", LoadType::Delta, 1788609600);
-            SeedChanges(con, b.stage_table, n);
+    for (const auto &shape : shapes) {
+        for (long long n : {1'000LL, 10'000LL, 100'000LL}) {
+            duckdb::DuckDB db(nullptr);
+            duckdb::Connection con(db);
+            schema::Migrate(con, "bench");
+            Run(con, "INSERT INTO _erpl_rev_delta_state "
+                     "(target, method, source_from, keys, chg_col, wm_kind, wm_value, "
+                     " safety_secs, cadence, status, log_enabled) VALUES "
+                     "('t','WATERMARK','T','id','CHANGED_AT','NUMTS','20260101000000',120,"
+                     "'manual','IDLE',false)");
 
-            double build = 0;
-            if (with_pk) {
-                const auto p0 = Clock::now();
-                Run(con, "ALTER TABLE " + b.stage_table + " ADD PRIMARY KEY (id)");
-                build = Ms(p0, Clock::now());
+            auto cycle_once = [&](bool with_pk) {
+                Seed(con, kBase);
+                Run(con, "UPDATE _erpl_rev_delta_state SET wm_value='20260101000000', "
+                         "status='IDLE', active_run_id=NULL");
+                auto b = cycle::Begin(con, "t", LoadType::Delta, 1788609600);
+                Run(con, "DROP TABLE IF EXISTS " + b.stage_table);
+                // "mixed" straddles the boundary: half the staged keys exist.
+                const long long start = std::string(shape.name) == "mixed"
+                                            ? kBase - n / 2
+                                            : shape.first_id;
+                Run(con, "CREATE TABLE " + b.stage_table + " AS SELECT " +
+                             std::to_string(start) + " + i AS id, 'new' || i AS v, "
+                             "'20260905120000' AS changed_at FROM range(" +
+                             std::to_string(n) + ") tbl(i)");
+
+                double build = 0;
+                if (with_pk) {
+                    const auto p0 = Clock::now();
+                    Run(con, "ALTER TABLE " + b.stage_table + " ADD PRIMARY KEY (id)");
+                    build = Ms(p0, Clock::now());
+                }
+                const auto t0 = Clock::now();
+                cycle::Commit(con, "t", b.run_id, {n});
+                return std::pair<double, double>{Ms(t0, Clock::now()), build};
+            };
+
+            // Median of kReps, and one discarded warm-up per arm: a single
+            // unwarmed sample is an anecdote, and the first version of this
+            // benchmark reported five of them as a trend.
+            auto median = [](std::vector<double> v) {
+                std::sort(v.begin(), v.end());
+                return v[v.size() / 2];
+            };
+            std::vector<double> plain, keyed, builds;
+            cycle_once(false);
+            cycle_once(true);
+            for (int r = 0; r < kReps; ++r) {
+                plain.push_back(cycle_once(false).first);
+                const auto k = cycle_once(true);
+                keyed.push_back(k.first + k.second);
+                builds.push_back(k.second);
             }
-            const auto t0 = Clock::now();
-            cycle::Commit(con, "t", b.run_id, {n});
-            return std::pair<double, double>{Ms(t0, Clock::now()), build};
-        };
 
-        const auto plain = cycle_once(false);
-        const auto keyed = cycle_once(true);
-        const double total_keyed = keyed.first + keyed.second;
-
-        std::printf("%6lld | %16.1f | %13.1f | %15.1f | %s\n", n, plain.first, total_keyed,
-                    keyed.second,
-                    total_keyed <= plain.first ? "PK pays" : "PK costs");
+            std::printf("%13s | %6lld | %16.1f | %13.1f | %14.1f\n", shape.name, n,
+                        median(plain), median(keyed), median(builds));
+        }
     }
-    std::printf("\n  (1,000,000-row target. The 'stage PK' column includes the time to\n"
-                "   build the index, because a delta stage is created, indexed, read\n"
-                "   once and dropped -- so the build is part of the cycle, not setup.)\n\n");
+    std::printf("\n  (1,000,000-row target, median of %d cycles per arm after a warm-up.\n"
+                "   The 'stage PK' column includes the time to build the index, because a\n"
+                "   delta stage is created, indexed, read once and dropped -- the build is\n"
+                "   part of the cycle, not setup. No statement in Commit can consult a\n"
+                "   stage-side index, so this is a cost, not a comparison.)\n\n", kReps);
     SUCCEED();
 }
