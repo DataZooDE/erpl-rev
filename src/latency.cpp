@@ -1,5 +1,6 @@
 #include "latency.hpp"
 
+#include <cctype>
 #include <cstdio>
 
 #include "cycle.hpp"
@@ -35,22 +36,51 @@ LatencyStats GetLatencyStats(duckdb::Connection &con, const std::string &target,
         where += " AND _commit_ts >= now() - INTERVAL '" + std::to_string(window_secs) +
                  "' SECOND";
 
+    // ONE SAMPLE PER CHANGE, at its FIRST apply.
+    //
+    // The safety overlap re-reads recently-changed rows on purpose and the keyed
+    // merge absorbs the duplicates, so a single source change appears in the log
+    // several times, each with a later _applied_at. Counting every row answers
+    // "how long after it changed did we write this particular copy" -- a
+    // question nobody asked, whose answer is dominated by the overlap window.
+    // The promise is about how long until a change is VISIBLE, which is the
+    // first apply. Measured on real data the two differed by 5x, in the
+    // pessimistic direction.
+    //
+    // A change is identified by its key plus its source timestamp; without the
+    // key, two rows that changed in the same second would collapse into one.
+    std::string group_cols = "_commit_ts";
+    {
+        auto k = con.Query("SELECT keys FROM _erpl_rev_delta_state WHERE target=" + Lit(target));
+        if (!k->HasError() && k->RowCount() > 0) {
+            const auto keys = k->GetValue(0, 0).ToString();
+            std::string cur;
+            for (char c : keys + ",") {
+                if (c == ',') {
+                    if (!cur.empty()) group_cols += ", " + cur;
+                    cur.clear();
+                } else if (!std::isspace(static_cast<unsigned char>(c))) {
+                    cur += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                }
+            }
+        }
+    }
+
+    const std::string per_change =
+        "(SELECT epoch(min(_applied_at)) - epoch(_commit_ts) AS lat, "
+        "any_value(_op) AS _op FROM " + log + " WHERE " + where +
+        " GROUP BY " + group_cols + ")";
+
     auto r = con.Query(
-        "SELECT count(*), "
-        "avg(epoch(_applied_at) - epoch(_commit_ts)), "
+        "SELECT count(*), avg(lat), "
         // quantile_disc, not quantile_cont: a reported p95 should be a latency
         // that a change actually experienced, not an interpolation between two
         // that did. Interpolation also understates a sparse tail, which is the
         // half of the distribution this exists to expose.
-        "quantile_disc(epoch(_applied_at) - epoch(_commit_ts), 0.50), "
-        "quantile_disc(epoch(_applied_at) - epoch(_commit_ts), 0.95), "
-        "quantile_disc(epoch(_applied_at) - epoch(_commit_ts), 0.99), "
-        "min(epoch(_applied_at) - epoch(_commit_ts)), "
-        "max(epoch(_applied_at) - epoch(_commit_ts)), "
-        "count(*) FILTER (WHERE _op='I'), "
-        "count(*) FILTER (WHERE _op='U'), "
-        "count(*) FILTER (WHERE _op='D') "
-        "FROM " + log + " WHERE " + where);
+        "quantile_disc(lat, 0.50), quantile_disc(lat, 0.95), quantile_disc(lat, 0.99), "
+        "min(lat), max(lat), "
+        "count(*) FILTER (WHERE _op='I'), count(*) FILTER (WHERE _op='U'), "
+        "count(*) FILTER (WHERE _op='D') FROM " + per_change);
     if (r->HasError() || r->RowCount() == 0) return s;
 
     s.samples = r->GetValue(0, 0).GetValue<int64_t>();

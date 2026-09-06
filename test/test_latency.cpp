@@ -26,7 +26,14 @@ void Exec(duckdb::Connection &con, const std::string &sql) {
 }
 
 // A change log holding `n` rows whose apply lag is a known sequence of seconds.
+// Each row gets its own key, so they are distinct CHANGES rather than repeated
+// deliveries of one -- the stats group by key plus source timestamp.
 void SeedLog(duckdb::Connection &con, const std::vector<int> &lags_secs) {
+    auto reg = con.Query(
+        "INSERT OR REPLACE INTO _erpl_rev_delta_state "
+        "(target, method, source_from, keys, chg_col, wm_kind, cadence, status) VALUES "
+        "('t','WATERMARK','T','id','CHANGED_AT','NUMTS','manual','IDLE')");
+    REQUIRE_FALSE(reg->HasError());
     const auto log = cycle::ChangeLogName("t");
     Exec(con, "DROP TABLE IF EXISTS " + log);
     Exec(con, "CREATE TABLE " + log + "(id BIGINT, _seq BIGINT, _op VARCHAR, _run_id BIGINT, "
@@ -41,6 +48,43 @@ void SeedLog(duckdb::Connection &con, const std::vector<int> &lags_secs) {
     }
 }
 }  // namespace
+
+TEST_CASE("latency: a re-delivered change is counted once, at its FIRST apply",
+          "[latency]") {
+    // The safety overlap deliberately re-reads recently-changed rows, and the
+    // keyed merge absorbs the duplicates -- so one source change is logged
+    // several times, each with a LATER _applied_at.
+    //
+    // Counting every log row answers "how long after it changed did we write
+    // this particular copy", which nobody asked. The question the promise is
+    // about is "how long until the change was visible", and that is the FIRST
+    // apply. Measured on real data the difference was p95 9.94s versus 2.08s --
+    // the same pipeline, reported five times worse.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    schema::Migrate(con, "test");
+    Exec(con, "INSERT INTO _erpl_rev_delta_state "
+              "(target, method, source_from, keys, chg_col, wm_kind, cadence, status) VALUES "
+              "('t','WATERMARK','T','id','CHANGED_AT','NUMTS','manual','IDLE')");
+
+    const auto log = cycle::ChangeLogName("t");
+    Exec(con, "CREATE TABLE " + log + "(id BIGINT, _seq BIGINT, _op VARCHAR, _run_id BIGINT, "
+              "_commit_ts TIMESTAMPTZ, _applied_at TIMESTAMPTZ)");
+    // One change to key 1, applied at +1s and then re-delivered at +3s and +5s.
+    for (int lag : {1, 3, 5})
+        Exec(con, "INSERT INTO " + log + " VALUES (1,1,'U',1, TIMESTAMPTZ '2026-09-05 12:00:00', "
+                  "TIMESTAMPTZ '2026-09-05 12:00:00' + INTERVAL '" + std::to_string(lag) +
+                  "' SECOND)");
+    // A second, distinct change to the same key, delivered once at +2s.
+    Exec(con, "INSERT INTO " + log + " VALUES (1,4,'U',2, TIMESTAMPTZ '2026-09-05 12:01:00', "
+              "TIMESTAMPTZ '2026-09-05 12:01:02')");
+
+    const auto s = GetLatencyStats(con, "t");
+    // Two distinct changes, not four log rows.
+    CHECK(s.samples == 2);
+    CHECK(s.max == 2.0);       // the 5s re-delivery is not the latency of anything
+    CHECK(s.p50 <= 2.0);
+}
 
 TEST_CASE("latency: percentiles over the change log", "[latency]") {
     duckdb::DuckDB db(nullptr);
