@@ -28,6 +28,9 @@ CLASS zcl_erpl_rev_streamstress DEFINITION PUBLIC FINAL CREATE PUBLIC.
     METHODS register IMPORTING iv_target TYPE string iv_kind TYPE string
                                iv_col TYPE string iv_tcol TYPE string.
     METHODS report IMPORTING iv_target TYPE string iv_label TYPE string iv_sap TYPE int8.
+    METHODS load_oracles.
+    METHODS key_expr IMPORTING iv_alias TYPE string RETURNING VALUE(rv) TYPE string.
+    METHODS same_key IMPORTING iv_a TYPE string iv_b TYPE string RETURNING VALUE(rv) TYPE string.
     METHODS out_line IMPORTING iv_text TYPE string.
 ENDCLASS.
 
@@ -100,6 +103,16 @@ CLASS zcl_erpl_rev_streamstress IMPLEMENTATION.
     ENDWHILE.
     out->write( |{ lv_cycles } cycles per strategy at a 2s tick| ).
 
+    " --- settle ------------------------------------------------------------
+    " The cycle ceiling is read_start minus the safety window, so a change
+    " committed in the workload's final second is deliberately NOT eligible
+    " until a cycle starts a safety window later. Without this wait the
+    " anti-joins below would report the engine's correct behaviour as loss.
+    WAIT UP TO 10 SECONDS.
+    zcl_erpl_rev_delta=>run( iv_target = 'str_numts' ).
+    zcl_erpl_rev_delta=>run( iv_target = 'str_dt' ).
+    zcl_erpl_rev_delta=>run( iv_target = 'str_int' ).
+
     " --- what the generator actually committed -----------------------------
     SELECT COUNT(*) FROM zdelta_audit WHERE runid = @c_run INTO @DATA(lv_changes).
     SELECT COUNT(*) FROM zdelta_audit WHERE runid = @c_run AND op = 'I' INTO @DATA(lv_gi).
@@ -113,6 +126,8 @@ CLASS zcl_erpl_rev_streamstress IMPLEMENTATION.
     ok( cond = xsdbool( lv_gu > 0 AND lv_gd > 0 )
         what = 'the workload really contained updates and deletes'
         detail = |U={ lv_gu } D={ lv_gd }| ).
+
+    load_oracles( ).
 
     report( iv_target = 'str_numts' iv_label = 'NUMTS   ' iv_sap = lv_sap_rows ).
     report( iv_target = 'str_dt'    iv_label = 'DATETIME' iv_sap = lv_sap_rows ).
@@ -146,12 +161,57 @@ CLASS zcl_erpl_rev_streamstress IMPLEMENTATION.
     DATA(lv_rows) = cnt( |SELECT count(*) AS c FROM { iv_target }| ).
     DATA(lv_log)  = cnt( |SELECT count(*) AS c FROM _erpl_rev_log_{ iv_target }| ).
 
-    " A watermark tier cannot see a physical delete -- that is what the snapshot
-    " and trigger tiers are for -- so the target legitimately holds MORE rows
-    " than SAP. What must never happen is holding FEWER: that is a lost row.
-    ok( cond   = xsdbool( lv_rows >= iv_sap )
+    " LOSS, by key, not by count. Comparing counts passes for a target holding
+    " the right NUMBER of the wrong rows -- and under a workload that inserts
+    " and deletes at the same time, the counts drift into agreement by
+    " accident. So: every key still present in SAP must be present in the
+    " target. This is an anti-join against the real source, evaluated in the
+    " engine, over the two tables that were loaded side by side.
+    DATA(lv_lost) = cnt(
+      |SELECT count(*) AS c FROM stress_truth t WHERE NOT EXISTS (| &&
+      |SELECT 1 FROM { iv_target } x WHERE | && same_key( iv_a = 'x' iv_b = 't' ) && |)| ).
+    ok( cond   = xsdbool( lv_lost = 0 )
         what   = |{ iv_label }: no rows lost|
-        detail = |sap={ iv_sap } target={ lv_rows }| ).
+        detail = |{ lv_lost } key(s) in SAP are missing from the target | &&
+                 |(sap={ iv_sap } target={ lv_rows })| ).
+
+    " PHANTOMS, the other direction. A watermark tier cannot see a physical
+    " delete, so a target key absent from SAP is legitimate EXACTLY when the
+    " generator deleted it. A key that is in neither the source nor the
+    " generator's audit was invented by the pipeline.
+    DATA(lv_matched) = cnt(
+      |SELECT count(*) AS c FROM { iv_target } x JOIN stress_audit a ON | &&
+      |trim(a.keyval) = { key_expr( 'x' ) }| ).
+    IF lv_matched = 0 AND lv_rows > 0.
+      " Say so instead of reporting every row as a phantom: an audit key that
+      " no longer renders the way the target's key columns do is a broken
+      " oracle, and a broken oracle that fails LOUDLY beats one that indicts
+      " the engine.
+      ok( cond = abap_false what = |{ iv_label }: the audit oracle still matches the target's keys|
+          detail = |no target row matches any audit keyval -- key rendering drifted| ).
+    ELSE.
+      DATA(lv_phantom) = cnt(
+        |SELECT count(*) AS c FROM { iv_target } x | &&
+        |WHERE NOT EXISTS (SELECT 1 FROM stress_truth t WHERE | &&
+        same_key( iv_a = 'x' iv_b = 't' ) && |) | &&
+        |AND NOT EXISTS (SELECT 1 FROM stress_audit a | &&
+        |WHERE trim(a.keyval) = { key_expr( 'x' ) })| ).
+      ok( cond   = xsdbool( lv_phantom = 0 )
+          what   = |{ iv_label }: no phantom rows|
+          detail = |{ lv_phantom } target key(s) the generator never wrote| ).
+    ENDIF.
+
+    " STALE PAYLOAD. A key can be present and still wrong: delivered once on
+    " its insert and never refreshed by any of the updates that followed.
+    " Neither anti-join above can see that, and it is the failure a customer
+    " notices last.
+    DATA(lv_stale) = cnt(
+      |SELECT count(*) AS c FROM stress_truth t JOIN { iv_target } x ON | &&
+      same_key( iv_a = 'x' iv_b = 't' ) && | WHERE x.dmbtr IS DISTINCT FROM t.dmbtr| ).
+    ok( cond   = xsdbool( lv_stale = 0 )
+        what   = |{ iv_label }: no stale payload|
+        detail = |{ lv_stale } row(s) carry an older value than SAP does| ).
+
     ok( cond   = xsdbool( lv_log > 0 )
         what   = |{ iv_label }: the change log captured the workload|
         detail = |{ lv_log }| ).
@@ -177,6 +237,38 @@ CLASS zcl_erpl_rev_streamstress IMPLEMENTATION.
       |count(*) FILTER (WHERE _op='U') AS u | &&
       |FROM _erpl_rev_log_{ iv_target }| ).
     out_line( |{ iv_label } applied  { lv_ops } rows={ lv_rows }| ).
+  ENDMETHOD.
+
+  METHOD load_oracles.
+    " Both oracles are pulled into the engine by an ordinary full load, AFTER
+    " the workload has finished and the deltas have settled. Comparing them
+    " with the delta targets is then one SQL statement each, in one place,
+    " instead of shipping key sets back into ABAP to be diffed in a loop.
+    zcl_erpl_rev_util=>replicate( iv_tab = 'ZDELTA_ALL' iv_target = 'stress_truth'
+                                  iv_record = abap_false ).
+    zcl_erpl_rev_util=>replicate( iv_tab = 'ZDELTA_AUDIT' iv_target = 'stress_audit'
+                                  iv_where = |RUNID = '{ c_run }'|
+                                  iv_record = abap_false ).
+    out_line( |oracles: stress_truth={ cnt( 'SELECT count(*) AS c FROM stress_truth' ) } | &&
+              |stress_audit={ cnt( 'SELECT count(*) AS c FROM stress_audit' ) }| ).
+  ENDMETHOD.
+
+  METHOD key_expr.
+    " The generator writes its audit key as BUKRS/BELNR/GJAHR/BUZEI. Rendering
+    " it here from the target's own key columns is what makes the phantom
+    " check a real comparison rather than a count.
+    " The pipe is the string-template delimiter, so SQL's concatenation
+    " operator is spelled with backtick literals rather than escaped inside
+    " one: || in a template is a syntax error, and \|\| is unreadable.
+    DATA(lc) = ` || '/' || `.
+    rv = |{ iv_alias }.bukrs| && lc && |{ iv_alias }.belnr| && lc &&
+         |{ iv_alias }.gjahr| && lc && |{ iv_alias }.buzei|.
+  ENDMETHOD.
+
+  METHOD same_key.
+    rv = |{ iv_a }.client = { iv_b }.client AND { iv_a }.bukrs = { iv_b }.bukrs | &&
+         |AND { iv_a }.belnr = { iv_b }.belnr AND { iv_a }.gjahr = { iv_b }.gjahr | &&
+         |AND { iv_a }.buzei = { iv_b }.buzei|.
   ENDMETHOD.
 
   METHOD out_line.

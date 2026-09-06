@@ -177,7 +177,12 @@ fi
 # suite meant hand-bumping a number here; those are the most rubber-stamped
 # lines in the file and the first to be "fixed" by making them match.
 ONLY="${ERPL_REV_E2E_ONLY:-}"
-SKIP="${ERPL_REV_E2E_SKIP:-@soak|@perf}"
+# The default skip keeps the long lanes out of an ordinary run. But asking for a
+# suite BY NAME and being told "skipped" is a gate that silently runs nothing --
+# so an explicit ONLY beats the DEFAULT skip. An explicit SKIP still wins, which
+# is how a soak lane excludes one suite from the set it asked for.
+if [ -n "$ONLY" ]; then SKIP="${ERPL_REV_E2E_SKIP:-}"
+else SKIP="${ERPL_REV_E2E_SKIP:-@soak|@perf}"; fi
 
 suite() {  # NAME CLASS file marker-prefix min-pass tag description
   local name="$1" cls="$2" file="$3" marker="$4" minpass="${5:-1}" tag="${6:-}" desc="${7:-}"
@@ -260,6 +265,9 @@ suite publish ZCL_ERPL_REV_PUBTEST abap/zcl_erpl_rev_pubtest.abap PUBTEST 6 "" \
 
 suite watermark ZCL_ERPL_REV_WMTEST abap/zcl_erpl_rev_wmtest.abap WM 8 "" \
   "the corrections: a late commit below the observed max is delivered, DATE never reads today, a DATS+TIMS pair survives midnight, load types I and F"
+
+suite stress ZCL_ERPL_REV_STREAMSTRESS abap/zcl_erpl_rev_streamstress.abap STRESS 14 "@soak" \
+  "a real change workload, then the two anti-joins: nothing lost, nothing invented, nothing stale"
 
 suite cds ZCL_ERPL_REV_CDSTEST abap/zcl_erpl_rev_cdstest.abap CDS 8 "" \
   "CDS view entity as a source: keys, parity, parameters"
