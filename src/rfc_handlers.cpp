@@ -10,6 +10,7 @@
 #include "cdc_dialect.hpp"
 #include "cdc_status.hpp"
 #include "split_planner.hpp"
+#include "validation.hpp"
 #include "json_util.hpp"
 #include "logging.hpp"
 #include "erpl_rev_telemetry.hpp"
@@ -1003,6 +1004,105 @@ extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE,
             }
             plan = "{\"portions\":[" + arr + "],\"predicates\":[" + preds +
                    "],\"count\":" + std::to_string(portions.size()) + "}";
+        } else if (action == "VALIDATE") {
+            // The DuckDB half of a two-sided comparison. ABAP renders the SAP
+            // side with fingerprint_cell and sends its per-key fingerprints;
+            // here the same rows are rendered from the replica with the
+            // matching expressions, and the two are compared.
+            //
+            // Canonical TEXT per column, not a row count: a replica that is the
+            // right size and the wrong content passes every count check there
+            // is. FLTP is excluded because binary floating point does not
+            // round-trip through decimal text and would report mismatches on
+            // correct data.
+            validation::Policy pol;
+            const auto mode = JsonField(params, "mode");
+            pol.mode = mode == "full" ? validation::Mode::Full : validation::Mode::Sample;
+            const auto sr = JsonField(params, "sample_rows");
+            if (!sr.empty()) pol.sample_rows = std::atoll(sr.c_str());
+
+            std::vector<validation::Field> fields;
+            {
+                const auto arr = JsonArray(params, "fields");
+                size_t at = 0;
+                while ((at = arr.find("{", at)) != std::string::npos) {
+                    const auto end = arr.find("}", at);
+                    if (end == std::string::npos) break;
+                    const auto obj = arr.substr(at, end - at + 1);
+                    validation::Field f;
+                    f.name = JsonField(obj, "name");
+                    f.datatype = JsonField(obj, "datatype");
+                    const auto len = JsonField(obj, "length");
+                    const auto dec = JsonField(obj, "decimals");
+                    if (!len.empty()) f.length = std::atoi(len.c_str());
+                    if (!dec.empty()) f.decimals = std::atoi(dec.c_str());
+                    if (!f.name.empty() && validation::IsComparable(f)) fields.push_back(f);
+                    at = end + 1;
+                }
+            }
+            if (fields.empty())
+                throw std::runtime_error("VALIDATE: no comparable columns for " + target);
+
+            const auto vplan = validation::BuildPlan(pol, target, fields);
+            QueryResult ours = g_bridge->Query(vplan.sql);
+
+            // The SAP side's fingerprints, compared POSITIONALLY.
+            //
+            // Both sides render the same columns in the same order and sort by
+            // them, which is what BuildPlan's ORDER BY is for -- two unordered
+            // result sets cannot be compared row by row at all. Position is the
+            // contract; inventing a key here would have been a second one.
+            std::vector<std::string> theirs;
+            {
+                const auto arr = JsonArray(params, "rows");
+                size_t at = 0;
+                while (at < arr.size()) {
+                    const auto b = arr.find('"', at);
+                    if (b == std::string::npos) break;
+                    std::string v;
+                    size_t i = b + 1;
+                    for (; i < arr.size() && arr[i] != '"'; ++i) {
+                        if (arr[i] == '\\' && i + 1 < arr.size()) ++i;
+                        v += arr[i];
+                    }
+                    theirs.push_back(v);
+                    at = i + 1;
+                }
+            }
+            long long compared = 0, mismatched = 0;
+            std::string first_bad;
+            const size_t n = std::min(theirs.size(), ours.rows.size());
+            for (size_t i = 0; i < n; ++i) {
+                ++compared;
+                const auto mine = JsonField(ours.rows[i], "fp");
+                if (mine != theirs[i]) {
+                    ++mismatched;
+                    if (first_bad.empty()) first_bad = "row " + std::to_string(i + 1);
+                }
+            }
+            // A row count that differs is itself a mismatch, and reporting only
+            // the overlap would call a truncated replica identical.
+            if (theirs.size() != ours.rows.size()) {
+                ++mismatched;
+                if (first_bad.empty())
+                    first_bad = "row count: SAP " + std::to_string(theirs.size()) +
+                                ", replica " + std::to_string(ours.rows.size());
+            }
+
+            // Recorded like any other run: a validation nobody can find later
+            // did not happen as far as an auditor is concerned.
+            Exec(con, "INSERT INTO _erpl_rev_run_stats "
+                      "(run_id, target, source, run_type, method, status, rows_read, "
+                      "validation_status) VALUES (nextval('_erpl_rev_run_seq')," +
+                      SqlLit(target) + "," + SqlLit(target) + ",'VALIDATE','OPERATOR'," +
+                      SqlLit(mismatched == 0 ? "SUCCESS" : "ERROR") + "," +
+                      std::to_string(compared) + "," +
+                      SqlLit(mismatched == 0 ? "PASSED" : "FAILED") + ")");
+
+            plan = "{\"compared\":" + std::to_string(compared) + ",\"mismatched\":" +
+                   std::to_string(mismatched) + ",\"verdict\":" +
+                   json::QuoteString(mismatched == 0 ? "PASSED" : "FAILED") +
+                   ",\"first_mismatch\":" + json::QuoteString(first_bad) + "}";
         } else if (action == "SET_WM") {
             // An operator moving the position, deliberately -- to re-deliver a
             // window after a downstream loss, or to adopt a position after a
@@ -1061,7 +1161,7 @@ extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE,
             throw std::runtime_error(
                 "unknown plan action '" + action +
                 "'. Known: BEGIN_CYCLE, CYCLE_COMMIT, TICK, CDC_APPLY, DRIFT, SUBS, "
-                "RETAIN, SET_WM, PREVIEW, CDC_PROBE, CDC_STATUS, CDC_REPAIR, SPLIT.");
+                "RETAIN, SET_WM, PREVIEW, CDC_PROBE, CDC_STATUS, CDC_REPAIR, SPLIT, VALIDATE.");
         }
 
         SetString(funcHandle, "EV_PLAN", plan);

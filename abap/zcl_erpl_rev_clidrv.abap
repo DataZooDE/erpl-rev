@@ -420,6 +420,92 @@ CLASS zcl_erpl_rev_clidrv IMPLEMENTATION.
           ENDIF.
         ENDIF.
 
+      WHEN 'validate'.
+        " Two-sided, cell by cell. A replica that is the right SIZE and the
+        " wrong CONTENT passes every count check there is, so both sides render
+        " the same columns as canonical text and the fingerprints are compared.
+        "
+        " The SAP half is rendered here because it has to be: fingerprint_cell
+        " turns a DDIC-typed value into that text, and moving it to the server
+        " would duplicate the DDIC knowledge where the two could silently
+        " disagree -- which is the whole failure this feature exists to catch.
+        DATA(lv_vt) = jstr( iv_json = iv_params iv_key = 'target' ).
+        DATA(ls_vs) = zcl_erpl_rev_delta=>state( lv_vt ).
+        DATA(lv_vsrc) = COND string( WHEN ls_vs-source_from IS NOT INITIAL
+                                     THEN ls_vs-source_from ELSE lv_vt ).
+        DATA(lv_vn) = zcl_erpl_rev_delta=>jstr( iv_json = iv_params iv_key = 'sample_rows' ).
+        DATA(lv_vmax) = COND i( WHEN lv_vn IS INITIAL THEN 1000 ELSE CONV i( lv_vn ) ).
+
+        DATA(ls_vd) = zcl_erpl_rev_util=>describe_table( iv_tab = lv_vsrc iv_target = lv_vt ).
+        IF ls_vd-error IS NOT INITIAL.
+          ev_error = ls_vd-error.
+        ELSE.
+          " The comparable columns, in one order, used for both the ORDER BY and
+          " the fingerprint. Position is the contract between the two sides.
+          DATA lt_vf TYPE string_table.
+          DATA lv_vfj TYPE string VALUE `[`.
+          LOOP AT ls_vd-fields INTO DATA(ls_vfl).
+            " FLTP is excluded on both sides: binary floating point does not
+            " round-trip through decimal text and would report mismatches on
+            " correct data.
+            IF ls_vfl-datatype = 'FLTP'. CONTINUE. ENDIF.
+            APPEND ls_vfl-name TO lt_vf.
+            IF lv_vfj <> `[`. lv_vfj = lv_vfj && `,`. ENDIF.
+            lv_vfj = lv_vfj && |\{"name":"{ ls_vfl-name }","datatype":"{ ls_vfl-datatype }",| &&
+                     |"length":{ ls_vfl-length },"decimals":{ ls_vfl-decimals }\}|.
+          ENDLOOP.
+          lv_vfj = lv_vfj && `]`.
+
+          IF lt_vf IS INITIAL.
+            ev_error = |{ lv_vt } has no comparable columns|.
+          ELSE.
+            DATA(lv_vcols) = concat_lines_of( table = lt_vf sep = `,` ).
+            DATA lv_vrows TYPE string VALUE `[`.
+            " The row type comes from the SOURCE's own DDIC definition. A
+            " dynamic select list gives the compiler nothing to infer, so an
+            " inline target is not allowed -- and a hand-declared one that does
+            " not fit the columns dumps the work process rather than raising.
+            DATA lo_vt TYPE REF TO data.
+            FIELD-SYMBOLS <vtab> TYPE STANDARD TABLE.
+            FIELD-SYMBOLS <vr> TYPE any.
+            FIELD-SYMBOLS <vc> TYPE any.
+            TRY.
+                CREATE DATA lo_vt TYPE TABLE OF (lv_vsrc).
+                ASSIGN lo_vt->* TO <vtab>.
+                SELECT (lv_vcols) FROM (lv_vsrc)
+                  ORDER BY (lv_vcols)
+                  INTO CORRESPONDING FIELDS OF TABLE @<vtab> UP TO @lv_vmax ROWS.
+                LOOP AT <vtab> ASSIGNING <vr>.
+                  DATA(lv_fp) = ``.
+                  LOOP AT ls_vd-fields INTO DATA(ls_vf2).
+                    IF ls_vf2-datatype = 'FLTP'. CONTINUE. ENDIF.
+                    ASSIGN COMPONENT ls_vf2-name OF STRUCTURE <vr> TO <vc>.
+                    IF <vc> IS NOT ASSIGNED. CONTINUE. ENDIF.
+                    IF lv_fp IS NOT INITIAL. lv_fp = lv_fp && `|`. ENDIF.
+                    lv_fp = lv_fp && zcl_erpl_rev_util=>fingerprint_cell(
+                                       is_field = ls_vf2 iv_val = <vc> ).
+                  ENDLOOP.
+                  IF lv_vrows <> `[`. lv_vrows = lv_vrows && `,`. ENDIF.
+                  lv_vrows = lv_vrows && `"` && escape( val = lv_fp
+                                                        format = cl_abap_format=>e_json_string )
+                                      && `"`.
+                ENDLOOP.
+                lv_vrows = lv_vrows && `]`.
+              CATCH cx_root INTO DATA(lx_v).
+                ev_error = |reading { lv_vsrc } for validation failed: { lx_v->get_text( ) }|.
+                RETURN.
+            ENDTRY.
+
+            DATA(lv_vp) = |\{"fields":{ lv_vfj },"rows":{ lv_vrows },| &&
+                          |"mode":"{ jstr( iv_json = iv_params iv_key = 'mode' ) }",| &&
+                          |"sample_rows":{ lv_vmax }\}|.
+            DATA(ls_vr) = zcl_erpl_rev_delta=>plan_json(
+              iv_action = 'VALIDATE' iv_target = lv_vt iv_params = lv_vp ).
+            ev_error  = ls_vr-error.
+            ev_result = ls_vr-json.
+          ENDIF.
+        ENDIF.
+
       WHEN 'set_wm' OR 'preview'.
         " Server-side actions: set_wm moves the position and records the run
         " that moved it in one transaction; preview reads through whatever a

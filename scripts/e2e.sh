@@ -501,6 +501,20 @@ MRW="$(cli sql "SELECT CASE WHEN count(*) > 0 THEN 'LOADED' ELSE 'EMPTY' END AS 
 grep -q LOADED <<<"$MRW" || fail "mass run moved no rows: $MRW"
 echo "   mass run: portions cut by the server, persisted, and loaded"
 
+# validate: compare what was replicated against the SAP source, cell by cell.
+# A replica that is the right SIZE and the wrong CONTENT passes every count
+# check there is, which is why this compares canonical text per column.
+VD="$(cli sync validate t000_cli --yes 2>&1)" || fail "sync validate failed: $VD"
+grep -qiE "PASSED|compared" <<<"$VD" || fail "sync validate said nothing usable: $VD"
+VA="$(cli sql "SELECT CASE WHEN count(*) > 0 THEN 'AUDITED' ELSE 'NO_RECORD' END AS v FROM _erpl_rev_run_stats WHERE target='t000_cli' AND run_type='VALIDATE'" 2>&1)"
+grep -q AUDITED <<<"$VA" || fail "validate left no audit row: $VA"
+
+# ...and it must actually catch corruption, or it is a green light with no bulb.
+cli sql "UPDATE t000_cli SET mtext = 'corrupted-by-e2e' WHERE rowid = 0" >/dev/null 2>&1
+VC="$(cli sync validate t000_cli --yes 2>&1 || true)"
+grep -qiE "FAILED|mismatch" <<<"$VC" || fail "validate did not detect a changed cell: $VC"
+echo "   sync validate: a clean target passes, a corrupted cell is caught"
+
 # cdc status on a target that is not a trigger target must say so, not crash.
 CS="$(cli cdc status --target t000_cli --yes 2>&1 || true)"
 grep -qiE "not a registered trigger target|no registration" <<<"$CS"   || fail "cdc status on a non-CDC target gave no usable message: $CS"

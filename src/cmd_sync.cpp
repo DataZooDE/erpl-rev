@@ -63,6 +63,7 @@ std::string UnknownFlag(const std::vector<std::string> &args, const std::string 
     };
     static const Spec kSyncSetWm[]  = { {"--wm-value", true} };
     static const Spec kSyncPreview[] = { {"--rows", true} };
+    static const Spec kSyncValidate[] = { {"--full", false}, {"--sample-rows", true} };
     static const Spec kDaemon[]     = { {"--tick", true}, {"--workers", true} };
     static const Spec kSub[]        = { {"--target", true}, {"--sink", true},
                                         {"--dedup-keys", true} };
@@ -84,6 +85,7 @@ std::string UnknownFlag(const std::vector<std::string> &args, const std::string 
                                       { known = kSyncRun;      count = std::size(kSyncRun); }
     else if (sub == "sync set-wm")    { known = kSyncSetWm;    count = std::size(kSyncSetWm); }
     else if (sub == "sync preview")   { known = kSyncPreview;  count = std::size(kSyncPreview); }
+    else if (sub == "sync validate") { known = kSyncValidate; count = std::size(kSyncValidate); }
     else if (sub.rfind("daemon", 0) == 0) { known = kDaemon; count = std::size(kDaemon); }
     else if (sub.rfind("sub", 0) == 0)    { known = kSub;    count = std::size(kSub); }
     else if (sub == "retain")             { known = kRetain; count = std::size(kRetain); }
@@ -542,6 +544,7 @@ static int SyncSchedule(Options &o) {
 
 int SyncSetWm(Options &o, const std::string &target);
 int SyncPreview(Options &o, const std::string &target);
+int SyncValidate(Options &o, const std::string &target);
 
 int RunSync(Options o) {
     const std::string sub = o.args.empty() ? "" : o.args.front();
@@ -565,6 +568,7 @@ int RunSync(Options o) {
         if (sub == "schedule")      return SyncSchedule(o);
         if (sub == "set-wm")        return SyncSetWm(o, arg);
         if (sub == "preview")       return SyncPreview(o, arg);
+        if (sub == "validate")      return SyncValidate(o, arg);
     } catch (const abapgen::UnsafeValue &e) {
         std::fprintf(stderr, "erpl-rev: %s\n", e.what());
         return 2;
@@ -574,7 +578,7 @@ int RunSync(Options o) {
     }
     std::fprintf(stderr,
                  "erpl-rev sync: expected ls, show, create, run, run-due, schedule, "
-                 "set-wm or preview.\n");
+                 "set-wm, preview or validate.\n");
     return 2;
 }
 
@@ -597,6 +601,20 @@ int SyncPreview(Options &o, const std::string &target) {
     }
     return RunViaDriver(o, "preview",
                         BuildParams({{"target", target}, {"rows", Field(o, "--rows", "20")}}));
+}
+
+int SyncValidate(Options &o, const std::string &target) {
+    if (target.empty()) {
+        std::fprintf(stderr, "erpl-rev sync validate <target> [--full] [--sample-rows N]\n"
+                             "  Compares the replica against SAP cell by cell. A replica that "
+                             "is the\n  right size and the wrong content passes every count "
+                             "check there is.\n");
+        return 2;
+    }
+    return RunViaDriver(o, "validate", BuildParams({
+        {"target", target},
+        {"mode", HasFlag(o, "--full") ? "full" : "sample"},
+        {"sample_rows", Field(o, "--sample-rows", "1000")}}));
 }
 
 // ---------------------------------------------------------------------------
