@@ -9,6 +9,7 @@
 #include "duckdb_bridge.hpp"
 #include "cdc_dialect.hpp"
 #include "cdc_status.hpp"
+#include "split_planner.hpp"
 #include "json_util.hpp"
 #include "logging.hpp"
 #include "erpl_rev_telemetry.hpp"
@@ -116,6 +117,11 @@ std::string ReplaceAll(std::string s, const std::string &from, const std::string
     while ((p = s.find(from, p)) != std::string::npos) { s.replace(p, from.size(), to); p += to.size(); }
     return s;
 }
+std::string LowerOf(std::string s) {
+    for (char &c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
 std::string UpperOf(std::string s) {
     for (char &c : s) if (c >= 'a' && c <= 'z') c = char(c - 'a' + 'A');
     return s;
@@ -494,6 +500,28 @@ std::string JsonField(const std::string &json, const std::string &key) {
     return out;
 }
 
+// The ARRAY token for a key, brackets included, or empty.
+//
+// JsonField stops at the first ',' or '}' for a non-string value, so asking it
+// for an array returns the first fragment of one. That is the third time in this
+// codebase a scalar extractor has been pointed at a structured value -- the ABAP
+// side needed the same split, and the command queue's result reader had it too.
+// Different language, same shape: the scalar version is always the one already
+// in reach.
+std::string JsonArray(const std::string &json, const std::string &key) {
+    const std::string needle = "\"" + key + "\"";
+    auto at = json.find(needle);
+    if (at == std::string::npos) return {};
+    at = json.find('[', at + needle.size());
+    if (at == std::string::npos) return {};
+    int depth = 0;
+    for (auto i = at; i < json.size(); ++i) {
+        if (json[i] == '[') ++depth;
+        else if (json[i] == ']' && --depth == 0) return json.substr(at, i - at + 1);
+    }
+    return {};
+}
+
 // The tick plan, as JSON. Reads the three control tables the planner needs and
 // hands the pure function its rows, so the daemon and the batch tick get the
 // same answer from the same code.
@@ -863,6 +891,118 @@ extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE,
                 arr += json::QuoteString(ddl[i]);
             }
             plan = "{\"ddl\":[" + arr + "],\"count\":" + std::to_string(ddl.size()) + "}";
+        } else if (action == "SPLIT") {
+            // Cut a mass load into portions, and PERSIST them before any worker
+            // starts -- that is what makes the run restartable. ABAP supplies
+            // the facts it alone has (the histogram, the fiscal ranges, the
+            // bytes per row); the server decides every boundary, so one code
+            // path cuts every strategy.
+            split::SplitRequest req;
+            const auto strat = JsonField(params, "strategy");
+            // The strategy names the operator types, mapped here rather than in
+            // ABAP: the server decides every boundary, so it also owns what the
+            // strategy words mean.
+            const std::string sname = strat.empty() ? "records" : LowerOf(strat);
+            if (sname == "records")      req.strategy = split::Strategy::Records;
+            else if (sname == "size")    req.strategy = split::Strategy::Size;
+            else if (sname == "time")    req.strategy = split::Strategy::Time;
+            else if (sname == "fiscal")  req.strategy = split::Strategy::Fiscal;
+            else if (sname == "list")    req.strategy = split::Strategy::List;
+            else if (sname == "key")     req.strategy = split::Strategy::Key;
+            else throw std::runtime_error("SPLIT: unknown strategy '" + strat +
+                                          "'. Known: records, size, time, fiscal, list, key.");
+            req.part_col = JsonField(params, "part_col");
+            req.user_where = JsonField(params, "where");
+            const auto lr = JsonField(params, "limit_rows");
+            const auto lm = JsonField(params, "limit_mb");
+            const auto bpr = JsonField(params, "bytes_per_row");
+            if (!lr.empty()) req.limit_rows = std::atoll(lr.c_str());
+            if (!lm.empty()) req.limit_mb = std::atoll(lm.c_str());
+            if (!bpr.empty()) req.bytes_per_row = std::atoll(bpr.c_str());
+            req.range_min = JsonField(params, "range_min");
+            req.range_max = JsonField(params, "range_max");
+            const auto tot = JsonField(params, "total_rows");
+            if (!tot.empty()) req.total_rows = std::atoll(tot.c_str());
+            req.time_unit = JsonField(params, "time_unit");
+            req.time_from = JsonField(params, "time_from");
+            req.time_to = JsonField(params, "time_to");
+            {
+                // The histogram: {"bucket":"...","rows":N} objects.
+                size_t at = 0;
+                const auto h = JsonArray(params, "histogram");
+                while ((at = h.find("{", at)) != std::string::npos) {
+                    const auto end = h.find("}", at);
+                    if (end == std::string::npos) break;
+                    const auto obj = h.substr(at, end - at + 1);
+                    split::Bucket b;
+                    b.value = JsonField(obj, "bucket");
+                    const auto n = JsonField(obj, "rows");
+                    b.rows = n.empty() ? 0 : std::atoll(n.c_str());
+                    if (!b.value.empty()) req.histogram.push_back(b);
+                    at = end + 1;
+                }
+            }
+            const auto portions = split::PlanSplit(req);
+            // Say WHY, not just "none". A split that produces nothing is always
+            // a missing input, and which one is the entire question.
+            if (portions.empty()) {
+                std::string why = "SPLIT produced no portions for " + target + " (strategy " +
+                                  sname + ")";
+                if ((req.strategy == split::Strategy::Records ||
+                     req.strategy == split::Strategy::Size) && req.histogram.empty() &&
+                    req.range_min.empty())
+                    why += ": no histogram and no partition bounds -- pass --part-col";
+                else if (req.strategy == split::Strategy::Records && req.limit_rows <= 0)
+                    why += ": --limit-rows is required";
+                else if (req.strategy == split::Strategy::Size && req.limit_mb <= 0)
+                    why += ": --limit-mb is required";
+                else if (req.strategy == split::Strategy::Time)
+                    why += ": a time range is required";
+                throw std::runtime_error(why);
+            }
+
+            // Persisted first, in one transaction: a portion list that exists
+            // only in the caller's memory cannot be restarted after a crash,
+            // which is the whole reason to split rather than stream.
+            Exec(con, "BEGIN");
+            try {
+                Exec(con, "CREATE TABLE IF NOT EXISTS _erpl_rev_portion ("
+                          "target VARCHAR, run_id BIGINT, portion_no INTEGER, "
+                          "predicate VARCHAR, est_rows BIGINT, status VARCHAR DEFAULT 'PENDING', "
+                          "attempts INTEGER DEFAULT 0, started_ts TIMESTAMPTZ, "
+                          "finished_ts TIMESTAMPTZ, rows_done BIGINT)");
+                Exec(con, "DELETE FROM _erpl_rev_portion WHERE target=" + SqlLit(target) +
+                              " AND status <> 'DONE'");
+                for (const auto &p : portions)
+                    Exec(con, "INSERT INTO _erpl_rev_portion "
+                              "(target, run_id, portion_no, predicate, est_rows, status) VALUES (" +
+                              SqlLit(target) + ",0," + std::to_string(p.portion_no) + "," +
+                              SqlLit(p.predicate) + "," + std::to_string(p.est_rows) +
+                              ",'PENDING')");
+                Exec(con, "COMMIT");
+            } catch (...) {
+                Exec(con, "ROLLBACK");
+                throw;
+            }
+
+            std::string arr;
+            for (size_t i = 0; i < portions.size(); ++i) {
+                if (i) arr += ",";
+                arr += "{\"portion_no\":" + std::to_string(portions[i].portion_no) +
+                       ",\"predicate\":" + json::QuoteString(portions[i].predicate) +
+                       ",\"est_rows\":" + std::to_string(portions[i].est_rows) + "}";
+            }
+            // A flat predicate array alongside the detailed one: the driver
+            // needs the predicates in order and nothing else, and parsing
+            // objects out of a nested array in ABAP is how the repair DDL got
+            // mangled twice.
+            std::string preds;
+            for (size_t i = 0; i < portions.size(); ++i) {
+                if (i) preds += ",";
+                preds += json::QuoteString(portions[i].predicate);
+            }
+            plan = "{\"portions\":[" + arr + "],\"predicates\":[" + preds +
+                   "],\"count\":" + std::to_string(portions.size()) + "}";
         } else if (action == "SET_WM") {
             // An operator moving the position, deliberately -- to re-deliver a
             // window after a downstream loss, or to adopt a position after a
@@ -921,7 +1061,7 @@ extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE,
             throw std::runtime_error(
                 "unknown plan action '" + action +
                 "'. Known: BEGIN_CYCLE, CYCLE_COMMIT, TICK, CDC_APPLY, DRIFT, SUBS, "
-                "RETAIN, SET_WM, PREVIEW, CDC_PROBE, CDC_STATUS, CDC_REPAIR.");
+                "RETAIN, SET_WM, PREVIEW, CDC_PROBE, CDC_STATUS, CDC_REPAIR, SPLIT.");
         }
 
         SetString(funcHandle, "EV_PLAN", plan);

@@ -177,3 +177,49 @@ TEST_CASE("split: every row of the histogram ends up in exactly one portion",
                                        [](long long a, const Portion &x) { return a + x.est_rows; });
     CHECK(total == 2000);
 }
+
+TEST_CASE("split: records without a histogram cuts equal ranges from min/max",
+          "[split]") {
+    // A per-value histogram needs a multi-row dynamic SELECT, and the ABAP side
+    // has no proven pattern for one -- the shape cannot be inferred from a
+    // dynamic select list, and a declared shape that does not fit the columns
+    // dumps the work process rather than raising anything catchable.
+    //
+    // What ABAP does have, and uses today for parallel loads, is a scalar
+    // MIN/MAX read. So the facts it supplies are min, max and a row count, and
+    // the SERVER still decides every boundary -- which is the contract: ABAP
+    // provides data, never a cut.
+    SplitRequest r;
+    r.strategy = Strategy::Records;
+    r.part_col = "BELNR";
+    r.limit_rows = 250;
+    r.range_min = "0000000001";
+    r.range_max = "0000001000";
+    r.total_rows = 1000;
+
+    const auto p = PlanSplit(r);
+    REQUIRE(p.size() == 4);
+    // Zero padding preserved: a NUMC document number compared as text sorts
+    // wrongly the moment a leading zero is dropped.
+    CHECK(p[0].predicate.find("'0000000001'") != std::string::npos);
+    CHECK(p[3].predicate.find("'0000001000'") != std::string::npos);
+    // Contiguous and non-overlapping: every row lands in exactly one portion.
+    for (size_t i = 1; i < p.size(); ++i)
+        CHECK(p[i].portion_no == p[i - 1].portion_no + 1);
+}
+
+TEST_CASE("split: a histogram still wins when one is supplied", "[split]") {
+    // The fallback must not displace the better input: a real histogram cuts on
+    // actual row counts, min/max can only assume they are evenly spread.
+    SplitRequest r;
+    r.strategy = Strategy::Records;
+    r.part_col = "BUKRS";
+    r.limit_rows = 100;
+    r.histogram = {{"1000", 60}, {"2000", 60}};
+    r.range_min = "1000";
+    r.range_max = "2000";
+    r.total_rows = 120;
+
+    const auto p = PlanSplit(r);
+    CHECK(p.size() == 2);   // 60 + 60 exceeds 100, so they do not merge
+}

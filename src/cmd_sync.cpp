@@ -67,6 +67,7 @@ std::string UnknownFlag(const std::vector<std::string> &args, const std::string 
     static const Spec kSub[]        = { {"--target", true}, {"--sink", true},
                                         {"--dedup-keys", true} };
     static const Spec kMass[]       = { {"--split", true}, {"--limit-rows", true},
+                                        {"--target", true}, {"--source", true},
                                         {"--limit-mb", true}, {"--time-unit", true},
                                         {"--part-col", true}, {"--restart", true},
                                         {"--jobs", true}, {"--server-group", true} };

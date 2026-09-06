@@ -104,6 +104,61 @@ std::vector<Portion> ByBuckets(const SplitRequest &r, long long limit) {
 
 }  // namespace
 
+// Equal-width ranges over [range_min, range_max], as many as the row count and
+// the per-portion limit imply. Boundaries are computed HERE, from facts ABAP
+// supplied -- ABAP provides data, never a cut, which is what keeps one code path
+// cutting every strategy.
+//
+// The arithmetic is on the numeric value, but the predicate keeps the source's
+// text width: a NUMC document number compared as text sorts wrongly the moment
+// a leading zero is dropped.
+std::vector<Portion> ByEvenRanges(const SplitRequest &r, long long limit) {
+    std::vector<Portion> out;
+    if (limit <= 0 || r.total_rows <= 0 || r.range_min.empty() || r.range_max.empty())
+        return out;
+    const bool numeric = r.range_min.find_first_not_of("0123456789") == std::string::npos &&
+                         r.range_max.find_first_not_of("0123456789") == std::string::npos;
+    if (!numeric) {
+        // A non-numeric column cannot be cut arithmetically. One portion over
+        // the whole range is honest; pretending otherwise would produce
+        // boundaries that do not partition the data.
+        Portion p;
+        p.portion_no = 1;
+        p.est_rows = r.total_rows;
+        p.predicate = WithUserFilter(r.part_col + " >= '" + r.range_min + "' AND " +
+                                         r.part_col + " <= '" + r.range_max + "'",
+                                     r.user_where);
+        out.push_back(p);
+        return out;
+    }
+    const long long lo = std::stoll(r.range_min);
+    const long long hi = std::stoll(r.range_max);
+    const size_t width = r.range_min.size();
+    long long n = (r.total_rows + limit - 1) / limit;
+    if (n < 1) n = 1;
+    if (hi < lo) return out;
+    const long long span = hi - lo + 1;
+    if (n > span) n = span;
+    const long long step = (span + n - 1) / n;
+
+    auto pad = [&](long long v) {
+        std::string t = std::to_string(v);
+        return t.size() >= width ? t : std::string(width - t.size(), '0') + t;
+    };
+    int no = 0;
+    for (long long start = lo; start <= hi; start += step) {
+        const long long end = std::min(start + step - 1, hi);
+        Portion p;
+        p.portion_no = ++no;
+        p.est_rows = r.total_rows / n;
+        p.predicate = WithUserFilter(r.part_col + " >= '" + pad(start) + "' AND " +
+                                         r.part_col + " <= '" + pad(end) + "'",
+                                     r.user_where);
+        out.push_back(p);
+    }
+    return out;
+}
+
 std::vector<Portion> PlanSplit(const SplitRequest &r) {
     RefuseFilterOnPartitionColumn(r);
 
@@ -117,14 +172,16 @@ std::vector<Portion> PlanSplit(const SplitRequest &r) {
             return FromRanges(r, r.periods, /*half_open=*/false);
 
         case Strategy::Records:
-            return ByBuckets(r, r.limit_rows);
+            if (!r.histogram.empty()) return ByBuckets(r, r.limit_rows);
+            return ByEvenRanges(r, r.limit_rows);
 
         case Strategy::Size: {
             // Rows per portion derived from a measured bytes-per-row, taken from
             // a probe package rather than assumed.
             if (r.bytes_per_row <= 0 || r.limit_mb <= 0) return {};
             const long long rows = (r.limit_mb * 1024 * 1024) / r.bytes_per_row;
-            return ByBuckets(r, rows);
+            if (!r.histogram.empty()) return ByBuckets(r, rows);
+            return ByEvenRanges(r, rows);
         }
 
         case Strategy::Time: {

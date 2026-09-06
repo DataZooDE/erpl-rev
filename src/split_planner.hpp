@@ -38,6 +38,15 @@ struct SplitRequest {
     long long bytes_per_row = 0;
     std::vector<Bucket> histogram;
 
+    // The fallback when no histogram is available: the partition column's
+    // bounds and the total row count, which is what a scalar MIN/MAX read can
+    // supply. A per-value histogram is better -- it cuts on where the rows
+    // actually are rather than assuming they are evenly spread -- so it wins
+    // when present. These exist because the ABAP side has no proven pattern for
+    // a multi-row dynamic SELECT, and inventing one dumped the work process.
+    std::string range_min, range_max;
+    long long total_rows = 0;
+
     // Time
     std::string time_unit;   // day | month | year
     std::string time_from, time_to;

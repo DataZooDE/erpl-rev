@@ -490,6 +490,11 @@ PV="$(cli sync preview t000_cli --rows 1 --yes 2>&1)" || fail "sync preview fail
 grep -qE '[{]|MANDT|mandt' <<<"$PV" || fail "sync preview returned no rows: $PV"
 echo "   sync set-wm (audited) and sync preview"
 
+# cdc status on a target that is not a trigger target must say so, not crash.
+CS="$(cli cdc status --target t000_cli --yes 2>&1 || true)"
+grep -qiE "not a registered trigger target|no registration" <<<"$CS"   || fail "cdc status on a non-CDC target gave no usable message: $CS"
+echo "   cdc status on a non-CDC target reports it cleanly"
+
 srv_kill; sleep 1
 on_server rm -f "$E2E_DB" "$E2E_DB".wal /tmp/erpl_taxi.parquet
 # ldd and the SDK path are this box's; a remote binary is a different platform's
