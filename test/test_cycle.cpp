@@ -898,6 +898,13 @@ TEST_CASE("cycle: the first cycle of a log-enabled target logs its rows", "[cycl
     // Everything a target's first cycle brings is new.
     CHECK(Scalar(con, "SELECT count(*) FROM " + log + " WHERE _op='I'") == "2");
     CHECK(r.logged == 2);
+    // rows_applied, not zero. It used to be zero on this path, because the
+    // counts were computed only when a merge was planned -- and rows_applied is
+    // what the tick planner reads to decide inline-vs-worker for the NEXT
+    // cycle, so a target that had just self-created with millions of rows had
+    // its next cycle planned on the daemon's own tick thread.
+    CHECK(Scalar(con, "SELECT rows_applied FROM _erpl_rev_delta_state WHERE target='fresh'")
+          == "2");
 }
 
 TEST_CASE("cycle: a reload records the rows it removed, so subscribers converge",

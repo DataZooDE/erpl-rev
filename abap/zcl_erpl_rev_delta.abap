@@ -441,6 +441,16 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
     DATA(lv_asof)   = jstr( iv_json = lv_plan iv_key = 'as_of_date' ).
     DATA(lv_chg)    = jstr( iv_json = lv_plan iv_key = 'chg_col' ).
     DATA(lv_tcol)   = jstr( iv_json = lv_plan iv_key = 'time_col' ).
+    " The server decides what this cycle reads, and it already ships the answer.
+    " Reading is_state-source_from instead meant one registration row had two
+    " independent readers per cycle -- the state() SELECT here and the server's
+    " own LoadState inside the fenced transaction. register() is an upsert, so a
+    " re-registration between the two left the stage read from one source and
+    " merged on another registration's keys, inside a transaction that believed
+    " itself consistent. Falls back to the local copy only if an older server
+    " does not send it.
+    DATA(lv_src)    = jstr( iv_json = lv_plan iv_key = 'source_from' ).
+    IF lv_src IS INITIAL. lv_src = is_state-source_from. ENDIF.
 
     IF lv_stage IS INITIAL OR lv_run_id IS INITIAL.
       rs-error = |BEGIN_CYCLE gave no run: { lv_plan }|.
@@ -487,7 +497,7 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       ENDIF.
 
       DATA(r) = zcl_erpl_rev_util=>replicate(
-        iv_tab      = is_state-source_from
+        iv_tab      = lv_src
         iv_target   = lv_stage
         iv_mode     = 'INSERT'
         iv_truncate = abap_true

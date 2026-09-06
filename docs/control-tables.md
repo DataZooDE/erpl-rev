@@ -43,6 +43,10 @@ macros are `CREATE OR REPLACE`d on every open.
 | `_erpl_rev_cli_cmd` | queued command | the CLI's queue, drained by the ABAP driver |
 | `_erpl_rev_log_<target>` | applied change | opt-in change log: `_seq`, `_op`, `_run_id`, `_commit_ts`, `_applied_at`, plus the target's own columns |
 
+`_op` is `I`, `U` or `D` on both tiers. A `D` arrives from a trigger's own
+delete event, or from a reload noticing that a key the target held is not in the
+new image -- the second has no source timestamp, so its `_commit_ts` is NULL.
+
 `_commit_ts` is when the **source** says the row changed; `_applied_at` is when
 erpl-rev wrote it. Two columns, not one: the difference between them is the
 replication latency, and a single column filled from whichever clock was nearest
