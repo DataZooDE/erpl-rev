@@ -1172,7 +1172,8 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
     std::string log_sql, log_del_sql;
     {
         auto le = con.Query("SELECT count(*) FROM _erpl_rev_delta_state "
-                            "WHERE target='" + target + "' AND coalesce(log_enabled,false)");
+                            "WHERE target=" + SqlLit(target) +
+                            " AND coalesce(log_enabled,false)");
         const bool want_log = !le->HasError() && le->RowCount() > 0 &&
                               le->GetValue(0, 0).GetValue<int64_t>() > 0;
         if (want_log) {
@@ -1242,14 +1243,36 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
                         kcl += kl[i];
                         ksl += cast_to("c." + kl[i], type_of(kl[i]));
                     }
+                    const std::string dts =
+                        in_staging("_ts") ? "(try_strptime(CAST(c.\"_ts\" AS VARCHAR), "
+                                            "'%Y%m%d%H%M%S') AT TIME ZONE 'UTC')"
+                                          : "NULL";
+                    // EVERY row that leaves the target, and only those.
+                    //
+                    // net_del alone was wrong twice over. It missed the mirror
+                    // race -- a net-I/U key the re-read could not find is
+                    // deleted from the target deliberately, and its op in the
+                    // shadow log is 'U', so it appeared in neither append and
+                    // left the target with no subscriber ever told. And it
+                    // included keys the target never held (a seed whose
+                    // snapshot post-dates the delete, the trigger row queued
+                    // below the seeded position), inventing a delete record for
+                    // a row nobody ever received -- which is the thing the
+                    // comment above this block calls worse than no log at all.
+                    //
+                    // The EXISTS is the same anti-join `del_sql` and `res.del`
+                    // already use, so `count(*) WHERE _op='D'` now equals
+                    // `res.del` by construction rather than by coincidence.
+                    const std::string del_src =
+                        vanished.empty()
+                            ? net_del
+                            : ("(SELECT * FROM " + net_del + " UNION ALL BY NAME SELECT * FROM " +
+                               vanished + ")");
                     log_del_sql = "INSERT INTO " + logtab + " (" + kcl +
                                   ", _seq, _op, _run_id, _commit_ts, _applied_at) SELECT " + ksl +
-                                  ", nextval('" + logtab + "_seq'), 'D', 0, " +
-                                  (in_staging("_ts")
-                                       ? "(try_strptime(CAST(c.\"_ts\" AS VARCHAR), "
-                                         "'%Y%m%d%H%M%S') AT TIME ZONE 'UTC')"
-                                       : "NULL") +
-                                  ", now() FROM " + net_del + " c";
+                                  ", nextval('" + logtab + "_seq'), 'D', 0, " + dts +
+                                  ", now() FROM " + del_src + " c WHERE EXISTS (SELECT 1 FROM " +
+                                  target + " t WHERE " + key_join("t", "c") + ")";
                 }
             }
         }
@@ -1257,22 +1280,29 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
 
     Exec(con, "BEGIN");
     try {
-        Exec(con, del_sql);
-        // del_iu removes every net-I/U key first; ins_sql then puts back only the
-        // ones the re-read actually found. A key that vanished in between is
-        // therefore deleted by construction, which is exactly what it should be.
         // NOT best-effort any more. This used to swallow the error on the
         // reasoning that a failed append must not fail the apply -- and the
         // append then failed on every apply, for a misspelled column, for as
         // long as the feature has existed, while every target reported success.
         // A log that silently stops recording is worse than an apply that
         // stops: the target stays right and the sink quietly goes wrong.
-        for (const auto &sql : {log_del_sql, log_sql}) {
-            if (sql.empty()) continue;
+        auto append = [&](const std::string &sql) {
+            if (sql.empty()) return;
             auto lr = con.Query(sql);
             if (lr->HasError())
                 throw std::runtime_error("CDC: change-log append failed: " + lr->GetError());
-        }
+        };
+
+        // The delete records go FIRST, before anything leaves the target. They
+        // are qualified by the row still being there -- so running them after
+        // the deletes, which is where they used to sit, logged nothing at all.
+        append(log_del_sql);
+
+        Exec(con, del_sql);
+        // del_iu removes every net-I/U key first; ins_sql then puts back only the
+        // ones the re-read actually found. A key that vanished in between is
+        // therefore deleted by construction, which is exactly what it should be.
+        append(log_sql);
         if (!del_iu_sql.empty()) { Exec(con, del_iu_sql); Exec(con, ins_sql); }
         else if (keys_mode) {
             // No data columns in common with the images (a keys-only re-read):
@@ -1285,8 +1315,26 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
         Exec(con, "DROP TABLE " + staging);
         if (keys_mode) Exec(con, "DROP TABLE IF EXISTS " + images);
         Exec(con, "COMMIT");
+    } catch (const std::exception &e) {
+        Exec(con, "ROLLBACK");
+        // Record WHY, outside the rolled-back transaction, and park the target.
+        //
+        // The rollback leaves the position unmoved and the status 'ACTIVE', the
+        // staging table has a fixed name the next cycle recreates, and the
+        // scheduler keeps selecting ACTIVE/SEEDED -- so a batch that cannot be
+        // applied re-staged and re-failed every cycle, forever, with the reason
+        // stored nowhere and the shadow log growing without bound. Throwing is
+        // right; failing silently and indefinitely is not. The tick planner
+        // already skips a target that is not ACTIVE or SEEDED, so this is what
+        // stops the loop.
+        con.Query("UPDATE _erpl_rev_cdc SET status='ERROR', error=" +
+                  SqlLit(std::string(e.what()).substr(0, 500)) +
+                  ", last_run_ts=now() WHERE target=" + SqlLit(target));
+        throw;
     } catch (...) {
         Exec(con, "ROLLBACK");
+        con.Query("UPDATE _erpl_rev_cdc SET status='ERROR', error='apply failed', "
+                  "last_run_ts=now() WHERE target=" + SqlLit(target));
         throw;
     }
     res.prune_bound = max_seq;

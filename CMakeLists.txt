@@ -303,8 +303,16 @@ target_compile_definitions(erpl_rev_core PUBLIC
   ERPL_REV_VERSION="${ERPL_REV_VERSION}")
 # Linked for their INTERFACE include directories: an OBJECT library does not
 # inherit a consumer's link interface, so these have to be named here or the
-# telemetry/banner headers are not on the include path.
-target_link_libraries(erpl_rev_core PUBLIC posthog_telemetry datazoo_banner)
+# headers they carry are not on the include path.
+#
+# OpenSSL and ZLIB belong on this list for the same reason the other two do, and
+# were missed: payload.cpp includes <zlib.h> and erpl_rev_telemetry.cpp includes
+# <openssl/sha.h>, and both moved into this library when the engine sources were
+# unified. On Linux and macOS those headers sit in system include paths, so the
+# omission was invisible; on Windows they exist only inside the vcpkg imported
+# targets, and the build stopped at the first #include.
+target_link_libraries(erpl_rev_core PUBLIC
+  posthog_telemetry datazoo_banner OpenSSL::Crypto ZLIB::ZLIB)
 set_target_properties(erpl_rev_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # --- Server ------------------------------------------------------------------

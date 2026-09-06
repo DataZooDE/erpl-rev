@@ -94,6 +94,15 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
 void FinishCycleFenced(duckdb::Connection &con, const std::string &target, long long run_id,
                             const std::string &new_watermark, long long rows_applied);
 
+// The failure counterpart of FinishCycleFenced: record that this run failed and
+// release the target -- but, like its sibling, ONLY while this run still owns
+// it. A run whose commit threw because it had already lost the target must not
+// release the successor that took it.
+//
+// Called from Commit's catch block, OUTSIDE the rolled-back transaction, because
+// the failure has to survive the rollback.
+void ReleaseFailedCycle(duckdb::Connection &con, const std::string &target, long long run_id);
+
 // Per-target change log. Named through the collision-safe token, because the
 // input is a customer-chosen target name.
 std::string ChangeLogName(const std::string &target);

@@ -10,6 +10,8 @@
 #pragma once
 
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "adt.hpp"
 
@@ -34,10 +36,28 @@ struct ReplicateParams {
 // One delta target, as zcl_erpl_rev_delta=>register takes it.
 struct SyncState {
     std::string target, method, source_from, keys, chg_col, wm_kind, wm_value;
+    // The TIMS half of a DATETIME pair. Absent from the skeleton path for its
+    // whole life, which is how a DATETIME target could register cleanly,
+    // replicate one batch and then silently stop.
+    std::string time_col;
     long long safety_secs = 120;
+    long long safety_units = 0;   // counter kinds; a duration means nothing there
     std::string cadence = "nightly";
     std::string extra;
+    bool log_enabled = false;             // keep a per-target change log
+    std::string load_type_default;        // D | F | I | L; F and L are one-shot
+    bool allow_empty_reload = false;      // let a reload empty the target
 };
+
+// The register call's fields, in one ordered list, as {ABAP field name, ABAP
+// literal}. Both writers of the register surface render from this: the
+// S_DEVELOP-free driver path and the generated-ABAP path.
+//
+// One list because there were two, and they drifted: the generated skeleton
+// omitted time_col and safety_units entirely, so a field added to the state
+// arrived at the server empty and the feature that needed it simply did
+// nothing -- no compile error, no runtime error.
+std::vector<std::pair<std::string, std::string>> RegisterFields(const SyncState &s);
 
 // Each renderer returns complete, deployable ABAP with `nonce` woven into its
 // result lines. They throw UnsafeValue if any parameter cannot be embedded.

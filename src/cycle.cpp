@@ -89,6 +89,24 @@ State LoadState(duckdb::Connection &con, const std::string &target) {
 
 }  // namespace
 
+void ReleaseFailedCycle(duckdb::Connection &con, const std::string &target, long long run_id) {
+    // FENCED, like every other write to this row. Unfenced, this released
+    // whoever owned the target rather than whoever failed -- and the run
+    // reaching here may well NOT be the owner: that is precisely what
+    // FinishCycleFenced's "lost ownership" throw means. A displaced run then
+    // handed away the lease its successor was still holding, a third cycle
+    // could claim it, and two cycles wrote one target -- the outcome the fence
+    // exists to prevent, arriving through the code that reports it working.
+    //
+    // The failure IS counted against the target when it is the owner: the
+    // planner's backoff reads fail_count, and without the increment a target
+    // that fails every cycle retries at full cadence forever. A displaced run
+    // must not count -- it lost a race, the target is not broken.
+    con.Query("UPDATE _erpl_rev_delta_state SET fail_count = coalesce(fail_count,0) + 1, "
+              "status='ERROR', active_run_id=NULL WHERE target=" + Lit(target) +
+              " AND active_run_id=" + std::to_string(run_id));
+}
+
 // Provision the per-target change log: the table, its control columns and its
 // sequence, reconciled against the target's shape. Extracted because the CDC
 // tier had no provisioner at all -- it probed for the table and silently wrote
@@ -136,8 +154,14 @@ void EnsureChangeLog(duckdb::Connection &con, const std::string &target,
                               std::string("_commit_ts TIMESTAMPTZ"),
                               std::string("_applied_at TIMESTAMPTZ")})
             Exec(con, "ALTER TABLE " + log + " ADD COLUMN " + c, "log column");
-        Exec(con, "CREATE SEQUENCE IF NOT EXISTS " + log + "_seq START 1", "log sequence");
     }
+    // Outside the branch: the table can exist without its sequence -- a database
+    // restored table by table, a log copied by an operator, a stray DROP
+    // SEQUENCE -- and then every nextval fails. That used to be a swallowed
+    // best-effort append; it is a hard throw on both tiers now, and this is the
+    // one function responsible for making the log usable. Idempotent, one
+    // catalogue statement.
+    Exec(con, "CREATE SEQUENCE IF NOT EXISTS " + log + "_seq START 1", "log sequence");
 }
 
 void FinishCycleFenced(duckdb::Connection &con, const std::string &target,
@@ -812,11 +836,7 @@ CommitResult Commit(duckdb::Connection &con, const std::string &target, long lon
         // RUNNING forever and its staging table is never swept.
         con.Query("UPDATE _erpl_rev_run_stats SET status='ERROR' WHERE run_id=" +
                   std::to_string(run_id) + " AND status='RUNNING'");
-        // This one IS the target failing, so it counts: the planner's backoff
-        // reads fail_count, and without the increment a target that fails every
-        // cycle retries at full cadence forever.
-        con.Query("UPDATE _erpl_rev_delta_state SET fail_count = coalesce(fail_count,0) + 1, "
-                  "status='ERROR', active_run_id=NULL WHERE target=" + Lit(target));
+        ReleaseFailedCycle(con, target, run_id);
         throw;
     }
     return res;

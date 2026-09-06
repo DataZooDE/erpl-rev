@@ -1042,3 +1042,80 @@ TEST_CASE("cycle: a delta cycle does not touch the target's default load type",
 
     CHECK(Scalar(con, "SELECT load_type_default FROM _erpl_rev_delta_state") == "D");
 }
+
+TEST_CASE("cycle: the failure release is fenced too", "[cycle]") {
+    // The failure path must release only what it owns. A run reaching it may not
+    // be the owner -- that is exactly what FinishCycleFenced's "lost ownership"
+    // throw means -- and unfenced it handed away the lease the SUCCESSOR was
+    // holding. A third cycle could then claim the target and two would write it:
+    // the outcome the fence exists to prevent, reached through the code that
+    // reports the fence working.
+    //
+    // Reachable in production only by losing a real race between the commit's
+    // pre-check and its transaction, which one connection cannot stage -- so the
+    // guard is tested directly, the same way FinishCycleFenced's is.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con);
+    Exec(con, "UPDATE _erpl_rev_delta_state SET active_run_id=78, status='RUNNING'");
+
+    cycle::ReleaseFailedCycle(con, "zdelta_wm", 77);   // 77 is not the owner
+
+    CHECK(Scalar(con, "SELECT active_run_id FROM _erpl_rev_delta_state") == "78");
+    CHECK(Scalar(con, "SELECT status FROM _erpl_rev_delta_state") == "RUNNING");
+    // And a displaced run does not count against the target: it lost a race,
+    // the target is not broken, and backing it off would be the wrong response.
+    CHECK(Scalar(con, "SELECT fail_count FROM _erpl_rev_delta_state") == "0");
+
+    // The owner's own failure does count, and does release.
+    cycle::ReleaseFailedCycle(con, "zdelta_wm", 78);
+    CHECK(Scalar(con, "SELECT active_run_id FROM _erpl_rev_delta_state").empty());
+    CHECK(Scalar(con, "SELECT fail_count FROM _erpl_rev_delta_state") == "1");
+}
+
+TEST_CASE("cycle: a reclaimed run is refused before it can do any damage",
+          "[cycle]") {
+    // The failure path of a run that has ALREADY lost the target must not touch
+    // the target's ownership. Run 77 passes the pre-transaction fence, run 78
+    // claims the target, FinishCycleFenced correctly refuses 77 -- and then 77's
+    // catch block cleared active_run_id with no run predicate, handing away the
+    // lease 78 is holding while 78 is still running. A third Begin can then
+    // claim it, and two cycles write the same target: exactly what the fence
+    // exists to prevent, reached through the code that reports the fence
+    // working.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con);
+
+    const auto losing = cycle::Begin(con, "zdelta_wm", LoadType::Delta, kReadStart);
+    StageRows(con, losing.stage_table);
+    // A successor takes the target while the first run is still working.
+    Exec(con, "UPDATE _erpl_rev_delta_state SET active_run_id=78, status='RUNNING'");
+
+    REQUIRE_THROWS(cycle::Commit(con, "zdelta_wm", losing.run_id, {2}));
+
+    CHECK(Scalar(con, "SELECT active_run_id FROM _erpl_rev_delta_state") == "78");
+    CHECK(Scalar(con, "SELECT status FROM _erpl_rev_delta_state") == "RUNNING");
+    // And the successor can still finish, which is the whole point.
+    cycle::FinishCycleFenced(con, "zdelta_wm", 78, "20260905120000", 2);
+    CHECK(Scalar(con, "SELECT wm_value FROM _erpl_rev_delta_state") == "20260905120000");
+}
+
+TEST_CASE("cycle: the change log's sequence is ensured even when the table exists",
+          "[cycle][log]") {
+    // The CREATE SEQUENCE sat inside the branch that creates the table, so a log
+    // table that existed without its sequence -- a database restored table by
+    // table, a log copied by an operator, a stray DROP SEQUENCE -- made every
+    // nextval fail. That used to be a swallowed best-effort append; it is a hard
+    // throw on both tiers now.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    Setup(con, /*log_enabled=*/true);
+    const std::string log = cycle::ChangeLogName("zdelta_wm");
+
+    cycle::EnsureChangeLog(con, "zdelta_wm", {"id", "v", "changed_at"});
+    Exec(con, "DROP SEQUENCE " + log + "_seq");
+    cycle::EnsureChangeLog(con, "zdelta_wm", {"id", "v", "changed_at"});
+
+    CHECK(Scalar(con, "SELECT nextval('" + log + "_seq') > 0") == "true");
+}

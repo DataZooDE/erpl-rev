@@ -96,16 +96,7 @@ CLASS $ERPL_CLASS$ IMPLEMENTATION.
     " from the CLI keeps one writer and reuses the granularity gate that
     " rejects, for instance, a date-only column on a sub-hourly cadence.
     DATA(lv_err) = zcl_erpl_rev_delta=>register( VALUE #(
-      target      = $ERPL_TARGET$
-      method      = $ERPL_METHOD$
-      source_from = $ERPL_SOURCE$
-      keys        = $ERPL_KEYS$
-      chg_col     = $ERPL_CHGCOL$
-      wm_kind     = $ERPL_WMKIND$
-      wm_value    = $ERPL_WMVALUE$
-      safety_secs = $ERPL_SAFETY$
-      cadence     = $ERPL_CADENCE$
-      extra       = $ERPL_EXTRA$ ) ).
+$ERPL_REGFIELDS$ ) ).
 
     DATA(lv_e) = replace( val = lv_err
                           sub = cl_abap_char_utilities=>newline
@@ -250,21 +241,39 @@ std::string RenderReplicate(const ReplicateParams &p, const std::string &nonce) 
     return t.Render();
 }
 
+std::vector<std::pair<std::string, std::string>> RegisterFields(const SyncState &s) {
+    return {
+        {"target", Backtick(s.target, "<target>")},
+        {"method", Backtick(s.method, "--method")},
+        {"source_from", Backtick(s.source_from, "--source")},
+        {"keys", Backtick(s.keys, "--keys")},
+        {"chg_col", Backtick(s.chg_col, "--chg-col")},
+        {"time_col", Backtick(s.time_col, "--time-col")},
+        {"wm_kind", Backtick(s.wm_kind, "--wm-kind")},
+        {"wm_value", Backtick(s.wm_value, "--wm-value")},
+        {"safety_secs", Int(s.safety_secs)},
+        {"safety_units", Int(s.safety_units)},
+        {"cadence", Backtick(s.cadence, "--cadence")},
+        {"extra", Backtick(s.extra, "--extra")},
+        {"log_enabled", s.log_enabled ? "abap_true" : "abap_false"},
+        {"load_type_default",
+         Backtick(s.load_type_default.empty() ? "D" : s.load_type_default, "--load-type-default")},
+        {"allow_empty_reload", s.allow_empty_reload ? "abap_true" : "abap_false"},
+    };
+}
+
 std::string RenderSyncRegister(const SyncState &s, const std::string &nonce) {
     const std::string cls = "ZCL_ERPL_REV_CLI_C" + nonce;
     CheckClassName(cls);
     Template t(kRegister);
-    t.Set("CLASS", cls).Set("NONCE", Backtick(nonce, "nonce"))
-     .Set("TARGET", Backtick(s.target, "<target>"))
-     .Set("METHOD", Backtick(s.method, "--method"))
-     .Set("SOURCE", Backtick(s.source_from, "--source"))
-     .Set("KEYS", Backtick(s.keys, "--keys"))
-     .Set("CHGCOL", Backtick(s.chg_col, "--chg-col"))
-     .Set("WMKIND", Backtick(s.wm_kind, "--wm-kind"))
-     .Set("WMVALUE", Backtick(s.wm_value, "--wm-value"))
-     .Set("SAFETY", Int(s.safety_secs))
-     .Set("CADENCE", Backtick(s.cadence, "--cadence"))
-     .Set("EXTRA", Backtick(s.extra, "--extra"));
+    std::string body;
+    for (const auto &f : RegisterFields(s)) {
+        body += "      " + f.first;
+        body += std::string(12 > f.first.size() ? 12 - f.first.size() : 1, ' ');
+        body += "= " + f.second + "\n";
+    }
+    if (!body.empty()) body.pop_back();
+    t.Set("CLASS", cls).Set("NONCE", Backtick(nonce, "nonce")).Set("REGFIELDS", body);
     return t.Render();
 }
 

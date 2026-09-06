@@ -30,6 +30,14 @@ CLASS zcl_erpl_rev_delta DEFINITION PUBLIC FINAL CREATE PUBLIC.
              safety_units TYPE i,       " overlap in values, counter kinds (INT)
              cadence     TYPE string,   " micro:<sec> | hourly | nightly | manual
              extra       TYPE string,   " JSON, e.g. {"objectclas":"MATERIAL"}
+             " Three controls the server reads and nothing could write. The
+             " change log itself, the load type the daemon schedules, and the
+             " escape hatch the reload refusal names in its own error message --
+             " all reachable only by hand-written SQL until they were added
+             " here. Exactly the failure the comment in register() warns about.
+             log_enabled       TYPE abap_bool,   " keep a per-target change log
+             load_type_default TYPE string,      " D | F | I | L; F and L are one-shot
+             allow_empty_reload TYPE abap_bool,  " let a reload empty the target
              status      TYPE string,
            END OF ty_state.
 
@@ -227,28 +235,53 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       rv_error = |granularity gate: wm_kind=DATE cannot use cadence { is_state-cadence }|.
       RETURN.
     ENDIF.
+    " Keys are not optional. Every merge, every delete anti-join and every log
+    " op is keyed, so a keyless registration produces a cycle that cannot merge
+    " and a reload whose delete accounting renders as a broken predicate. The
+    " trigger tier already refuses this at registration; so does this one now.
+    IF is_state-keys IS INITIAL.
+      rv_error = |keys are required: a cycle merges, deletes and logs by key|.
+      RETURN.
+    ENDIF.
+    IF is_state-load_type_default IS NOT INITIAL AND
+       is_state-load_type_default <> 'D' AND is_state-load_type_default <> 'F' AND
+       is_state-load_type_default <> 'I' AND is_state-load_type_default <> 'L'.
+      rv_error = |unknown load type { is_state-load_type_default }; expected D, F, I or L|.
+      RETURN.
+    ENDIF.
     " Every column of the state row is written here. A field added to ty_state but
     " forgotten in this statement is not a compile error and not a runtime error:
     " it simply arrives at the server as empty, and the feature that needed it
     " does nothing. time_col was exactly that -- a DATETIME target registered
     " cleanly, replicated its first batch, and then silently stopped, because the
     " server was comparing a pair whose time half it had never been told about.
+    " Rendered before the statement: a multi-line COND inside a string template
+    " is not a template any more.
+    DATA(lv_log) = COND string( WHEN is_state-log_enabled = abap_true THEN 'true' ELSE 'false' ).
+    DATA(lv_aer) = COND string( WHEN is_state-allow_empty_reload = abap_true
+                                THEN 'true' ELSE 'false' ).
+    DATA(lv_lt)  = COND string( WHEN is_state-load_type_default IS INITIAL
+                                THEN 'D' ELSE q( is_state-load_type_default ) ).
     DATA(lv_sql) =
       |INSERT INTO _erpl_rev_delta_state | &&
       |(target,method,source_from,keys,chg_col,time_col,wm_kind,wm_value,| &&
-      |safety_secs,safety_units,cadence,extra,status) VALUES (| &&
+      |safety_secs,safety_units,cadence,extra,log_enabled,load_type_default,| &&
+      |allow_empty_reload,status) VALUES (| &&
       |'{ q( is_state-target ) }','{ q( is_state-method ) }','{ q( is_state-source_from ) }',| &&
       |'{ q( is_state-keys ) }','{ q( is_state-chg_col ) }',| &&
       |{ COND string( WHEN is_state-time_col IS INITIAL THEN 'NULL' ELSE |'{ q( is_state-time_col ) }'| ) },| &&
       |'{ q( is_state-wm_kind ) }',| &&
       |{ COND string( WHEN is_state-wm_value IS INITIAL THEN 'NULL' ELSE |'{ q( is_state-wm_value ) }'| ) },| &&
       |{ is_state-safety_secs },{ is_state-safety_units },'{ q( is_state-cadence ) }',| &&
-      |{ COND string( WHEN is_state-extra IS INITIAL THEN 'NULL' ELSE |'{ q( is_state-extra ) }'| ) },'IDLE') | &&
+      |{ COND string( WHEN is_state-extra IS INITIAL THEN 'NULL' ELSE |'{ q( is_state-extra ) }'| ) },| &&
+      |{ lv_log },'{ lv_lt }',{ lv_aer },'IDLE') | &&
       |ON CONFLICT (target) DO UPDATE SET method=excluded.method, source_from=excluded.source_from, | &&
       |keys=excluded.keys, chg_col=excluded.chg_col, time_col=excluded.time_col, | &&
       |wm_kind=excluded.wm_kind, wm_value=excluded.wm_value, | &&
       |safety_secs=excluded.safety_secs, safety_units=excluded.safety_units, | &&
-      |cadence=excluded.cadence, extra=excluded.extra|.
+      |cadence=excluded.cadence, extra=excluded.extra, | &&
+      |log_enabled=excluded.log_enabled, load_type_default=excluded.load_type_default, | &&
+      |allow_empty_reload=excluded.allow_empty_reload|.
     DATA(ls) = zcl_erpl_rev_util=>query( lv_sql ).
     rv_error = ls-error.
   ENDMETHOD.
@@ -260,7 +293,11 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       |coalesce(wm_kind,'') AS wm_kind, coalesce(wm_value,'') AS wm_value, | &&
       |coalesce(safety_secs,0) AS safety_secs, | &&
       |coalesce(safety_units,0) AS safety_units, coalesce(cadence,'manual') AS cadence, | &&
-      |coalesce(extra,'') AS extra, coalesce(status,'IDLE') AS status | &&
+      |coalesce(extra,'') AS extra, | &&
+      |coalesce(log_enabled,false) AS log_enabled, | &&
+      |coalesce(load_type_default,'D') AS load_type_default, | &&
+      |coalesce(allow_empty_reload,false) AS allow_empty_reload, | &&
+      |coalesce(status,'IDLE') AS status | &&
       |FROM _erpl_rev_delta_state WHERE target='{ q( iv_target ) }'| ).
     IF ls-error IS NOT INITIAL OR ls-row_count = 0. RETURN. ENDIF.
     DATA lt TYPE STANDARD TABLE OF ty_state WITH EMPTY KEY.

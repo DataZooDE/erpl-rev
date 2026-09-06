@@ -47,6 +47,9 @@ std::string UnknownFlag(const std::vector<std::string> &args, const std::string 
         {"--method", true},   {"--source", true},  {"--keys", true},
         {"--chg-col", true},  {"--wm-kind", true}, {"--wm-value", true},
         {"--cadence", true},  {"--extra", true},   {"--safety-secs", true},
+        {"--time-col", true}, {"--safety-units", true},
+        {"--log", false},     {"--load-type-default", true},
+        {"--allow-empty-reload", false},
     };
     static const Spec kSyncSchedule[] = {
         {"--every", true}, {"--remove", false},
@@ -345,8 +348,21 @@ static int SyncCreate(Options &o, const std::string &target) {
     st.wm_value    = Field(o, "--wm-value");
     st.cadence     = Field(o, "--cadence", "nightly");
     st.extra       = Field(o, "--extra");
+    st.time_col    = Field(o, "--time-col");
     const std::string safety = Field(o, "--safety-secs");
     if (!safety.empty()) st.safety_secs = std::atoll(safety.c_str());
+    const std::string units = Field(o, "--safety-units");
+    if (!units.empty()) st.safety_units = std::atoll(units.c_str());
+    st.log_enabled        = HasFlag(o, "--log");
+    st.allow_empty_reload = HasFlag(o, "--allow-empty-reload");
+    st.load_type_default  = Field(o, "--load-type-default");
+    if (!st.load_type_default.empty() && st.load_type_default != "D" &&
+        st.load_type_default != "F" && st.load_type_default != "I" &&
+        st.load_type_default != "L") {
+        std::fprintf(stderr,
+                     "erpl-rev sync create: --load-type-default must be D, F, I or L.\n");
+        return 2;
+    }
 
     if (st.method.empty() || st.source_from.empty() || st.keys.empty()) {
         std::fprintf(stderr,
@@ -357,11 +373,18 @@ static int SyncCreate(Options &o, const std::string &target) {
     if (!o.print_abap && !o.dry_run && (o.queue_only || DriverAvailable(o))) {
         if (const int rc = ConsentGate(o, "Register sync job '" + st.target + "' on " + o.host))
             return rc;
-        const std::string j = BuildParams({
-            {"target", st.target}, {"method", st.method}, {"source_from", st.source_from},
-            {"keys", st.keys}, {"chg_col", st.chg_col}, {"wm_kind", st.wm_kind},
-            {"wm_value", st.wm_value}, {"cadence", st.cadence}, {"extra", st.extra},
-            {"safety_secs", std::to_string(st.safety_secs)}});
+        // Rendered from the SAME list as the generated-ABAP path, so the two
+        // writers of this surface cannot drift again. Backticks are the ABAP
+        // literal form; the queue carries plain values.
+        std::vector<std::pair<std::string, std::string>> kv;
+        for (const auto &f : abapgen::RegisterFields(st)) {
+            std::string v = f.second;
+            if (v.size() >= 2 && v.front() == '`' && v.back() == '`') v = v.substr(1, v.size() - 2);
+            else if (v == "abap_true") v = "true";
+            else if (v == "abap_false") v = "false";
+            kv.push_back({f.first, v});
+        }
+        const std::string j = BuildParams(kv);
         return RunViaDriver(o, "sync_register", j);
     }
     const std::string nonce = abapgen::MakeNonce();

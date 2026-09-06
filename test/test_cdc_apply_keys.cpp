@@ -176,3 +176,78 @@ TEST_CASE("cdc_keys: a log-enabled trigger target actually gets a change log",
     CHECK(db.Query("SELECT count(*) AS c FROM " + log + " WHERE _op='D'").rows[0] ==
           R"({"c":1})");
 }
+
+TEST_CASE("cdc_keys: a key that vanished before the re-read is logged as a delete",
+          "[bridge][cdc][keys]") {
+    // The log's whole contract is that replaying it reproduces the target. A
+    // net-I/U key the re-read could not find is DELETED from the target -- that
+    // is the mirror race, and it is deliberate -- but it was written to the log
+    // nowhere: the I/U append reads the images, where it is absent, and the
+    // delete append read only the shadow log's net-'D' set, where its op is
+    // 'U'. The row left the target and no subscriber was ever told.
+    DuckDbBridge db;
+    SetupKeysTarget(db);
+    db.Execute("INSERT INTO _erpl_rev_delta_state (target, method, source_from, keys, "
+               "log_enabled) VALUES ('t','CDC','T','id',true)");
+    db.Execute("INSERT INTO klog VALUES (2,'U',1)");
+    db.Execute("CREATE TABLE kimg(id INTEGER, v VARCHAR)");   // the re-read found nothing
+
+    auto r = db.CdcApply("t", "klog", {"id"}, "kimg");
+    REQUIRE(r.applied);
+
+    CHECK(db.Query("SELECT count(*) AS c FROM t WHERE id=2").rows[0] == R"({"c":0})");
+    const std::string log = cycle::ChangeLogName("t");
+    CHECK(db.Query("SELECT count(*) AS c FROM " + log + " WHERE _op='D'").rows[0] ==
+          R"({"c":1})");
+}
+
+TEST_CASE("cdc_keys: a delete for a key the target never held is not logged",
+          "[bridge][cdc][keys]") {
+    // The other direction, and the same invariant read backwards: the log must
+    // not record a change the target never received. A trigger row can name a
+    // key the target never had -- a seed whose snapshot post-dates the delete,
+    // with the trigger row queued below the seeded position. Nothing is deleted
+    // and res.del counts nothing, but the log gained a 'D' anyway, so the count
+    // the sibling test asserts stopped matching what actually happened.
+    DuckDbBridge db;
+    SetupKeysTarget(db);   // target holds 1, 2, 3
+    db.Execute("INSERT INTO _erpl_rev_delta_state (target, method, source_from, keys, "
+               "log_enabled) VALUES ('t','CDC','T','id',true)");
+    db.Execute("INSERT INTO klog VALUES (9,'D',1)");   // 9 was never replicated
+    db.Execute("CREATE TABLE kimg(id INTEGER, v VARCHAR)");
+
+    auto r = db.CdcApply("t", "klog", {"id"}, "kimg");
+    REQUIRE(r.applied);
+    CHECK(r.del == 0);
+
+    const std::string log = cycle::ChangeLogName("t");
+    // The number of delete records must equal the number of deletes.
+    CHECK(db.Query("SELECT count(*) AS c FROM " + log + " WHERE _op='D'").rows[0] ==
+          R"({"c":0})");
+}
+
+TEST_CASE("cdc_keys: an apply that cannot succeed parks the target instead of looping",
+          "[bridge][cdc][keys]") {
+    // The rollback leaves the position unmoved and the staging table has a fixed
+    // name the next cycle recreates, so a batch that cannot be applied re-staged
+    // and re-failed every cycle forever -- with the reason stored nowhere and
+    // the shadow log growing without bound. The tick planner skips a target that
+    // is not ACTIVE or SEEDED, so recording the failure is what stops the loop.
+    DuckDbBridge db;
+    SetupKeysTarget(db);
+    db.Execute("INSERT INTO _erpl_rev_delta_state (target, method, source_from, keys, "
+               "log_enabled) VALUES ('t','CDC','T','id',true)");
+    db.Execute("INSERT INTO klog VALUES (1,'U',1)");
+    db.Execute("CREATE TABLE kimg(id INTEGER, v VARCHAR)");
+    db.Execute("INSERT INTO kimg VALUES (1,'new-a')");
+    // A log table whose shape the append cannot satisfy.
+    db.Execute("CREATE TABLE " + cycle::ChangeLogName("t") + "(nothing INTEGER)");
+
+    CHECK_THROWS(db.CdcApply("t", "klog", {"id"}, "kimg"));
+
+    CHECK(db.CdcGet("t").status == "ERROR");
+    CHECK(db.Query("SELECT count(*) AS c FROM _erpl_rev_cdc WHERE target='t' "
+                   "AND error IS NOT NULL").rows[0] == R"({"c":1})");
+    // Rolled back: the position did not move, so nothing was lost.
+    CHECK(db.CdcGet("t").position == 0);
+}
