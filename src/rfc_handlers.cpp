@@ -2,6 +2,7 @@
 #include "cycle.hpp"
 #include "drift.hpp"
 #include "load_type.hpp"
+#include "metrics.hpp"
 #include "publish.hpp"
 #include "tick_planner.hpp"
 #include "rfc_metadata.hpp"
@@ -208,6 +209,13 @@ void StopQuackServer(const std::string &listen) {
     std::lock_guard<std::mutex> lk(g_mtx);
     g_bridge->StopQuack(listen);
 }
+
+bool StartMetricsServer(int port, std::string &error) {
+    if (!g_bridge) { error = "no database open"; return false; }
+    return metrics::server::Start(*g_bridge, port, error);
+}
+
+void StopMetricsServer() { metrics::server::Stop(); }
 
 void StartTunnelForward(const std::string &import_sql) {
     std::lock_guard<std::mutex> lk(g_mtx);

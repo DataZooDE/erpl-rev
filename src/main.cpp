@@ -11,6 +11,7 @@
 //   ERPL_REV_GWSERV      (default 3300)   -- sapgw00 on A4H
 #include "rfc_handlers.hpp"
 #include "duckdb_bridge.hpp"
+#include "metrics.hpp"
 #include "logging.hpp"
 #ifdef _WIN32
 #include <windows.h>    // GetCurrentProcessId
@@ -124,6 +125,7 @@ struct Cli {
     std::string quack_listen;
     bool quack_listen_set = false;
     std::string quack_token;
+    int metrics_port = 0;
     bool quack_token_set = false;
     std::string db_path;
     bool db_set = false;
@@ -295,6 +297,11 @@ Cli ParseArgs(int argc, char **argv) {
         // parsed further down by setup::ParseOption into a different struct.
         // Without the verb guard these branches would swallow them first and
         // silently break both verbs.
+        } else if (c.verb == Verb::Serve && key == "--metrics-port") {
+            // Prometheus exposition, off unless asked for. Loopback only: a
+            // replication server that opens a metrics port on every interface
+            // by default is an exposure nobody requested.
+            c.metrics_port = std::atoi(take_value().c_str());
         } else if (c.verb == Verb::Serve && key == "--gwhost") {
             c.gwhost = take_value();
             c.gwhost_set = true;
@@ -617,6 +624,20 @@ int main(int argc, char **argv) {
         // Optionally expose this same in-process DuckDB to remote DuckDB clients
         // over the network via the quack extension. Treated as best-effort: if it
         // can't start (e.g. offline, engine < 1.5.3), keep serving RFC.
+        // Metrics before quack: if the port is taken, the operator finds out at
+        // startup rather than the first time a scrape returns nothing.
+        if (cli.metrics_port > 0) {
+            std::string merr;
+            if (StartMetricsServer(cli.metrics_port, merr))
+                log::get().Info("metrics", "prometheus endpoint listening",
+                                {{"url", "http://127.0.0.1:" +
+                                             std::to_string(cli.metrics_port) + "/metrics"}});
+            else
+                // Reported, never fatal: failing to expose metrics must not stop
+                // replication.
+                log::get().Warn("metrics", "prometheus endpoint not started", {{"error", merr}});
+        }
+
         if (quack_enabled) {
             const bool allow_other = !ListenIsLoopback(quack_listen);
             try {

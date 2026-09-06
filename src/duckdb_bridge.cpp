@@ -254,6 +254,65 @@ DuckDbBridge::DuckDbBridge(const std::string &path, const std::string &init_sql)
     if (rview->HasError())
         throw std::runtime_error("DuckDB run-stats view init failed: " + rview->GetError());
 
+    // --- the operational views ----------------------------------------------
+    //
+    // What an operator asks is never "show me the run table"; it is "is
+    // replication keeping up, and which target is the problem". These answer
+    // exactly that, and every surface that displays them -- the CLI, the TUI,
+    // the metrics endpoint, the ABAP screen -- reads the SAME view, so four
+    // displays cannot disagree about whether a target is healthy.
+    //
+    // Views, not a rollup: nothing extra to write on the cycle path, nothing to
+    // keep consistent, and they cannot drift from the truth because they are it.
+    auto tview = con.Query(
+        "CREATE OR REPLACE VIEW erpl_rev_targets AS SELECT "
+        "target, method, coalesce(cadence,'manual') AS cadence, "
+        "coalesce(status,'IDLE') AS status, "
+        // NULL, not zero, when it has never run. A target registered and never
+        // run is the commonest "why is there no data" call, and reporting it as
+        // current sends the operator looking anywhere but at it.
+        "CASE WHEN last_run_ts IS NULL THEN NULL "
+        "     ELSE CAST(epoch(now()) - epoch(last_run_ts) AS BIGINT) END AS lag_seconds, "
+        "last_run_ts, coalesce(rows_applied,0) AS last_rows, "
+        "coalesce(fail_count,0) AS fail_count, last_error, "
+        "coalesce(log_enabled,false) AS log_enabled, "
+        "coalesce(wm_value,'') AS watermark, "
+        // Three different operator actions, kept apart. Collapsing them into
+        // one "unhealthy" flag makes the view useless for deciding what to DO:
+        // a parked target needs unpark, a blocked one needs re-registering, a
+        // failing one needs its error read.
+        "(coalesce(status,'') = 'BLOCKED') AS is_blocked, "
+        "(parked_until IS NOT NULL AND parked_until > now()) AS is_parked, "
+        "park_reason, "
+        "(last_run_ts IS NOT NULL AND coalesce(fail_count,0) = 0 "
+        " AND coalesce(status,'') <> 'BLOCKED' "
+        " AND (parked_until IS NULL OR parked_until <= now())) AS is_healthy "
+        "FROM _erpl_rev_delta_state");
+    if (tview->HasError())
+        throw std::runtime_error("DuckDB targets view init failed: " + tview->GetError());
+
+    // One row, so no display has to aggregate client-side and get it subtly
+    // different from the next display. "Nothing is replicating" is usually the
+    // daemon rather than the targets, so its heartbeat is here too -- a stale
+    // one says so directly instead of leaving the operator to infer it from
+    // every target being late at once.
+    auto hview = con.Query(
+        "CREATE OR REPLACE VIEW erpl_rev_health AS SELECT "
+        "(SELECT count(*) FROM erpl_rev_targets) AS targets, "
+        "(SELECT count(*) FROM erpl_rev_targets WHERE is_healthy) AS healthy, "
+        "(SELECT count(*) FROM erpl_rev_targets WHERE is_blocked) AS blocked, "
+        "(SELECT count(*) FROM erpl_rev_targets WHERE is_parked) AS parked, "
+        "(SELECT count(*) FROM erpl_rev_targets WHERE fail_count > 0) AS failing, "
+        "(SELECT max(lag_seconds) FROM erpl_rev_targets) AS worst_lag_seconds, "
+        "(SELECT count(*) FROM erpl_rev_targets WHERE lag_seconds IS NULL) AS never_run, "
+        "(SELECT coalesce(status,'STOPPED') FROM _erpl_rev_daemon WHERE id=1) AS daemon_status, "
+        "(SELECT CASE WHEN heartbeat_ts IS NULL THEN NULL "
+        "             ELSE CAST(epoch(now()) - epoch(heartbeat_ts) AS BIGINT) END "
+        " FROM _erpl_rev_daemon WHERE id=1) AS daemon_heartbeat_age_s, "
+        "(SELECT coalesce(ticks,0) FROM _erpl_rev_daemon WHERE id=1) AS daemon_ticks");
+    if (hview->HasError())
+        throw std::runtime_error("DuckDB health view init failed: " + hview->GetError());
+
     // Transformation macros, recreated on every open for the same reason as the
     // view above: a macro stored as versioned DDL in a customer's file could
     // never be corrected, so a bug found later would stay broken on every file

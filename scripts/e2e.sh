@@ -143,6 +143,8 @@ fi
 # Isolate the DB: the server is now file-backed by default, so give e2e a fresh
 # throwaway file (removed around the run) — never the persistent default.
 E2E_DB="/tmp/erpl_e2e_$$.duckdb"
+# A per-run port, so two e2e runs on one machine do not fight over it.
+ERPL_REV_METRICS_PORT="${ERPL_REV_METRICS_PORT:-$(( 19000 + ($$ % 1000) ))}"
 on_server rm -f "$E2E_DB" "$E2E_DB".wal
 if [ -n "$REMOTE" ]; then
   # Detached, and its pid comes back so srv_kill can reach it. `ssh -n` keeps the
@@ -156,7 +158,8 @@ if [ -n "$REMOTE" ]; then
     || { ssh "$REMOTE" "cat /tmp/erpl_e2e_srv.log"; SRV=""; fail "server died on $REMOTE"; }
   echo "   server up on $REMOTE (pid $SRV), registered at gateway $GWHOST:3300"
 else
-  LD_LIBRARY_PATH="$RFC_LIB_DIR" "$LOCAL_BIN" --db "$E2E_DB" >/tmp/erpl_e2e_srv.log 2>&1 &
+  LD_LIBRARY_PATH="$RFC_LIB_DIR" "$LOCAL_BIN" --db "$E2E_DB" \
+      --metrics-port "$ERPL_REV_METRICS_PORT" >/tmp/erpl_e2e_srv.log 2>&1 &
   SRV=$!
   sleep 6
   ps -p "$SRV" >/dev/null || { cat /tmp/erpl_e2e_srv.log; fail "server died"; }
@@ -522,6 +525,20 @@ UP="$(cli sync unpark t000_cli --yes 2>&1)" || fail "sync unpark failed: $UP"
 UPV="$(cli sql "SELECT CASE WHEN parked_until IS NULL AND coalesce(fail_count,0)=0 THEN 'RELEASED' ELSE 'STILL_PARKED' END AS v FROM _erpl_rev_delta_state WHERE target='t000_cli'" 2>&1)"
 grep -q RELEASED <<<"$UPV" || fail "unpark did not release the target: $UPV"
 echo "   sync unpark releases a parked target and clears its backoff"
+
+# The Prometheus endpoint, scraped for real. A metrics surface that is only
+# unit-tested is a page nobody has ever fetched.
+if command -v curl >/dev/null 2>&1; then
+  MET="$(curl -s --max-time 5 "http://127.0.0.1:${ERPL_REV_METRICS_PORT}/metrics" 2>&1 || true)"
+  grep -q "# TYPE erpl_rev_target_lag_seconds gauge" <<<"$MET"     || fail "the metrics endpoint served no target gauge: $(head -c 300 <<<"$MET")"
+  grep -q "erpl_rev_daemon_up" <<<"$MET" || fail "no daemon gauge in the exposition"
+  # A target registered earlier in this run must appear, or the exposition is
+  # a static page rather than a view of the system.
+  grep -q 'erpl_rev_target_healthy{target="t000_cli"}' <<<"$MET"     || fail "the scrape does not reflect the registered targets"
+  echo "   prometheus endpoint scraped: per-target gauges and the daemon heartbeat"
+else
+  echo "   prometheus endpoint skipped (no curl)"
+fi
 
 # cdc status on a target that is not a trigger target must say so, not crash.
 CS="$(cli cdc status --target t000_cli --yes 2>&1 || true)"

@@ -277,6 +277,7 @@ add_library(erpl_rev_core OBJECT
   src/transform_macros.cpp
   src/validation.cpp
   src/publish.cpp
+  src/metrics.cpp
   src/cdc_status.cpp
   src/portion.cpp
   src/cds_delta.cpp
@@ -367,6 +368,8 @@ if(TRUE)  # tests always build; DuckDB is in-tree
     test/test_transform_macros.cpp
     test/test_validation.cpp
     test/test_publish.cpp
+    test/test_stats_views.cpp
+    test/test_metrics.cpp
     test/test_cdc_status.cpp
     test/test_portion.cpp
     test/test_cds_delta.cpp
