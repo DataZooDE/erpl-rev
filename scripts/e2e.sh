@@ -591,6 +591,45 @@ if [ "$RFC_BACKEND" = proto ] && [ -z "$REMOTE" ]; then
   fi
 fi
 
+# --- E-UPGRADE ---------------------------------------------------------------
+#
+# The only test of what happens to a database that ALREADY EXISTS. Everything
+# else in this file starts from an empty file, which is the one case no customer
+# is in. A migration that works forwards from nothing and breaks an existing
+# file is the most expensive possible bug: discovered on upgrade, in production,
+# by someone who did nothing wrong.
+#
+# The fixture is a real v1 file written by the binary from before the schema was
+# versioned -- not a hand-made one, which would only prove the migration agrees
+# with my idea of v1.
+if [ -z "$REMOTE" ]; then
+  echo "== upgrade =="
+  UPG_DB="/tmp/erpl_upgrade_$$.duckdb"
+  rm -f "$UPG_DB" "$UPG_DB".wal
+  gunzip -c "$HERE/test/fixtures/control_schema_v1.duckdb.gz" > "$UPG_DB" \
+    || fail "could not unpack the v1 fixture"
+
+  # Opening it must migrate it in place. The schema moves to current AND the
+  # pre-existing rows survive -- a migration that "succeeds" by recreating the
+  # tables empty passes every version check and loses the registrations.
+  upgsql() { "$LOCAL_BIN" sql --db "$UPG_DB" "$1" 2>&1; }
+  UPGV="$(upgsql "SELECT CASE WHEN (SELECT max(version) FROM _erpl_rev_schema_version) >= 8 AND (SELECT count(*) FROM _erpl_rev_delta_state) > 0 THEN 'MIGRATED_WITH_DATA' WHEN (SELECT max(version) FROM _erpl_rev_schema_version) >= 8 THEN 'MIGRATED_BUT_EMPTY' ELSE 'NOT_MIGRATED' END AS v")"
+  grep -q MIGRATED_WITH_DATA <<<"$UPGV" || fail "v1 upgrade: $UPGV"
+
+  # The columns later versions added must be readable, or the first cycle after
+  # an upgrade fails on a missing column rather than at boot.
+  UPGC="$(upgsql "SELECT count(*) AS c FROM _erpl_rev_delta_state WHERE one_shot_spent IS NOT NULL OR one_shot_spent IS NULL")"
+  grep -qE "[0-9]" <<<"$UPGC" || fail "v8 columns unreadable after upgrade: $UPGC"
+
+  # And the operational views resolve against a migrated file, since that is
+  # what every monitoring surface reads.
+  UPGT="$(upgsql "SELECT count(*) AS c FROM erpl_rev_targets")"
+  grep -qE "[0-9]" <<<"$UPGT" || fail "the views do not resolve after upgrade: $UPGT"
+
+  rm -f "$UPG_DB" "$UPG_DB".wal
+  echo "   a v1 database migrates in place, keeps its rows, and serves the views"
+fi
+
 suite footprint ZCL_ERPL_REV_FOOTPRINT abap/zcl_erpl_rev_footprint.abap FOOTPRINT 14 "" \
   "the delivered package contains exactly the documented objects, and nothing else"
 

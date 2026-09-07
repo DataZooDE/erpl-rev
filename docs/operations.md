@@ -84,10 +84,14 @@ erpl-rev mass run --target hist --source BSEG --part-col BELNR \
     --split records --limit-rows 100000
 ```
 
-The server cuts the portions and persists them **before any worker starts**,
-which is what makes a mass load restartable rather than merely parallel. ABAP
-supplies only facts — the partition column's bounds and a row count — so one
-code path cuts every strategy.
+The server cuts the portions and persists them before any worker starts, and
+ABAP supplies only facts — the partition column's bounds and a row count — so
+one code path cuts every strategy.
+
+**A mass load is parallel, not resumable.** If it dies part-way, re-run it: the
+target is rebuilt from scratch. The persisted portion list records what was
+planned, and nothing yet reads it back to resume — so a half-finished load is
+not something to recover, it is something to repeat.
 
 ## Trigger targets
 

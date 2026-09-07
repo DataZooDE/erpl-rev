@@ -221,7 +221,12 @@ TEST_CASE("args: subscription and mass verbs", "[args]") {
                            "sub create").empty());
     CHECK(cmd::UnknownFlag({"run", "--split", "records", "--limit-rows", "1000000"},
                            "mass run").empty());
-    CHECK(cmd::UnknownFlag({"run", "--restart", "42"}, "mass run").empty());
+    // --restart is REFUSED, deliberately. It was accepted and read by nothing
+    // while the runbook promised resumable mass loads: the portion list is
+    // persisted but nothing reads it back, so a half-finished load is repeated,
+    // not resumed. A flag an operator can type and that silently does nothing
+    // is worse than not having it.
+    CHECK(cmd::UnknownFlag({"run", "--restart", "42"}, "mass run") == "--restart");
     CHECK(cmd::UnknownFlag({"run", "--splt", "records"}, "mass run") == "--splt");
 }
 

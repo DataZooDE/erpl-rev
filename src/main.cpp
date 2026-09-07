@@ -368,6 +368,14 @@ Cli ParseArgs(int argc, char **argv) {
             c.bad_args = true;
         }
     }
+    // --db reaches the COMMANDS too, not only serve.
+    //
+    // It landed on the serve-only field and was never copied here, so
+    // `erpl-rev sql --db some.duckdb "..."` silently opened the default
+    // database instead: an operator inspecting one file was shown another,
+    // with no error and no hint. Found while wiring the upgrade lane, which
+    // could not point at the fixture it had just unpacked.
+    if (c.db_set) c.cmd.db_path = c.db_path;
     return c;
 }
 
