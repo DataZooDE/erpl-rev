@@ -33,7 +33,14 @@ PARAMETERS: p_tab   TYPE char30 DEFAULT 'ZDELTA_ALL' OBLIGATORY,
             p_del   TYPE i DEFAULT 20,
             p_run   TYPE char20 DEFAULT 'GEN1'.
 
+" The sequence restarts at 1 on every run, and the reset below clears only
+" THIS run's rows -- so ZDELTA_AUDIT is keyed CLIENT+RUNID+SEQNO. Keyed on
+" seqno alone, a second run under a different runid collided with the first
+" run's range and every audit insert here was silently dropped, leaving an
+" empty oracle. An empty oracle does not read as "no evidence"; it reads as
+" "the pipeline lost everything", which is the opposite of the truth.
 DATA gv_seq TYPE i.
+DATA gv_audit_lost TYPE i.
 
 *---------------------------------------------------------------------*
 FORM audit USING iv_key TYPE string iv_op TYPE char1.
@@ -47,6 +54,12 @@ FORM audit USING iv_key TYPE string iv_op TYPE char1.
   ls-op           = iv_op.
   ls-committed_at = lv_ts.
   INSERT zdelta_audit FROM ls.
+  " A dropped audit row is a hole in the oracle, and an oracle with holes
+  " accuses the replicator of losing rows it never saw. Counted, and reported
+  " at the end, so the evidence says when it cannot be trusted.
+  IF sy-subrc <> 0.
+    gv_audit_lost = gv_audit_lost + 1.
+  ENDIF.
 ENDFORM.
 
 *---------------------------------------------------------------------*
@@ -165,4 +178,4 @@ START-OF-SELECTION.
 
   COMMIT WORK AND WAIT.
   WRITE: / |GEN RESULT pass={ lv_done } fail=0 ins={ lv_ins } upd={ lv_upd } del={ lv_del } | &&
-           |keyspace={ lv_keyspace }|.
+           |keyspace={ lv_keyspace } audit_lost={ gv_audit_lost }|.

@@ -6,8 +6,8 @@
 define table zdelta_audit {
 
   key client     : abap.clnt not null;
+  key runid      : abap.char(20) not null;
   key seqno      : abap.int4 not null;
-  runid          : abap.char(20);
   keyval         : abap.char(60);
   op             : abap.char(1);
   committed_at   : abap.dec(21,7);

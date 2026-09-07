@@ -269,10 +269,21 @@ suite publish ZCL_ERPL_REV_PUBTEST abap/zcl_erpl_rev_pubtest.abap PUBTEST 6 "" \
 suite watermark ZCL_ERPL_REV_WMTEST abap/zcl_erpl_rev_wmtest.abap WM 8 "" \
   "the corrections: a late commit below the observed max is delivered, DATE never reads today, a DATS+TIMS pair survives midnight, load types I and F"
 
-suite daemon ZCL_ERPL_REV_DAEMONTEST abap/zcl_erpl_rev_daemontest.abap DAEMON 16 "@soak" \
+# The soak reads its duration from the database, so the same suite runs for two
+# minutes here and for twenty-four hours before a release:
+#
+#   erpl-rev sql "DELETE FROM _erpl_rev_soak; INSERT INTO _erpl_rev_soak VALUES (86400)"
+#   ERPL_REV_E2E_ONLY=soak ./scripts/e2e.sh
+#
+# A soak that can only run for its full length never gets run, and one that can
+# only run short is not a soak.
+suite soak ZCL_ERPL_REV_SOAKTEST abap/zcl_erpl_rev_soaktest.abap SOAK 6 "@soak" \
+  "the daemon under continuous change: no stall, no parking, nothing lost"
+
+suite daemon ZCL_ERPL_REV_DAEMONTEST abap/zcl_erpl_rev_daemontest.abap DAEMON 19 "@soak" \
   "the daemon as a real background job: it ticks, it replicates with nobody calling run(), a second one refuses to start, and the stop flag ends it"
 
-suite stress ZCL_ERPL_REV_STREAMSTRESS abap/zcl_erpl_rev_streamstress.abap STRESS 14 "@soak" \
+suite stress ZCL_ERPL_REV_STREAMSTRESS abap/zcl_erpl_rev_streamstress.abap STRESS 25 "@soak" \
   "a real change workload, then the two anti-joins: nothing lost, nothing invented, nothing stale"
 
 suite cds ZCL_ERPL_REV_CDSTEST abap/zcl_erpl_rev_cdstest.abap CDS 8 "" \

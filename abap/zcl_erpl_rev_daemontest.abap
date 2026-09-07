@@ -27,9 +27,14 @@ CLASS zcl_erpl_rev_daemontest DEFINITION PUBLIC FINAL CREATE PUBLIC.
     METHODS wait_until IMPORTING iv_sql TYPE string iv_want TYPE i iv_secs TYPE i
                        RETURNING VALUE(rv_got) TYPE i.
     METHODS seed_rows IMPORTING iv_from TYPE i iv_count TYPE i.
+    METHODS out_line IMPORTING iv_text TYPE string.
 ENDCLASS.
 
 CLASS zcl_erpl_rev_daemontest IMPLEMENTATION.
+
+  METHOD out_line.
+    mo->write( iv_text ).
+  ENDMETHOD.
 
   METHOD ok.
     IF cond = abap_true. mv_pass = mv_pass + 1.
@@ -109,7 +114,7 @@ CLASS zcl_erpl_rev_daemontest IMPLEMENTATION.
     sql( |DROP TABLE IF EXISTS _erpl_rev_log_dmn_wm| ).
     sql( |DELETE FROM _erpl_rev_delta_state WHERE target LIKE 'dmn\\_%' ESCAPE '\\'| ).
     sql( |UPDATE _erpl_rev_daemon SET status='STOPPED', stop=false, instance_id=NULL, | &&
-         |heartbeat_ts=NULL WHERE id=1| ).
+         |heartbeat_ts=NULL, ticks=0 WHERE id=1| ).
 
     " A target on a 2-second cadence, so the daemon has something due on
     " almost every tick.
@@ -121,6 +126,7 @@ CLASS zcl_erpl_rev_daemontest IMPLEMENTATION.
       chg_col     = 'CHG_TSTAMP'
       wm_kind     = 'NUMTS'
       safety_secs = 2
+      log_enabled = 'true'
       cadence     = 'micro:2' ) ).
 
     seed_rows( iv_from = 0 iv_count = 5 ).
@@ -139,19 +145,41 @@ CLASS zcl_erpl_rev_daemontest IMPLEMENTATION.
     ENDIF.
 
     " It claims the singleton row and starts beating.
+    " Ninety seconds, not thirty. A background job is not started when it is
+    " submitted -- it is started when a work process picks it up, and on a
+    " system that has just finished a soak that can take a while. The daemon
+    " being slow to be SCHEDULED is not the daemon failing, and a suite that
+    " calls it one produces failures nobody can act on.
+    " The CLAIM first, then the ticks. ticks is a cumulative counter, not a
+    " fresh one: waiting on it alone was satisfied by the PREVIOUS suite's
+    " leftover count, so this suite ran on past a daemon that had not started
+    " yet and then reported the absence of an instance id as a defect. The
+    " clean slate above now zeroes ticks too; waiting on the claim as well
+    " means the order of the suites cannot decide this again.
+    DATA(lv_claimed) = wait_until(
+      iv_sql = |SELECT count(*) AS c FROM _erpl_rev_daemon | &&
+               |WHERE id=1 AND instance_id IS NOT NULL|
+      iv_want = 1 iv_secs = 90 ).
     DATA(lv_ticks) = wait_until(
       iv_sql = |SELECT coalesce(ticks,0) AS c FROM _erpl_rev_daemon WHERE id=1|
-      iv_want = 2 iv_secs = 30 ).
+      iv_want = 2 iv_secs = 90 ).
     ok( cond = xsdbool( lv_ticks >= 2 )
         what = 'DAEMON-TICK: the loop is running and beating'
         detail = |ticks={ lv_ticks }| ).
     DATA(lv_inst) = scalar( |SELECT instance_id FROM _erpl_rev_daemon WHERE id=1| ).
     ok( cond = xsdbool( lv_inst IS NOT INITIAL )
-        what = 'DAEMON-TICK: it claimed the singleton' detail = lv_inst ).
+        what = 'DAEMON-TICK: it claimed the singleton'
+        detail = |inst={ lv_inst } ticks={ lv_ticks } | &&
+                 |status={ scalar( |SELECT status FROM _erpl_rev_daemon WHERE id=1| ) } | &&
+                 |inst_null={ cnt( |SELECT count(*) AS c FROM _erpl_rev_daemon | &&
+                                   |WHERE id=1 AND instance_id IS NULL| ) } | &&
+                 |hb_age={ cnt( |SELECT CAST(coalesce(epoch(now())-epoch(heartbeat_ts),-1) | &&
+                                |AS BIGINT) AS c FROM _erpl_rev_daemon WHERE id=1| ) } | &&
+                 |job={ job_status( lv_job ) }| ).
 
     " --- the point: it replicates without anyone asking ------------------
     DATA(lv_rows) = wait_until( iv_sql = |SELECT count(*) AS c FROM dmn_wm|
-                                iv_want = 5 iv_secs = 30 ).
+                                iv_want = 5 iv_secs = 60 ).
     ok( cond = xsdbool( lv_rows >= 5 )
         what = 'DAEMON-WORK: the five seeded rows replicated, with no run() call'
         detail = |{ lv_rows }/5| ).
@@ -160,10 +188,54 @@ CLASS zcl_erpl_rev_daemontest IMPLEMENTATION.
     " streaming claim, and nothing else in the suite makes it.
     seed_rows( iv_from = 100 iv_count = 5 ).
     DATA(lv_rows2) = wait_until( iv_sql = |SELECT count(*) AS c FROM dmn_wm|
-                                 iv_want = 10 iv_secs = 30 ).
+                                 iv_want = 10 iv_secs = 60 ).
     ok( cond = xsdbool( lv_rows2 >= 10 )
         what = 'DAEMON-STREAM: rows committed while it ran were picked up'
         detail = |{ lv_rows2 }/10| ).
+
+    " --- DAEMON-LAT: how far behind the source the daemon actually is -------
+    "
+    " The number the product is sold on. The stress harness measures latency for
+    " a hand-driven cycle loop; this measures it THROUGH THE DAEMON, which is
+    " what a customer runs -- tick scheduling, the planner, the worker budget
+    " and the cycle, end to end.
+    "
+    " ONE SAMPLE PER CHANGE, at its first apply. The safety overlap re-reads
+    " recent rows on purpose, so a change is logged several times with
+    " ever-later apply times; counting every log row measures the overlap window
+    " rather than the pipeline, and reported it five times slower than it is.
+    " In MILLISECONDS, as an integer, read with cnt().
+    "
+    " scalar() extracts a QUOTED JSON value, and a number is not quoted -- so
+    " reading a p95 with it returned empty, the comparison ran against zero, and
+    " the assertion passed however slow the daemon was. The one claim the
+    " streaming tier makes, guarded by something that could not fail.
+    DATA(lv_samples) = cnt(
+      |SELECT count(*) AS c FROM (| &&
+      |SELECT epoch(min(_applied_at))-epoch(_commit_ts) AS lat | &&
+      |FROM _erpl_rev_log_dmn_wm WHERE _commit_ts IS NOT NULL | &&
+      |GROUP BY client, bukrs, belnr, gjahr, buzei, _commit_ts)| ).
+    DATA(lv_p95ms) = cnt(
+      |SELECT CAST(coalesce(round(quantile_disc(lat,0.95)*1000),0) AS BIGINT) AS c FROM (| &&
+      |SELECT epoch(min(_applied_at))-epoch(_commit_ts) AS lat | &&
+      |FROM _erpl_rev_log_dmn_wm WHERE _commit_ts IS NOT NULL | &&
+      |GROUP BY client, bukrs, belnr, gjahr, buzei, _commit_ts)| ).
+    DATA(lv_n) = cnt( |SELECT count(*) AS c FROM _erpl_rev_log_dmn_wm| ).
+    ok( cond = xsdbool( lv_n > 0 )
+        what = 'DAEMON-LAT: the change log captured the daemon''s work'
+        detail = |{ lv_n } row(s)| ).
+    " p95 under five seconds on a two-second tick. Asserted, not printed: a
+    " latency figure nobody checks is a number in a log, and this is the one
+    " claim the streaming tier makes.
+    " Samples must EXIST before a latency claim means anything: "no samples"
+    " and "fast" are the same number otherwise.
+    ok( cond = xsdbool( lv_samples > 0 )
+        what = 'DAEMON-LAT: there are latency samples to judge'
+        detail = |{ lv_samples } sample(s)| ).
+    ok( cond = xsdbool( lv_samples > 0 AND lv_p95ms > 0 AND lv_p95ms <= 5000 )
+        what = 'DAEMON-LAT: p95 source-commit to applied is within 5s'
+        detail = |p95={ lv_p95ms }ms over { lv_samples } sample(s)| ).
+    out_line( |DAEMON-LAT p95={ lv_p95ms }ms samples={ lv_samples }| ).
 
     " --- a second daemon must not start ----------------------------------
     " Two daemons run every target against each other: same source, same

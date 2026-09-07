@@ -180,7 +180,10 @@ CLASS zcl_erpl_rev_streamstress IMPLEMENTATION.
     zcl_erpl_rev_util=>query( |DROP TABLE IF EXISTS _erpl_rev_log_{ iv_target }| ).
     zcl_erpl_rev_util=>query( |DROP SEQUENCE IF EXISTS _erpl_rev_log_{ iv_target }_seq| ).
     zcl_erpl_rev_util=>query( |DELETE FROM _erpl_rev_delta_state WHERE target='{ iv_target }'| ).
-    zcl_erpl_rev_delta=>register( VALUE #(
+    " The return value is the registration's verdict. Discarded, a refused
+    " registration surfaced 18 cycles later as "no delta registration for
+    " <target>" -- which reads like an engine defect and is not one.
+    DATA(lv_regerr) = zcl_erpl_rev_delta=>register( VALUE #(
       target      = iv_target
       method      = 'WATERMARK'
       source_from = 'ZDELTA_ALL'
@@ -191,6 +194,8 @@ CLASS zcl_erpl_rev_streamstress IMPLEMENTATION.
       safety_secs = 5
       safety_units = iv_units
       cadence     = 'manual' ) ).
+    ok( cond = xsdbool( lv_regerr IS INITIAL )
+        what = |registration accepted { iv_target }| detail = lv_regerr ).
     " The change log is the latency instrument: without it there is nothing to
     " measure after the fact.
     zcl_erpl_rev_util=>query(
@@ -328,11 +333,17 @@ CLASS zcl_erpl_rev_streamstress IMPLEMENTATION.
     " the workload has finished and the deltas have settled. Comparing them
     " with the delta targets is then one SQL statement each, in one place,
     " instead of shipping key sets back into ABAP to be diffed in a loop.
-    zcl_erpl_rev_util=>replicate( iv_tab = 'ZDELTA_ALL' iv_target = 'stress_truth'
+    " An oracle that silently loaded nothing does not fail here -- it fails
+    " later, as "the pipeline lost everything", which is the opposite reading.
+    DATA(ls_t) = zcl_erpl_rev_util=>replicate( iv_tab = 'ZDELTA_ALL' iv_target = 'stress_truth'
                                   iv_record = abap_false ).
-    zcl_erpl_rev_util=>replicate( iv_tab = 'ZDELTA_AUDIT' iv_target = 'stress_audit'
+    ok( cond = xsdbool( ls_t-error IS INITIAL )
+        what = 'the truth oracle loaded' detail = ls_t-error ).
+    DATA(ls_a) = zcl_erpl_rev_util=>replicate( iv_tab = 'ZDELTA_AUDIT' iv_target = 'stress_audit'
                                   iv_where = |RUNID = '{ c_run }'|
                                   iv_record = abap_false ).
+    ok( cond = xsdbool( ls_a-error IS INITIAL )
+        what = 'the audit oracle loaded' detail = ls_a-error ).
     out_line( |oracles: stress_truth={ cnt( 'SELECT count(*) AS c FROM stress_truth' ) } | &&
               |stress_audit={ cnt( 'SELECT count(*) AS c FROM stress_audit' ) }| ).
   ENDMETHOD.
