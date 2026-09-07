@@ -242,7 +242,7 @@ suite diff ZCL_ERPL_REV_DIFFTEST abap/zcl_erpl_rev_difftest.abap DIFF 4 "" \
   "every replicated cell equals the SAP source; corruption is detected"
 
 
-suite delta ZCL_ERPL_REV_DELTATEST abap/zcl_erpl_rev_deltatest.abap DELTA 51 "" \
+suite delta ZCL_ERPL_REV_DELTATEST abap/zcl_erpl_rev_deltatest.abap DELTA 54 "" \
   "watermark, snapshot delete, real change documents, orchestration"
 
 

@@ -602,8 +602,14 @@ CLASS zcl_erpl_rev_clidrv IMPLEMENTATION.
                     " ones: ('','B') must render the same here as in DuckDB, and
                     " joining only non-empty parts renders "B" against "|B".
                     IF lv_anyk = abap_true. lv_k = lv_k && `|`. ENDIF.
-                    lv_k = lv_k && zcl_erpl_rev_util=>fingerprint_cell(
-                                     is_field = ls_kf iv_val = <vc> ).
+                    " The separator escaped inside each part, identically to the
+                    " server: without it ('A|B','C') and ('A','B|C') render the
+                    " same key, two different rows collapse into one, and the
+                    " comparison pairs the wrong ones and reports PASSED.
+                    DATA(lv_kp) = zcl_erpl_rev_util=>fingerprint_cell(
+                                    is_field = ls_kf iv_val = <vc> ).
+                    REPLACE ALL OCCURRENCES OF `|` IN lv_kp WITH `\|`.
+                    lv_k = lv_k && lv_kp.
                     lv_anyk = abap_true.
                   ENDLOOP.
                   " Falls back only when there are NO usable key columns -- the
@@ -623,7 +629,12 @@ CLASS zcl_erpl_rev_clidrv IMPLEMENTATION.
                 RETURN.
             ENDTRY.
 
-            DATA(lv_vp) = |\{"fields":{ lv_vfj },"rows":{ lv_vrows },| &&
+            " The source's TOTAL, not the sampled count. With the replica query
+            " now restricted to the sampled keys, this is what carries the
+            " cardinality signal: a replica holding rows the source does not.
+            DATA lv_vtot TYPE i.
+            SELECT COUNT(*) FROM (lv_vsrc) INTO @lv_vtot.
+            DATA(lv_vp) = |\{"source_rows":{ lv_vtot },"fields":{ lv_vfj },"rows":{ lv_vrows },| &&
                           |"mode":"{ jstr( iv_json = iv_params iv_key = 'mode' ) }",| &&
                           |"sample_rows":{ lv_vmax }\}|.
             DATA(ls_vr) = zcl_erpl_rev_delta=>plan_json(

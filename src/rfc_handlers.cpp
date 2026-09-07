@@ -1063,7 +1063,36 @@ extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE,
                     vkeys = SplitCsv(kr->GetValue(0, 0).ToString());
             }
             const auto vplan = validation::BuildPlan(pol, target, fields, vkeys);
-            QueryResult ours = g_bridge->Query(vplan.sql);
+
+            // In SAMPLE mode, restrict the replica to the keys the source
+            // actually sent.
+            //
+            // Both sides used to take their own first N by their own ORDER BY,
+            // which is the very assumption keying was introduced to remove: one
+            // extra row in the replica shifts its window by one, and the
+            // boundary source rows are then reported as "missing from the
+            // replica" -- a lost-row alarm for rows that are present. Driving
+            // the window from one side makes both describe the same rows.
+            std::string vsql = vplan.sql;
+            if (pol.mode != validation::Mode::Full) {
+                std::string in;
+                const auto arr = JsonArray(params, "rows");
+                size_t at = 0;
+                while ((at = arr.find("{", at)) != std::string::npos) {
+                    const auto e2 = arr.find("}", at);
+                    if (e2 == std::string::npos) break;
+                    const auto k = JsonField(arr.substr(at, e2 - at + 1), "k");
+                    at = e2 + 1;
+                    if (k.empty()) continue;
+                    if (!in.empty()) in += ",";
+                    in += SqlLit(k);
+                }
+                // No keys sent means nothing to restrict to; the comparison
+                // below reports the empty payload rather than silently passing.
+                if (!in.empty())
+                    vsql = "SELECT * FROM (" + vplan.sql + ") WHERE k IN (" + in + ")";
+            }
+            QueryResult ours = g_bridge->Query(vsql);
 
             // Paired by KEY, not by position.
             //
@@ -1125,10 +1154,28 @@ extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE,
             // never propagated, the flagship failure of any replicator -- was
             // caught by the row-count check until the keyed rewrite dropped it.
             // Anything left in `mine` after the pass above is exactly that.
-            const bool capped = pol.mode != validation::Mode::Full &&
-                                (static_cast<long long>(ours.rows.size()) >= pol.sample_rows ||
-                                 compared >= pol.sample_rows);
-            if (!capped) {
+            // In sample mode the replica query is now restricted to the source's
+            // own keys, so leftovers cannot appear there by construction -- and
+            // an extra replica row would go unseen again. The row count carries
+            // that signal instead: the source's total, sent by ABAP, against the
+            // replica's, neither of which is capped for a table under the sample
+            // size.
+            if (pol.mode != validation::Mode::Full) {
+                const auto src_total = JsonField(params, "source_rows");
+                const auto rep = con.Query("SELECT count(*) FROM " + target);
+                if (!src_total.empty() && !rep->HasError() && rep->RowCount() > 0) {
+                    const long long st = std::atoll(src_total.c_str());
+                    const long long rt = rep->GetValue(0, 0).GetValue<int64_t>();
+                    if (st != rt && st < pol.sample_rows) {
+                        ++mismatched;
+                        if (first_bad.empty())
+                            first_bad = "row count: source " + std::to_string(st) +
+                                        ", replica " + std::to_string(rt);
+                    }
+                }
+            }
+
+            if (pol.mode == validation::Mode::Full) {
                 for (const auto &kv : mine) {
                     for (size_t n = 0; n < kv.second.size(); ++n) {
                         ++mismatched;

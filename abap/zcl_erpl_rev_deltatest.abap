@@ -381,6 +381,56 @@ CLASS zcl_erpl_rev_deltatest IMPLEMENTATION.
         what = 'validate: a changed cell is still caught'
         detail = lv_r ).
 
+    " --- the two holes the keyed rewrite opened ------------------------------
+    "
+    " On a SIMPLE target, deliberately. The negative-amount target above has
+    " many columns and a hand-made row, and both of these assertions passed
+    " against it for reasons unrelated to their names -- twice. A two-column
+    " table with one key column leaves nothing to be confused about.
+    zcl_erpl_rev_util=>query( |DROP TABLE IF EXISTS val_card| ).
+    " WITHOUT a primary key, deliberately. A target that has one cannot hold the
+    " same key twice at all -- the duplicate INSERT below just fails. The case
+    " being guarded is the target whose PK build was SKIPPED, which the create
+    " path does best-effort and silently: those are the targets where a
+    " double-applied load can actually duplicate a row.
+    zcl_erpl_rev_util=>replicate( iv_tab = 'T000' iv_target = 'val_card'
+                                  iv_record = abap_false iv_build_pk = abap_false ).
+    zcl_erpl_rev_util=>query( |DELETE FROM _erpl_rev_delta_state WHERE target='val_card'| ).
+    zcl_erpl_rev_delta=>register( VALUE #(
+      target = 'val_card' method = 'WATERMARK' source_from = 'T000'
+      keys = 'MANDT' chg_col = 'MANDT' wm_kind = 'NUMTS' cadence = 'manual' ) ).
+
+    zcl_erpl_rev_clidrv=>execute(
+      EXPORTING iv_verb = 'validate' iv_params = '{"target":"val_card"}'
+      IMPORTING ev_result = lv_r ev_error = lv_e ).
+    ok( cond = xsdbool( lv_r CS '"verdict":"PASSED"' )
+        what = 'validate: the cardinality fixture starts clean' detail = lv_r ).
+
+    " A row the source does not have -- the flagship replicator failure. In
+    " SAMPLE mode, which is the default and the mode that regressed: every
+    " source key still pairs, so only a reverse check can see it.
+    zcl_erpl_rev_util=>query( |INSERT INTO val_card (mandt) VALUES ('888')| ).
+    zcl_erpl_rev_clidrv=>execute(
+      EXPORTING iv_verb = 'validate' iv_params = '{"target":"val_card"}'
+      IMPORTING ev_result = lv_r ev_error = lv_e ).
+    ok( cond = xsdbool( lv_r CS '"verdict":"FAILED"' )
+        what = 'validate: a row in the replica the source does not have is caught'
+        detail = lv_r ).
+
+    " The same key twice -- a double-applied load. A map keyed by identity
+    " collapsed them and the pair matched.
+    zcl_erpl_rev_util=>query( |DELETE FROM val_card WHERE mandt='888'| ).
+    zcl_erpl_rev_util=>query(
+      |INSERT INTO val_card SELECT * FROM val_card LIMIT 1| ).
+    zcl_erpl_rev_clidrv=>execute(
+      EXPORTING iv_verb = 'validate' iv_params = '{"target":"val_card"}'
+      IMPORTING ev_result = lv_r ev_error = lv_e ).
+    ok( cond = xsdbool( lv_r CS '"verdict":"FAILED"' )
+        what = 'validate: the same key twice in the replica is caught' detail = lv_r ).
+
+    zcl_erpl_rev_util=>query( |DROP TABLE IF EXISTS val_card| ).
+    zcl_erpl_rev_util=>query( |DELETE FROM _erpl_rev_delta_state WHERE target='val_card'| ).
+
     DELETE FROM zdelta_all WHERE belnr = '9999999999'.
     COMMIT WORK AND WAIT.
     zcl_erpl_rev_util=>query( |DROP TABLE IF EXISTS val_neg| ).

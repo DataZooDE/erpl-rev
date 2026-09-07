@@ -161,3 +161,18 @@ TEST_CASE("validation: key names are matched case- and blank-insensitively",
     CHECK(k.find("mandt") != std::string::npos);
     CHECK(k.find("bukrs") != std::string::npos);
 }
+
+TEST_CASE("validation: a key part containing the separator cannot collide",
+          "[validation]") {
+    // Keys ('A|B','C') and ('A','B|C') both render "A|B|C" if the separator is
+    // not escaped, so two different rows become one map entry and the
+    // comparison silently pairs the wrong ones -- a false PASSED on divergent
+    // data, which is the failure mode this whole comparison was rewritten to
+    // remove.
+    Policy p;
+    std::vector<Field> fields{{"A", "CHAR", 10, 0}, {"B", "CHAR", 10, 0}};
+    const auto plan = BuildPlan(p, "t", fields, {"A", "B"});
+    const auto k = plan.sql.substr(0, plan.sql.find(" AS k"));
+    // The separator is only unambiguous if the parts are escaped first.
+    CHECK(k.find("replace(") != std::string::npos);
+}

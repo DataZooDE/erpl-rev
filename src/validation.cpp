@@ -76,7 +76,11 @@ Plan BuildPlan(const Policy &p, const std::string &target, const std::vector<Fie
             // nothing pairs -- and full mode then calls a byte-perfect replica
             // wrong in both directions.
             if (any_key) key += " || '|' || ";
-            key += DuckExpr(f);
+            // The separator escaped INSIDE each part, or ('A|B','C') and
+            // ('A','B|C') render the same key and two different rows collapse
+            // into one -- pairing the wrong rows and reporting PASSED. ABAP
+            // does the identical substitution.
+            key += "replace(" + DuckExpr(f) + ", '|', '\\|')";
             any_key = true;
             break;
         }
