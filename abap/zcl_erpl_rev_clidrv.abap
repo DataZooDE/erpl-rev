@@ -47,6 +47,24 @@ CLASS zcl_erpl_rev_clidrv DEFINITION PUBLIC FINAL CREATE PUBLIC.
       RETURNING VALUE(rt)     TYPE tt_done.
 
   PRIVATE SECTION.
+    "! Read the HANA catalogue the CDC_PROBE plan named, and render what is
+    "! actually there as the params the server derives a status from.
+    "!
+    "! One method, two callers: cdc_status derives once, and cdc_repair derives
+    "! AGAIN after re-creating the missing objects -- the status comes from the
+    "! catalogue, so the only way to know a repair worked is to look again.
+    "! Those two blocks were the same forty lines twice, once with every local
+    "! suffixed `2`, which is a trigger-parsing bug waiting to be fixed in one
+    "! copy and left standing in the other.
+    "!
+    "! An EMPTY result means the catalogue could not be read -- which is not an
+    "! empty catalogue, and must never be derived from: it would mark a healthy
+    "! target INCONSISTENT. The callers phrase that failure themselves, because
+    "! it means something different before a repair than after one.
+    CLASS-METHODS probe_snapshot
+      IMPORTING iv_plan   TYPE string
+      RETURNING VALUE(rv) TYPE string.
+
     "! Claim the oldest pending command, returning its fields as one JSON row.
     CLASS-METHODS claim
       RETURNING VALUE(rs) TYPE zcl_erpl_rev_util=>ty_query.
@@ -112,6 +130,46 @@ CLASS zcl_erpl_rev_clidrv IMPLEMENTATION.
                       status = COND string( WHEN lv_err IS INITIAL THEN 'DONE' ELSE 'ERROR' )
                       result = lv_res error = lv_err ) TO rt.
     ENDDO.
+  ENDMETHOD.
+
+  METHOD probe_snapshot.
+    DATA(lv_t) = zcl_erpl_rev_cdc=>probe_names(
+                   zcl_erpl_rev_delta=>jstr( iv_json = iv_plan iv_key = 'tables_sql' ) ).
+    DATA(lv_s) = zcl_erpl_rev_cdc=>probe_names(
+                   zcl_erpl_rev_delta=>jstr( iv_json = iv_plan iv_key = 'sequences_sql' ) ).
+    DATA(lv_g) = zcl_erpl_rev_cdc=>probe_names(
+                   zcl_erpl_rev_delta=>jstr( iv_json = iv_plan iv_key = 'triggers_sql' ) ).
+    IF lv_t IS INITIAL OR lv_s IS INITIAL OR lv_g IS INITIAL.
+      RETURN.
+    ENDIF.
+
+    " The triggers come back as "<name>:<IS_VALID>"; split them into the
+    " enabled and disabled sets the derivation compares against.
+    DATA lv_en TYPE string VALUE `[`.
+    DATA lv_di TYPE string VALUE `[`.
+    SPLIT lv_g AT ',' INTO TABLE DATA(lt_tg).
+    LOOP AT lt_tg INTO DATA(lv_tg).
+      REPLACE ALL OCCURRENCES OF `[` IN lv_tg WITH ``.
+      REPLACE ALL OCCURRENCES OF `]` IN lv_tg WITH ``.
+      REPLACE ALL OCCURRENCES OF `"` IN lv_tg WITH ``.
+      IF lv_tg IS INITIAL. CONTINUE. ENDIF.
+      SPLIT lv_tg AT ':' INTO DATA(lv_nm) DATA(lv_fl).
+      IF lv_fl = 'TRUE' OR lv_fl = 'true' OR lv_fl = 'X'.
+        IF lv_en <> `[`. lv_en = lv_en && `,`. ENDIF.
+        lv_en = lv_en && `"` && lv_nm && `"`.
+      ELSE.
+        IF lv_di <> `[`. lv_di = lv_di && `,`. ENDIF.
+        lv_di = lv_di && `"` && lv_nm && `"`.
+      ENDIF.
+    ENDLOOP.
+    lv_en = lv_en && `]`.
+    lv_di = lv_di && `]`.
+
+    rv = |\{"tables":{ lv_t },"sequences":{ lv_s },| &&
+         |"enabled_triggers":{ lv_en },"disabled_triggers":{ lv_di },| &&
+         |"log_table":"{ zcl_erpl_rev_delta=>jstr( iv_json = iv_plan iv_key = 'log_table' ) }",| &&
+         |"seq_name":"{ zcl_erpl_rev_delta=>jstr( iv_json = iv_plan iv_key = 'seq_name' ) }",| &&
+         |"triggers":{ zcl_erpl_rev_delta=>jarr( iv_json = iv_plan iv_key = 'triggers' ) }\}|.
   ENDMETHOD.
 
   METHOD claim.
@@ -353,47 +411,12 @@ CLASS zcl_erpl_rev_clidrv IMPLEMENTATION.
         IF ls_pr-error IS NOT INITIAL.
           ev_error = ls_pr-error.
         ELSE.
-          DATA(lv_tj) = zcl_erpl_rev_cdc=>probe_names(
-                          zcl_erpl_rev_delta=>jstr( iv_json = ls_pr-json
-                                                    iv_key = 'tables_sql' ) ).
-          DATA(lv_sj) = zcl_erpl_rev_cdc=>probe_names(
-                          zcl_erpl_rev_delta=>jstr( iv_json = ls_pr-json
-                                                    iv_key = 'sequences_sql' ) ).
-          DATA(lv_gj) = zcl_erpl_rev_cdc=>probe_names(
-                          zcl_erpl_rev_delta=>jstr( iv_json = ls_pr-json
-                                                    iv_key = 'triggers_sql' ) ).
-          IF lv_tj IS INITIAL OR lv_sj IS INITIAL OR lv_gj IS INITIAL.
+          DATA(lv_sp) = probe_snapshot( ls_pr-json ).
+          IF lv_sp IS INITIAL.
             " A probe that could not run is not an empty catalogue. Deriving a
             " status from it would mark a healthy target INCONSISTENT.
             ev_error = |CDC probe failed: the catalogue could not be read|.
           ELSE.
-            " The triggers come back as "<name>:<IS_VALID>"; split them into the
-            " enabled and disabled sets the derivation compares against.
-            DATA lv_en TYPE string VALUE `[`.
-            DATA lv_di TYPE string VALUE `[`.
-            SPLIT lv_gj AT ',' INTO TABLE DATA(lt_tg).
-            LOOP AT lt_tg INTO DATA(lv_tg).
-              REPLACE ALL OCCURRENCES OF `[` IN lv_tg WITH ``.
-              REPLACE ALL OCCURRENCES OF `]` IN lv_tg WITH ``.
-              REPLACE ALL OCCURRENCES OF `"` IN lv_tg WITH ``.
-              IF lv_tg IS INITIAL. CONTINUE. ENDIF.
-              SPLIT lv_tg AT ':' INTO DATA(lv_nm) DATA(lv_fl).
-              IF lv_fl = 'TRUE' OR lv_fl = 'true' OR lv_fl = 'X'.
-                IF lv_en <> `[`. lv_en = lv_en && `,`. ENDIF.
-                lv_en = lv_en && `"` && lv_nm && `"`.
-              ELSE.
-                IF lv_di <> `[`. lv_di = lv_di && `,`. ENDIF.
-                lv_di = lv_di && `"` && lv_nm && `"`.
-              ENDIF.
-            ENDLOOP.
-            lv_en = lv_en && `]`.
-            lv_di = lv_di && `]`.
-
-            DATA(lv_sp) = |\{"tables":{ lv_tj },"sequences":{ lv_sj },| &&
-                          |"enabled_triggers":{ lv_en },"disabled_triggers":{ lv_di },| &&
-                          |"log_table":"{ zcl_erpl_rev_delta=>jstr( iv_json = ls_pr-json iv_key = 'log_table' ) }",| &&
-                          |"seq_name":"{ zcl_erpl_rev_delta=>jstr( iv_json = ls_pr-json iv_key = 'seq_name' ) }",| &&
-                          |"triggers":{ zcl_erpl_rev_delta=>jarr( iv_json = ls_pr-json iv_key = 'triggers' ) }\}|.
             DATA(ls_st) = zcl_erpl_rev_delta=>plan_json(
               iv_action = 'CDC_STATUS' iv_target = lv_ct iv_params = lv_sp ).
             ev_error  = ls_st-error.
@@ -425,40 +448,8 @@ CLASS zcl_erpl_rev_clidrv IMPLEMENTATION.
                   " the repair worked and replication stays stopped. The status
                   " is derived from the catalogue, so the only way to know it is
                   " fixed is to look again.
-                  DATA(lv_tj2) = zcl_erpl_rev_cdc=>probe_names(
-                                   zcl_erpl_rev_delta=>jstr( iv_json = ls_pr-json
-                                                             iv_key = 'tables_sql' ) ).
-                  DATA(lv_sj2) = zcl_erpl_rev_cdc=>probe_names(
-                                   zcl_erpl_rev_delta=>jstr( iv_json = ls_pr-json
-                                                             iv_key = 'sequences_sql' ) ).
-                  DATA(lv_gj2) = zcl_erpl_rev_cdc=>probe_names(
-                                   zcl_erpl_rev_delta=>jstr( iv_json = ls_pr-json
-                                                             iv_key = 'triggers_sql' ) ).
-                  IF lv_tj2 IS NOT INITIAL AND lv_sj2 IS NOT INITIAL AND lv_gj2 IS NOT INITIAL.
-                    DATA lv_en2 TYPE string VALUE `[`.
-                    DATA lv_di2 TYPE string VALUE `[`.
-                    SPLIT lv_gj2 AT ',' INTO TABLE DATA(lt_tg2).
-                    LOOP AT lt_tg2 INTO DATA(lv_tg2).
-                      REPLACE ALL OCCURRENCES OF `[` IN lv_tg2 WITH ``.
-                      REPLACE ALL OCCURRENCES OF `]` IN lv_tg2 WITH ``.
-                      REPLACE ALL OCCURRENCES OF `"` IN lv_tg2 WITH ``.
-                      IF lv_tg2 IS INITIAL. CONTINUE. ENDIF.
-                      SPLIT lv_tg2 AT ':' INTO DATA(lv_nm2) DATA(lv_fl2).
-                      IF lv_fl2 = 'TRUE' OR lv_fl2 = 'true' OR lv_fl2 = 'X'.
-                        IF lv_en2 <> `[`. lv_en2 = lv_en2 && `,`. ENDIF.
-                        lv_en2 = lv_en2 && `"` && lv_nm2 && `"`.
-                      ELSE.
-                        IF lv_di2 <> `[`. lv_di2 = lv_di2 && `,`. ENDIF.
-                        lv_di2 = lv_di2 && `"` && lv_nm2 && `"`.
-                      ENDIF.
-                    ENDLOOP.
-                    lv_en2 = lv_en2 && `]`.
-                    lv_di2 = lv_di2 && `]`.
-                    DATA(lv_sp3) = |\{"tables":{ lv_tj2 },"sequences":{ lv_sj2 },| &&
-                                   |"enabled_triggers":{ lv_en2 },"disabled_triggers":{ lv_di2 },| &&
-                                   |"log_table":"{ zcl_erpl_rev_delta=>jstr( iv_json = ls_pr-json iv_key = 'log_table' ) }",| &&
-                                   |"seq_name":"{ zcl_erpl_rev_delta=>jstr( iv_json = ls_pr-json iv_key = 'seq_name' ) }",| &&
-                                   |"triggers":{ zcl_erpl_rev_delta=>jarr( iv_json = ls_pr-json iv_key = 'triggers' ) }\}|.
+                  DATA(lv_sp3) = probe_snapshot( ls_pr-json ).
+                  IF lv_sp3 IS NOT INITIAL.
                     DATA(ls_st2) = zcl_erpl_rev_delta=>plan_json(
                       iv_action = 'CDC_STATUS' iv_target = lv_ct iv_params = lv_sp3 ).
                     " The re-derivation's own error propagates. Swallowing it
