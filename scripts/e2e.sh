@@ -280,7 +280,7 @@ suite watermark ZCL_ERPL_REV_WMTEST abap/zcl_erpl_rev_wmtest.abap WM 8 "" \
 suite soak ZCL_ERPL_REV_SOAKTEST abap/zcl_erpl_rev_soaktest.abap SOAK 6 "@soak" \
   "the daemon under continuous change: no stall, no parking, nothing lost"
 
-suite daemon ZCL_ERPL_REV_DAEMONTEST abap/zcl_erpl_rev_daemontest.abap DAEMON 19 "@soak" \
+suite daemon ZCL_ERPL_REV_DAEMONTEST abap/zcl_erpl_rev_daemontest.abap DAEMON 20 "@soak" \
   "the daemon as a real background job: it ticks, it replicates with nobody calling run(), a second one refuses to start, and the stop flag ends it"
 
 suite stress ZCL_ERPL_REV_STREAMSTRESS abap/zcl_erpl_rev_streamstress.abap STRESS 25 "@soak" \

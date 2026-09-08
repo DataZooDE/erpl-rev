@@ -116,6 +116,18 @@ CLASS zcl_erpl_rev_daemontest IMPLEMENTATION.
     sql( |UPDATE _erpl_rev_daemon SET status='STOPPED', stop=false, instance_id=NULL, | &&
          |heartbeat_ts=NULL, ticks=0 WHERE id=1| ).
 
+    " The clean slate, asserted rather than assumed. ticks is a CUMULATIVE
+    " counter and the reset above is the only thing that zeroes it, so without
+    " that clause this suite starts with the PREVIOUS suite's count already
+    " past every gate below -- and then races the daemon's claim for the
+    " verdict. A race is not a test: it passes on a quiet system and fails on a
+    " busy one, and both readings look like the daemon's fault.
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM _erpl_rev_daemon WHERE id=1 | &&
+                             |AND coalesce(ticks,0)=0 AND instance_id IS NULL| ) = 1 )
+        what = 'DAEMON-SLATE: the singleton starts reset, not inherited'
+        detail = |ticks={ cnt( |SELECT coalesce(ticks,0) AS c FROM _erpl_rev_daemon | &&
+                               |WHERE id=1| ) }| ).
+
     " A target on a 2-second cadence, so the daemon has something due on
     " almost every tick.
     zcl_erpl_rev_delta=>register( VALUE #(
