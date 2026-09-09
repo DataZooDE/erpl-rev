@@ -40,7 +40,9 @@ CLASS zcl_erpl_rev_cdc DEFINITION PUBLIC FINAL CREATE PUBLIC.
 
     "! Provision CDC for a target: fetch the plan, run the log-table + trigger DDL on
     "! the SAP DB, mark SEEDED. The DuckDB target must already be seeded (a full-load
-    "! replicate) before the first run. iv_mode: DELETE_ONLY (default) | FULL_IUD.
+    "! replicate) before the first run. iv_mode: DELETE_ONLY (default) | KEYS_IUD |
+    "! IMAGE_IUD. FULL_IUD is the pre-rename spelling of IMAGE_IUD and is still
+    "! accepted, permanently.
     CLASS-METHODS provision
       IMPORTING iv_target TYPE string
                 iv_source TYPE string
