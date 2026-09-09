@@ -308,7 +308,7 @@ AT SELECTION-SCREEN ON HELP-REQUEST FOR p_dwm.
 AT SELECTION-SCREEN ON HELP-REQUEST FOR p_dwmk.
   PERFORM help USING 'Watermark kind'
     'The type of the watermark column, so the high-water compares correctly.'
-    ' NUMTS = numeric timestamp, DATETIME = date+time pair, CHANGENR = change number,'
+    ' NUMTS = numeric timestamp, TIMESTAMPL = sub-second, DATETIME = date+time pair,'
     ' INT = integer, DATE = date only (coarse - nightly only).'.
 AT SELECTION-SCREEN ON HELP-REQUEST FOR p_dxtra.
   PERFORM help USING 'Change-document object'
@@ -378,7 +378,11 @@ AT SELECTION-SCREEN OUTPUT.
   lt_vrm = VALUE #(
     ( key = 'NUMTS'    text = 'NUMTS - numeric UTC timestamp' )
     ( key = 'DATETIME' text = 'DATETIME - date + time pair' )
-    ( key = 'CHANGENR' text = 'CHANGENR - change-document number' )
+    " CHANGENR is deliberately absent. The change number comes from a buffered
+    " number range and is not monotonic in commit order, so an overlap counted in
+    " change numbers bounds no loss at all -- the engine refuses it. Offering it
+    " here let an operator register a configuration that would then be rejected.
+    " The CHANGEDOC method is the supported way to follow change documents.
     ( key = 'INT'      text = 'INT - monotonic integer sequence' )
     ( key = 'DATE'     text = 'DATE - date only (nightly only)' ) ).
   CALL FUNCTION 'VRM_SET_VALUES' EXPORTING id = 'P_DWMK' values = lt_vrm.

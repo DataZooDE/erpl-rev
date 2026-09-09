@@ -62,6 +62,18 @@ std::string UnknownFlag(const std::vector<std::string> &args, const std::string 
 
 int RunSql(Options o);
 int RunSync(Options o);
+
+// The operator verbs. Everything they do reaches DuckDB, but they go through
+// the SAP command queue like every other verb: one path for all operator
+// commands, drained by the ABAP driver, which then calls a server-side PLAN
+// action. The work still happens in one server-side transaction -- the queue
+// carries the request, not the work.
+int RunDaemon(Options o);   // start | stop | status
+int RunSub(Options o);      // create | advance | ls
+int RunRetain(Options o);   // prune a target's change log
+int RunCdc(Options o);      // status | repair
+int RunMass(Options o);     // run --split
+int RunTop(Options o);      // the replication monitor
 int RunReplicate(Options o);
 
 } // namespace erpl_rev::cmd

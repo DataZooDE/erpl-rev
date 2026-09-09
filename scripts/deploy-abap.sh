@@ -36,8 +36,15 @@ dep() {  # dep <adt-type> <NAME> <file> <desc> [<source-type>]
     local t="$1" n="$2" f="$3" d="$4" st="${5:-}"
     if [ ! -f "$AB/$f" ]; then echo "  MISS $n ($f)"; rc=1; return 1; fi
     adt object create --type "$t" --name "$n" --package '$TMP' --description "$d" >/dev/null 2>&1
-    local args=(source write "$n" --file "$AB/$f" --activate)
-    [ -n "$st" ] && args=(source write "$n" --type "$st" --file "$AB/$f" --activate)
+    # SAP's DDL parser rejects comments inside a table body, so a .ddl file keeps
+    # its explanation as a leading `*` block and it is stripped on the way in.
+    # Losing that prose to satisfy a parser would be the wrong trade.
+    local src="$AB/$f"
+    if [ "${f##*.}" = "ddl" ] && head -1 "$src" | grep -q '^\*'; then
+        src="$(mktemp)"; sed '/^\*/d' "$AB/$f" > "$src"
+    fi
+    local args=(source write "$n" --file "$src" --activate)
+    [ -n "$st" ] && args=(source write "$n" --type "$st" --file "$src" --activate)
     # "Nothing to activate" is what an UNCHANGED object returns -- success, not
     # failure. Matching only "Activated" made every re-run report the whole
     # catalogue as broken, which trains you to ignore the warnings.
@@ -51,6 +58,8 @@ dep() {  # dep <adt-type> <NAME> <file> <desc> [<source-type>]
 }
 cls()  { dep CLAS/OC "$1" "$2" "$3"; }
 prog() { dep PROG/P "$1" "$2" "$3"; }
+# SAP's DDL parser rejects comments inside a table body, so the repo copies keep
+# their explanation as a leading `*` block and it is stripped on the way in.
 tabl() { dep TABL/DT "$1" "$2" "$3" TABL; }
 intf() { dep INTF/OI "$1" "$2" "$3" INTF; }
 ddls() { dep DDLS/DF "$1" "$2" "$3" DDLS; }
@@ -58,6 +67,10 @@ ddls() { dep DDLS/DF "$1" "$2" "$3" DDLS; }
 echo "== DDIC fixtures =="
 tabl ZWIDE_BSEG zwide_bseg.ddl "wide BSEG repro (erpl-rev)"
 tabl ZDELTA_WM  zdelta_wm.ddl  "delta watermark test table (erpl-rev)"
+tabl ZDELTA_D   zdelta_d.ddl   "DATE watermark test table (complete-day rule)"
+tabl ZDELTA_ALL zdelta_all.ddl "one column per replication strategy (BSEG-shaped)"
+tabl ZDELTA_AUDIT zdelta_audit.ddl "change-generator audit (the loss/latency oracle)"
+tabl ZDELTA_DT  zdelta_dt.ddl  "DATS+TIMS watermark test table (pair comparison)"
 
 echo "== interfaces (before util -- replicate's signature references it) =="
 intf ZIF_ERPL_REV_PROGRESS zif_erpl_rev_progress.intf.abap "replicate progress callback"
@@ -96,8 +109,11 @@ prog Z_ERPL_REV_REPL_WORKER   z_erpl_rev_repl_worker.prog.abap   "parallel-repli
 prog Z_ERPL_REV_REPLICATE     z_erpl_rev_replicate.prog.abap     "replicate SAP table -> DuckDB"
 prog Z_ERPL_REV_SQL           z_erpl_rev_sql.prog.abap           "DuckDB SQL console"
 prog Z_ERPL_REV_DELTA         z_erpl_rev_delta.prog.abap         "delta orchestration loop"
+prog Z_ERPL_REV_DAEMON        z_erpl_rev_daemon.prog.abap        "streaming daemon (second-scale)"
 prog Z_ERPL_REV_DELTA_SFLIGHT z_erpl_rev_delta_sflight.prog.abap "SFLIGHT delta demo"
 cls  ZCL_ERPL_REV_REPLRUN     zcl_erpl_rev_replrun.abap          "report parallel-branch E2E"
+cls  ZCL_ERPL_REV_WMTEST      zcl_erpl_rev_wmtest.abap           "watermark correctness E2E"
+cls  ZCL_ERPL_REV_FOOTPRINT   zcl_erpl_rev_footprint.abap        "delivered-object inventory"
 
 # RS_FUNCTIONMODULE_INSERT fails with invalid_function_pool unless the group already
 # exists, and nothing else creates it -- so on a fresh container every FM is silently

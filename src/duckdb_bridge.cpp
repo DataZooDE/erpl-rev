@@ -1,4 +1,9 @@
 #include "duckdb_bridge.hpp"
+#include "control_schema.hpp"
+#include "cycle.hpp"
+#include "transform_macros.hpp"
+
+#include <set>
 #include "payload.hpp"
 #include "json_util.hpp"
 #include "sxml_binary.hpp"
@@ -86,6 +91,22 @@ std::string SqlLit(const std::string &s) {
 
 // The trigger-CDC state-machine transition guard.
 bool AllowedCdcTransition(const std::string &from, const std::string &to) {
+    // INCONSISTENT and ERROR are OBSERVATIONS, not steps in the lifecycle, and
+    // they are reachable from anywhere.
+    //
+    // The lifecycle guard used to refuse them, which made the trigger tier
+    // unable to record what the catalogue actually said: a trigger dropped out
+    // of band left the target ACTIVE, `cdc status` threw "illegal transition
+    // ACTIVE -> INCONSISTENT", and the target went on cycling and capturing
+    // nothing. A status derived from probing the database cannot be constrained
+    // by a state machine that assumes only this program changes it -- the whole
+    // reason to probe is that something else did.
+    if (to == "INCONSISTENT" || to == "ERROR") return true;
+    // ...and a target observed broken must be able to come back once it is
+    // repaired or re-provisioned.
+    if (from == "INCONSISTENT" || from == "ERROR")
+        return to == "ACTIVE" || to == "SEEDED" || to == "PROVISIONED" || to == "DISABLED";
+
     if (from == "PROVISIONED") return to == "SEEDED" || to == "DISABLED";
     if (from == "SEEDED")      return to == "ACTIVE" || to == "DISABLED";
     if (from == "ACTIVE")      return to == "ACTIVE" || to == "DISABLED";
@@ -207,40 +228,17 @@ DuckDbBridge::DuckDbBridge(const std::string &path, const std::string &init_sql)
     // skips this); a later remote query auto-loads it anyway.
     if (!con.Query("LOAD httpfs")->HasError())
         con.Query("SET GLOBAL httpfs_connection_caching=true");
-    // Delta registry + runtime state — created once, always (independent of the
-    // optional boot init_sql). Both the per-target config and the watermark/lease
-    // state for incremental extraction live here; ABAP reads/writes it through
-    // Z_DUCKDB_QUERY, so there is no new SAP-side state table. (HLD §4.1.)
-    auto d = con.Query(
-        "CREATE TABLE IF NOT EXISTS _erpl_rev_delta_state ("
-        "target VARCHAR PRIMARY KEY, method VARCHAR NOT NULL, source_from VARCHAR NOT NULL, "
-        "keys VARCHAR NOT NULL, chg_col VARCHAR, wm_kind VARCHAR, wm_value VARCHAR, "
-        "safety_secs INTEGER DEFAULT 120, cadence VARCHAR DEFAULT 'nightly', extra VARCHAR, "
-        // TIMESTAMPTZ (not naive TIMESTAMP): now() is tz-aware, so storing it in a
-        // naive column and later doing epoch(now()) - epoch(col) yields a spurious
-        // local-UTC offset. Matching types keeps cadence/lease arithmetic correct.
-        "last_run_ts TIMESTAMPTZ, rows_applied BIGINT, status VARCHAR DEFAULT 'IDLE', "
-        "lease_ts TIMESTAMPTZ, last_error VARCHAR)");
-    if (d->HasError())
-        throw std::runtime_error("DuckDB delta-state init failed: " + d->GetError());
-    // Replication run statistics — one durable row per full or incremental run,
-    // written by the ABAP apply path (zcl_erpl_rev_util=>record_run via Z_DUCKDB_QUERY),
-    // with enough dimensions/measures to build a replication dashboard straight from
-    // DuckDB (see docs/stats.md). run_id from a sequence; ts defaults to the server
-    // clock (now()) so it agrees with the delta-state clock. The erpl_rev_run_stats
-    // view adds derived rows_applied / rows_per_sec / started_at / is_success.
-    auto seq = con.Query("CREATE SEQUENCE IF NOT EXISTS _erpl_rev_run_seq START 1");
-    if (seq->HasError())
-        throw std::runtime_error("DuckDB run-seq init failed: " + seq->GetError());
-    auto rstat = con.Query(
-        "CREATE TABLE IF NOT EXISTS _erpl_rev_run_stats ("
-        "run_id BIGINT PRIMARY KEY DEFAULT nextval('_erpl_rev_run_seq'), "
-        "ts TIMESTAMPTZ DEFAULT now(), "
-        "target VARCHAR, source VARCHAR, run_type VARCHAR, method VARCHAR, status VARCHAR, "
-        "duration_ms BIGINT, rows_read BIGINT, rows_ins BIGINT, rows_upd BIGINT, rows_del BIGINT, "
-        "wm_from VARCHAR, wm_to VARCHAR, jobs INTEGER, error_text VARCHAR)");
-    if (rstat->HasError())
-        throw std::runtime_error("DuckDB run-stats init failed: " + rstat->GetError());
+    // Control schema: every table erpl-rev owns is created and evolved from the
+    // one ordered migration list in control_schema.cpp, so a DuckDB file from an
+    // older binary is migrated in place at boot rather than diverging. v1 of that
+    // list is exactly the DDL that used to be inline here.
+    //
+    // Only the server migrates: the CLI reaches DuckDB over quack while the
+    // server holds the file lock, so it must never run this.
+    schema::Migrate(con, ERPL_REV_VERSION);
+
+    // The run-stats view is CREATE OR REPLACE on every open rather than a
+    // migration, so a view fix reaches existing files without a version bump.
     auto rview = con.Query(
         "CREATE OR REPLACE VIEW erpl_rev_run_stats AS SELECT "
         "run_id, ts AS finished_at, "
@@ -255,32 +253,87 @@ DuckDbBridge::DuckDbBridge(const std::string &path, const std::string &init_sql)
         "FROM _erpl_rev_run_stats");
     if (rview->HasError())
         throw std::runtime_error("DuckDB run-stats view init failed: " + rview->GetError());
-    // Trigger-CDC state machine (opt-in physical-delete tier, ADR-0004 / epic #17).
-    // One row per CDC target: config + provisioning status + log position. Guarded
-    // transitions live in the CDC* methods; the table itself is plain DuckDB so the
-    // state survives a server restart.
-    auto cdc = con.Query(
-        "CREATE TABLE IF NOT EXISTS _erpl_rev_cdc ("
-        "target VARCHAR PRIMARY KEY, source VARCHAR NOT NULL, keys VARCHAR NOT NULL, "
-        "platform VARCHAR DEFAULT 'HANA', mode VARCHAR DEFAULT 'DELETE_ONLY', "
-        "status VARCHAR DEFAULT 'PROVISIONED', log_table VARCHAR, position BIGINT DEFAULT 0, "
-        "provisioned_ts TIMESTAMPTZ, seeded_ts TIMESTAMPTZ, last_run_ts TIMESTAMPTZ, error VARCHAR)");
-    if (cdc->HasError())
-        throw std::runtime_error("DuckDB cdc-state init failed: " + cdc->GetError());
-    // The CLI command queue. The CLI writes a row here and ABAP picks it up, so
-    // parameters reach SAP as *data* rather than as generated source -- which is
-    // what lets sync/replicate work for a user with no developer authorisation,
-    // and removes the ABAP-escaping surface entirely. See issue #85.
-    auto cmdq = con.Query(
-        "CREATE SEQUENCE IF NOT EXISTS _erpl_rev_cli_seq START 1;"
-        "CREATE TABLE IF NOT EXISTS _erpl_rev_cli_cmd ("
-        "cmd_id BIGINT PRIMARY KEY, created_ts TIMESTAMPTZ DEFAULT now(), "
-        "verb VARCHAR NOT NULL, params VARCHAR NOT NULL, "
-        "status VARCHAR DEFAULT 'PENDING', "
-        "claimed_ts TIMESTAMPTZ, finished_ts TIMESTAMPTZ, "
-        "result VARCHAR, error VARCHAR)");
-    if (cmdq->HasError())
-        throw std::runtime_error("DuckDB cli-queue init failed: " + cmdq->GetError());
+
+    // --- the operational views ----------------------------------------------
+    //
+    // What an operator asks is never "show me the run table"; it is "is
+    // replication keeping up, and which target is the problem". These answer
+    // exactly that, and every surface that displays them -- the CLI, the TUI,
+    // the metrics endpoint, the ABAP screen -- reads the SAME view, so four
+    // displays cannot disagree about whether a target is healthy.
+    //
+    // Views, not a rollup: nothing extra to write on the cycle path, nothing to
+    // keep consistent, and they cannot drift from the truth because they are it.
+    auto tview = con.Query(
+        "CREATE OR REPLACE VIEW erpl_rev_targets AS SELECT "
+        "target, method, coalesce(cadence,'manual') AS cadence, "
+        "coalesce(status,'IDLE') AS status, "
+        // NULL, not zero, when it has never run. A target registered and never
+        // run is the commonest "why is there no data" call, and reporting it as
+        // current sends the operator looking anywhere but at it.
+        "CASE WHEN last_run_ts IS NULL THEN NULL "
+        "     ELSE CAST(epoch(now()) - epoch(last_run_ts) AS BIGINT) END AS lag_seconds, "
+        "last_run_ts, coalesce(rows_applied,0) AS last_rows, "
+        "coalesce(fail_count,0) AS fail_count, last_error, "
+        "coalesce(log_enabled,false) AS log_enabled, "
+        "coalesce(wm_value,'') AS watermark, "
+        // Three different operator actions, kept apart. Collapsing them into
+        // one "unhealthy" flag makes the view useless for deciding what to DO:
+        // a parked target needs unpark, a blocked one needs re-registering, a
+        // failing one needs its error read.
+        "(coalesce(status,'') = 'BLOCKED') AS is_blocked, "
+        "(parked_until IS NOT NULL AND parked_until > now()) AS is_parked, "
+        "park_reason, "
+        "(last_run_ts IS NOT NULL AND coalesce(fail_count,0) = 0 "
+        " AND coalesce(status,'') <> 'BLOCKED' "
+        " AND (parked_until IS NULL OR parked_until <= now())) AS is_healthy "
+        "FROM _erpl_rev_delta_state");
+    if (tview->HasError())
+        throw std::runtime_error("DuckDB targets view init failed: " + tview->GetError());
+
+    // One row, so no display has to aggregate client-side and get it subtly
+    // different from the next display. "Nothing is replicating" is usually the
+    // daemon rather than the targets, so its heartbeat is here too -- a stale
+    // one says so directly instead of leaving the operator to infer it from
+    // every target being late at once.
+    auto hview = con.Query(
+        "CREATE OR REPLACE VIEW erpl_rev_health AS SELECT "
+        "(SELECT count(*) FROM erpl_rev_targets) AS targets, "
+        "(SELECT count(*) FROM erpl_rev_targets WHERE is_healthy) AS healthy, "
+        "(SELECT count(*) FROM erpl_rev_targets WHERE is_blocked) AS blocked, "
+        "(SELECT count(*) FROM erpl_rev_targets WHERE is_parked) AS parked, "
+        "(SELECT count(*) FROM erpl_rev_targets WHERE fail_count > 0) AS failing, "
+        "(SELECT max(lag_seconds) FROM erpl_rev_targets) AS worst_lag_seconds, "
+        "(SELECT count(*) FROM erpl_rev_targets WHERE lag_seconds IS NULL) AS never_run, "
+        "(SELECT coalesce(status,'STOPPED') FROM _erpl_rev_daemon WHERE id=1) AS daemon_status, "
+        "(SELECT CASE WHEN heartbeat_ts IS NULL THEN NULL "
+        "             ELSE CAST(epoch(now()) - epoch(heartbeat_ts) AS BIGINT) END "
+        " FROM _erpl_rev_daemon WHERE id=1) AS daemon_heartbeat_age_s, "
+        "(SELECT coalesce(ticks,0) FROM _erpl_rev_daemon WHERE id=1) AS daemon_ticks");
+    if (hview->HasError())
+        throw std::runtime_error("DuckDB health view init failed: " + hview->GetError());
+
+    // Transformation macros, recreated on every open for the same reason as the
+    // view above: a macro stored as versioned DDL in a customer's file could
+    // never be corrected, so a bug found later would stay broken on every file
+    // already created.
+    auto macros = con.Query(TransformMacroSql());
+    if (macros->HasError())
+        throw std::runtime_error("DuckDB transform macros init failed: " + macros->GetError());
+
+    // The currency macros depend on TCURX being replicated. DuckDB binds a macro
+    // body eagerly, so referencing a missing table here would stop the server
+    // booting; instead the macro is defined to raise a clear error, and the
+    // failure lands on the query that needs it.
+    bool have_tcurx = false;
+    {
+        auto t = con.Query("SELECT count(*) FROM duckdb_tables() WHERE lower(table_name)='tcurx'");
+        have_tcurx = !t->HasError() && t->RowCount() > 0 &&
+                     t->GetValue(0, 0).GetValue<int64_t>() > 0;
+    }
+    auto cmac = con.Query(CurrencyMacroSql(have_tcurx));
+    if (cmac->HasError())
+        throw std::runtime_error("DuckDB currency macros init failed: " + cmac->GetError());
 
     // Boot init: explicit init_sql (CLI/--init-file) wins; else env fallback. Runs
     // INSTALL/LOAD/CREATE SECRET/ATTACH so replication can publish to external
@@ -985,8 +1038,11 @@ void DuckDbBridge::CdcAdvancePosition(const std::string &target, long long posit
               " WHERE target=" + SqlLit(target));
 }
 
+duckdb::Connection DuckDbBridge::Connect() { return duckdb::Connection(*db_); }
+
 CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::string &staging,
-                                      const std::vector<std::string> &keys) {
+                                      const std::vector<std::string> &keys,
+                                      const std::string &images) {
     CdcState st = CdcGet(target);
     if (!st.exists) throw std::runtime_error("CDC: no registration for " + target);
     CdcApplyResult res;
@@ -1062,12 +1118,71 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
     const std::string net_del = "(SELECT * FROM " + coalesced + " c WHERE lower(c.\"_op\")='d')";
     const std::string net_iu  = "(SELECT * FROM " + coalesced + " c WHERE lower(c.\"_op\") IN ('i','u'))";
 
-    // Data columns to upsert = target columns also present in staging (so delete-only
-    // staging, which carries only keys, yields a keys-only upsert == DO NOTHING).
+    // KEYS_IUD: the shadow log carries keys only and the row values come from a
+    // second staging table the cycle filled by re-reading the source. The log is
+    // still the only authority on WHICH keys changed and what the net op was --
+    // the images are only a source of values.
+    const bool keys_mode = !images.empty();
+    std::set<std::string> iset;
+    if (keys_mode) {
+        auto icols = con.Query("SELECT * FROM " + images + " LIMIT 0");
+        if (icols->HasError())
+            throw std::runtime_error("CDC: images describe failed: " + icols->GetError());
+        for (duckdb::idx_t c = 0; c < icols->ColumnCount(); c++)
+            iset.insert(LowerName(icols->names[c]));
+    }
+    auto in_images = [&](const std::string &n) { return iset.count(n) > 0; };
+
+    // Data columns to upsert = target columns also present in the value source
+    // (so delete-only staging, which carries only keys, yields a keys-only
+    // upsert == DO NOTHING).
     std::vector<std::string> dcols, dtypes;
     for (duckdb::idx_t c = 0; c < tcols->ColumnCount(); c++) {
         std::string n = LowerName(tcols->names[c]);
-        if (in_staging(n)) { dcols.push_back(n); dtypes.push_back(tcols->types[c].ToString()); }
+        // __erpl_* is this engine's own namespace: the keys-mode projection
+        // carries the trigger's op and timestamp through as __erpl_op/__erpl_ts,
+        // and a source column of that name would make the projection ambiguous
+        // or feed the log the wrong value. Refuse rather than mis-replicate.
+        if (n.rfind("__erpl_", 0) == 0)
+            throw std::runtime_error(
+                "CDC: " + target + " has a column named '" + n +
+                "'; __erpl_ is reserved for replication control columns");
+        const bool present = keys_mode ? in_images(n) : in_staging(n);
+        if (present) { dcols.push_back(n); dtypes.push_back(tcols->types[c].ToString()); }
+    }
+
+    // The rows to write, in KEYS mode: the images INNER JOINed to the net-I/U key
+    // set. The join is what stops a key whose net op turned out to be a delete
+    // from being resurrected because the re-read happened to catch it alive.
+    std::string upsert_src = net_iu;
+    if (keys_mode) {
+        std::string on;
+        for (size_t i = 0; i < kl.size(); i++) {
+            if (i) on += " AND ";
+            on += "img." + kl[i] + " = " + cast_to("n." + kl[i], type_of(kl[i]));
+        }
+        // The op and the trigger timestamp come from the LOG, not the images --
+        // the images are only a source of values. Carried through so the change
+        // log can be written from one relation; ins_sql names its columns
+        // explicitly, so the extra ones cost it nothing.
+        upsert_src = "(SELECT img.*, n.\"_op\" AS __erpl_op" +
+                     (in_staging("_ts") ? std::string(", n.\"_ts\" AS __erpl_ts") : std::string()) +
+                     " FROM " + images + " img JOIN " + net_iu + " n ON " + on + ")";
+    }
+
+    // ...and the mirror race: a key the log says was inserted or updated, which
+    // the re-read could not find because it was deleted in between. Leaving the
+    // old row in place would strand a stale row forever -- nothing will change
+    // that key again, so no later cycle would revisit it. It is a delete.
+    std::string vanished;
+    if (keys_mode) {
+        std::string on;
+        for (size_t i = 0; i < kl.size(); i++) {
+            if (i) on += " AND ";
+            on += "img." + kl[i] + " = " + cast_to("c." + kl[i], type_of(kl[i]));
+        }
+        vanished = "(SELECT c.* FROM " + net_iu + " c WHERE NOT EXISTS ("
+                   "SELECT 1 FROM " + images + " img WHERE " + on + "))";
     }
 
     // Counts (pre-apply, key-only anti-joins): del = net-deletes present in target;
@@ -1086,6 +1201,26 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
         res.del = cr->GetValue(0, 0).GetValue<int64_t>();
         res.ins = cr->GetValue(1, 0).GetValue<int64_t>();
         res.upd = cr->GetValue(2, 0).GetValue<int64_t>();
+
+        if (keys_mode) {
+            // Re-count against the images: a net-I/U key the re-read could not
+            // find is applied as a delete, so it must be reported as one rather
+            // than as an insert or update that silently did nothing.
+            const std::string dj = key_join("t", "c");
+            auto kr = con.Query(
+                "SELECT "
+                "(SELECT count(*) FROM " + vanished + " c WHERE EXISTS (SELECT 1 FROM " + target +
+                  " t WHERE " + dj + ")) AS gone,"
+                "(SELECT count(*) FROM " + upsert_src + " c WHERE NOT EXISTS (SELECT 1 FROM " +
+                  target + " t WHERE " + key_join("t", "c") + ")) AS ins,"
+                "(SELECT count(*) FROM " + upsert_src + " c WHERE EXISTS (SELECT 1 FROM " +
+                  target + " t WHERE " + key_join("t", "c") + ")) AS upd");
+            if (kr->HasError())
+                throw std::runtime_error("CDC: keys-mode count failed: " + kr->GetError());
+            res.del += kr->GetValue(0, 0).GetValue<int64_t>();
+            res.ins = kr->GetValue(1, 0).GetValue<int64_t>();
+            res.upd = kr->GetValue(2, 0).GetValue<int64_t>();
+        }
     }
 
     // Atomic apply: delete net-deletes, upsert net-I/U, advance position + mark ACTIVE,
@@ -1110,19 +1245,224 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
         del_iu_sql = "DELETE FROM " + target + " t WHERE EXISTS (SELECT 1 FROM " + net_iu +
                      " c WHERE " + key_join("t", "c") + ")";
         ins_sql = "INSERT INTO " + target + " (" + collist + ") SELECT " + sellist +
-                  " FROM " + net_iu + " c";
+                  " FROM " + upsert_src + " c";
+    }
+
+    // The change log, if this target has one. Written inside the SAME transaction
+    // as the apply -- a log that records changes the target never received is
+    // worse than no log. _commit_ts comes from the trigger's own timestamp, so
+    // the trigger tier's latency is measurable exactly like the watermark tier's.
+    // A real run id, from the same sequence the watermark tier uses. The log's
+    // _run_id was a hard-coded 0, so anything joining it to _erpl_rev_run_stats
+    // dropped every trigger-tier row -- and the two tiers write one shared log.
+    long long run_id = 0;
+    {
+        auto rq = con.Query("SELECT nextval('_erpl_rev_run_seq')");
+        if (rq->HasError() || rq->RowCount() == 0)
+            throw std::runtime_error("CDC: cannot allocate a run id: " + rq->GetError());
+        run_id = rq->GetValue(0, 0).GetValue<int64_t>();
+    }
+
+    std::string log_sql, log_del_sql;
+    // Provisioned INSIDE the apply transaction, below, not here. Both tiers make
+    // the same promise: a change log appears on a target's first SUCCESSFUL
+    // cycle, so an apply that rolls back leaves no half-made log behind and the
+    // readers' "no table yet" handling means one thing rather than two.
+    bool provision_log = false;
+    {
+        auto le = con.Query("SELECT count(*) FROM _erpl_rev_delta_state "
+                            "WHERE target=" + SqlLit(target) +
+                            " AND coalesce(log_enabled,false)");
+        const bool want_log = !le->HasError() && le->RowCount() > 0 &&
+                              le->GetValue(0, 0).GetValue<int64_t>() > 0;
+        if (want_log) {
+            // The SAME name the watermark path uses. Built by hand here, these
+            // diverged for any target whose name is not already a clean
+            // identifier: CDC wrote one table while subscriptions and retention
+            // read another, and the mismatch was invisible because the append is
+            // skipped when the table is missing.
+            const std::string logtab = cycle::ChangeLogName(target);
+            // PROVISION it, do not probe for it. This used to skip the append
+            // when the table was missing -- and nothing else in the tree creates
+            // a log for a trigger target, so a log-enabled CDC target had no log
+            // forever and every subscription on it published an empty stream and
+            // reported success. One provisioner, shared with the watermark tier.
+            provision_log = true;
+            {
+                std::string cl, sl;
+                for (size_t i = 0; i < dcols.size(); ++i) {
+                    if (i) { cl += ","; sl += ","; }
+                    cl += dcols[i];
+                    sl += cast_to("c." + dcols[i], dtypes[i]);
+                }
+                if (!cl.empty()) {
+                    const std::string src = keys_mode ? upsert_src : net_iu;
+                    // The op and timestamp columns, spelled the way they
+                    // actually arrive. These read c."_OP" and c."_TS" in upper
+                    // case, while the shadow batch lands in DuckDB lower-cased
+                    // -- which every other statement here already assumes
+                    // (net_del filters on c."_op"). A quoted identifier is
+                    // case-sensitive, so the append referenced columns that do
+                    // not exist and failed on every single apply; the failure
+                    // was then swallowed as "best-effort", so a log-enabled
+                    // trigger target wrote nothing and reported success.
+                    const std::string op_src = keys_mode ? "c.__erpl_op" : "c.\"_op\"";
+                    // The shadow batch carries the trigger's timestamp in both
+                    // modes -- in keys mode it rides through upsert_src as
+                    // __erpl_ts, gated on this same predicate.
+                    const bool have_ts = in_staging("_ts");
+                    const std::string ts_src =
+                        !have_ts ? std::string("NULL")
+                                 : (keys_mode ? std::string("c.__erpl_ts")
+                                              : std::string("c.\"_ts\""));
+                    // upper(): the shadow log writes 'i'/'u'/'d' while every
+                    // reader of the change log -- the latency statistics, the
+                    // stress harness, the subscription dedup -- filters on
+                    // 'I'/'U'/'D'. A target replicated by both tiers otherwise
+                    // ends up with two alphabets in one table.
+                    //
+                    // AT TIME ZONE 'UTC': the trigger's timestamp is a wall-clock
+                    // value like every other, and letting it cast into a
+                    // TIMESTAMPTZ column picks up the server's session zone --
+                    // the same two-hour error the watermark path was fixed for.
+                    const std::string commit_ts =
+                        have_ts ? "(try_strptime(CAST(" + ts_src +
+                                      " AS VARCHAR), '%Y%m%d%H%M%S') AT TIME ZONE 'UTC')"
+                                : "NULL";
+                    // The ENGINE's verdict, not the source's claim -- the same
+                    // rule the watermark tier follows, so one subscriber reads
+                    // both tiers the same way. The trigger says 'I' or 'U'
+                    // about what happened at the source; what matters to a sink
+                    // is whether the key was already in the target. A seeded
+                    // target replaying an old 'I' for a key it already holds
+                    // would otherwise make a subscriber conflict on insert.
+                    //
+                    // op_src is still consulted for nothing here, but the
+                    // presence test is exactly the one res.ins/res.upd use.
+                    (void)op_src;
+                    const std::string tgt_has =
+                        "EXISTS (SELECT 1 FROM " + target + " t WHERE " + key_join("t", "c") + ")";
+                    log_sql = "INSERT INTO " + logtab + " (" + cl +
+                              ", _seq, _op, _run_id, _commit_ts, _applied_at) SELECT " + sl +
+                              ", nextval('" + logtab + "_seq'), CASE WHEN " + tgt_has +
+                              " THEN 'U' ELSE 'I' END, " + std::to_string(run_id) + ", " +
+                              commit_ts + ", now() FROM " + src + " c";
+
+                    // The deletes, which this never recorded at all: the append
+                    // only ever read the net-I/U side. A trigger target's whole
+                    // reason to exist is that it sees physical deletes, and they
+                    // were the one op its change log did not carry -- so every
+                    // subscriber kept rows the source had dropped.
+                    std::string kcl, ksl;
+                    for (size_t i = 0; i < kl.size(); ++i) {
+                        if (i) { kcl += ","; ksl += ","; }
+                        kcl += kl[i];
+                        ksl += cast_to("c." + kl[i], type_of(kl[i]));
+                    }
+                    const std::string dts =
+                        in_staging("_ts") ? "(try_strptime(CAST(c.\"_ts\" AS VARCHAR), "
+                                            "'%Y%m%d%H%M%S') AT TIME ZONE 'UTC')"
+                                          : "NULL";
+                    // EVERY row that leaves the target, and only those.
+                    //
+                    // net_del alone was wrong twice over. It missed the mirror
+                    // race -- a net-I/U key the re-read could not find is
+                    // deleted from the target deliberately, and its op in the
+                    // shadow log is 'U', so it appeared in neither append and
+                    // left the target with no subscriber ever told. And it
+                    // included keys the target never held (a seed whose
+                    // snapshot post-dates the delete, the trigger row queued
+                    // below the seeded position), inventing a delete record for
+                    // a row nobody ever received -- which is the thing the
+                    // comment above this block calls worse than no log at all.
+                    //
+                    // The EXISTS is the same anti-join `del_sql` and `res.del`
+                    // already use, so `count(*) WHERE _op='D'` now equals
+                    // `res.del` by construction rather than by coincidence.
+                    const std::string del_src =
+                        vanished.empty()
+                            ? net_del
+                            : ("(SELECT * FROM " + net_del + " UNION ALL BY NAME SELECT * FROM " +
+                               vanished + ")");
+                    log_del_sql = "INSERT INTO " + logtab + " (" + kcl +
+                                  ", _seq, _op, _run_id, _commit_ts, _applied_at) SELECT " + ksl +
+                                  ", nextval('" + logtab + "_seq'), 'D', " +
+                                  std::to_string(run_id) + ", " + dts +
+                                  ", now() FROM " + del_src + " c WHERE EXISTS (SELECT 1 FROM " +
+                                  target + " t WHERE " + key_join("t", "c") + ")";
+                }
+            }
+        }
     }
 
     Exec(con, "BEGIN");
     try {
+        // NOT best-effort any more. This used to swallow the error on the
+        // reasoning that a failed append must not fail the apply -- and the
+        // append then failed on every apply, for a misspelled column, for as
+        // long as the feature has existed, while every target reported success.
+        // A log that silently stops recording is worse than an apply that
+        // stops: the target stays right and the sink quietly goes wrong.
+        auto append = [&](const std::string &sql) {
+            if (sql.empty()) return;
+            auto lr = con.Query(sql);
+            if (lr->HasError())
+                throw std::runtime_error("CDC: change-log append failed: " + lr->GetError());
+        };
+
+        // Provision, then append -- both inside the transaction, so a rolled-back
+        // apply leaves no log table for a cycle that never happened.
+        if (provision_log) cycle::EnsureChangeLog(con, target, dcols);
+
+        // The delete records go FIRST, before anything leaves the target. They
+        // are qualified by the row still being there -- so running them after
+        // the deletes, which is where they used to sit, logged nothing at all.
+        append(log_del_sql);
+
         Exec(con, del_sql);
+        // del_iu removes every net-I/U key first; ins_sql then puts back only the
+        // ones the re-read actually found. A key that vanished in between is
+        // therefore deleted by construction, which is exactly what it should be.
+        append(log_sql);
         if (!del_iu_sql.empty()) { Exec(con, del_iu_sql); Exec(con, ins_sql); }
+        else if (keys_mode) {
+            // No data columns in common with the images (a keys-only re-read):
+            // still honour the vanished keys.
+            Exec(con, "DELETE FROM " + target + " t WHERE EXISTS (SELECT 1 FROM " + vanished +
+                      " c WHERE " + key_join("t", "c") + ")");
+        }
+        // The cycle, in the same statistics table the watermark tier writes, so
+        // one view answers "what has this target been doing" for both tiers.
+        Exec(con, "INSERT INTO _erpl_rev_run_stats (run_id, target, source, run_type, method, "
+                  "status, rows_ins, rows_upd, rows_del) VALUES (" + std::to_string(run_id) +
+                  "," + SqlLit(target) + "," + SqlLit(target) + ",'CDC','CDC','SUCCESS'," +
+                  std::to_string(res.ins) + "," + std::to_string(res.upd) + "," +
+                  std::to_string(res.del) + ")");
         Exec(con, "UPDATE _erpl_rev_cdc SET position=" + std::to_string(max_seq) +
                   ", last_run_ts=now(), status='ACTIVE' WHERE target=" + SqlLit(target));
         Exec(con, "DROP TABLE " + staging);
+        if (keys_mode) Exec(con, "DROP TABLE IF EXISTS " + images);
         Exec(con, "COMMIT");
+    } catch (const std::exception &e) {
+        Exec(con, "ROLLBACK");
+        // Record WHY, outside the rolled-back transaction, and park the target.
+        //
+        // The rollback leaves the position unmoved and the status 'ACTIVE', the
+        // staging table has a fixed name the next cycle recreates, and the
+        // scheduler keeps selecting ACTIVE/SEEDED -- so a batch that cannot be
+        // applied re-staged and re-failed every cycle, forever, with the reason
+        // stored nowhere and the shadow log growing without bound. Throwing is
+        // right; failing silently and indefinitely is not. The tick planner
+        // already skips a target that is not ACTIVE or SEEDED, so this is what
+        // stops the loop.
+        con.Query("UPDATE _erpl_rev_cdc SET status='ERROR', error=" +
+                  SqlLit(std::string(e.what()).substr(0, 500)) +
+                  ", last_run_ts=now() WHERE target=" + SqlLit(target));
+        throw;
     } catch (...) {
         Exec(con, "ROLLBACK");
+        con.Query("UPDATE _erpl_rev_cdc SET status='ERROR', error='apply failed', "
+                  "last_run_ts=now() WHERE target=" + SqlLit(target));
         throw;
     }
     res.prune_bound = max_seq;

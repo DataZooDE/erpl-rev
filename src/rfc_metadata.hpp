@@ -34,6 +34,7 @@ RFC_FUNCTION_DESC_HANDLE BuildSnapshotMergeDesc();
 RFC_FUNCTION_DESC_HANDLE BuildOpenDesc();
 RFC_FUNCTION_DESC_HANDLE BuildFetchDesc();
 RFC_FUNCTION_DESC_HANDLE BuildCloseDesc();
+RFC_FUNCTION_DESC_HANDLE BuildPlanDesc();
 
 // Trigger-CDC FMs (opt-in physical-delete tier, ADR-0004 / epic #17):
 //  Z_DUCKDB_CDC_PLAN : IMPORTING IV_TARGET, IV_SOURCE, IV_KEYS, IV_MODE,

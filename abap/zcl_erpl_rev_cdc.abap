@@ -1,5 +1,25 @@
 CLASS zcl_erpl_rev_cdc DEFINITION PUBLIC FINAL CREATE PUBLIC.
   PUBLIC SECTION.
+    "! Runs a catalogue probe and returns the first column of every row as a
+    "! JSON array of strings. Used only for the ZCDC_* catalogue queries the
+    "! server hands over, which return one or two name columns.
+    "!
+    "! A second column, when the statement selects one, is treated as a
+    "! true/false flag and appended as "<name>:<flag>" -- HANA's trigger probe
+    "! reports IS_VALID that way, and an invalid trigger is present in the
+    "! catalogue while firing nothing, which looks healthy and captures nothing.
+    CLASS-METHODS probe_names
+      IMPORTING iv_sql TYPE string
+      RETURNING VALUE(rv_json) TYPE string.
+
+    "! Runs one DDL statement natively. Public so the command driver can apply
+    "! a repair plan the server computed -- only the missing objects, never the
+    "! whole provision DDL, which would recreate the shadow table and reset the
+    "! position.
+    CLASS-METHODS repair_exec
+      IMPORTING iv_sql TYPE string
+      RETURNING VALUE(rv_error) TYPE string.
+
     " Thin executor for the opt-in trigger-CDC delta tier (epic #17 / ADR-0004).
     " It makes ZERO CDC decisions: the server (Z_DUCKDB_CDC_PLAN / Z_DUCKDB_CDC_APPLY)
     " generates every piece of SQL and owns all state; this class only
@@ -46,6 +66,24 @@ CLASS zcl_erpl_rev_cdc DEFINITION PUBLIC FINAL CREATE PUBLIC.
       RETURNING VALUE(rt_targets) TYPE string_table.
 
   PRIVATE SECTION.
+    "! One integer out of a flat JSON object the server produced.
+    CLASS-METHODS json_int
+      IMPORTING iv_json   TYPE string
+                iv_key    TYPE string
+      RETURNING VALUE(rv) TYPE i.
+
+    "! Rebuild key tuples from the server's net-key JSON, in key order.
+    CLASS-METHODS net_key_rows
+      IMPORTING iv_json     TYPE string
+                it_key_cols TYPE string_table
+      EXPORTING et_rows     TYPE zcl_erpl_rev_util=>tt_keyrows.
+
+    "! DDIC datatype per key column, so numeric keys are not quoted.
+    CLASS-METHODS key_types
+      IMPORTING iv_source   TYPE csequence
+                it_key_cols TYPE string_table
+      EXPORTING et_types    TYPE string_table.
+
     CONSTANTS c_dest TYPE rfcdest VALUE 'ERPL_REV'.
 
     TYPES: BEGIN OF ty_plan,
@@ -60,6 +98,12 @@ CLASS zcl_erpl_rev_cdc DEFINITION PUBLIC FINAL CREATE PUBLIC.
              read_sql      TYPE string,
              read_from     TYPE string,
              prune_sql     TYPE string,
+             " KEYS_IUD needs three more things from the plan: which mode it is
+             " in, what to re-read the row images from, and which keys the server
+             " decided actually need re-reading.
+             mode          TYPE string,
+             source        TYPE string,
+             netkeys_sql   TYPE string,
            END OF ty_plan.
 
     "! Ask the server for the plan (and drive the state transition for the action).
@@ -77,6 +121,9 @@ CLASS zcl_erpl_rev_cdc DEFINITION PUBLIC FINAL CREATE PUBLIC.
       IMPORTING iv_target  TYPE string
                 iv_staging TYPE string
                 iv_keys    TYPE string
+                " KEYS_IUD only: the second staging table holding the row images
+                " the cycle re-read from the source. Empty for the other modes.
+                iv_images  TYPE string OPTIONAL
       RETURNING VALUE(rs)  TYPE ty_result.
 
     "! Run one opaque SQL string on the SAP DB. iv_ddl=true -> execute_ddl (CREATE/
@@ -123,11 +170,48 @@ CLASS zcl_erpl_rev_cdc IMPLEMENTATION.
   METHOD apply.
     DATA: lv_ins TYPE string, lv_upd TYPE string, lv_del TYPE string,
           lv_pru TYPE string, lv_app TYPE string.
+
+    " A KEYS_IUD cycle carries a second staging table of re-read row images.
+    " Routed through the planning FM only as a fallback: see below.
+    IF abap_false = abap_true.
+      DATA lv_plan TYPE string.
+      DATA lv_perr TYPE string.
+      DATA lv_msg2 TYPE c LENGTH 255.
+      CALL FUNCTION 'Z_DUCKDB_PLAN' DESTINATION c_dest
+        EXPORTING iv_action = 'CDC_APPLY'
+                  iv_target = iv_target
+                  iv_params = |\{"staging":"{ iv_staging }","keys":"{ iv_keys }",| &&
+                              |"images":"{ iv_images }"\}|
+        IMPORTING ev_plan   = lv_plan
+                  ev_error  = lv_perr
+        EXCEPTIONS system_failure        = 1 MESSAGE lv_msg2
+                   communication_failure = 2 MESSAGE lv_msg2
+                   OTHERS                = 3.
+      IF sy-subrc <> 0.
+        rs-error = |RFC subrc={ sy-subrc } { lv_msg2 }|.
+        RETURN.
+      ENDIF.
+      IF lv_perr IS NOT INITIAL.
+        rs-error = lv_perr.
+        RETURN.
+      ENDIF.
+      rs-ins     = json_int( iv_json = lv_plan iv_key = 'ins' ).
+      rs-upd     = json_int( iv_json = lv_plan iv_key = 'upd' ).
+      rs-del     = json_int( iv_json = lv_plan iv_key = 'del' ).
+      rs-prune   = json_int( iv_json = lv_plan iv_key = 'prune' ).
+      rs-applied = xsdbool( lv_plan CS '"applied":true' ).
+      RETURN.
+    ENDIF.
+
     DATA lv_msg TYPE c LENGTH 255.
     CALL FUNCTION 'Z_DUCKDB_CDC_APPLY' DESTINATION c_dest
       EXPORTING iv_target  = iv_target
                 iv_staging = iv_staging
                 iv_keys    = iv_keys
+                " Empty for DELETE_ONLY and IMAGE_IUD; the re-read images table
+                " for a KEYS_IUD cycle. Optional, so a caller generated before
+                " this parameter existed still binds.
+                iv_images  = iv_images
       IMPORTING ev_ins     = lv_ins
                 ev_upd     = lv_upd
                 ev_del     = lv_del
@@ -146,6 +230,55 @@ CLASS zcl_erpl_rev_cdc IMPLEMENTATION.
     rs-del     = to_int( lv_del ).
     rs-prune   = to_int( lv_pru ).
     rs-applied = xsdbool( lv_app = 'X' ).
+  ENDMETHOD.
+
+  METHOD probe_names.
+    TYPES: BEGIN OF ty_row,
+             c1 TYPE string,
+             c2 TYPE string,
+           END OF ty_row.
+    DATA lt TYPE STANDARD TABLE OF ty_row WITH EMPTY KEY.
+    DATA lo_res TYPE REF TO cl_sql_result_set.
+
+    rv_json = `[]`.
+    TRY.
+        lo_res = NEW cl_sql_statement( )->execute_query( iv_sql ).
+        DATA(lt_md) = lo_res->get_metadata( ).
+        DATA(lv_cols) = lines( lt_md ).
+        GET REFERENCE OF lt INTO DATA(lr).
+        IF lv_cols = 1.
+          " One column: bind a one-field structure, or ADBC rejects the shape.
+          TYPES: BEGIN OF ty_one, c1 TYPE string, END OF ty_one.
+          DATA lt1 TYPE STANDARD TABLE OF ty_one WITH EMPTY KEY.
+          GET REFERENCE OF lt1 INTO DATA(lr1).
+          lo_res->set_param_table( lr1 ).
+          lo_res->next_package( ).
+          lo_res->close( ).
+          LOOP AT lt1 INTO DATA(ls1).
+            IF rv_json = `[]`. rv_json = `[`. ELSE. rv_json = rv_json && `,`. ENDIF.
+            rv_json = rv_json && `"` && ls1-c1 && `"`.
+          ENDLOOP.
+          IF rv_json <> `[]`. rv_json = rv_json && `]`. ENDIF.
+        ELSE.
+          lo_res->set_param_table( lr ).
+          lo_res->next_package( ).
+          lo_res->close( ).
+          LOOP AT lt INTO DATA(ls).
+            IF rv_json = `[]`. rv_json = `[`. ELSE. rv_json = rv_json && `,`. ENDIF.
+            rv_json = rv_json && `"` && ls-c1 && `:` && ls-c2 && `"`.
+          ENDLOOP.
+          IF rv_json <> `[]`. rv_json = rv_json && `]`. ENDIF.
+        ENDIF.
+      CATCH cx_root.
+        " A probe that cannot run is not an empty catalogue. Returning [] would
+        " read as "every object is missing" and mark a healthy target
+        " INCONSISTENT, so say nothing rather than something false.
+        rv_json = ``.
+    ENDTRY.
+  ENDMETHOD.
+
+  METHOD repair_exec.
+    rv_error = exec_native( iv_sql = iv_sql iv_ddl = abap_true ).
   ENDMETHOD.
 
   METHOD exec_native.
@@ -209,7 +342,54 @@ CLASS zcl_erpl_rev_cdc IMPLEMENTATION.
     IF lr-error IS NOT INITIAL. rs-error = lr-error. RETURN. ENDIF.
 
     DATA(lv_keys) = concat_lines_of( table = ls-key_cols sep = `,` ).
-    rs = apply( iv_target = iv_target iv_staging = lv_stg iv_keys = lv_keys ).
+
+    " KEYS_IUD: the shadow log carries key + op + sequence only, so the row VALUES
+    " have to be re-read from the source. That is the whole point of the mode --
+    " the trigger a customer's transactions pay for stays small, instead of writing
+    " a full row image on every change to a wide hot table.
+    "
+    " The server decides WHICH keys need re-reading (netkeys_sql coalesces the
+    " batch to a net op per key and returns only the net inserts and updates); ABAP
+    " re-reads them and stages the images. Deletes are NOT re-read: the row is
+    " gone, and the log is the only remaining evidence it existed.
+    DATA lv_img TYPE string.
+    IF ls-mode = 'KEYS_IUD' AND ls-netkeys_sql IS NOT INITIAL.
+      DATA(lk) = zcl_erpl_rev_util=>query( ls-netkeys_sql ).
+      IF lk-error IS NOT INITIAL. rs-error = lk-error. RETURN. ENDIF.
+
+      IF lk-row_count > 0.
+        lv_img = |{ iv_target }__cdcimg|.
+
+        " Rebuild the key tuples from the server's answer, then let the shared
+        " predicate builder turn them into a WHERE -- the same one the
+        " change-document re-read uses, so a composite key works and a large key
+        " set is chunked rather than exceeding the parser.
+        DATA lt_rows TYPE zcl_erpl_rev_util=>tt_keyrows.
+        net_key_rows( EXPORTING iv_json = lk-rows it_key_cols = ls-key_cols
+                      IMPORTING et_rows = lt_rows ).
+
+        DATA lt_types TYPE string_table.
+        key_types( EXPORTING iv_source = ls-source it_key_cols = ls-key_cols
+                   IMPORTING et_types = lt_types ).
+
+        DATA(lv_where) = zcl_erpl_rev_util=>key_in_predicate(
+          it_key_cols  = ls-key_cols
+          it_key_types = lt_types
+          it_rows      = lt_rows ).
+
+        DATA(li) = zcl_erpl_rev_util=>replicate(
+          iv_tab      = ls-source
+          iv_target   = lv_img
+          iv_mode     = 'INSERT'
+          iv_truncate = abap_true
+          iv_where    = lv_where
+          iv_record   = abap_false ).
+        IF li-error IS NOT INITIAL. rs-error = li-error. RETURN. ENDIF.
+      ENDIF.
+    ENDIF.
+
+    rs = apply( iv_target = iv_target iv_staging = lv_stg iv_keys = lv_keys
+                iv_images = lv_img ).
     IF rs-error IS NOT INITIAL. RETURN. ENDIF.
 
     " Prune the SAP log up to the server-confirmed position (watermark-driven, never
@@ -248,6 +428,62 @@ CLASS zcl_erpl_rev_cdc IMPLEMENTATION.
 
   METHOD to_int.
     IF iv CO ` 0123456789-`. rv = CONV i( iv ). ENDIF.
+  ENDMETHOD.
+
+
+  METHOD net_key_rows.
+    " The server returns the net insert/update keys as JSON rows. Turn them back
+    " into key tuples in KEY ORDER, which is what the predicate builder expects --
+    " the order is what makes a composite tuple line up with its columns.
+    CLEAR et_rows.
+    DATA lt_generic TYPE STANDARD TABLE OF string WITH EMPTY KEY.
+    SPLIT iv_json AT '},' INTO TABLE lt_generic.
+    LOOP AT lt_generic INTO DATA(lv_obj).
+      DATA lt_tuple TYPE string_table.
+      CLEAR lt_tuple.
+      LOOP AT it_key_cols INTO DATA(lv_col).
+        DATA(lv_lc) = to_lower( lv_col ).
+        DATA lv_val TYPE string.
+        CLEAR lv_val.
+        " Built by concatenation, not as a string template: inside |...| the
+        " braces are expression delimiters, and a regex character class that
+        " needs a literal '}' cannot be expressed there without escaping every
+        " one of them.
+        DATA(lv_pat) = `"` && lv_lc && `"\s*:\s*"?([^",` && `}` && `]*)"?`.
+        FIND PCRE lv_pat IN lv_obj SUBMATCHES lv_val.
+        APPEND lv_val TO lt_tuple.
+      ENDLOOP.
+      " Skip a fragment that yielded nothing: a trailing separator, not a key.
+      IF line_exists( lt_tuple[ table_line = `` ] ) AND lines( lt_tuple ) = 1.
+        CONTINUE.
+      ENDIF.
+      APPEND lt_tuple TO et_rows.
+    ENDLOOP.
+  ENDMETHOD.
+
+  METHOD key_types.
+    " DDIC types for the key columns, so a numeric key is written unquoted. A
+    " quoted numeric compares as text and matches nothing -- silently.
+    CLEAR et_types.
+    DATA(ld) = zcl_erpl_rev_util=>describe_table( iv_tab = iv_source iv_target = 'x' ).
+    LOOP AT it_key_cols INTO DATA(lv_col).
+      DATA(lv_up) = to_upper( lv_col ).
+      DATA(lv_ty) = `CHAR`.
+      LOOP AT ld-fields INTO DATA(lf) WHERE name = lv_up.
+        lv_ty = lf-datatype.
+      ENDLOOP.
+      APPEND lv_ty TO et_types.
+    ENDLOOP.
+  ENDMETHOD.
+
+
+  METHOD json_int.
+    DATA lv_val TYPE string.
+    DATA(lv_pat) = `"` && iv_key && `"\s*:\s*(-?[0-9]+)`.
+    FIND PCRE lv_pat IN iv_json SUBMATCHES lv_val.
+    IF sy-subrc = 0.
+      rv = lv_val.
+    ENDIF.
   ENDMETHOD.
 
 ENDCLASS.

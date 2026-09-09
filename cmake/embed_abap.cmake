@@ -7,18 +7,22 @@
 # emitting something that will not compile.
 #
 # The list is the PRODUCTION set in DEPENDENCY order — see src/abap_assets.hpp
-# for why the order is what it is. Test drivers, demo reports and the ZWIDE_BSEG
-# fixture are deliberately absent: they belong in a dev checkout, not a
-# customer's system.
+# for why the order is what it is. Test drivers, demo reports and the test
+# fixtures are deliberately absent: they belong in a dev checkout, not a
+# customer's system, and the footprint inventory asserts this list exactly.
+#
+# ZDELTA_WM and ZCL_ERPL_REV_DELTADRV used to be here, contradicting the
+# paragraph above them. They are a watermark fixture table and a change-injection
+# driver -- test scaffolding whose only users are the test classes and the
+# SFLIGHT demo report, none of which ship. scripts/deploy-abap.sh still deploys
+# them for a dev checkout and for the e2e run.
 
 set(ERPL_ABAP_ASSETS
     # file | ABAP name | ADT type | source --type | description
-    "zdelta_wm.ddl|ZDELTA_WM|TABL/DT|TABL|erpl-rev delta watermark table"
     "zif_erpl_rev_progress.intf.abap|ZIF_ERPL_REV_PROGRESS|INTF/OI|INTF|replicate progress callback"
     "zcl_erpl_rev_typemap.abap|ZCL_ERPL_REV_TYPEMAP|CLAS/OC||DDIC<->DuckDB type map"
     "zcl_erpl_rev_util.abap|ZCL_ERPL_REV_UTIL|CLAS/OC||query/describe/replicate"
     "zcl_erpl_rev_delta.abap|ZCL_ERPL_REV_DELTA|CLAS/OC||delta engine"
-    "zcl_erpl_rev_deltadrv.abap|ZCL_ERPL_REV_DELTADRV|CLAS/OC||delta change-injection driver"
     "zcl_erpl_rev_cdc.abap|ZCL_ERPL_REV_CDC|CLAS/OC||trigger-CDC executor"
     "zcl_erpl_rev_mkfm.abap|ZCL_ERPL_REV_MKFM|CLAS/OC||create the Z_DUCKDB_* RFC FMs"
     "zcl_erpl_rev_setup.abap|ZCL_ERPL_REV_SETUP|CLAS/OC||create the registered destination"
@@ -28,6 +32,7 @@ set(ERPL_ABAP_ASSETS
     "z_erpl_rev_replicate.prog.abap|Z_ERPL_REV_REPLICATE|PROG/P||replicate SAP table -> DuckDB"
     "z_erpl_rev_sql.prog.abap|Z_ERPL_REV_SQL|PROG/P||DuckDB SQL console"
     "z_erpl_rev_delta.prog.abap|Z_ERPL_REV_DELTA|PROG/P||delta orchestration loop"
+    "z_erpl_rev_daemon.prog.abap|Z_ERPL_REV_DAEMON|PROG/P||streaming daemon (second-scale)"
 )
 
 function(erpl_generate_abap_assets OUT_VAR)

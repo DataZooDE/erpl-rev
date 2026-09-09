@@ -213,6 +213,7 @@ find_package(OpenSSL REQUIRED)
 # comes from the vcpkg static triplet, so the single-file bundle gains no new
 # runtime .so/.dylib/.dll and DuckDB stays the only bundled library.
 find_package(ZLIB REQUIRED)
+find_package(ftxui CONFIG REQUIRED)
 
 # The ABAP objects `erpl-rev setup` deploys, compiled into the binary: a PyPI
 # install has no checkout to read them from.
@@ -256,12 +257,34 @@ if(UNIX AND NOT APPLE)
   add_link_options(-static-libstdc++ -static-libgcc)
 endif()
 
-# --- Server ------------------------------------------------------------------
-add_executable(erpl_rev_server
-  src/sap_uc.cpp
-  src/rfc_metadata.cpp
-  src/rfc_handlers.cpp
+# --- Shared engine (one source list, two consumers) ---------------------------
+# The server and the test binary compile the same engine sources. Listing them
+# twice invites the failure where a new file is added to one list only and the
+# test binary silently keeps testing an older translation unit -- so they are
+# listed once, here, and both targets link the objects.
+#
+# Deliberately NOT here: sap_uc/rfc_metadata/rfc_handlers (need the RFC SDK
+# headers), logging (only the server and rfc_handlers use it) and main.
+add_library(erpl_rev_core OBJECT
   src/duckdb_bridge.cpp
+  src/control_schema.cpp
+  src/delta_plan.cpp
+  src/load_type.cpp
+  src/rfc_contract.cpp
+  src/tick_planner.cpp
+  src/cycle.cpp
+  src/split_planner.cpp
+  src/drift.cpp
+  src/transform_macros.cpp
+  src/validation.cpp
+  src/publish.cpp
+  src/metrics.cpp
+  src/tui_model.cpp
+  src/cmd_top.cpp
+  src/cdc_status.cpp
+  src/portion.cpp
+  src/cds_delta.cpp
+  src/latency.cpp
   src/cdc_dialect.cpp
   src/json_util.cpp
   src/sxml_binary.cpp
@@ -276,9 +299,33 @@ add_executable(erpl_rev_server
   src/cli_common.cpp
   src/tunnel.cpp
   src/sap_setup.cpp
-  ${ERPL_ABAP_GENERATED}
-  src/logging.cpp
   src/erpl_rev_telemetry.cpp
+  ${ERPL_ABAP_GENERATED})
+target_include_directories(erpl_rev_core PUBLIC src "${DUCKDB_INCLUDE}")
+target_compile_definitions(erpl_rev_core PUBLIC
+  ERPL_REV_DUCKDB_VERSION="${DUCKDB_VERSION}"
+  ERPL_REV_VERSION="${ERPL_REV_VERSION}")
+# Linked for their INTERFACE include directories: an OBJECT library does not
+# inherit a consumer's link interface, so these have to be named here or the
+# headers they carry are not on the include path.
+#
+# OpenSSL and ZLIB belong on this list for the same reason the other two do, and
+# were missed: payload.cpp includes <zlib.h> and erpl_rev_telemetry.cpp includes
+# <openssl/sha.h>, and both moved into this library when the engine sources were
+# unified. On Linux and macOS those headers sit in system include paths, so the
+# omission was invisible; on Windows they exist only inside the vcpkg imported
+# targets, and the build stopped at the first #include.
+target_link_libraries(erpl_rev_core PUBLIC
+  posthog_telemetry datazoo_banner OpenSSL::Crypto ZLIB::ZLIB
+  ftxui::screen ftxui::dom ftxui::component)
+set_target_properties(erpl_rev_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# --- Server ------------------------------------------------------------------
+add_executable(erpl_rev_server
+  src/sap_uc.cpp
+  src/rfc_metadata.cpp
+  src/rfc_handlers.cpp
+  src/logging.cpp
   src/main.cpp)
 
 # DuckDB is linked INTO this executable, so a loaded .duckdb_extension resolves
@@ -292,13 +339,9 @@ add_executable(erpl_rev_server
 # LoadInternal, which reads as a broken extension rather than a missing flag.
 set_target_properties(erpl_rev_server PROPERTIES ENABLE_EXPORTS TRUE)
 
-target_include_directories(erpl_rev_server PRIVATE
-  "${RFC_INCLUDE}" "${DUCKDB_INCLUDE}" src)
-target_compile_definitions(erpl_rev_server PRIVATE
-  ERPL_REV_VERSION="${ERPL_REV_VERSION}"
-  ERPL_REV_DUCKDB_VERSION="${DUCKDB_VERSION}")
+target_include_directories(erpl_rev_server PRIVATE "${RFC_INCLUDE}")
 target_link_libraries(erpl_rev_server PRIVATE
-  ${SAP_LIBS} ${DUCKDB_LIB} Threads::Threads ${CMAKE_DL_LIBS}
+  erpl_rev_core ${SAP_LIBS} ${DUCKDB_LIB} Threads::Threads ${CMAKE_DL_LIBS}
   posthog_telemetry datazoo_banner OpenSSL::Crypto ZLIB::ZLIB)
 
 # So the extracted inner binary finds the bundled libs sitting next to it
@@ -316,6 +359,27 @@ if(TRUE)  # tests always build; DuckDB is in-tree
   add_executable(erpl_rev_tests
     test/test_duckdb_bridge.cpp
     test/test_cdc_dialect.cpp
+    test/test_sql_name.cpp
+    test/test_control_schema.cpp
+    test/test_delta_plan.cpp
+    test/test_load_type.cpp
+    test/test_rfc_contract.cpp
+    test/test_cdc_apply_keys.cpp
+    test/test_tick_planner.cpp
+    test/test_cycle.cpp
+    test/test_split_planner.cpp
+    test/test_drift.cpp
+    test/test_transform_macros.cpp
+    test/test_validation.cpp
+    test/test_publish.cpp
+    test/test_stats_views.cpp
+    test/test_metrics.cpp
+    test/test_tui_model.cpp
+    test/test_cdc_status.cpp
+    test/test_portion.cpp
+    test/test_cds_delta.cpp
+    test/test_footprint.cpp
+    test/test_latency.cpp
     test/test_sxml_binary.cpp
     test/test_payload.cpp
     test/test_telemetry.cpp
@@ -326,30 +390,22 @@ if(TRUE)  # tests always build; DuckDB is in-tree
     test/test_sap_setup.cpp
     test/test_tunnel.cpp
     test/bench_ingest.cpp
-    src/duckdb_bridge.cpp
-    src/cdc_dialect.cpp
-    src/json_util.cpp
-    src/sxml_binary.cpp
-    src/payload.cpp
-    src/erpl_rev_telemetry.cpp
-    src/abap_codegen.cpp
-    src/db_client.cpp
-    src/table_render.cpp
-    src/cmd_sql.cpp
-    src/cmd_sync.cpp
-    src/abap_skeletons.cpp
-    src/cli_common.cpp
-    src/tunnel.cpp
-    src/sap_setup.cpp
-    src/adt.cpp
-    ${ERPL_ABAP_GENERATED})
-  target_include_directories(erpl_rev_tests PRIVATE src "${DUCKDB_INCLUDE}")
+    test/bench_cycle.cpp)
   target_compile_definitions(erpl_rev_tests PRIVATE
     ERPL_REV_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
-    ERPL_REV_DUCKDB_VERSION="${DUCKDB_VERSION}")
+    ERPL_REV_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures"
+    ERPL_REV_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
   target_link_libraries(erpl_rev_tests PRIVATE
-    ${DUCKDB_LIB} Threads::Threads Catch2::Catch2WithMain
+    erpl_rev_core ${DUCKDB_LIB} Threads::Threads Catch2::Catch2WithMain
     posthog_telemetry datazoo_banner OpenSSL::Crypto ZLIB::ZLIB)
+
+  # ctest, so CI (and a bisect) can run one case or one tag instead of the whole
+  # binary. catch_discover_tests registers each Catch2 case as its own ctest
+  # test, which is what makes `ctest -R watermark` work; a single aggregate
+  # add_test() would not. `make test` still runs the binary directly.
+  enable_testing()
+  include(Catch)
+  catch_discover_tests(erpl_rev_tests)
   # No BUILD_RPATH: DuckDB is inside the binary, so there is nothing to find.
 else()
   message(WARNING "libduckdb not found at ${DUCKDB_LIB}; skipping tests.")

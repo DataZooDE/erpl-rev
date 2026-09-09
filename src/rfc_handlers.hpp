@@ -28,6 +28,13 @@ std::string StartQuackServer(const std::string &listen, bool allow_other_host,
                              const std::string &token = "");
 void        StopQuackServer(const std::string &listen);
 
+// The Prometheus endpoint, over the same in-process database the RFC handlers
+// serve. Here rather than in main() for the same reason quack is: g_bridge lives
+// in this translation unit, and handing it out would let anything hold a
+// reference to a database the shutdown path closes.
+bool        StartMetricsServer(int port, std::string &error);
+void        StopMetricsServer();
+
 // Open the optional gateway tunnel on the shared bridge, and read back its
 // tunnels() row (empty => the forward is not there). Same mutex as the handlers.
 // Only called when the operator named a secret; with no tunnel configured the
