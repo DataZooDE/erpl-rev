@@ -80,19 +80,10 @@ Coverage CoverageOf(LoadType t) {
         // Every cycle in the WM suite is a D run; that is what makes it the
         // default rather than a variant needing its own arm.
         case LoadType::Delta:    return {"D", "[loadtype]", "WM", ""};
-        case LoadType::InitAndFull:
-            // FOUND BY THIS GATE, on its first run. m4_load_types exercises I
-            // and F and stops. L seeds the watermark and THEN full-loads, and
-            // it is one-shot -- spent through one_shot_spent once it has run --
-            // so the interesting part is the interaction between the seed, the
-            // load and the spend, and none of it is proven on a live system.
-            // The CLI lane only checks that load_type_default='L' survives the
-            // command queue, which is the field round-tripping, not the
-            // behaviour happening.
-            return {"L", "[loadtype]", "",
-                    "no live arm: add an L case to zcl_erpl_rev_wmtest's "
-                    "m4_load_types asserting the seed, the full load and that "
-                    "one_shot_spent flips exactly once"};
+        // Found by this gate on its first run with no live arm at all, and
+        // closed: m4_load_types now covers the seed, the load, the spend, and
+        // that spent stays spent across the next cycle.
+        case LoadType::InitAndFull: return {"L", "[loadtype]", "WM", ""};
     }
     return {"", "", "", "unreachable"};
 }
