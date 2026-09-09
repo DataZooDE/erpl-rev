@@ -129,7 +129,14 @@ CdcPlan HanaDialect::Plan(const CdcSpec &spec) const {
             keycsv += Lower(spec.keys[i]);
         }
         p.netkeys_sql =
-            "SELECT " + keycsv + " FROM (SELECT * FROM " + p.log_table + "__cdclog"
+            // %STG% -- the DuckDB staging table this cycle loaded, substituted
+            // by the caller like %POS% and %CONF%. It was rendered here as
+            // log_table + "__cdclog" while the ABAP executor stages into
+            // target + "__cdclog"; the two never agreed, so every KEYS_IUD
+            // cycle asked for a table that did not exist. The staging name is
+            // a per-cycle caller concern and the server cannot know it: a
+            // CdcSpec describes SAP-side objects, and the target is not one.
+            "SELECT " + keycsv + " FROM (SELECT * FROM %STG%"
             " QUALIFY row_number() OVER (PARTITION BY " + keycsv +
             " ORDER BY \"" + p.seq_col + "\" DESC)=1) WHERE lower(\"" + p.op_col +
             "\") IN ('i','u')";

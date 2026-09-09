@@ -286,6 +286,13 @@ suite daemon ZCL_ERPL_REV_DAEMONTEST abap/zcl_erpl_rev_daemontest.abap DAEMON 20
 suite stress ZCL_ERPL_REV_STREAMSTRESS abap/zcl_erpl_rev_streamstress.abap STRESS 25 "@soak" \
   "a real change workload, then the two anti-joins: nothing lost, nothing invented, nothing stale"
 
+# The @perf lane. Tagged, so it is excluded from the default gate: these arms
+# move real volume through a ~400-column table and the numbers only mean
+# something on a quiet box. Run it deliberately:
+#   ERPL_REV_E2E_ONLY='perf' ./scripts/e2e.sh
+suite perf ZCL_ERPL_REV_PERFTEST abap/zcl_erpl_rev_perftest.abap PERF 7 "@perf" \
+  "P-KEYS: KEYS_IUD vs IMAGE_IUD on a wide table -- timings reported, correctness asserted"
+
 suite cds ZCL_ERPL_REV_CDSTEST abap/zcl_erpl_rev_cdstest.abap CDS 8 "" \
   "CDS view entity as a source: keys, parity, parameters"
 

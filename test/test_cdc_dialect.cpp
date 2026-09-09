@@ -236,6 +236,14 @@ TEST_CASE("cdc_dialect: KEYS_IUD emits the net-key query, other modes do not",
     // Only net inserts and updates -- a net delete has nothing to re-read.
     CHECK(k.netkeys_sql.find("('i','u')") != std::string::npos);
 
+    // The DuckDB staging table is a PER-CYCLE caller concern, like %POS% and
+    // %CONF%, so it travels as a placeholder. It used to be rendered here as
+    // "<log_table>__cdclog" while ABAP staged into "<target>__cdclog": the two
+    // never agreed, so every KEYS_IUD cycle failed on a table that did not
+    // exist. Nothing caught it because no test exercised KEYS_IUD end to end.
+    CHECK(k.netkeys_sql.find("%STG%") != std::string::npos);
+    CHECK(k.netkeys_sql.find("ZCDC_SFLIGHT_LOG__cdclog") == std::string::npos);
+
     s.mode = CdcMode::ImageIud;
     CHECK(d.Plan(s).netkeys_sql.empty());
     s.mode = CdcMode::DeleteOnly;

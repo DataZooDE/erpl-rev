@@ -356,7 +356,11 @@ CLASS zcl_erpl_rev_cdc IMPLEMENTATION.
     " gone, and the log is the only remaining evidence it existed.
     DATA lv_img TYPE string.
     IF ls-mode = 'KEYS_IUD' AND ls-netkeys_sql IS NOT INITIAL.
-      DATA(lk) = zcl_erpl_rev_util=>query( ls-netkeys_sql ).
+      " %STG% is the staging table THIS cycle just loaded -- substituted here
+      " like %POS% and %CONF%, because the server names SAP-side objects and
+      " the DuckDB staging name is not one of them.
+      DATA(lv_nk) = replace( val = ls-netkeys_sql sub = `%STG%` with = lv_stg occ = 0 ).
+      DATA(lk) = zcl_erpl_rev_util=>query( lv_nk ).
       IF lk-error IS NOT INITIAL. rs-error = lk-error. RETURN. ENDIF.
 
       IF lk-row_count > 0.
@@ -455,8 +459,20 @@ CLASS zcl_erpl_rev_cdc IMPLEMENTATION.
         FIND PCRE lv_pat IN lv_obj SUBMATCHES lv_val.
         APPEND lv_val TO lt_tuple.
       ENDLOOP.
-      " Skip a fragment that yielded nothing: a trailing separator, not a key.
-      IF line_exists( lt_tuple[ table_line = `` ] ) AND lines( lt_tuple ) = 1.
+      " Skip a fragment that yielded nothing for EVERY key part: a trailing
+      " separator, not a key.
+      "
+      " The guard used to also require lines( lt_tuple ) = 1, so it fired only
+      " for a single-column key. A COMPOSITE key turned the trailing fragment
+      " into a tuple of N empty strings, which the predicate builder rendered
+      " as client = '' AND bukrs = '' AND ... -- and HANA refuses an empty
+      " character literal outright, so the re-read failed and with it every
+      " KEYS_IUD cycle on a multi-column key.
+      DATA(lv_any) = abap_false.
+      LOOP AT lt_tuple INTO DATA(lv_part).
+        IF lv_part IS NOT INITIAL. lv_any = abap_true. EXIT. ENDIF.
+      ENDLOOP.
+      IF lv_any = abap_false.
         CONTINUE.
       ENDIF.
       APPEND lt_tuple TO et_rows.

@@ -46,7 +46,8 @@ struct CdcSpec {
 };
 
 // The generated plan. read_sql/prune_sql carry the placeholders %POS% / %CONF%
-// (the current position / confirmed bound), substituted by the caller per cycle.
+// (the current position / confirmed bound) and netkeys_sql carries %STG% (the
+// staging table the cycle loaded), all substituted by the caller per cycle.
 struct CdcPlan {
     std::string log_table;
     std::string seq_name;
