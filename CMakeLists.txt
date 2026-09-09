@@ -365,6 +365,7 @@ if(TRUE)  # tests always build; DuckDB is in-tree
     test/test_load_type.cpp
     test/test_rfc_contract.cpp
     test/test_cdc_apply_keys.cpp
+    test/test_variant_coverage.cpp
     test/test_tick_planner.cpp
     test/test_cycle.cpp
     test/test_split_planner.cpp
@@ -391,6 +392,16 @@ if(TRUE)  # tests always build; DuckDB is in-tree
     test/test_tunnel.cpp
     test/bench_ingest.cpp
     test/bench_cycle.cpp)
+  # The coverage matrix in test/test_variant_coverage.cpp works by switching
+  # over each enum with no `default:`. That is only a WARNING by default, so the
+  # gate compiled happily with a variant missing and proved nothing -- the exact
+  # shape of defect it exists to catch. Promoted to an error here, which is what
+  # turns "somebody should notice" into "this does not build".
+  if(NOT MSVC)
+    target_compile_options(erpl_rev_tests PRIVATE -Werror=switch)
+  else()
+    target_compile_options(erpl_rev_tests PRIVATE /we4062)
+  endif()
   target_compile_definitions(erpl_rev_tests PRIVATE
     ERPL_REV_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
     ERPL_REV_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures"
