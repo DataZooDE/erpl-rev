@@ -11,6 +11,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <string>
+#include <vector>
+
 #include "cycle.hpp"
 #include "duckdb_bridge.hpp"
 
@@ -18,13 +21,42 @@ using namespace erpl_rev;
 
 namespace {
 // A target, a keys-only shadow batch, and the re-read images for it.
+// The three relations, typed the way production really types them -- and they
+// are NOT all the same, which is the whole point.
+//
+// This fixture used to build t/klog/kimg out of INTEGER and VARCHAR only. Every
+// coercion then degenerated to CAST(x AS x), so the date/time branches were
+// unreachable and thirteen cases stayed green over a mode that had never
+// completed a cycle anywhere.
+//
+//   t, kimg  what `replicate` produces: DATS -> DATE, TIMS -> TIME,
+//            DEC -> DECIMAL, NUMC/CHAR -> VARCHAR
+//   klog     what `replicate_native` produces from the HANA shadow log: every
+//            column NVARCHAR, so the keys arrive as SAP-raw text ('20240101')
+//
+// Retyping the log side "to match" would be tidier and would stop exercising
+// the text-parsing path, which is the one that must keep working for
+// DELETE_ONLY and IMAGE_IUD. The asymmetry is the test.
+const std::vector<std::string> kKeys = {"mandt", "carrid", "fldate"};
+
 void SetupKeysTarget(DuckDbBridge &db) {
-    db.Execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v VARCHAR)");
-    db.Execute("INSERT INTO t VALUES (1,'old-a'),(2,'old-b'),(3,'old-c')");
-    db.CdcRegister("t", "T", "id", "HANA", "KEYS_IUD", "ZCDC_T_LOG");
+    db.Execute("CREATE TABLE t(mandt VARCHAR, carrid VARCHAR, fldate DATE, "
+               "price DECIMAL(23,2), dep TIME, note VARCHAR, "
+               "PRIMARY KEY(mandt,carrid,fldate))");
+    db.Execute("INSERT INTO t VALUES "
+               "('100','LH',DATE '2024-01-01',100.00,TIME '08:00:00','old-a'),"
+               "('100','LH',DATE '2024-01-02',200.00,TIME '09:00:00','old-b'),"
+               "('100','LH',DATE '2024-01-03',300.00,TIME '10:00:00','old-c')");
+    db.CdcRegister("t", "T", "mandt,carrid,fldate", "HANA", "KEYS_IUD", "ZCDC_T_LOG");
     db.CdcSetStatus("t", "SEEDED");
     // The shadow log: keys, op, sequence. No row image -- that is the point.
-    db.Execute("CREATE TABLE klog(id INTEGER, \"_op\" VARCHAR, \"_seq\" BIGINT)");
+    db.Execute("CREATE TABLE klog(mandt VARCHAR, carrid VARCHAR, fldate VARCHAR, "
+               "\"_op\" VARCHAR, \"_seq\" BIGINT, \"_ts\" VARCHAR)");
+}
+
+void SetupKeysImages(DuckDbBridge &db) {
+    db.Execute("CREATE TABLE kimg(mandt VARCHAR, carrid VARCHAR, fldate DATE, "
+               "price DECIMAL(23,2), dep TIME, note VARCHAR)");
 }
 }  // namespace
 
@@ -32,17 +64,25 @@ TEST_CASE("cdc_keys: images supply the row values the shadow log does not carry"
           "[bridge][cdc][keys]") {
     DuckDbBridge db;
     SetupKeysTarget(db);
-    db.Execute("INSERT INTO klog VALUES (1,'U',1),(4,'I',2)");
+    db.Execute("INSERT INTO klog VALUES ('100','LH','20240101','U',1,'20240115090000'),"
+               "('100','LH','20240104','I',2,'20240115100000')");
     // Re-read of the source for the net I/U keys.
-    db.Execute("CREATE TABLE kimg(id INTEGER, v VARCHAR)");
-    db.Execute("INSERT INTO kimg VALUES (1,'new-a'),(4,'new-d')");
+    SetupKeysImages(db);
+    db.Execute("INSERT INTO kimg VALUES "
+               "('100','LH',DATE '2024-01-01',150.00,TIME '08:30:00','new-a'),"
+               "('100','LH',DATE '2024-01-04',400.00,TIME '11:00:00','new-d')");
 
-    auto r = db.CdcApply("t", "klog", {"id"}, "kimg");
+    auto r = db.CdcApply("t", "klog", kKeys, "kimg");
     REQUIRE(r.applied);
     CHECK(r.upd == 1);
     CHECK(r.ins == 1);
-    CHECK(db.Query("SELECT v FROM t WHERE id=1").rows[0] == R"({"v":"new-a"})");
-    CHECK(db.Query("SELECT v FROM t WHERE id=4").rows[0] == R"({"v":"new-d"})");
+    CHECK(db.Query("SELECT note FROM t WHERE fldate=DATE '2024-01-01'").rows[0]
+          == R"({"note":"new-a"})");
+    CHECK(db.Query("SELECT note FROM t WHERE fldate=DATE '2024-01-04'").rows[0]
+          == R"({"note":"new-d"})");
+    // Typed, not text that happens to render the same.
+    CHECK(db.Query("SELECT typeof(fldate) AS t FROM t LIMIT 1").rows[0] == R"({"t":"DATE"})");
+    CHECK(db.Query("SELECT typeof(dep) AS t FROM t LIMIT 1").rows[0] == R"({"t":"TIME"})");
     CHECK(db.CdcGet("t").position == 2);
 }
 
@@ -58,14 +98,18 @@ TEST_CASE("cdc_keys: a key that vanished between the shadow read and the re-read
     // again.
     DuckDbBridge db;
     SetupKeysTarget(db);
-    db.Execute("INSERT INTO klog VALUES (1,'U',1),(2,'U',2)");
-    db.Execute("CREATE TABLE kimg(id INTEGER, v VARCHAR)");
-    db.Execute("INSERT INTO kimg VALUES (1,'new-a')");   // key 2 is gone
+    db.Execute("INSERT INTO klog VALUES ('100','LH','20240101','U',1,'20240115090000'),"
+               "('100','LH','20240102','U',2,'20240115100000')");
+    SetupKeysImages(db);
+    db.Execute("INSERT INTO kimg VALUES "
+               "('100','LH',DATE '2024-01-01',150.00,TIME '08:30:00','new-a')");  // 01-02 gone
 
-    auto r = db.CdcApply("t", "klog", {"id"}, "kimg");
+    auto r = db.CdcApply("t", "klog", kKeys, "kimg");
     REQUIRE(r.applied);
-    CHECK(db.Query("SELECT count(*) AS c FROM t WHERE id=2").rows[0] == R"({"c":0})");
-    CHECK(db.Query("SELECT v FROM t WHERE id=1").rows[0] == R"({"v":"new-a"})");
+    CHECK(db.Query("SELECT count(*) AS c FROM t WHERE fldate=DATE '2024-01-02'").rows[0]
+          == R"({"c":0})");
+    CHECK(db.Query("SELECT note FROM t WHERE fldate=DATE '2024-01-01'").rows[0]
+          == R"({"note":"new-a"})");
     // It left as a delete, so it is counted as one.
     CHECK(r.del == 1);
 }
@@ -78,14 +122,19 @@ TEST_CASE("cdc_keys: an image whose net op is a delete is not resurrected",
     // back to the net-I/U key set would re-insert a row the source no longer has.
     DuckDbBridge db;
     SetupKeysTarget(db);
-    db.Execute("INSERT INTO klog VALUES (3,'U',1),(3,'D',2),(1,'U',3)");
-    db.Execute("CREATE TABLE kimg(id INTEGER, v VARCHAR)");
-    db.Execute("INSERT INTO kimg VALUES (3,'stale-c'),(1,'new-a')");
+    db.Execute("INSERT INTO klog VALUES ('100','LH','20240103','U',1,'20240115090000'),"
+               "('100','LH','20240103','D',2,'20240115100000'),('100','LH','20240101','U',3,'20240115110000')");
+    SetupKeysImages(db);
+    db.Execute("INSERT INTO kimg VALUES "
+               "('100','LH',DATE '2024-01-03',300.00,TIME '10:00:00','stale-c'),"
+               "('100','LH',DATE '2024-01-01',150.00,TIME '08:30:00','new-a')");
 
-    auto r = db.CdcApply("t", "klog", {"id"}, "kimg");
+    auto r = db.CdcApply("t", "klog", kKeys, "kimg");
     REQUIRE(r.applied);
-    CHECK(db.Query("SELECT count(*) AS c FROM t WHERE id=3").rows[0] == R"({"c":0})");
-    CHECK(db.Query("SELECT v FROM t WHERE id=1").rows[0] == R"({"v":"new-a"})");
+    CHECK(db.Query("SELECT count(*) AS c FROM t WHERE fldate=DATE '2024-01-03'").rows[0]
+          == R"({"c":0})");
+    CHECK(db.Query("SELECT note FROM t WHERE fldate=DATE '2024-01-01'").rows[0]
+          == R"({"note":"new-a"})");
     CHECK(r.del == 1);
 }
 
@@ -95,14 +144,15 @@ TEST_CASE("cdc_keys: both staging tables and the position survive a rollback",
     // unmoved and BOTH staging tables still there.
     DuckDbBridge db;
     SetupKeysTarget(db);
-    db.Execute("INSERT INTO klog VALUES (1,'U',1)");
+    db.Execute("INSERT INTO klog VALUES ('100','LH','20240101','U',1,'20240115090000')");
     // The image carries a value that cannot be cast into the target column.
-    db.Execute("CREATE TABLE kimg(id INTEGER, v VARCHAR)");
-    db.Execute("INSERT INTO kimg VALUES (1,'ok')");
+    SetupKeysImages(db);
+    db.Execute("INSERT INTO kimg VALUES "
+               "('100','LH',DATE '2024-01-01',150.00,TIME '08:30:00','not-a-number')");
     // Force the failure by making the target column type incompatible.
-    db.Execute("ALTER TABLE t ALTER v TYPE INTEGER USING 0");
+    db.Execute("ALTER TABLE t ALTER note TYPE INTEGER USING 0");
 
-    REQUIRE_THROWS(db.CdcApply("t", "klog", {"id"}, "kimg"));
+    REQUIRE_THROWS(db.CdcApply("t", "klog", kKeys, "kimg"));
     CHECK(db.CdcGet("t").position == 0);
     CHECK(db.Query("SELECT count(*) AS c FROM duckdb_tables() WHERE table_name='klog'").rows[0]
           == R"({"c":1})");
@@ -116,10 +166,10 @@ TEST_CASE("cdc_keys: deletes still come from the log, not from the images",
     // path must therefore keep reading the shadow log.
     DuckDbBridge db;
     SetupKeysTarget(db);
-    db.Execute("INSERT INTO klog VALUES (2,'D',1)");
-    db.Execute("CREATE TABLE kimg(id INTEGER, v VARCHAR)");   // empty: nothing to re-read
+    db.Execute("INSERT INTO klog VALUES ('100','LH','20240102','D',1,'20240115090000')");
+    SetupKeysImages(db);   // empty: nothing to re-read
 
-    auto r = db.CdcApply("t", "klog", {"id"}, "kimg");
+    auto r = db.CdcApply("t", "klog", kKeys, "kimg");
     REQUIRE(r.applied);
     CHECK(r.del == 1);
     CHECK(db.Query("SELECT count(*) AS c FROM t").rows[0] == R"({"c":2})");
@@ -128,9 +178,9 @@ TEST_CASE("cdc_keys: deletes still come from the log, not from the images",
 TEST_CASE("cdc_keys: an empty shadow batch leaves everything alone", "[bridge][cdc][keys]") {
     DuckDbBridge db;
     SetupKeysTarget(db);
-    db.Execute("CREATE TABLE kimg(id INTEGER, v VARCHAR)");
+    SetupKeysImages(db);
 
-    auto r = db.CdcApply("t", "klog", {"id"}, "kimg");
+    auto r = db.CdcApply("t", "klog", kKeys, "kimg");
     CHECK_FALSE(r.applied);
     CHECK(db.CdcGet("t").position == 0);
     CHECK(db.Query("SELECT count(*) AS c FROM t").rows[0] == R"({"c":3})");
@@ -162,12 +212,15 @@ TEST_CASE("cdc_keys: a log-enabled trigger target actually gets a change log",
     DuckDbBridge db;
     SetupKeysTarget(db);
     db.Execute("INSERT INTO _erpl_rev_delta_state (target, method, source_from, keys, "
-               "log_enabled) VALUES ('t','CDC','T','id',true)");
-    db.Execute("INSERT INTO klog VALUES (1,'U',1),(4,'I',2),(2,'D',3)");
-    db.Execute("CREATE TABLE kimg(id INTEGER, v VARCHAR)");
-    db.Execute("INSERT INTO kimg VALUES (1,'new-a'),(4,'new-d')");
+               "log_enabled) VALUES ('t','CDC','T','mandt,carrid,fldate',true)");
+    db.Execute("INSERT INTO klog VALUES ('100','LH','20240101','U',1,'20240115090000'),"
+               "('100','LH','20240104','I',2,'20240115100000'),('100','LH','20240102','D',3,'20240115110000')");
+    SetupKeysImages(db);
+    db.Execute("INSERT INTO kimg VALUES "
+               "('100','LH',DATE '2024-01-01',150.00,TIME '08:30:00','new-a'),"
+               "('100','LH',DATE '2024-01-04',400.00,TIME '11:00:00','new-d')");
 
-    auto r = db.CdcApply("t", "klog", {"id"}, "kimg");
+    auto r = db.CdcApply("t", "klog", kKeys, "kimg");
     REQUIRE(r.applied);
 
     const std::string log = cycle::ChangeLogName("t");
@@ -188,14 +241,15 @@ TEST_CASE("cdc_keys: a key that vanished before the re-read is logged as a delet
     DuckDbBridge db;
     SetupKeysTarget(db);
     db.Execute("INSERT INTO _erpl_rev_delta_state (target, method, source_from, keys, "
-               "log_enabled) VALUES ('t','CDC','T','id',true)");
-    db.Execute("INSERT INTO klog VALUES (2,'U',1)");
-    db.Execute("CREATE TABLE kimg(id INTEGER, v VARCHAR)");   // the re-read found nothing
+               "log_enabled) VALUES ('t','CDC','T','mandt,carrid,fldate',true)");
+    db.Execute("INSERT INTO klog VALUES ('100','LH','20240102','U',1,'20240115090000')");
+    SetupKeysImages(db);   // the re-read found nothing
 
-    auto r = db.CdcApply("t", "klog", {"id"}, "kimg");
+    auto r = db.CdcApply("t", "klog", kKeys, "kimg");
     REQUIRE(r.applied);
 
-    CHECK(db.Query("SELECT count(*) AS c FROM t WHERE id=2").rows[0] == R"({"c":0})");
+    CHECK(db.Query("SELECT count(*) AS c FROM t WHERE fldate=DATE '2024-01-02'").rows[0]
+          == R"({"c":0})");
     const std::string log = cycle::ChangeLogName("t");
     CHECK(db.Query("SELECT count(*) AS c FROM " + log + " WHERE _op='D'").rows[0] ==
           R"({"c":1})");
@@ -212,11 +266,12 @@ TEST_CASE("cdc_keys: a delete for a key the target never held is not logged",
     DuckDbBridge db;
     SetupKeysTarget(db);   // target holds 1, 2, 3
     db.Execute("INSERT INTO _erpl_rev_delta_state (target, method, source_from, keys, "
-               "log_enabled) VALUES ('t','CDC','T','id',true)");
-    db.Execute("INSERT INTO klog VALUES (9,'D',1)");   // 9 was never replicated
-    db.Execute("CREATE TABLE kimg(id INTEGER, v VARCHAR)");
+               "log_enabled) VALUES ('t','CDC','T','mandt,carrid,fldate',true)");
+    // A key the target never held.
+    db.Execute("INSERT INTO klog VALUES ('100','LH','20240109','D',1,'20240115090000')");
+    SetupKeysImages(db);
 
-    auto r = db.CdcApply("t", "klog", {"id"}, "kimg");
+    auto r = db.CdcApply("t", "klog", kKeys, "kimg");
     REQUIRE(r.applied);
     CHECK(r.del == 0);
 
@@ -236,14 +291,15 @@ TEST_CASE("cdc_keys: an apply that cannot succeed parks the target instead of lo
     DuckDbBridge db;
     SetupKeysTarget(db);
     db.Execute("INSERT INTO _erpl_rev_delta_state (target, method, source_from, keys, "
-               "log_enabled) VALUES ('t','CDC','T','id',true)");
-    db.Execute("INSERT INTO klog VALUES (1,'U',1)");
-    db.Execute("CREATE TABLE kimg(id INTEGER, v VARCHAR)");
-    db.Execute("INSERT INTO kimg VALUES (1,'new-a')");
+               "log_enabled) VALUES ('t','CDC','T','mandt,carrid,fldate',true)");
+    db.Execute("INSERT INTO klog VALUES ('100','LH','20240101','U',1,'20240115090000')");
+    SetupKeysImages(db);
+    db.Execute("INSERT INTO kimg VALUES "
+               "('100','LH',DATE '2024-01-01',150.00,TIME '08:30:00','new-a')");
     // A log table whose shape the append cannot satisfy.
     db.Execute("CREATE TABLE " + cycle::ChangeLogName("t") + "(nothing INTEGER)");
 
-    CHECK_THROWS(db.CdcApply("t", "klog", {"id"}, "kimg"));
+    CHECK_THROWS(db.CdcApply("t", "klog", kKeys, "kimg"));
 
     CHECK(db.CdcGet("t").status == "ERROR");
     CHECK(db.Query("SELECT count(*) AS c FROM _erpl_rev_cdc WHERE target='t' "
@@ -262,10 +318,10 @@ TEST_CASE("cdc_keys: a rolled-back apply leaves no change log behind",
     DuckDbBridge db;
     SetupKeysTarget(db);
     db.Execute("INSERT INTO _erpl_rev_delta_state (target, method, source_from, keys, "
-               "log_enabled) VALUES ('t','CDC','T','id',true)");
-    db.Execute("INSERT INTO klog VALUES (1,'U',1)");
+               "log_enabled) VALUES ('t','CDC','T','mandt,carrid,fldate',true)");
+    db.Execute("INSERT INTO klog VALUES ('100','LH','20240101','U',1,'20240115090000')");
     // No images table at all: the apply fails inside the transaction.
-    CHECK_THROWS(db.CdcApply("t", "klog", {"id"}, "no_such_images"));
+    CHECK_THROWS(db.CdcApply("t", "klog", kKeys, "no_such_images"));
 
     CHECK(db.Query("SELECT count(*) AS c FROM duckdb_tables() WHERE table_name='" +
                    cycle::ChangeLogName("t") + "'").rows[0] == R"({"c":0})");
@@ -282,18 +338,102 @@ TEST_CASE("cdc_keys: the log carries the engine's verdict and a real run id",
     DuckDbBridge db;
     SetupKeysTarget(db);   // target holds 1, 2, 3
     db.Execute("INSERT INTO _erpl_rev_delta_state (target, method, source_from, keys, "
-               "log_enabled) VALUES ('t','CDC','T','id',true)");
+               "log_enabled) VALUES ('t','CDC','T','mandt,carrid,fldate',true)");
     // The source calls both an insert; only key 4 is new to the target.
-    db.Execute("INSERT INTO klog VALUES (1,'I',1),(4,'I',2)");
-    db.Execute("CREATE TABLE kimg(id INTEGER, v VARCHAR)");
-    db.Execute("INSERT INTO kimg VALUES (1,'a2'),(4,'d')");
+    db.Execute("INSERT INTO klog VALUES ('100','LH','20240101','I',1,'20240115090000'),"
+               "('100','LH','20240104','I',2,'20240115100000')");
+    SetupKeysImages(db);
+    db.Execute("INSERT INTO kimg VALUES "
+               "('100','LH',DATE '2024-01-01',150.00,TIME '08:30:00','a2'),"
+               "('100','LH',DATE '2024-01-04',400.00,TIME '11:00:00','d')");
 
-    REQUIRE(db.CdcApply("t", "klog", {"id"}, "kimg").applied);
+    REQUIRE(db.CdcApply("t", "klog", kKeys, "kimg").applied);
 
     const std::string log = cycle::ChangeLogName("t");
-    CHECK(db.Query("SELECT _op AS o FROM " + log + " WHERE id=1").rows[0] == R"({"o":"U"})");
-    CHECK(db.Query("SELECT _op AS o FROM " + log + " WHERE id=4").rows[0] == R"({"o":"I"})");
+    CHECK(db.Query("SELECT _op AS o FROM " + log + " WHERE fldate=DATE '2024-01-01'").rows[0]
+          == R"({"o":"U"})");
+    CHECK(db.Query("SELECT _op AS o FROM " + log + " WHERE fldate=DATE '2024-01-04'").rows[0]
+          == R"({"o":"I"})");
     // The run id joins to a real statistics row.
     CHECK(db.Query("SELECT count(*) AS c FROM " + log + " l JOIN _erpl_rev_run_stats r "
                    "ON r.run_id = l._run_id").rows[0] == R"({"c":2})");
+}
+
+TEST_CASE("cdc_keys: a target column the images do not carry is refused, not emptied",
+          "[bridge][cdc][keys]") {
+    // The keys-mode apply is delete-then-insert, so a target column absent from
+    // the re-read is set to NULL for every changed key -- not left stale, and
+    // with no error. That is silent data loss on an ordinary trigger: a source
+    // column dropped or retyped leaves the intersection and takes the target's
+    // data with it.
+    DuckDbBridge db;
+    SetupKeysTarget(db);
+    db.Execute("INSERT INTO klog VALUES ('100','LH','20240101','U',1,'20240115090000')");
+    // The re-read produced everything except `dep`.
+    db.Execute("CREATE TABLE kimg(mandt VARCHAR, carrid VARCHAR, fldate DATE, "
+               "price DECIMAL(23,2), note VARCHAR)");
+    db.Execute("INSERT INTO kimg VALUES ('100','LH',DATE '2024-01-01',150.00,'new-a')");
+
+    REQUIRE_THROWS(db.CdcApply("t", "klog", kKeys, "kimg"));
+    // Refused whole: the row still holds what it held.
+    CHECK(db.Query("SELECT note FROM t WHERE fldate=DATE '2024-01-01'").rows[0]
+          == R"({"note":"old-a"})");
+    CHECK(db.CdcGet("t").position == 0);
+}
+
+TEST_CASE("cdc_keys: the change log records the shape a subscriber reads by",
+          "[bridge][cdc][keys]") {
+    // Counts alone were asserted, so nothing pinned what a sink actually reads:
+    // the op alphabet, a commit timestamp, and a run id that joins. All three
+    // were unreachable behind an apply that could not bind.
+    DuckDbBridge db;
+    SetupKeysTarget(db);
+    db.Execute("INSERT INTO _erpl_rev_delta_state (target, method, source_from, keys, "
+               "log_enabled) VALUES ('t','CDC','T','mandt,carrid,fldate',true)");
+    db.Execute("INSERT INTO klog VALUES ('100','LH','20240101','U',1,'20240115090000'),"
+               "('100','LH','20240102','D',2,'20240115100000')");
+    SetupKeysImages(db);
+    db.Execute("INSERT INTO kimg VALUES "
+               "('100','LH',DATE '2024-01-01',150.00,TIME '08:30:00','new-a')");
+
+    REQUIRE(db.CdcApply("t", "klog", kKeys, "kimg").applied);
+
+    const std::string log = cycle::ChangeLogName("t");
+    // Nothing outside the alphabet both tiers share.
+    CHECK(db.Query("SELECT count(*) AS c FROM " + log +
+                   " WHERE _op NOT IN ('I','U','D')").rows[0] == R"({"c":0})");
+    CHECK(db.Query("SELECT count(*) AS c FROM " + log +
+                   " WHERE _commit_ts IS NULL").rows[0] == R"({"c":0})");
+    CHECK(db.Query("SELECT count(*) AS c FROM " + log +
+                   " WHERE _run_id IS NULL OR _run_id = 0").rows[0] == R"({"c":0})");
+    // The logged values are typed, not the log's raw text.
+    CHECK(db.Query("SELECT typeof(fldate) AS t FROM " + log + " LIMIT 1").rows[0]
+          == R"({"t":"DATE"})");
+}
+
+TEST_CASE("cdc_keys: replaying the same batch changes nothing", "[bridge][cdc][keys]") {
+    // The position advanced on the first apply, so the second sees an empty
+    // batch and must be a no-op. Idempotency is what makes a crashed cycle safe
+    // to simply re-run, and nothing exercised it.
+    DuckDbBridge db;
+    SetupKeysTarget(db);
+    db.Execute("INSERT INTO klog VALUES ('100','LH','20240101','U',1,'20240115090000')");
+    SetupKeysImages(db);
+    db.Execute("INSERT INTO kimg VALUES "
+               "('100','LH',DATE '2024-01-01',150.00,TIME '08:30:00','new-a')");
+
+    REQUIRE(db.CdcApply("t", "klog", kKeys, "kimg").applied);
+    const auto after = db.Query("SELECT count(*) AS c FROM t").rows[0];
+    CHECK(db.CdcGet("t").position == 1);
+
+    // The cycle re-stages under the same names; with the batch consumed it is empty.
+    db.Execute("CREATE TABLE klog(mandt VARCHAR, carrid VARCHAR, fldate VARCHAR, "
+               "\"_op\" VARCHAR, \"_seq\" BIGINT, \"_ts\" VARCHAR)");
+    SetupKeysImages(db);
+    auto r2 = db.CdcApply("t", "klog", kKeys, "kimg");
+    CHECK_FALSE(r2.applied);
+    CHECK(db.CdcGet("t").position == 1);
+    CHECK(db.Query("SELECT count(*) AS c FROM t").rows[0] == after);
+    CHECK(db.Query("SELECT note FROM t WHERE fldate=DATE '2024-01-01'").rows[0]
+          == R"({"note":"new-a"})");
 }

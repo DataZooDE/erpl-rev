@@ -58,26 +58,39 @@ Building the key costs about as much as it saves. Not worth it at these shapes.
   1527 ms (**32,743 rows/s**); decode is 43% of ingest.
 - **query cap** 10k over 5M rows: streaming 0.011 s vs drain-all 0.381 s — 33x.
 
-### P-KEYS — **not measured: the mode does not work**
+### P-KEYS — KEYS_IUD versus IMAGE_IUD
 
-`KEYS_IUD` versus `IMAGE_IUD` on `ZWIDE_BSEG` (5 key columns, ~400 payload columns)
-could not be run, because `KEYS_IUD` fails before it applies anything. The
-benchmark exists (`abap/zcl_erpl_rev_perftest.abap`, the `@perf` lane) and found
-three defects in a mode **no test had ever exercised**:
+`ZWIDE_BSEG` (5 key columns, ~400 payload columns), 2,000 changes, both arms
+converging the same target to what SAP holds.
 
-1. the server built `netkeys_sql` against `<log_table>__cdclog` while the executor
-   staged into `<target>__cdclog` — **fixed**, the staging name now travels as
-   `%STG%` like `%POS%` and `%CONF%`;
-2. the net-key parser's skip-guard required a single-column key, so a composite key
-   produced a tuple of empty strings and a `client = '' AND …` predicate HANA
-   refuses — **fixed**;
-3. the re-read of the net keys fails with `try_strptime(DATE, STRING_LITERAL)` on a
-   source carrying `DATS` columns — **open**.
+| mode | write ms | cycle ms | total ms | rows applied |
+|---|---:|---:|---:|---:|
+| `KEYS_IUD` | **43** | 2659 | 2702 | 2000 |
+| `IMAGE_IUD` | 619 | **936** | **1555** | 2000 |
 
-So the premise behind making `KEYS_IUD` the trigger tier's design centre is not
-merely unmeasured; the mode is unusable on a composite-key table today. Treat the
-`KEYS_IUD` / `IMAGE_IUD` choice in [`cdc.md`](cdc.md) accordingly until (3) is
-closed and this section carries real numbers.
+**The trade-off is real and it is not a wash.** `KEYS_IUD` costs **14x less on the
+source's write path** — 43 ms against 619 ms — and pays for it with a cycle roughly
+2.8x more expensive, because it re-reads ~400 columns for every changed key.
+`IMAGE_IUD` wins on total wall-clock by a wide margin.
+
+Which one is right depends on whose time is being spent. The write path is a
+customer's *business transaction*: a trigger writing a 400-column image sits inside
+their posting. The cycle is the replicator's own time, and it is asynchronous. On a
+wide, hot table `KEYS_IUD` is the right default for exactly that reason — and on a
+table that is not hot, `IMAGE_IUD` moves fewer bytes in total and is simpler.
+
+Neither is the provisioning default; that remains `DELETE_ONLY`. See
+[`cdc.md`](cdc.md).
+
+> These numbers came from a trial box with few work processes, and the arms report
+> rather than assert their timings — a threshold that moves with someone else's
+> background job fails for reasons nobody can act on. What the lane *asserts* is
+> that both modes converge the target to what SAP holds.
+
+**Getting here found five defects in a mode no test had ever exercised**, three of
+them silent data loss. They are listed in the commit that added this lane; the
+short version is that `KEYS_IUD` had never completed a single cycle on any system,
+and every one of its unit tests was structurally incapable of noticing.
 
 ### Not yet built
 

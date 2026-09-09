@@ -55,10 +55,14 @@ and streams the rows, and (c) runs the opaque prune.
 **`DELETE_ONLY` remains the default**, and provisioning without a mode still yields it.
 Choosing between the other two is a write-path question, not a correctness one: both
 capture I/U/D. `KEYS_IUD` moves the cost from the source's write path (a narrow log
-row) to the cycle (a re-read); `IMAGE_IUD` does the reverse. `P-KEYS` is the benchmark
-that decides it for a given table — and it has **not** been run on production-shaped
-data yet, so prefer `IMAGE_IUD` where the re-read is expensive and measure before
-committing a wide hot table to either.
+row) to the cycle (a re-read); `IMAGE_IUD` does the reverse.
+
+Measured on a 5-key, ~400-column table at 2,000 changes ([`perf-results.md`](perf-results.md)):
+`KEYS_IUD` costs **14x less on the write path** (43 ms vs 619 ms) and about **2.8x
+more per cycle** (2659 ms vs 936 ms). So the question is whose time you are spending.
+The write path sits inside the customer's business transaction; the cycle is the
+replicator's own, and asynchronous. For a wide, hot table `KEYS_IUD` is the better
+trade; where the table is not hot, `IMAGE_IUD` moves fewer bytes overall.
 
 ## Using it
 

@@ -378,18 +378,61 @@ CLASS zcl_erpl_rev_cdc IMPLEMENTATION.
         key_types( EXPORTING iv_source = ls-source it_key_cols = ls-key_cols
                    IMPORTING et_types = lt_types ).
 
-        DATA(lv_where) = zcl_erpl_rev_util=>key_in_predicate(
-          it_key_cols  = ls-key_cols
-          it_key_types = lt_types
-          it_rows      = lt_rows ).
+        " The CLIENT column is dropped from the predicate, and from every
+        " tuple with it.
+        "
+        " Open SQL refuses to be told the client: "the client field MANDT
+        " cannot be specified in the WHERE condition, client handling is
+        " performed by the compiler". The shadow log records it because the
+        " trigger sees a real row, and it is a genuine part of the key -- so it
+        " travels all the way here and then has to be left out of the one place
+        " that cannot accept it. Which is why every client-dependent table --
+        " that is, very nearly all of them -- could not be re-read at all.
+        "
+        " Dropped by TYPE, not by name: the client column is CLNT whatever the
+        " table happens to call it.
+        DATA lt_wcols TYPE string_table.
+        DATA lt_wtypes TYPE string_table.
+        DATA lt_wrows TYPE zcl_erpl_rev_util=>tt_keyrows.
+        LOOP AT ls-key_cols INTO DATA(lv_kc).
+          DATA(lv_ix) = sy-tabix.
+          IF VALUE string( lt_types[ lv_ix ] OPTIONAL ) = 'CLNT'. CONTINUE. ENDIF.
+          APPEND lv_kc TO lt_wcols.
+          APPEND VALUE string( lt_types[ lv_ix ] OPTIONAL ) TO lt_wtypes.
+        ENDLOOP.
+        LOOP AT lt_rows INTO DATA(lt_full).
+          DATA lt_kept TYPE string_table.
+          CLEAR lt_kept.
+          LOOP AT ls-key_cols INTO DATA(lv_kc2).
+            DATA(lv_ix2) = sy-tabix.
+            IF VALUE string( lt_types[ lv_ix2 ] OPTIONAL ) = 'CLNT'. CONTINUE. ENDIF.
+            APPEND VALUE string( lt_full[ lv_ix2 ] OPTIONAL ) TO lt_kept.
+          ENDLOOP.
+          APPEND lt_kept TO lt_wrows.
+        ENDLOOP.
 
+        DATA(lv_where) = zcl_erpl_rev_util=>key_in_predicate(
+          it_key_cols  = lt_wcols
+          it_key_types = lt_wtypes
+          it_rows      = lt_wrows ).
+
+        " iv_drift_target: the schema-drift watchdog must diff DDIC against the
+        " REAL target, not against __cdcimg. Without it the watchdog compared
+        " the source to a throwaway table `replicate` had just recreated from
+        " that same DDIC list -- so it was always clean, every ALTER landed on
+        " the images, a new source column never reached the target, and a
+        " dropped or retyped one never BLOCKed. It merely left dcols, and the
+        " keys-mode apply is delete-then-insert, so that column was NULLed for
+        " every changed key, silently. This is the same defect already fixed
+        " once on the watermark path; it was simply never carried across.
         DATA(li) = zcl_erpl_rev_util=>replicate(
           iv_tab      = ls-source
           iv_target   = lv_img
           iv_mode     = 'INSERT'
           iv_truncate = abap_true
           iv_where    = lv_where
-          iv_record   = abap_false ).
+          iv_record   = abap_false
+          iv_drift_target = iv_target ).
         IF li-error IS NOT INITIAL. rs-error = li-error. RETURN. ENDIF.
       ENDIF.
     ENDIF.
@@ -448,14 +491,23 @@ CLASS zcl_erpl_rev_cdc IMPLEMENTATION.
       DATA lt_tuple TYPE string_table.
       CLEAR lt_tuple.
       LOOP AT it_key_cols INTO DATA(lv_col).
-        DATA(lv_lc) = to_lower( lv_col ).
         DATA lv_val TYPE string.
         CLEAR lv_val.
+        " (?i) because the CASE of the JSON key is not ours to predict. The
+        " staging table is created by replicate_native from the HANA log, whose
+        " columns are upper case, and DuckDB reports a column by the name it
+        " stores -- so the rows come back as {"MANDT":...} however the server
+        " spelled the SELECT list. Lower-casing the column and matching
+        "mandt" found nothing, every tuple parsed empty, and the predicate
+        " builder turned that into `1 = 0`: the re-read selected no rows, so
+        " every net insert and update looked like a row that had vanished from
+        " the source and was DELETED from the target instead of applied.
+        "
         " Built by concatenation, not as a string template: inside |...| the
         " braces are expression delimiters, and a regex character class that
         " needs a literal '}' cannot be expressed there without escaping every
         " one of them.
-        DATA(lv_pat) = `"` && lv_lc && `"\s*:\s*"?([^",` && `}` && `]*)"?`.
+        DATA(lv_pat) = `(?i)"` && lv_col && `"\s*:\s*"?([^",` && `}` && `]*)"?`.
         FIND PCRE lv_pat IN lv_obj SUBMATCHES lv_val.
         APPEND lv_val TO lt_tuple.
       ENDLOOP.
