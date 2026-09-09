@@ -431,8 +431,22 @@ drop the request silently with zero impact. Details: [`docs/telemetry.md`](docs/
 
 ## Docs
 
-- [`docs/delta.md`](docs/delta.md) — incremental extraction (watermark / change-doc / snapshot)
+**Replicating**
+
+- [`docs/delta.md`](docs/delta.md) — incremental extraction (watermark / change-doc / snapshot), the read window, and the four load types
+- [`docs/cdc.md`](docs/cdc.md) — the opt-in trigger tier, for physical deletes
+- [`docs/daemon.md`](docs/daemon.md) — continuous replication in one background work process
+- [`docs/operations.md`](docs/operations.md) — the operator's verbs, the monitor, and the metrics endpoint
+- [`docs/control-tables.md`](docs/control-tables.md) — the control schema as a versioned interface
+- [`docs/stats.md`](docs/stats.md) — what each run records
+
+**Installing and upgrading**
+
 - [`docs/INSTALL.md`](docs/INSTALL.md) — SAP transport import + server install + upgrade/uninstall
+- [`docs/upgrading.md`](docs/upgrading.md) — **what changes for a system that is already replicating**
+
+**The system around it**
+
 - [`docs/enable-rfc-registration.md`](docs/enable-rfc-registration.md) — gateway registration / `reginfo`
 - [`docs/security.md`](docs/security.md) — Basis hardening, RFC user, SNC, ACLs
 - [`docs/tunnel.md`](docs/tunnel.md) — optional: reaching the gateway when this host has no route to it

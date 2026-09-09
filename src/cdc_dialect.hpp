@@ -18,8 +18,12 @@ namespace erpl_rev {
 enum class CdcMode {
     DeleteOnly,  // AFTER DELETE only — inserts/updates come from the watermark tier
     KeysIud,     // AFTER INSERT/UPDATE/DELETE, logging keys only — the cycle re-reads
-                 // the source for the row image. The default: cheaper on the write
-                 // path of a wide hot table than logging a full image per change.
+                 // the source for the row image. Cheaper on the write path of a wide
+                 // hot table than logging a full image per change. NOT the default:
+                 // provisioning without a mode yields DeleteOnly (see CdcModeOf and
+                 // the two spec.mode call sites in rfc_handlers.cpp). This comment
+                 // used to claim it was, which is the kind of thing a reader trusts
+                 // instead of checking.
     ImageIud,    // AFTER INSERT/UPDATE/DELETE, logging the whole row — for sources
                  // that cannot be re-read cheaply. Stored as FULL_IUD before the
                  // rename; that spelling is still accepted on read, forever.

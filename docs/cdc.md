@@ -37,12 +37,28 @@ log coalescing, the merge apply, the position advance and the prune bound. ABAP 
 (a) ADBC-executes the opaque DDL on the SAP DB, (b) runs the opaque incremental read
 and streams the rows, and (c) runs the opaque prune.
 
-## Two modes
+## Three modes
 
 | Mode | Triggers | Log payload | Use when |
 |------|----------|-------------|----------|
 | **DELETE_ONLY** (default) | `AFTER DELETE` only | keys | inserts/updates already come from the watermark tier — the trigger only closes the physical-delete gap, for minimal write-path overhead |
-| **FULL_IUD** | `AFTER INSERT`/`UPDATE`/`DELETE` | full row image | the source has no usable change column at all — the log carries the row so the server upserts I/U and deletes D, entirely server-side |
+| **KEYS_IUD** | `AFTER INSERT`/`UPDATE`/`DELETE` | keys only | the source has no usable change column, and it is wide or hot. The cycle coalesces the log to a net op per key and **re-reads the source** for the row values, so the write path carries a key and not a row image |
+| **IMAGE_IUD** | `AFTER INSERT`/`UPDATE`/`DELETE` | full row image | the source has no usable change column and **cannot be re-read cheaply** — the log carries the row, so the server upserts I/U and deletes D without going back to SAP |
+
+> **`FULL_IUD` was renamed `IMAGE_IUD`.** The old spelling names what the log holds
+> rather than implying "everything", now that a keys-only I/U/D mode exists beside it.
+> Stored values were rewritten by control-schema migration v3, and **`FULL_IUD` is
+> still accepted on read, permanently** — a system provisioned before the rename keeps
+> working, and an unrecognised mode is never silently downgraded to `DELETE_ONLY`,
+> because that would quietly stop capturing inserts and updates.
+
+**`DELETE_ONLY` remains the default**, and provisioning without a mode still yields it.
+Choosing between the other two is a write-path question, not a correctness one: both
+capture I/U/D. `KEYS_IUD` moves the cost from the source's write path (a narrow log
+row) to the cycle (a re-read); `IMAGE_IUD` does the reverse. `P-KEYS` is the benchmark
+that decides it for a given table — and it has **not** been run on production-shaped
+data yet, so prefer `IMAGE_IUD` where the re-read is expensive and measure before
+committing a wide hot table to either.
 
 ## Using it
 
@@ -53,7 +69,7 @@ zcl_erpl_rev_util=>replicate( iv_tab = 'ZDELTA_WM' iv_target = 'cdc_wm' ).
 " 2. provision the triggers (creates ZCDC_* log/sequence/trigger on the SAP DB)
 zcl_erpl_rev_cdc=>provision(
   iv_target = 'cdc_wm' iv_source = 'ZDELTA_WM' iv_keys = 'CLIENT,ID'
-  iv_mode = 'DELETE_ONLY' ).        " or 'FULL_IUD'
+  iv_mode = 'DELETE_ONLY' ).        " or 'KEYS_IUD' / 'IMAGE_IUD'
 
 " 3. each cycle: stage new log rows -> apply in the server -> prune the log
 DATA(r) = zcl_erpl_rev_cdc=>run( 'cdc_wm' ).   " r-ins / r-upd / r-del / r-applied
