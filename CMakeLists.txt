@@ -4,13 +4,28 @@ project(erpl_rev CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Sanitizers, off by default: -DERPL_REV_SANITIZE=address,undefined
+# Sanitizers, off by default:
 #
-# Added after a dangling capture in the TUI cost a live bisection against a
-# running server with concurrent writers. FTXUI's canvas() stores its callback
-# and runs it during layout, so a lambda capturing locals by reference read
-# them destroyed and looped forever -- a spinning thread and a frozen display,
-# indistinguishable from a hung query by eye. ASAN reports that as
+#   cmake -S . -B build-asan -G Ninja -DERPL_REV_SANITIZE=address,undefined
+#   cmake --build build-asan --target erpl_rev_tests
+#   ASAN_OPTIONS=detect_leaks=0 ./build-asan/erpl_rev_tests
+#
+# Leak detection off on purpose: the suite exercises DuckDB and the RFC SDK,
+# whose allocations at exit are not this project's to account for. The classes
+# worth catching are use-after-scope and undefined behaviour.
+#
+# CI no longer runs this -- the job was removed by owner's decision, because a
+# full instrumented rebuild of the dependency tree took about three hours with
+# no cache and blocked every pull request behind it. The option stays, and is
+# worth reaching for by hand when a symptom looks like memory rather than
+# logic.
+#
+# What it is for, from the one time it mattered: a dangling capture in the TUI
+# cost a live bisection against a running server with concurrent writers.
+# FTXUI's canvas() stores its callback and runs it during layout, so a lambda
+# capturing locals by reference read them destroyed and looped forever -- a
+# spinning thread and a frozen display, indistinguishable from a hung query by
+# eye, and three wrong diagnoses before the right one. ASAN reports that as
 # stack-use-after-scope on the first frame, naming the line, in seconds, with
 # no server and no terminal.
 set(ERPL_REV_SANITIZE "" CACHE STRING "Comma-separated sanitizers, e.g. address,undefined")
