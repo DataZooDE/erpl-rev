@@ -32,7 +32,7 @@ jobs:
           # RFC SDK and no ICU on any platform.
           #
           # Evidence differs by platform, and it is worth being clear about it.
-          # Linux is the combination the 13-stage live suite runs against a real
+          # Linux is the combination the live suite runs against a real
           # ABAP system. macOS and Windows are proven to compile, link, load and
           # answer RfcGetVersion (erpl-proto's `cross` CI job plus the smoke test
           # below) -- but NOT yet against a live SAP system. See erpl-rev#75.
@@ -396,9 +396,11 @@ jobs:
             implementation, linked statically. They carry no SAP NW RFC SDK and
             no ICU — DuckDB is the only bundled library.
 
-            The Linux build is additionally exercised by a 13-stage end-to-end
-            suite against a live ABAP system. macOS and Windows are verified to
-            build, link and start, but not yet against a live SAP system.
+            The Linux build is additionally exercised against a live ABAP
+            system: fifteen suites in `make e2e`, plus the opt-in `make e2e-full`
+            lane where a real background daemon replicates for minutes on end.
+            macOS and Windows are verified to build, link and start, but not yet
+            against a live SAP system.
 
             | OS | Asset |
             |----|-------|
