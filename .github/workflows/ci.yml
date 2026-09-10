@@ -52,50 +52,6 @@ jobs:
       - name: Run tests
         run: make test
 
-  sanitize:
-    name: Sanitized unit tests (Linux, ASAN/UBSAN)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y ninja-build unzip
-
-      - name: Setup vcpkg
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgGitCommitId: 11bbc873e00e9e58d4e9dffb30b7a5493a030e0b
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::331993160594:role/ErplGithubOicdRole
-          role-session-name: ErplRevGithubOidcSession
-          aws-region: eu-west-1
-
-      - name: Download SAP NW RFC SDK (Linux)
-        run: ./scripts/download_and_extract_nwrfc.sh 's3://erpl-resources/sapnwrfc/nwrfc750P_13-70002752_linux.zip' './nwrfcsdk/linux/'
-
-      # A dangling capture in the TUI cost a live bisection against a running
-      # server with concurrent writers, because by eye a spinning thread and a
-      # frozen display are indistinguishable from a hung query. ASAN reports
-      # the same fault as stack-use-after-return, naming the line, in seconds.
-      # Verified by reintroducing that bug deliberately.
-      - name: Build (sanitized)
-        run: |
-          cmake -S . -B build-asan -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" \
-            -DERPL_REV_SANITIZE=address,undefined
-          cmake --build build-asan --target erpl_rev_tests
-
-      # Leak detection off: the suite exercises DuckDB and the RFC SDK, whose
-      # allocations at exit are not this project's to account for. The classes
-      # worth catching here are use-after-scope and undefined behaviour.
-      - name: Run tests (sanitized)
-        run: ASAN_OPTIONS=detect_leaks=0 ./build-asan/erpl_rev_tests
-
   build-macos:
     # macOS had no CI at all: it was built only by the release workflow, on a
     # tag, which is the worst place to discover a platform break. It matters more

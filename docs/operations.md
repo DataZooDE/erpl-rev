@@ -193,6 +193,20 @@ make e2e-full    # …plus the daemon running for real: soak, daemon, stress
 make e2e-perf    # the measured numbers behind docs/perf-results.md
 ```
 
+CI does **not** run a sanitized build. When a symptom looks like memory rather than
+logic — a hang with no query behind it, a value that is wrong in a way no branch
+explains, a crash that moves when you add a print — build the tests with
+AddressSanitizer by hand and run them:
+
+```bash
+cmake -S . -B build-asan -G Ninja -DERPL_REV_SANITIZE=address,undefined
+cmake --build build-asan --target erpl_rev_tests
+ASAN_OPTIONS=detect_leaks=0 ./build-asan/erpl_rev_tests
+```
+
+It only sees code that actually runs, so pair it with a test that drives the suspect
+path — `top --once --graph --refreshes 3` exists for exactly that reason.
+
 **`make e2e-full` is the release gate.** It is where the product is driven the way
 a customer drives it — a background job that stays up and replicates things nobody
 asked it to replicate, including a trigger target end to end. Every defect that has
