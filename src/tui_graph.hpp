@@ -67,6 +67,33 @@ std::string FormatRate(double rows_per_sec);
 // the same rule used for seats in a parliament and for the same reason.
 std::vector<int> BandHeights(const std::vector<double> &rates, double ceiling, int height);
 
+// One drawn band: a vertical run of braille points in column x.
+//
+// Computed as VALUES rather than drawn straight onto a canvas, because FTXUI's
+// canvas() stores its callback and runs it during layout -- after the function
+// that built it has returned. A callback capturing the sample vectors by
+// reference reads them destroyed, and a destroyed vector's size is whatever is
+// in that memory: the draw loop then never ends and the monitor's thread spins
+// at 100% with the display frozen. That looks exactly like a hung query.
+//
+// Returning plain data makes the mistake unavailable: there is nothing to
+// dangle, and the geometry becomes testable without a terminal.
+struct BandSpan {
+    int x = 0;
+    int y_top = 0;      // canvas y grows downward, so top < bottom
+    int y_bottom = 0;
+    int band = 0;       // index into the caller's palette
+};
+
+// Lay out the whole graph: newest bucket at the right, bands stacked from the
+// baseline up, at most `px` columns and `py` points tall.
+//
+// `names` fixes both the band order and the palette index, so a target keeps
+// its colour and its place in the stack from frame to frame.
+std::vector<BandSpan> BandSpans(const std::vector<RateBucket> &buckets,
+                                const std::vector<std::string> &names, double ceiling,
+                                int px, int py);
+
 // A palette slot for a target, derived from its NAME.
 //
 // Never from its position: the target list is sorted by severity

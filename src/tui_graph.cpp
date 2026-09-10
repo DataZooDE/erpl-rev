@@ -102,6 +102,42 @@ std::vector<int> BandHeights(const std::vector<double> &rates, double ceiling, i
     return out;
 }
 
+std::vector<BandSpan> BandSpans(const std::vector<RateBucket> &buckets,
+                                const std::vector<std::string> &names, double ceiling,
+                                int px, int py) {
+    std::vector<BandSpan> out;
+    if (buckets.empty() || names.empty() || ceiling <= 0 || px <= 0 || py <= 0) return out;
+
+    // Newest on the right, which is the direction every monitor reads. An
+    // older history than fits is cropped from the left rather than squeezed.
+    const size_t n = std::min<size_t>(buckets.size(), static_cast<size_t>(px));
+    for (size_t i = 0; i < n; ++i) {
+        const auto &b = buckets[buckets.size() - n + i];
+        const int x = px - static_cast<int>(n) + static_cast<int>(i);
+
+        std::vector<double> rates;
+        rates.reserve(names.size());
+        for (const auto &nm : names) {
+            double v = 0;
+            for (const auto &r : b.rates)
+                if (r.first == nm) v = r.second;
+            rates.push_back(v);
+        }
+
+        // Stack from the baseline up, so the bands sit on one another and the
+        // top of the stack is the total.
+        const auto heights = BandHeights(rates, ceiling, py);
+        int y = py - 1;
+        for (size_t k = 0; k < heights.size() && y >= 0; ++k) {
+            if (heights[k] <= 0) continue;
+            const int top = std::max(0, y - heights[k] + 1);
+            out.push_back({x, top, y, static_cast<int>(k)});
+            y = top - 1;
+        }
+    }
+    return out;
+}
+
 int ColorSlotFor(const std::string &target, int palette_size) {
     if (palette_size <= 0) return 0;
     // FNV-1a rather than std::hash: this decides a colour a person will learn

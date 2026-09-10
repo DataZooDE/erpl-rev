@@ -190,33 +190,25 @@ int RunTop(Options o) {
         const double ceiling = tui::NiceCeiling(peak);
         const double now_rate = buckets.empty() ? 0.0 : buckets.back().Total();
 
-        auto c = canvas(px, py, [&](Canvas &cv) {
-            if (buckets.empty() || ceiling <= 0) return;
-            // Newest on the right, which is the direction every monitor reads.
-            const size_t n = std::min<size_t>(buckets.size(), static_cast<size_t>(px));
-            for (size_t i = 0; i < n; ++i) {
-                const auto &b = buckets[buckets.size() - n + i];
-                const int x = px - static_cast<int>(n) + static_cast<int>(i);
+        // Laid out by the pure half, and captured BY VALUE below.
+        //
+        // canvas() stores its callback and invokes it during LAYOUT -- after
+        // this function has returned. A callback capturing the sample vectors
+        // by reference reads them destroyed, and the draw loop then never
+        // ends: the monitor's thread spins at 100% and the display freezes,
+        // which looks exactly like a hung query. Values cannot dangle.
+        struct Span {
+            int x = 0, y_top = 0, y_bottom = 0;
+            Color col;
+        };
+        std::vector<Span> spans;
+        for (const auto &b : tui::BandSpans(buckets, names, ceiling, px, py))
+            spans.push_back({b.x, b.y_top, b.y_bottom,
+                             C(th.band[tui::ColorSlotFor(names[b.band], tui::Theme::kBands)])});
 
-                std::vector<double> rates;
-                rates.reserve(names.size());
-                for (const auto &nm : names) {
-                    double v = 0;
-                    for (const auto &r : b.rates)
-                        if (r.first == nm) v = r.second;
-                    rates.push_back(v);
-                }
-                const auto heights = tui::BandHeights(rates, ceiling, py);
-
-                // Stack from the baseline up, so the bands sit on each other
-                // and the top of the stack is the total.
-                int y = py - 1;
-                for (size_t k = 0; k < heights.size(); ++k) {
-                    const Color col = C(th.band[tui::ColorSlotFor(names[k], tui::Theme::kBands)]);
-                    for (int h = 0; h < heights[k] && y >= 0; ++h, --y)
-                        cv.DrawPoint(x, y, true, col);
-                }
-            }
+        auto c = canvas(px, py, [spans](Canvas &cv) {
+            for (const auto &s : spans)
+                for (int y = s.y_bottom; y >= s.y_top; --y) cv.DrawPoint(s.x, y, true, s.col);
         });
 
         Elements legend;

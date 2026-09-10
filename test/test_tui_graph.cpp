@@ -146,3 +146,43 @@ TEST_CASE("graph: a target keeps its colour when the table re-sorts", "[tui][gra
     CHECK(b1 >= 0);
     CHECK(b1 < 6);
 }
+
+TEST_CASE("graph: spans stack from the baseline and never leave the canvas", "[tui][graph]") {
+    // This layout used to be done inside the canvas callback, capturing the
+    // sample vectors by reference. FTXUI runs that callback during LAYOUT --
+    // after the function that built it has returned -- so it read destroyed
+    // vectors, and a destroyed vector's size is whatever was in that memory:
+    // the draw loop never ended and the monitor's thread spun at 100% with the
+    // display frozen. It presented as a hung query for half a day.
+    //
+    // Returning values instead makes the mistake unavailable, and makes this
+    // testable at all.
+    std::vector<RateBucket> buckets(1);
+    buckets[0].rates = {{"a", 300}, {"b", 100}};
+    const std::vector<std::string> names = {"a", "b"};
+
+    const auto spans = BandSpans(buckets, names, /*ceiling=*/400, /*px=*/10, /*py=*/20);
+    REQUIRE(spans.size() == 2);
+
+    for (const auto &s : spans) {
+        CHECK(s.x >= 0);
+        CHECK(s.x < 10);
+        CHECK(s.y_top >= 0);
+        CHECK(s.y_bottom < 20);
+        CHECK(s.y_top <= s.y_bottom);
+    }
+    // Newest bucket at the right edge.
+    CHECK(spans[0].x == 9);
+    // Stacked, not overlapping: the second band sits directly above the first.
+    CHECK(spans[1].y_bottom == spans[0].y_top - 1);
+    // The first band is drawn from the baseline.
+    CHECK(spans[0].y_bottom == 19);
+}
+
+TEST_CASE("graph: nothing to draw yields no spans", "[tui][graph]") {
+    CHECK(BandSpans({}, {"a"}, 100, 10, 20).empty());
+    std::vector<RateBucket> idle(2);
+    idle[0].rates = {{"a", 0}};
+    idle[1].rates = {{"a", 0}};
+    CHECK(BandSpans(idle, {"a"}, 0, 10, 20).empty());
+}
