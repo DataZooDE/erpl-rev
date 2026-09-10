@@ -1,0 +1,87 @@
+1
+00:00:00,500 --> 00:00:04,000
+Left is a real SAP system. Right is erpl-rev top, untouched.
+
+2
+00:00:05,500 --> 00:00:11,000
+This is the ABAP that drives the demo. It has three branches.
+
+3
+00:00:11,000 --> 00:00:15,000
+Branch one posts a goods receipt. A plain INSERT. No API, no exit.
+
+4
+00:00:14,500 --> 00:00:20,500
+Branch two transfers two items. One UPDATE, one unit of work.
+
+5
+00:00:20,500 --> 00:00:26,000
+Branch three deletes a row physically. No flag, no tombstone.
+
+6
+00:00:27,200 --> 00:00:32,200
+SAP contains one million goods movements. DuckDB contains none.
+
+7
+00:00:34,200 --> 00:00:43,200
+The sync starts. The left pane prints nothing. The graph shows the rate.
+
+8
+00:00:43,200 --> 00:00:51,200
+Colour is the target. The glyph is the operation. Up means insert.
+
+9
+00:00:55,200 --> 00:01:01,200
+One million rows in 11 seconds. About 91,000 per second, on a laptop.
+
+10
+00:01:02,000 --> 00:01:10,000
+Ten rows from end to end of the table. Real documents, real quantities.
+
+11
+00:01:12,900 --> 00:01:22,400
+A live change. The goods receipt is posted in SAP. Nothing runs here.
+
+12
+00:01:23,900 --> 00:01:30,400
+Three items arrive two seconds later. One cell: too small to measure.
+
+13
+00:01:31,900 --> 00:01:40,900
+The transfer moves two items to storage location 0002. One UPDATE.
+
+14
+00:01:42,400 --> 00:01:50,400
+Two updates. The row count does not change. The cycle reports them.
+
+15
+00:01:51,900 --> 00:02:00,900
+The archiving run deletes item 0003. The row is gone from SAP.
+
+16
+00:02:00,900 --> 00:02:07,400
+A watermark cannot see this. Trigger CDC can. The graph draws a delete.
+
+17
+00:02:10,900 --> 00:02:21,400
+SAP trigger time against apply time in DuckDB. The gap is under 2.4 s.
+
+18
+00:02:23,200 --> 00:02:32,200
+Now thirty seconds of ordinary traffic. Postings, corrections, archiving.
+
+19
+00:02:32,200 --> 00:02:41,200
+About twenty rows per second. A mid-size site's volume, not a benchmark.
+
+20
+00:02:41,200 --> 00:02:50,200
+All three glyphs at once. The table is written and pruned at the same time.
+
+21
+00:02:50,200 --> 00:03:02,200
+The left pane stays silent. The program only prints when it returns.
+
+22
+00:03:04,200 --> 00:03:17,200
+644 operations in SAP. Fewer changes applied: corrections inside one cycle arrive once.

@@ -53,6 +53,7 @@ TEST=(
   "ZCL_ERPL_REV_DIAG       CLAS zcl_erpl_rev_diag.abap"
   "ZCL_ERPL_REV_PARDEMO    CLAS zcl_erpl_rev_pardemo.abap"
   "ZCL_WIDE_BSEG           CLAS zcl_wide_bseg.abap"
+  "ZCL_STOCK_MOVE_FILL     CLAS zcl_stock_move_fill.abap"
   "Z_WIDE_BSEG_FILL        PROG z_wide_bseg_fill.prog.abap"
 )
 # DDIC + CDS fixtures (separate types): ZWIDE_BSEG (TABL), ZERPL_C_FLIGHTS /

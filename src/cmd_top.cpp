@@ -55,6 +55,19 @@ std::string Pad(std::string s, size_t w) {
     return s;
 }
 
+// A glyph plus a number, padded to a column count rather than a byte count.
+//
+// Pad() above measures bytes, which is right for every ASCII column here and
+// wrong for exactly one: "▲1.0M" is five columns wide and eight bytes long, so
+// Pad truncated a perfectly fitting figure to "▲1.…". The operation glyphs are
+// the only multi-byte content on the row, and they are always one column each.
+std::string OpCell(const char *glyph, const std::string &num, size_t w) {
+    std::string out = std::string(glyph) + num;
+    const size_t shown = 1 + num.size();
+    if (shown < w) out.append(w - shown, ' ');
+    return out;
+}
+
 }  // namespace
 
 int RunTop(Options o) {
@@ -151,7 +164,7 @@ int RunTop(Options o) {
         // first couple, which showed up as a graph that drew nothing over a
         // table growing by six thousand rows a second.
         tui::Snapshot fresh;
-        std::vector<std::pair<std::string, long long>> counts;
+        std::vector<tui::TargetCount> counts;
         try {
             auto db = dbc::Db::Open(ep);
             auto q = [&](const std::string &sql) { return db.Query(sql); };
@@ -190,7 +203,9 @@ int RunTop(Options o) {
 
     auto screen = ScreenInteractive::Fullscreen();
 
-    // The throughput box: a stacked braille area, one colour band per target.
+    // The throughput box: a stacked area, one colour band per target, drawn
+    // with a GLYPH PER OPERATION -- up for a row arriving, down for one
+    // leaving, a diamond for one changed in place.
     //
     // Deliberately NOT btop's encoding. btop spends colour on HEIGHT -- its CPU
     // graph runs purple to green as a peak rises -- so a glance at the hue
@@ -198,12 +213,23 @@ int RunTop(Options o) {
     // several concurrent replications at once is the thing this graph exists
     // for, and one area cannot encode both. The height gradients are kept for
     // the meters, where magnitude is the only thing being said.
+    //
+    // The cost of glyphs is resolution: this is a grid of character cells, not
+    // the braille surface, so a column is nine steps rather than thirty-six. A
+    // braille dot cannot carry a shape, and being able to see at a glance that
+    // a target is DELETING rather than loading is worth more than four times
+    // the vertical precision on a bar whose number is printed in the border
+    // anyway.
     auto throughput_box = [&](int cols) -> Element {
         const auto &th = tui::DefaultTheme();
-        const int chars_w = std::max(20, cols - 6);
-        const int rows_h = 7;
-        const int px = chars_w * 2;   // braille: 2 dots across a cell
-        const int py = rows_h * 4;    // and 4 down
+        // Two cells per bucket. At one cell each, a load lasting ten seconds
+        // is five hairlines against a hundred and seventy columns of empty
+        // box -- technically a chart, and unreadable as one. Two cells still
+        // leaves a history far longer than anything the refresh interval can
+        // fill.
+        const int bucket_w = 2;
+        const int px = std::max(10, (cols - 6) / bucket_w);   // buckets across
+        const int py = 8;                                     // cells tall
 
         const auto buckets = tui::Rates(history);
 
@@ -212,60 +238,125 @@ int RunTop(Options o) {
         std::vector<std::string> names;
         for (const auto &b : buckets)
             for (const auto &r : b.rates)
-                if (std::find(names.begin(), names.end(), r.first) == names.end())
-                    names.push_back(r.first);
+                if (std::find(names.begin(), names.end(), r.target) == names.end())
+                    names.push_back(r.target);
         std::sort(names.begin(), names.end());
 
+        // Scale and peak both come from the buckets that are DRAWN, so the two
+        // agree and the axis comes down of its own accord as a load scrolls off
+        // the left. Nothing is ever truncated: the tallest bar in the window is
+        // the top of the axis. Traffic too small to round to a cell is kept
+        // visible by the floor in BandHeights, not by moving the axis under it.
         double peak = 0;
-        for (const auto &b : buckets) peak = std::max(peak, b.Total());
-        const double ceiling = tui::NiceCeiling(peak);
+        const size_t drawn = std::min<size_t>(buckets.size(), static_cast<size_t>(px));
+        for (size_t i = buckets.size() - drawn; i < buckets.size(); ++i)
+            peak = std::max(peak, buckets[i].Total());
+        const double ceiling = tui::ScaleFor(buckets, px);
         const double now_rate = buckets.empty() ? 0.0 : buckets.back().Total();
 
-        // Laid out by the pure half, and captured BY VALUE below.
+        // Laid out by the pure half into a grid of values.
         //
-        // canvas() stores its callback and invokes it during LAYOUT -- after
-        // this function has returned. A callback capturing the sample vectors
-        // by reference reads them destroyed, and the draw loop then never
-        // ends: the monitor's thread spins at 100% and the display freezes,
-        // which looks exactly like a hung query. Values cannot dangle.
-        struct Span {
-            int x = 0, y_top = 0, y_bottom = 0;
+        // The predecessor of this code drew straight onto an FTXUI canvas from
+        // a callback that captured the sample vectors by reference. canvas()
+        // stores its callback and invokes it during LAYOUT -- after this
+        // function has returned -- so it read destroyed vectors, the draw loop
+        // never ended, and the monitor's thread spun at 100% with the display
+        // frozen. Values cannot dangle; that is why the grid is materialised
+        // here and the elements below are built from nothing else.
+        struct Cell {
+            const char *glyph = nullptr;
             Color col;
         };
-        std::vector<Span> spans;
-        for (const auto &b : tui::BandSpans(buckets, names, ceiling, px, py))
-            spans.push_back({b.x, b.y_top, b.y_bottom,
-                             C(th.band[tui::ColorSlotFor(names[b.band], tui::Theme::kBands)])});
+        const int grid_w = px * bucket_w;
+        std::vector<Cell> grid(static_cast<size_t>(grid_w) * py);
+        for (const auto &b : tui::BandSpans(buckets, names, ceiling, px, py)) {
+            const Color col =
+                C(th.band[tui::ColorSlotFor(names[b.band], tui::Theme::kBands)]);
+            const char *g = tui::OpGlyph(b.op);
+            for (int y = b.y_top; y <= b.y_bottom; ++y)
+                for (int c = 0; c < bucket_w; ++c)
+                    grid[static_cast<size_t>(y) * grid_w + b.x * bucket_w + c] = {g, col};
+        }
 
-        auto c = canvas(px, py, [spans](Canvas &cv) {
-            for (const auto &s : spans)
-                for (int y = s.y_bottom; y >= s.y_top; --y) cv.DrawPoint(s.x, y, true, s.col);
-        });
+        // One text element per RUN of identical cells rather than per cell:
+        // at 175 columns and nine rows that is the difference between a few
+        // dozen elements a frame and sixteen hundred, on a display that
+        // repaints every two seconds.
+        Elements lines;
+        for (int y = 0; y < py; ++y) {
+            Elements run;
+            std::string buf;
+            const Cell *cur = nullptr;
+            auto flush = [&] {
+                if (buf.empty()) return;
+                if (cur != nullptr && cur->glyph != nullptr)
+                    run.push_back(text(buf) | color(cur->col));
+                else
+                    run.push_back(text(buf));
+                buf.clear();
+            };
+            for (int x = 0; x < grid_w; ++x) {
+                const Cell &c = grid[static_cast<size_t>(y) * grid_w + x];
+                const bool same = cur != nullptr && c.glyph == cur->glyph &&
+                                  (c.glyph == nullptr || c.col == cur->col);
+                if (!same) {
+                    flush();
+                    cur = &c;
+                }
+                buf += c.glyph != nullptr ? c.glyph : " ";
+            }
+            flush();
+            lines.push_back(hbox(std::move(run)));
+        }
+
+        // The key gets its OWN LINE, and that is not a layout preference.
+        // FTXUI squeezes an over-long hbox proportionally rather than letting
+        // it overflow, so on a box with four targets registered the key was
+        // eaten -- first entirely, when it sat at the end of the legend, then
+        // down to "▲ ins ◆ u" when it was moved to the front. Anything sharing
+        // a row with a list that grows with the target count is negotiable.
+        // What a triangle means is the one thing on this line that is not
+        // reproduced anywhere else on the screen.
+        Elements key{text(" " + std::string(tui::OpGlyph(tui::Op::kInsert)) + " insert   " +
+                          tui::OpGlyph(tui::Op::kUpdate) + " update   " +
+                          tui::OpGlyph(tui::Op::kDelete) + " delete") |
+                     color(C(th.graph_text))};
 
         Elements legend;
         for (const auto &nm : names) {
-            double v = 0;
+            tui::OpRate v;
             if (!buckets.empty())
                 for (const auto &r : buckets.back().rates)
-                    if (r.first == nm) v = r.second;
-            legend.push_back(text("  ■ ") |
-                             color(C(th.band[tui::ColorSlotFor(nm, tui::Theme::kBands)])));
+                    if (r.target == nm) v = r;
+            const Color col = C(th.band[tui::ColorSlotFor(nm, tui::Theme::kBands)]);
+            legend.push_back(text("  ■ ") | color(col));
             legend.push_back(text(nm + " ") | color(C(th.main_fg)));
-            legend.push_back(text(tui::FormatRate(v)) | color(C(th.graph_text)));
+            // The three counters in the target's own colour, so the legend
+            // teaches the same rule the graph uses: the glyph is the
+            // operation, the colour is the replication.
+            for (int o = 0; o < tui::kOps; ++o) {
+                const auto op = static_cast<tui::Op>(o);
+                legend.push_back(text(OpCell(tui::OpGlyph(op), tui::FormatCount(v.At(op)), 7)) |
+                                 color(v.At(op) > 0 ? col : C(th.inactive_fg)));
+            }
         }
         if (names.empty())
-            legend.push_back(text("  sampling…") | color(C(th.inactive_fg)));
+            legend.push_back(text(" sampling…") | color(C(th.inactive_fg)));
 
         Element title = hbox({
             text(" throughput ") | bold | color(C(th.title)),
             text("scale " + tui::FormatRate(ceiling)) | color(C(th.inactive_fg)),
-
-
             text("  ·  ") | color(C(th.div_line)),
             text("now " + tui::FormatRate(now_rate)) | color(C(th.box_throughput)) | bold,
-            text("  peak " + tui::FormatRate(peak) + " ") | color(C(th.graph_text)),
+            text("  peak " + tui::FormatRate(peak)) | color(C(th.graph_text)),
+            // Said, not implied. A full-height bar drawn against a scale it
+            // exceeds is the one way this graph could mislead, so the border
+            // carries both the true peak and the fact that something is above
+            // the axis.
+            text(" ") | color(C(th.graph_text)),
         });
-        return window(title, vbox({c, hbox(legend)}), ROUNDED) |
+        return window(title,
+                      vbox({vbox(std::move(lines)), hbox(key), hbox(legend)}), ROUNDED) |
                color(C(th.box_throughput));
     };
 
@@ -311,10 +402,19 @@ int RunTop(Options o) {
                        color(daemon_ok ? C(th.ok) : C(th.bad)) | bold);
 
         Elements body;
-        body.push_back(hbox({text(Pad("TARGET", 24)), text(Pad("METHOD", 12)),
-                             text(Pad("CADENCE", 10)), text(Pad("STATUS", 10)),
-                             text(Pad("LAG", 9)), text(Pad("ROWS", 9)),
-                             text(Pad("FAILS", 6)), text("NOTE")}) |
+        // ROWS is gone and LAST CYCLE stands in its place. ROWS was
+        // rows_applied -- the SUM of the three numbers now printed beside it --
+        // and a sum cannot tell a target that loaded a million rows from one
+        // that deleted them, which is the most consequential distinction an
+        // operator can draw from this screen. METHOD and FAILS gave up four
+        // more columns between them: "CDC" and "DELTA" fit in eight, and a
+        // fail count needing five digits has stopped being a number anyone
+        // reads. The whole row now fits 80 columns, which is what a scripted
+        // `top --once` renders into and the narrowest place it has to be legible.
+        body.push_back(hbox({text(Pad("TARGET", 20)), text(Pad("METHOD", 8)),
+                             text(Pad("CADENCE", 9)), text(Pad("STATUS", 9)),
+                             text(Pad("LAG", 8)), text(Pad("FAILS", 6)),
+                             text(Pad("LAST CYCLE", 18)), text("NOTE")}) |
                        bold | color(C(th.hi_fg)));
         for (size_t i = 0; i < snap.rows.size(); ++i) {
             const auto &r = snap.rows[i];
@@ -324,11 +424,30 @@ int RunTop(Options o) {
                              : r.parked   ? r.park_reason
                              : r.fail_count > 0 ? r.last_error
                                                 : std::string();
-            auto line = hbox({text(Pad(r.target, 24)), text(Pad(r.method, 12)),
-                              text(Pad(r.cadence, 10)), text(Pad(r.status, 10)),
-                              text(Pad(tui::FormatLag(r.lag_seconds), 9)),
-                              text(Pad(std::to_string(r.rows), 9)),
-                              text(Pad(std::to_string(r.fail_count), 6)), text(note)}) |
+            // The exact split the last cycle reported, in the target's own
+            // band colour so the rule learned from the graph -- glyph is the
+            // operation, colour is the replication -- holds here too. Dimmed
+            // at zero, so a target that only ever inserts does not read as
+            // one that is also deleting.
+            const Color band =
+                C(th.band[tui::ColorSlotFor(r.target, tui::Theme::kBands)]);
+            const long long by_op[tui::kOps] = {r.last_ins, r.last_upd, r.last_del};
+            Elements ops;
+            for (int o = 0; o < tui::kOps; ++o) {
+                const auto op = static_cast<tui::Op>(o);
+                ops.push_back(text(OpCell(tui::OpGlyph(op),
+                                          tui::FormatCount(static_cast<double>(by_op[o])), 6)) |
+                              color(by_op[o] > 0 ? band : C(th.inactive_fg)));
+            }
+            auto line = hbox({text(Pad(r.target, 20)), text(Pad(r.method, 8)),
+                              text(Pad(r.cadence, 9)), text(Pad(r.status, 9)),
+                              text(Pad(tui::FormatLag(r.lag_seconds), 8)),
+                              text(Pad(std::to_string(r.fail_count), 6)),
+                              // LAST CYCLE last, because its three fields are
+                              // padded and NOTE therefore starts clear of it.
+                              // Ending on an unpadded column ran "FAILS" into
+                              // "NOTE" in the header.
+                              hbox(std::move(ops)), text(note)}) |
                         color(RowColour(r));
             if (static_cast<int>(i) == selected) line = line | inverted;
             body.push_back(line);
@@ -343,9 +462,17 @@ int RunTop(Options o) {
             foot.push_back(text("  " + snap.error) | color(C(th.bad)) | bold);
 
         Elements panes;
-        // The terminal's real width when there is one; a fixed, readable width
-        // for `--once`, whose output is sized to fit the document rather than a
-        // screen. `top`'s columns already need 88, so this is the same budget.
+        // The terminal's real width when there is one; a fixed width for
+        // `--once`, whose output is sized to fit the document rather than a
+        // screen.
+        //
+        // Eighty, and not a column more. FTXUI's Fit clamps the whole frame to
+        // the terminal anyway, so a wider box is not wider output -- it is the
+        // same output with its right-hand end cut off, and what sits at that
+        // end is the legend. Set to 104 to stop the target table being clipped,
+        // it clipped the graph's operation key instead, and the e2e assertion
+        // that greps for it is the only reason that was noticed. The table now
+        // fits eighty on its own.
         if (graph_on) panes.push_back(throughput_box(once ? 80 : term_cols.load()));
         panes.push_back(window(hbox(head), vbox(body) | flex, ROUNDED) |
                         color(C(th.box_targets)) | flex);

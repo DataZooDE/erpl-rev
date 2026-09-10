@@ -122,13 +122,23 @@ Keys: `q` quit, `r` refresh, **`g` throughput graph**, `n` run the selected targ
 
 ### What the throughput graph measures, and what it does not
 
-`g` opens a stacked graph of rows arriving per second, one coloured band per target,
-so several concurrent replications read as contributions to one total.
+`g` opens a stacked graph of rows arriving per second, so several concurrent
+replications read as contributions to one total. Two things are encoded at once:
+
+| | |
+|---|---|
+| **Colour** | which target — one band colour per replication, keyed to its name |
+| **Glyph** | which operation — `▲` insert, `◆` update, `▼` delete |
+
+Colour cannot also carry the operation, and the operation cannot be a colour without
+giving up the one thing the graph exists for, so the operation is a shape. The same
+rule holds in the target table, where the `LAST CYCLE` column prints the three counts
+the last completed cycle reported, in that target's own band colour.
 
 It is **sampled, not instrumented**. erpl-rev has no internal throughput meter — a full
 load writes one statistics row, at the end, so a graph fed from those would sit flat
 and then jump. Instead the monitor counts each target's rows on every refresh and
-differentiates. Three consequences worth knowing before you read anything into it:
+differentiates. Consequences worth knowing before you read anything into it:
 
 - **A rate needs two samples**, so a target draws nothing on its first one. A target
   that already holds a million rows is not replicating a million rows per second, and
@@ -139,9 +149,31 @@ differentiates. Three consequences worth knowing before you read anything into i
   tool this borrows its look from, which spends colour on magnitude — one area cannot
   encode both, and showing concurrent targets is the point here. The height gradients
   are kept for the lag meter, where magnitude is the only thing being said.
+- **Nothing is truncated, and a bucket that did anything is never drawn as nothing.**
+  A bulk load and the change traffic after it differ by five orders of magnitude, so on
+  an axis set by the load every ordinary change rounds to zero cells and the graph reads
+  as idle while replication is working. Such a bucket is rounded **up** to a single cell
+  at the baseline. That cell is an indicator — "some, below the resolution of this
+  scale" — not a measured height; the legend carries the figure it stands for. The floor
+  is on the bar, not on the bands inside it, so a trickle beside a bulk load *in the same
+  bucket* still rounds to nothing.
+- **The axis is the tallest bar in the window, and comes down when that bar leaves it.**
+  There is no rule deciding when to rescale: the scale is the peak of the buckets
+  actually drawn, so a load holds the axis up for as long as it is on screen and the axis
+  drops on its own once it scrolls off the left. Everything drawn is honestly in
+  proportion to the top of the axis.
+- **Within one bucket the split is net.** Inserts and deletes come from the row count,
+  which is the only signal that moves *during* a load; updates come from the cycle's
+  own report, because an update changes no row count and counting cannot see it at
+  all. So an interval that inserted three rows and deleted one draws two inserts. The
+  `LAST CYCLE` column carries the exact figures — read that when the split matters.
+- **Reported inserts and deletes are deliberately ignored.** Differentiating them as
+  well would draw the same rows twice: once as they arrived, and again as one
+  fabricated spike in whichever bucket the cycle happened to finish in.
 
-The sampling costs one small count per target per refresh, and runs only while the
-graph is open. That is why it is a key rather than always on.
+The sampling costs one small count per target per refresh plus one aggregate over the
+run statistics, and runs only while the graph is open. That is why it is a key rather
+than always on.
 
 `--refreshes N` runs N cycles at the real cadence **inside one process** and prints the
 final frame. That is what makes the graph testable: a rate needs two samples, so a loop
@@ -150,6 +182,33 @@ of separate `--once` runs can never draw a band and would pass over a broken bin
 **`LAG` is not freshness.** It is the time since that target last applied something. On
 an idle target it grows, correctly — nothing has changed. For how far behind the data
 actually is, compare `_commit_ts` with `_applied_at` in the change log.
+
+## Before a release
+
+`make e2e` skips two lanes, and they are the two that matter most:
+
+```bash
+make e2e         # 15 suites against a live ABAP system, minutes
+make e2e-full    # …plus the daemon running for real: soak, daemon, stress
+make e2e-perf    # the measured numbers behind docs/perf-results.md
+```
+
+**`make e2e-full` is the release gate.** It is where the product is driven the way
+a customer drives it — a background job that stays up and replicates things nobody
+asked it to replicate, including a trigger target end to end. Every defect that has
+reached `main` from this tree so far was invisible to the other lanes. It is opt-in
+because it takes minutes, not because it is optional.
+
+Run it as one pass rather than filtering to the slow suites with
+`ERPL_REV_E2E_ONLY='@soak'`. Two lanes that each pass on their own say nothing
+about the order they run in, and this suite has a history of one suite's leftovers
+deciding the next one's verdict.
+
+**Expect timing assertions to be load-dependent on a laptop.** `SOAK` fails the
+daemon if its heartbeat ever stalls for more than five ticks; on a box that has
+been running SAP, the engine and a full e2e for an hour, a seventeen-second gap
+at a two-second tick is the machine, not the daemon. Re-run it on a quiet system
+before treating it as a defect — and if it reproduces there, it is one.
 
 ## When something is wrong
 

@@ -91,7 +91,19 @@ TickPlan PlanTick(const std::vector<TargetRow> &targets, const std::vector<CdcRo
             // A trigger set with a missing or disabled object must not run: the
             // cycle would advance the position past changes never captured.
             if (c->status != "ACTIVE" && c->status != "SEEDED") continue;
-            if (c->shadow_rows <= 0) continue;
+            // shadow_rows > 0 is the FAST PATH -- "work is known to be
+            // waiting, run it now, whatever the clock says". It used to be the
+            // only path, and nothing in the tree ever writes that column: it is
+            // created by migration v3, read here and by the TICK handler, and
+            // assigned nowhere. So it was permanently 0 and this line skipped
+            // every trigger target on every tick. Registered, provisioned,
+            // triggers firing, shadow table filling -- and the daemon driving
+            // none of it, silently, because a skipped target reports nothing.
+            //
+            // The cadence is now the floor underneath that fast path. A cycle
+            // over an empty shadow table is already a cheap no-op (max(_seq) is
+            // NULL, the staging table is dropped and applied=false), so polling
+            // costs one read and cannot corrupt anything.
             // Expressed in SECONDS, like every other candidate's. It used to be
             // the raw row count, and the two were then sorted against each
             // other -- so a trigger target with three pending rows lost to any
@@ -108,6 +120,7 @@ TickPlan PlanTick(const std::vector<TargetRow> &targets, const std::vector<CdcRo
                                                                   : kDefaultCdcInterval;
             const double since =
                 t.last_run_epoch <= 0 ? interval : now_epoch - t.last_run_epoch;
+            if (c->shadow_rows <= 0 && since < interval) continue;
             overdue = since > interval ? since : interval;
         } else {
             const double interval = CadenceSeconds(t.cadence);

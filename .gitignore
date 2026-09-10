@@ -19,3 +19,16 @@ dev_rfc.log
 # agent-crew run artifacts (multi-agent review transcripts)
 .crew/
 .adt.creds
+
+# the demo records into these; the tape and scripts are what is versioned
+demo/bin/
+demo/demo.duckdb*
+demo/server.log
+demo/probe.gif
+demo/probe.png
+demo/f*.png
+demo/probe.tape
+
+# The packaged single-file recording: 5MB of base64 that demo/package-html.sh
+# regenerates from the mp4 in a second. The generator is the source, not this.
+demo/realtime.html

@@ -66,9 +66,38 @@ void SortForOperator(std::vector<Row> &rows) {
     });
 }
 
-std::vector<std::pair<std::string, long long>> SampleCounts(
-    const QueryFn &q, const std::vector<std::string> &targets) {
-    std::vector<std::pair<std::string, long long>> out;
+std::vector<TargetCount> SampleCounts(const QueryFn &q,
+                                      const std::vector<std::string> &targets) {
+    std::vector<TargetCount> out;
+
+    // The cumulative operation counters, for every target in ONE aggregate.
+    // Unlike the row counts this cannot fail per target -- a target with no
+    // completed run simply has no group -- so it is a single query rather than
+    // one each, and a failure here degrades the graph to inserts and deletes
+    // rather than blanking it.
+    //
+    // Only `upd` is actually differentiated by tui::Rates; ins and del are read
+    // so the target table and any later surface have one sampler to go to, and
+    // so a reader of this function is not left wondering where they went.
+    std::vector<TargetCount> reported;
+    try {
+        const auto r = q("SELECT target, "
+                         "sum(COALESCE(rows_ins,0)) AS ins, "
+                         "sum(COALESCE(rows_upd,0)) AS upd, "
+                         "sum(COALESCE(rows_del,0)) AS del "
+                         "FROM erpl_rev_run_stats GROUP BY target");
+        for (const auto &row : r.rows) {
+            TargetCount t;
+            t.target = Field(row, "target");
+            t.ins = Num(row, "ins");
+            t.upd = Num(row, "upd");
+            t.del = Num(row, "del");
+            reported.push_back(std::move(t));
+        }
+    } catch (const std::exception &) {
+        reported.clear();   // inserts and deletes still work; updates go quiet
+    }
+
     // One small count per target rather than a single UNION ALL over all of
     // them, because it needs no catalogue probe: a target registered but never
     // loaded has no table, its own count throws, and it is skipped. One new
@@ -90,7 +119,17 @@ std::vector<std::pair<std::string, long long>> SampleCounts(
             continue;
         try {
             const auto r = q("SELECT count(*) AS n FROM " + t);
-            if (!r.rows.empty()) out.emplace_back(t, Num(r.rows[0], "n"));
+            if (r.rows.empty()) continue;
+            TargetCount tc;
+            tc.target = t;
+            tc.rows = Num(r.rows[0], "n");
+            for (const auto &rep : reported)
+                if (rep.target == t) {
+                    tc.ins = rep.ins;
+                    tc.upd = rep.upd;
+                    tc.del = rep.del;
+                }
+            out.push_back(std::move(tc));
         } catch (const std::exception &) {
             continue;   // no table yet, or gone: a gap, not a failure
         }
@@ -102,7 +141,8 @@ Snapshot Load(const QueryFn &q) {
     Snapshot out;
     try {
         const auto t = q("SELECT target, method, cadence, status, lag_seconds, last_rows, "
-                         "fail_count, last_error, is_healthy, is_blocked, is_parked, park_reason "
+                         "fail_count, last_error, is_healthy, is_blocked, is_parked, park_reason, "
+                         "last_ins, last_upd, last_del "
                          "FROM erpl_rev_targets");
         for (const auto &r : t.rows) {
             Row row;
@@ -114,6 +154,9 @@ Snapshot Load(const QueryFn &q) {
             row.park_reason = Field(r, "park_reason");
             row.lag_seconds = Field(r, "lag_seconds").empty() ? -1 : Num(r, "lag_seconds");
             row.rows = Num(r, "last_rows");
+            row.last_ins = Num(r, "last_ins");
+            row.last_upd = Num(r, "last_upd");
+            row.last_del = Num(r, "last_del");
             row.fail_count = Num(r, "fail_count");
             row.healthy = Flag(r, "is_healthy");
             row.blocked = Flag(r, "is_blocked");

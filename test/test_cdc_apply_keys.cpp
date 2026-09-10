@@ -437,3 +437,33 @@ TEST_CASE("cdc_keys: replaying the same batch changes nothing", "[bridge][cdc][k
     CHECK(db.Query("SELECT note FROM t WHERE fldate=DATE '2024-01-01'").rows[0]
           == R"({"note":"new-a"})");
 }
+
+TEST_CASE("cdc_keys: a trigger cycle is visible on the operator surface",
+          "[bridge][cdc][keys]") {
+    // The apply wrote _erpl_rev_run_stats and _erpl_rev_cdc and stopped there.
+    // Every operator surface -- `top`, `sync ls`, the Prometheus gauges, the
+    // ALV report -- reads erpl_rev_targets, which is built from
+    // _erpl_rev_delta_state. So a trigger target replicated correctly and
+    // reported "IDLE, never run, 0 rows" for as long as it existed, and the
+    // comment above the run-stats insert claimed one view answered for both
+    // tiers while the view it named read a table this path never touched.
+    //
+    // An operator cannot monitor a tier that does not appear in the monitor.
+    DuckDbBridge db;
+    SetupKeysTarget(db);
+    db.Execute("INSERT INTO _erpl_rev_delta_state (target, method, source_from, keys) "
+               "VALUES ('t','CDC','T','mandt,carrid,fldate')");
+    db.Execute("INSERT INTO klog VALUES ('100','LH','20240101','U',1,'20240115090000')");
+    SetupKeysImages(db);
+    db.Execute("INSERT INTO kimg VALUES "
+               "('100','LH',DATE '2024-01-01',150.00,TIME '08:30:00','new-a')");
+
+    REQUIRE(db.CdcApply("t", "klog", kKeys, "kimg").applied);
+
+    // Ran, so it has a lag rather than "never"...
+    CHECK(db.Query("SELECT count(*) AS c FROM erpl_rev_targets "
+                   "WHERE target='t' AND lag_seconds IS NOT NULL").rows[0] == R"({"c":1})");
+    // ...and the row count it moved is the one an operator sees.
+    CHECK(db.Query("SELECT last_rows AS c FROM erpl_rev_targets WHERE target='t'").rows[0]
+          == R"({"c":1})");
+}
