@@ -142,7 +142,7 @@ Snapshot Load(const QueryFn &q) {
     try {
         const auto t = q("SELECT target, method, cadence, status, lag_seconds, last_rows, "
                          "fail_count, last_error, is_healthy, is_blocked, is_parked, park_reason, "
-                         "last_ins, last_upd, last_del "
+                         "last_ins, last_upd, last_del, cdc_status, cdc_error "
                          "FROM erpl_rev_targets");
         for (const auto &r : t.rows) {
             Row row;
@@ -157,6 +157,8 @@ Snapshot Load(const QueryFn &q) {
             row.last_ins = Num(r, "last_ins");
             row.last_upd = Num(r, "last_upd");
             row.last_del = Num(r, "last_del");
+            row.cdc_status = Field(r, "cdc_status");
+            row.cdc_error = Field(r, "cdc_error");
             row.fail_count = Num(r, "fail_count");
             row.healthy = Flag(r, "is_healthy");
             row.blocked = Flag(r, "is_blocked");

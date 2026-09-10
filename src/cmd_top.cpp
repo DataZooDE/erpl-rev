@@ -46,7 +46,24 @@ Color RowColour(const tui::Row &r) {
     if (r.parked) return Color::Magenta;
     if (r.lag_seconds < 0) return Color::GrayDark;
     if (r.fail_count > 0) return Color::Yellow;
+    // A trigger target the planner has stopped scheduling. Nothing else on the
+    // row moves when this happens -- the lag ages, the status still reads IDLE
+    // -- so without this it is the one fault that looks like an idle system.
+    if (!r.cdc_status.empty() && r.cdc_status != "ACTIVE" && r.cdc_status != "SEEDED")
+        return Color::Yellow;
     return Color::Default;
+}
+
+// Why a row is worth looking at, in one line. One place, so the table and the
+// footer cannot disagree about what is wrong with a target.
+std::string Note(const tui::Row &r) {
+    if (r.blocked) return r.last_error;
+    if (r.parked) return r.park_reason;
+    if (r.fail_count > 0) return r.last_error;
+    // The trigger registry, which is the only thing that says why a target has
+    // simply gone quiet: nothing else on the row moves when a trigger set is
+    // dropped or a provisioning never finished.
+    return r.cdc_error;
 }
 
 std::string Pad(std::string s, size_t w) {
@@ -401,6 +418,11 @@ int RunTop(Options o) {
                                                : "") + " ") |
                        color(daemon_ok ? C(th.ok) : C(th.bad)) | bold);
 
+        // 77 columns of fixed fields plus two of border; whatever is left is
+        // the note's. Computed from the frame the table is actually rendered
+        // into, so the fixed columns keep their widths at any terminal size.
+        const int note_budget = std::max(0, (once ? 80 : term_cols.load()) - 79);
+
         Elements body;
         // ROWS is gone and LAST CYCLE stands in its place. ROWS was
         // rows_applied -- the SUM of the three numbers now printed beside it --
@@ -420,10 +442,15 @@ int RunTop(Options o) {
             const auto &r = snap.rows[i];
             // The reason, where there is one: a status with no reason is a
             // status nobody can act on.
-            std::string note = r.blocked  ? r.last_error
-                             : r.parked   ? r.park_reason
-                             : r.fail_count > 0 ? r.last_error
-                                                : std::string();
+            // Truncated to what is actually LEFT, not to a fixed maximum. The
+            // note is the only column with no width, and FTXUI squeezes an
+            // over-long row proportionally rather than clipping its last
+            // element -- so one long error message compressed every fixed
+            // column beside it and the row stopped lining up with its own
+            // header. Whatever does not fit is in the footer, at full width.
+            std::string note = Note(r);
+            if (static_cast<int>(note.size()) > note_budget)
+                note = note_budget > 1 ? note.substr(0, note_budget - 1) + "…" : std::string();
             // The exact split the last cycle reported, in the target's own
             // band colour so the rule learned from the graph -- glyph is the
             // operation, colour is the replication -- holds here too. Dimmed
@@ -457,6 +484,15 @@ int RunTop(Options o) {
 
         Elements foot{text(" q quit   r refresh   g graph   n run now   u unpark   ↑/↓ select ") |
                       color(C(th.inactive_fg))};
+        // The selected row's reason, at full width. The table column is
+        // whatever fits; this is the whole of it, and on an eighty-column frame
+        // it is the only place the text appears at all.
+        if (selected >= 0 && selected < static_cast<int>(snap.rows.size())) {
+            const auto full = Note(snap.rows[selected]);
+            if (!full.empty())
+                foot.push_back(text("  " + snap.rows[selected].target + ": " + full) |
+                               color(C(th.warn)));
+        }
         if (!action_note.empty()) foot.push_back(text("  " + action_note) | color(C(th.hi_fg)));
         if (!snap.error.empty())
             foot.push_back(text("  " + snap.error) | color(C(th.bad)) | bold);

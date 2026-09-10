@@ -299,8 +299,26 @@ DuckDbBridge::DuckDbBridge(const std::string &path, const std::string &init_sql)
         "(coalesce(status,'') = 'BLOCKED') AS is_blocked, "
         "(parked_until IS NOT NULL AND parked_until > now()) AS is_parked, "
         "park_reason, "
+        // The trigger registry's own health, for the faults that are NOT a
+        // failed cycle: a trigger dropped by a transport, a log table removed,
+        // a provisioning that never finished. Those leave _erpl_rev_cdc outside
+        // ACTIVE/SEEDED -- which silently stops the planner scheduling the
+        // target -- while _erpl_rev_delta_state still says whatever the last
+        // successful cycle said. The target simply goes quiet, and every
+        // surface reports it healthy.
+        //
+        // NULL for a target that is not on the trigger tier, so a watermark
+        // target reads as "no trigger registry", not as "trigger broken".
+        "c.cdc_status_raw AS cdc_status, c.cdc_error_raw AS cdc_error, "
+        // A trigger target whose registry is not ACTIVE or SEEDED is NOT
+        // healthy, whatever delta_state remembers of the last good cycle: the
+        // planner will not schedule it, so it has stopped replicating. This is
+        // the one place is_healthy has to know about the tier, and every
+        // surface that reads this view inherits the answer.
         "(last_run_ts IS NOT NULL AND coalesce(fail_count,0) = 0 "
         " AND coalesce(status,'') <> 'BLOCKED' "
+        " AND (c.cdc_status_raw IS NULL "
+        "      OR c.cdc_status_raw IN ('ACTIVE','SEEDED')) "
         " AND (parked_until IS NULL OR parked_until <= now())) AS is_healthy "
         "FROM _erpl_rev_delta_state "
         // LEFT JOIN, and the subquery renames its key: a target registered but
@@ -309,7 +327,16 @@ DuckDbBridge::DuckDbBridge(const std::string &path, const std::string &init_sql)
         "                  row_number() OVER (PARTITION BY target "
         "                                     ORDER BY run_id DESC) AS rn "
         "           FROM _erpl_rev_run_stats) r "
-        "  ON r.rs_target = _erpl_rev_delta_state.target AND r.rn = 1");
+        "  ON r.rs_target = _erpl_rev_delta_state.target AND r.rn = 1 "
+        // The subquery RENAMES its columns rather than joining the table
+        // directly: _erpl_rev_cdc carries target, status and last_run_ts too,
+        // and every one of those is a column this view already selects
+        // unqualified. Same shape as the run-statistics join above, for the
+        // same reason.
+        "LEFT JOIN (SELECT target AS cdc_target, status AS cdc_status_raw, "
+        "                  error AS cdc_error_raw "
+        "           FROM _erpl_rev_cdc) c "
+        "  ON c.cdc_target = _erpl_rev_delta_state.target");
     if (tview->HasError())
         throw std::runtime_error("DuckDB targets view init failed: " + tview->GetError());
 
@@ -1062,9 +1089,68 @@ void DuckDbBridge::CdcAdvancePosition(const std::string &target, long long posit
 
 duckdb::Connection DuckDbBridge::Connect() { return duckdb::Connection(*db_); }
 
+namespace {
+// A failed trigger cycle, written where the OPERATOR will see it.
+//
+// The registry write above records the reason and stops the planner
+// rescheduling the target -- both correct, and both invisible. Every operator
+// surface (`top`, `sync ls`, the Prometheus gauges, the ABAP ALV report) is
+// built from erpl_rev_targets, which is built from _erpl_rev_delta_state, and
+// this path never touched it: a target whose cycles were failing reported
+// IDLE, never run, 0 rows, no error, to all four of them at once. The registry
+// knew and nobody who needed to know was told.
+//
+// fail_count moves too, so the failure is counted the way the watermark tier
+// counts one and the two tiers can be read the same way. It is not what stops
+// the retry loop here -- the planner's ACTIVE/SEEDED gate already does that --
+// which is worth stating so nobody removes that gate believing this covers it.
+//
+// Unfenced, like the success path beside it: the trigger tier does not claim a
+// target through active_run_id.
+void CdcFailDeltaState(duckdb::Connection &con, const std::string &target,
+                       const std::string &error) {
+    con.Query("UPDATE _erpl_rev_delta_state SET status='ERROR', last_error=" +
+              SqlLit(error) + ", fail_count=coalesce(fail_count,0)+1"
+              " WHERE target=" + SqlLit(target));
+}
+}  // namespace
+
+// Record any failed apply, wherever it was thrown, then rethrow.
+//
+// The inner function refuses a batch in several places BEFORE it opens a
+// transaction -- images that do not carry a target column, a staging table that
+// cannot be described, a missing registration. Those early refusals used to be
+// recorded nowhere at all: not in _erpl_rev_cdc, which therefore stayed
+// ACTIVE/SEEDED and kept the tick planner scheduling the target, and not in
+// _erpl_rev_delta_state, which is what every operator surface is built from.
+//
+// A target in that state re-staged, re-refused and re-logged nothing on every
+// single cycle, for as long as it existed, while `top`, `sync ls`, the
+// Prometheus gauges and the ABAP ALV report all showed it idle and healthy.
+//
+// One place records, so no failure path can be added later that forgets to.
 CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::string &staging,
                                       const std::vector<std::string> &keys,
                                       const std::string &images) {
+    try {
+        return CdcApplyInner(target, staging, keys, images);
+    } catch (const std::exception &e) {
+        const std::string why = std::string(e.what()).substr(0, 500);
+        duckdb::Connection con(*db_);
+        // The registry: also what stops the planner rescheduling a target whose
+        // batch cannot be applied, so an early refusal now stops the loop the
+        // way an in-transaction failure always did.
+        con.Query("UPDATE _erpl_rev_cdc SET status='ERROR', error=" + SqlLit(why) +
+                  ", last_run_ts=now() WHERE target=" + SqlLit(target));
+        CdcFailDeltaState(con, target, why);
+        throw;
+    }
+}
+
+CdcApplyResult DuckDbBridge::CdcApplyInner(const std::string &target,
+                                           const std::string &staging,
+                                           const std::vector<std::string> &keys,
+                                           const std::string &images) {
     CdcState st = CdcGet(target);
     if (!st.exists) throw std::runtime_error("CDC: no registration for " + target);
     CdcApplyResult res;
@@ -1576,14 +1662,12 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
         // right; failing silently and indefinitely is not. The tick planner
         // already skips a target that is not ACTIVE or SEEDED, so this is what
         // stops the loop.
-        con.Query("UPDATE _erpl_rev_cdc SET status='ERROR', error=" +
-                  SqlLit(std::string(e.what()).substr(0, 500)) +
-                  ", last_run_ts=now() WHERE target=" + SqlLit(target));
+        // Rolled back here, RECORDED by the wrapper. Doing both here counted
+        // the failure twice once the wrapper existed, and left the early
+        // refusals -- which never reach this block -- recorded nowhere.
         throw;
     } catch (...) {
         Exec(con, "ROLLBACK");
-        con.Query("UPDATE _erpl_rev_cdc SET status='ERROR', error='apply failed', "
-                  "last_run_ts=now() WHERE target=" + SqlLit(target));
         throw;
     }
     res.prune_bound = max_seq;
