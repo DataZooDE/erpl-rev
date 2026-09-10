@@ -31,6 +31,11 @@ struct Row {
     // graph's split is net within a bucket; these are the exact figures the
     // engine reported, which is why both surfaces exist.
     long long last_ins = 0, last_upd = 0, last_del = 0;
+    // The trigger registry's own state, empty for a target that is not on that
+    // tier. A trigger set that has been dropped or half-provisioned stops the
+    // planner scheduling the target without anything else changing, so this is
+    // the only field that says why a target has simply gone quiet.
+    std::string cdc_status, cdc_error;
     bool healthy = false, blocked = false, parked = false;
 };
 

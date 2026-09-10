@@ -125,6 +125,28 @@ SELECT status, error, shadow_rows FROM _erpl_rev_cdc WHERE target = 'cdc_wm';
 `erpl-rev top` shows the same thing per cycle in its `LAST CYCLE` column, and the
 throughput graph draws one glyph per operation.
 
+### When a trigger target goes quiet
+
+A trigger set can break without any cycle failing: a trigger dropped by a transport,
+a log table removed, a provisioning that never finished. That leaves
+`_erpl_rev_cdc.status` outside `ACTIVE`/`SEEDED`, which **silently stops the planner
+scheduling the target** — while `_erpl_rev_delta_state` still holds whatever the last
+successful cycle wrote. The target stops replicating, its lag ages, and its status
+still reads `IDLE`.
+
+`erpl_rev_targets` therefore carries the trigger registry's own state as `cdc_status`
+and `cdc_error`, and **a trigger target whose registry is not `ACTIVE` or `SEEDED` is
+not healthy**, whatever the last good cycle left behind. Every surface that reads the
+view inherits that: `top` colours the row and prints the reason, `sync ls` and the
+Prometheus gauges report it unhealthy, and the ALV report shows it too. For a target
+that was never on the trigger tier both columns are `NULL`, so a watermark target is
+not judged by a registry it does not have.
+
+A failed *cycle* is recorded in the same place. `CdcApply` records every failure —
+including the ones it refuses before opening a transaction, which previously went
+unrecorded anywhere and so re-refused on every cycle forever — into both the registry
+and `_erpl_rev_delta_state`, with the reason and an incremented `fail_count`.
+
 ## Correctness contract
 
 Every cycle is **at-least-once and idempotent**: the server stages the new log rows

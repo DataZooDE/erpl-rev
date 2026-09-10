@@ -210,6 +210,15 @@ public:
                             const std::vector<std::string> &keys,
                             const std::string &images = "");
 
+   private:
+    //! The apply itself. CdcApply wraps it so that EVERY failure is recorded in
+    //! one place -- see the comment there.
+    CdcApplyResult CdcApplyInner(const std::string &target, const std::string &staging,
+                                 const std::vector<std::string> &keys,
+                                 const std::string &images);
+
+   public:
+
     // --- Streaming cursors (fixed-memory paging for large results) ----------
     // OpenCursor starts a streaming query on its OWN DuckDB connection (DuckDB
     // allows only one active stream per connection) and returns a handle + the
