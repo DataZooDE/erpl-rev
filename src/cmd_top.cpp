@@ -8,6 +8,7 @@
 // All the judgement lives in tui_model: which target is worst, how a lag reads,
 // what counts as a problem. This file turns that into cells and keystrokes.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <mutex>
@@ -17,10 +18,13 @@
 
 #include "commands.hpp"
 #include "db_client.hpp"
+#include "tui_graph.hpp"
 #include "tui_model.hpp"
+#include "tui_theme.hpp"
 
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
+#include <ftxui/dom/canvas.hpp>
 #include <ftxui/dom/elements.hpp>
 
 namespace erpl_rev {
@@ -28,6 +32,10 @@ namespace cmd {
 namespace {
 
 using namespace ftxui;
+
+// The palette lives in tui_theme, free of FTXUI so its gradients can be tested
+// without a terminal. This is the only place the two meet.
+Color C(const tui::Rgb &c) { return Color::RGB(c.r, c.g, c.b); }
 
 // Colour carries the same three states the views keep apart, because they need
 // three different actions: blocked needs re-registering, parked needs unpark, a
@@ -71,6 +79,25 @@ int RunTop(Options o) {
     int selected = 0;
     std::string action_note;
 
+    // The throughput history, and whether anyone asked for it.
+    //
+    // Off by default and behind `g`, because the samples are not free: one row
+    // count per target per refresh. DuckDB answers those from metadata, but a
+    // monitor should not spend work nobody asked for -- and a scripted
+    // `top --once` should render the same frame it always did.
+    bool graph_on = false;
+
+    // The terminal width, read OFF the render path.
+    //
+    // Asking the screen for its width from inside render() -- which runs on
+    // FTXUI's thread while holding snap_mx -- stalled the refresh loop
+    // completely: the display froze and the graph drew nothing, which looks
+    // exactly like a broken graph rather than a monitor that has stopped
+    // updating. Sampled by the ticker instead, where nothing else is held.
+    std::atomic<int> term_cols{92};
+    std::vector<tui::CountSample> history;
+    const size_t kHistory = 240;   // ~8 minutes at the 2s refresh
+
     // Whether this is a live monitor or one frame. A tool an operator runs is
     // also a tool a script runs, and an interactive-only monitor cannot be put
     // in a log, a ticket or an e2e assertion.
@@ -83,16 +110,48 @@ int RunTop(Options o) {
         // Loaded OUTSIDE the lock: the read talks to the server and can block
         // for as long as the network takes, and holding the lock across it
         // would freeze the display exactly when the server is slow.
+        bool want_counts = false;
+        {
+            std::lock_guard<std::mutex> g(snap_mx);
+            want_counts = graph_on;
+        }
+
+        // ONE connection for both reads. Opening a second one per refresh for
+        // the graph's samples was enough to make them stop arriving after the
+        // first couple, which showed up as a graph that drew nothing over a
+        // table growing by six thousand rows a second.
         tui::Snapshot fresh;
+        std::vector<std::pair<std::string, long long>> counts;
         try {
             auto db = dbc::Db::Open(ep);
-            fresh = tui::Load([&](const std::string &sql) { return db.Query(sql); });
+            auto q = [&](const std::string &sql) { return db.Query(sql); };
+            fresh = tui::Load(q);
+            if (want_counts && fresh.error.empty()) {
+                std::vector<std::string> names;
+                names.reserve(fresh.rows.size());
+                for (const auto &r : fresh.rows) names.push_back(r.target);
+                counts = tui::SampleCounts(q, names);
+            }
         } catch (const std::exception &e) {
             fresh = tui::Snapshot{};
             fresh.error = e.what();
+            counts.clear();   // a gap in the graph, not a failed refresh
         }
+
         std::lock_guard<std::mutex> g(snap_mx);
         snap = std::move(fresh);
+        if (want_counts && !counts.empty()) {
+            tui::CountSample cs;
+            // A monotonic clock: the rate is a division by elapsed time, and a
+            // wall clock that steps backwards over NTP would render a negative
+            // or enormous spike out of nothing.
+            cs.at_epoch = std::chrono::duration<double>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count();
+            cs.counts = std::move(counts);
+            history.push_back(std::move(cs));
+            if (history.size() > kHistory) history.erase(history.begin());
+        }
         if (selected >= static_cast<int>(snap.rows.size()))
             selected = snap.rows.empty() ? 0 : static_cast<int>(snap.rows.size()) - 1;
     };
@@ -100,38 +159,140 @@ int RunTop(Options o) {
 
     auto screen = ScreenInteractive::Fullscreen();
 
+    // The throughput box: a stacked braille area, one colour band per target.
+    //
+    // Deliberately NOT btop's encoding. btop spends colour on HEIGHT -- its CPU
+    // graph runs purple to green as a peak rises -- so a glance at the hue
+    // gives the magnitude. Here colour says WHICH TARGET, because showing
+    // several concurrent replications at once is the thing this graph exists
+    // for, and one area cannot encode both. The height gradients are kept for
+    // the meters, where magnitude is the only thing being said.
+    auto throughput_box = [&](int cols) -> Element {
+        const auto &th = tui::DefaultTheme();
+        const int chars_w = std::max(20, cols - 6);
+        const int rows_h = 7;
+        const int px = chars_w * 2;   // braille: 2 dots across a cell
+        const int py = rows_h * 4;    // and 4 down
+
+        const auto buckets = tui::Rates(history);
+
+        // Which targets to draw, and in a stable order. Sorted by name so a
+        // band does not jump between rows when the table re-sorts by severity.
+        std::vector<std::string> names;
+        for (const auto &b : buckets)
+            for (const auto &r : b.rates)
+                if (std::find(names.begin(), names.end(), r.first) == names.end())
+                    names.push_back(r.first);
+        std::sort(names.begin(), names.end());
+
+        double peak = 0;
+        for (const auto &b : buckets) peak = std::max(peak, b.Total());
+        const double ceiling = tui::NiceCeiling(peak);
+        const double now_rate = buckets.empty() ? 0.0 : buckets.back().Total();
+
+        auto c = canvas(px, py, [&](Canvas &cv) {
+            if (buckets.empty() || ceiling <= 0) return;
+            // Newest on the right, which is the direction every monitor reads.
+            const size_t n = std::min<size_t>(buckets.size(), static_cast<size_t>(px));
+            for (size_t i = 0; i < n; ++i) {
+                const auto &b = buckets[buckets.size() - n + i];
+                const int x = px - static_cast<int>(n) + static_cast<int>(i);
+
+                std::vector<double> rates;
+                rates.reserve(names.size());
+                for (const auto &nm : names) {
+                    double v = 0;
+                    for (const auto &r : b.rates)
+                        if (r.first == nm) v = r.second;
+                    rates.push_back(v);
+                }
+                const auto heights = tui::BandHeights(rates, ceiling, py);
+
+                // Stack from the baseline up, so the bands sit on each other
+                // and the top of the stack is the total.
+                int y = py - 1;
+                for (size_t k = 0; k < heights.size(); ++k) {
+                    const Color col = C(th.band[tui::ColorSlotFor(names[k], tui::Theme::kBands)]);
+                    for (int h = 0; h < heights[k] && y >= 0; ++h, --y)
+                        cv.DrawPoint(x, y, true, col);
+                }
+            }
+        });
+
+        Elements legend;
+        for (const auto &nm : names) {
+            double v = 0;
+            if (!buckets.empty())
+                for (const auto &r : buckets.back().rates)
+                    if (r.first == nm) v = r.second;
+            legend.push_back(text("  ■ ") |
+                             color(C(th.band[tui::ColorSlotFor(nm, tui::Theme::kBands)])));
+            legend.push_back(text(nm + " ") | color(C(th.main_fg)));
+            legend.push_back(text(tui::FormatRate(v)) | color(C(th.graph_text)));
+        }
+        if (names.empty())
+            legend.push_back(text("  sampling…") | color(C(th.inactive_fg)));
+
+        Element title = hbox({
+            text(" throughput ") | bold | color(C(th.title)),
+            text("scale " + tui::FormatRate(ceiling)) | color(C(th.inactive_fg)),
+
+
+            text("  ·  ") | color(C(th.div_line)),
+            text("now " + tui::FormatRate(now_rate)) | color(C(th.box_throughput)) | bold,
+            text("  peak " + tui::FormatRate(peak) + " ") | color(C(th.graph_text)),
+        });
+        return window(title, vbox({c, hbox(legend)}), ROUNDED) |
+               color(C(th.box_throughput));
+    };
+
     auto render = [&] {
         std::lock_guard<std::mutex> g(snap_mx);
+        const auto &th = tui::DefaultTheme();
         const auto &s = snap.summary;
         // The header answers "is anything wrong" before the eye reaches the
         // table. The daemon is here because "nothing is replicating" is usually
         // the daemon, not the targets.
         auto daemon_ok = s.daemon_status == "RUNNING";
+        // The counts live in the box's own border, as btop puts a value in the
+        // title: the answer to "is anything wrong" arrives before the eye
+        // reaches the first row.
         Elements head{
-            text("erpl-rev") | bold,
-            text("  targets " + std::to_string(s.targets)),
-            text("  healthy " + std::to_string(s.healthy)) | color(Color::Green),
+            text(" targets ") | bold | color(C(th.title)),
+            text(std::to_string(s.targets)) | color(C(th.main_fg)),
+            text("  healthy " + std::to_string(s.healthy)) | color(C(th.ok)),
         };
         if (s.blocked) head.push_back(text("  blocked " + std::to_string(s.blocked)) |
-                                      color(Color::Red) | bold);
+                                      color(C(th.bad)) | bold);
         if (s.parked) head.push_back(text("  parked " + std::to_string(s.parked)) |
-                                     color(Color::Magenta));
+                                     color(C(th.parked_c)));
         if (s.failing) head.push_back(text("  failing " + std::to_string(s.failing)) |
-                                      color(Color::Yellow));
+                                      color(C(th.warn)));
         if (s.never_run) head.push_back(text("  never run " + std::to_string(s.never_run)) |
-                                        color(Color::GrayDark));
-        head.push_back(filler());
-        head.push_back(text("worst lag " + tui::FormatLag(s.worst_lag)));
-        head.push_back(text("  daemon " + s.daemon_status +
+                                        color(C(th.inactive_fg)));
+        // No filler() here. A window's title is sized to its content, so a
+        // filler has nothing to expand into and the right-hand items simply
+        // butt against the left-hand ones -- "healthy 2worst lag 0s". Separated
+        // explicitly instead, which also survives a narrow terminal.
+        head.push_back(text("  ·  ") | color(C(th.div_line)));
+        // The lag gradient: calm to warm as it grows. An hour is the ceiling
+        // for the ramp -- past that it is simply red, and the number says how
+        // much worse.
+        const double lag_t = s.worst_lag < 0 ? 0.0 : std::min(1.0, s.worst_lag / 3600.0);
+        head.push_back(text("worst lag " + tui::FormatLag(s.worst_lag)) |
+                       color(C(th.lag.At(lag_t))));
+        head.push_back(text("  ·  ") | color(C(th.div_line)));
+        head.push_back(text("daemon " + s.daemon_status +
                             (s.daemon_age >= 0 ? " (" + tui::FormatLag(s.daemon_age) + " ago)"
-                                               : "")) |
-                       color(daemon_ok ? Color::Green : Color::Red));
+                                               : "") + " ") |
+                       color(daemon_ok ? C(th.ok) : C(th.bad)) | bold);
 
         Elements body;
-        body.push_back(hbox({text(Pad("TARGET", 24)) | bold, text(Pad("METHOD", 12)) | bold,
-                             text(Pad("CADENCE", 10)) | bold, text(Pad("STATUS", 10)) | bold,
-                             text(Pad("LAG", 9)) | bold, text(Pad("ROWS", 9)) | bold,
-                             text(Pad("FAILS", 6)) | bold, text("NOTE") | bold}));
+        body.push_back(hbox({text(Pad("TARGET", 24)), text(Pad("METHOD", 12)),
+                             text(Pad("CADENCE", 10)), text(Pad("STATUS", 10)),
+                             text(Pad("LAG", 9)), text(Pad("ROWS", 9)),
+                             text(Pad("FAILS", 6)), text("NOTE")}) |
+                       bold | color(C(th.hi_fg)));
         for (size_t i = 0; i < snap.rows.size(); ++i) {
             const auto &r = snap.rows[i];
             // The reason, where there is one: a status with no reason is a
@@ -150,16 +311,23 @@ int RunTop(Options o) {
             body.push_back(line);
         }
         if (snap.rows.empty())
-            body.push_back(text("  no registered targets") | color(Color::GrayDark));
+            body.push_back(text("  no registered targets") | color(C(th.inactive_fg)));
 
-        Elements foot{text(" q quit   r refresh   n run now   u unpark   ↑/↓ select ") |
-                      color(Color::GrayDark)};
-        if (!action_note.empty()) foot.push_back(text("  " + action_note) | color(Color::Cyan));
+        Elements foot{text(" q quit   r refresh   g graph   n run now   u unpark   ↑/↓ select ") |
+                      color(C(th.inactive_fg))};
+        if (!action_note.empty()) foot.push_back(text("  " + action_note) | color(C(th.hi_fg)));
         if (!snap.error.empty())
-            foot.push_back(text("  " + snap.error) | color(Color::Red) | bold);
+            foot.push_back(text("  " + snap.error) | color(C(th.bad)) | bold);
 
-        return vbox({hbox(head), separator(), vbox(body) | flex, separator(), hbox(foot)}) |
-               border;
+        Elements panes;
+        // The terminal's real width when there is one; a fixed, readable width
+        // for `--once`, whose output is sized to fit the document rather than a
+        // screen. `top`'s columns already need 88, so this is the same budget.
+        if (graph_on) panes.push_back(throughput_box(once ? 92 : term_cols.load()));
+        panes.push_back(window(hbox(head), vbox(body) | flex, ROUNDED) |
+                        color(C(th.box_targets)) | flex);
+        panes.push_back(hbox(foot));
+        return vbox(panes);
     };
 
     // Actions go through the ordinary queue, exactly as the CLI verbs do. A
@@ -224,6 +392,19 @@ int RunTop(Options o) {
             if (selected > 0) --selected;
             return true;
         }
+        if (e == Event::Character('g')) {
+            {
+                std::lock_guard<std::mutex> g(snap_mx);
+                graph_on = !graph_on;
+                // Opening the graph starts a fresh history. Keeping the old
+                // samples across a close and re-open would put a gap of
+                // arbitrary length between two counts and render whatever
+                // arrived in between as one enormous spike.
+                if (graph_on) history.clear();
+            }
+            refresh();
+            return true;
+        }
         if (e == Event::Character('n')) { act("run"); return true; }
         if (e == Event::Character('u')) { act("unpark"); return true; }
         return false;
@@ -236,6 +417,7 @@ int RunTop(Options o) {
         while (alive.load()) {
             std::this_thread::sleep_for(std::chrono::seconds(2));
             if (!alive.load()) break;
+            term_cols.store(std::max(40, screen.dimx()));
             refresh();
             screen.PostEvent(Event::Custom);
         }

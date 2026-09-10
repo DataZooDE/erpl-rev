@@ -1,5 +1,7 @@
 #include "tui_model.hpp"
 
+#include <set>
+
 #include <algorithm>
 #include <cstdio>
 
@@ -62,6 +64,40 @@ void SortForOperator(std::vector<Row> &rows) {
         if (a.lag_seconds != b.lag_seconds) return a.lag_seconds > b.lag_seconds;
         return a.target < b.target;
     });
+}
+
+std::vector<std::pair<std::string, long long>> SampleCounts(
+    const QueryFn &q, const std::vector<std::string> &targets) {
+    std::vector<std::pair<std::string, long long>> out;
+    // One small count per target, deliberately, rather than a single
+    // UNION ALL over all of them.
+    //
+    // The combined form -- SELECT 'a' AS t, count(*) FROM a UNION ALL ... --
+    // wedged the monitor's refresh loop after a handful of iterations when it
+    // travelled through the quack client, and a stalled monitor looks exactly
+    // like a broken graph. A plain count per target does not, and it costs one
+    // round trip per registered target every couple of seconds, only while the
+    // graph is open.
+    //
+    // It also removes the need to ask the catalogue what exists first: a
+    // target registered but never loaded has no table, that count throws, and
+    // it is skipped. One new target must not blank the whole graph.
+    for (const auto &t : targets) {
+        if (t.empty()) continue;
+        // The engine created these names, so they are already safe; checking
+        // again costs nothing and means a hand-edited registry cannot reach
+        // the SQL.
+        if (t.find_first_not_of("abcdefghijklmnopqrstuvwxyz"
+                                "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_") != std::string::npos)
+            continue;
+        try {
+            const auto r = q("SELECT count(*) AS n FROM " + t);
+            if (!r.rows.empty()) out.emplace_back(t, Num(r.rows[0], "n"));
+        } catch (const std::exception &) {
+            continue;   // no table yet, or gone: a gap, not a failure
+        }
+    }
+    return out;
 }
 
 Snapshot Load(const QueryFn &q) {

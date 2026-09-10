@@ -280,6 +280,8 @@ add_library(erpl_rev_core OBJECT
   src/publish.cpp
   src/metrics.cpp
   src/tui_model.cpp
+  src/tui_graph.cpp
+  src/tui_theme.cpp
   src/cmd_top.cpp
   src/cdc_status.cpp
   src/portion.cpp
@@ -375,6 +377,7 @@ if(TRUE)  # tests always build; DuckDB is in-tree
     test/test_stats_views.cpp
     test/test_metrics.cpp
     test/test_tui_model.cpp
+    test/test_tui_graph.cpp
     test/test_cdc_status.cpp
     test/test_portion.cpp
     test/test_cds_delta.cpp
