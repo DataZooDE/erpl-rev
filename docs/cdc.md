@@ -173,6 +173,47 @@ the idempotent merge absorbs. The state machine guards transitions
   `erpl_rev_targets` reports the target as run rather than as never run, and that a
   physical delete leaves the trigger target while the watermark target keeps it.
 
+- **Parity against an independent full load** — `ZCL_ERPL_REV_PARITYTEST`. Two paths
+  to the same data must agree cell by cell: path A is the incremental method under
+  test, over a type-spanning source with an edge-value corpus (negative decimals,
+  NUMC leading zeros, empty rather than null, unicode, DATS/TIMS boundaries); path B
+  is a plain full load at the same moment. `diff_joindiff` from the
+  [anofox-tabular](https://github.com/DataZooDE/anofox-tabular) DuckDB extension does
+  the comparison.
+
+  **Each method is held to its own claim, because not all of them make the same one:**
+
+  | Method | Workload | Expected |
+  |---|---|---|
+  | CDC `KEYS_IUD` | insert, update, physical delete | exact parity |
+  | CDC `IMAGE_IUD` | insert, update, physical delete | exact parity |
+  | `SNAPSHOT` | insert, update, physical delete | exact parity |
+  | `WATERMARK` | insert, update | exact parity |
+  | `WATERMARK` | …then a physical delete | **must diverge**, by exactly the deleted rows |
+
+  That last row is the reason this tier exists, written as a test instead of as a
+  sentence: a watermark reads rows whose change column moved, and a deleted row has
+  no change column left to read. If it ever passes, either the workload stopped
+  deleting or the diff stopped comparing — and both have happened here before.
+
+  `IMAGE_IUD` is not redundant with `KEYS_IUD`: one takes its values from the logged
+  row image and the other from a re-read of the source, so a coercion bug in one path
+  and not the other is invisible to a single-mode test.
+
+  Not covered yet, and named rather than left silent: CDC `DELETE_ONLY`, whose claim
+  is only meaningful paired with a watermark tier, and `CHANGEDOC`, which would need
+  synthetic change documents built for the fixture's five-part key first.
+
+  Every defect found in `KEYS_IUD` was type-specific or key-specific **while the row
+  counts matched** — rows deleted and re-inserted empty, values coerced wrong, keys
+  joined on the wrong column. A count is blind to all of it; a diff names the key and
+  the column. The suite carries its own negative controls: a tampered cell and a
+  tampered key must both be caught, or a diff that returns zero has proved nothing.
+
+  Both paths are ours, so a shared coercion bug would agree with itself. The
+  comparison that crosses the boundary to SAP is `sync validate --full`, and that is
+  the anchor.
+
   It exists because three defects reached `main` together — the planner gating trigger
   targets on a column nothing wrote, the daemon running every planned cycle through the
   watermark entry point, and the trigger apply never writing `_erpl_rev_delta_state` —

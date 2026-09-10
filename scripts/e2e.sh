@@ -252,6 +252,25 @@ suite delta ZCL_ERPL_REV_DELTATEST abap/zcl_erpl_rev_deltatest.abap DELTA 54 "" 
 # Trigger-CDC (opt-in physical-delete tier, ADR-0004): provisions REAL HANA triggers
 # on the source via the server-generated DDL, physically deletes rows, and proves one
 # CDC cycle reflects the deletes in the DuckDB target; idempotent re-run; teardown
+# Parity: every incremental method against an independent full load of the same
+# source, diffed cell by cell by anofox-tabular's diff_joindiff over a
+# type-spanning corpus (negative decimals, NUMC leading zeros, empty vs null,
+# unicode, DATS/TIMS boundaries). Every defect found in KEYS_IUD was type- or
+# key-specific while the row counts matched, which is exactly what a count
+# cannot see; a diff NAMES the offending key and column.
+#
+# Each method is held to what it CLAIMS, not to a blanket parity rule:
+# KEYS_IUD, IMAGE_IUD and SNAPSHOT to exact parity after inserts, updates and
+# physical deletes; WATERMARK to exact parity after inserts and updates, and to
+# DIVERGING after a delete -- the reason the trigger tier exists, asserted
+# rather than documented.
+#
+# Carries its own negative controls: a tampered cell and a tampered key must
+# both be caught, or a diff that returns zero has proved nothing.
+# Needs network, for INSTALL ... FROM community.
+suite parity ZCL_ERPL_REV_PARITYTEST abap/zcl_erpl_rev_paritytest.abap PARITY 10 "" \
+  "every method against a full load, cell by cell -- and the watermark's blindness"
+
 # leaves no orphan objects. Needs ZCL_ERPL_REV_CDC[TEST] + the CDC FMs (mkfm).
 suite cdc ZCL_ERPL_REV_CDCTEST abap/zcl_erpl_rev_cdctest.abap CDC 47 "" \
   "real HANA triggers capture physical deletes; teardown leaves nothing"
