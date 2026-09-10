@@ -73,3 +73,55 @@ TEST_CASE("tui: a failed read is shown, not thrown", "[tui]") {
     CHECK_FALSE(snap.error.empty());
     CHECK(snap.rows.empty());
 }
+
+TEST_CASE("model: SampleCounts reads the row counts it asked for", "[tui][graph]") {
+    // Written after the graph shipped 0/s over a table that had grown from
+    // 1,000 rows to 79,500: the sampling was the one piece with no test, and
+    // it was the one that was wrong.
+    std::vector<std::string> seen;
+    auto q = [&](const std::string &sql) {
+        seen.push_back(sql);
+        QueryResult r;
+        r.rows = {sql.find("stock_moves") != std::string::npos ? R"({"n":79500})"
+                                                              : R"({"n":12200})"};
+        r.row_count = 1;
+        return r;
+    };
+
+    const auto got = tui::SampleCounts(q, {"stock_moves", "material_master"});
+    REQUIRE(got.size() == 2);
+    CHECK(got[0].first == "stock_moves");
+    CHECK(got[0].second == 79500);
+    CHECK(got[1].second == 12200);
+    // One query per target, so a missing table costs only its own sample.
+    // This does NOT assert the absence of a UNION: an earlier version did,
+    // enforcing a diagnosis that turned out to be wrong, which is how a
+    // refuted claim outlives the evidence against it.
+    CHECK(seen.size() == 2);
+}
+
+TEST_CASE("model: a target with no table yet is skipped, not fatal", "[tui][graph]") {
+    // Registered but never loaded. Counting it throws, and one new target must
+    // not blank the whole graph.
+    auto q = [&](const std::string &sql) -> QueryResult {
+        if (sql.find("material_master") != std::string::npos)
+            throw std::runtime_error("Catalog Error: Table with name material_master does not exist");
+        QueryResult r;
+        r.rows = {R"({"n":10})"};
+        return r;
+    };
+    const auto got = tui::SampleCounts(q, {"stock_moves", "material_master"});
+    REQUIRE(got.size() == 1);
+    CHECK(got[0].first == "stock_moves");
+}
+
+TEST_CASE("model: a target name that is not a plain identifier is refused", "[tui][graph]") {
+    bool asked = false;
+    auto q = [&](const std::string &) {
+        asked = true;
+        return QueryResult{};
+    };
+    const auto got = tui::SampleCounts(q, {"a; DROP TABLE x"});
+    CHECK(got.empty());
+    CHECK_FALSE(asked);
+}

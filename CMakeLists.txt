@@ -4,6 +4,21 @@ project(erpl_rev CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Sanitizers, off by default: -DERPL_REV_SANITIZE=address,undefined
+#
+# Added after a dangling capture in the TUI cost a live bisection against a
+# running server with concurrent writers. FTXUI's canvas() stores its callback
+# and runs it during layout, so a lambda capturing locals by reference read
+# them destroyed and looped forever -- a spinning thread and a frozen display,
+# indistinguishable from a hung query by eye. ASAN reports that as
+# stack-use-after-scope on the first frame, naming the line, in seconds, with
+# no server and no terminal.
+set(ERPL_REV_SANITIZE "" CACHE STRING "Comma-separated sanitizers, e.g. address,undefined")
+if(ERPL_REV_SANITIZE)
+  add_compile_options(-fsanitize=${ERPL_REV_SANITIZE} -fno-omit-frame-pointer -g)
+  add_link_options(-fsanitize=${ERPL_REV_SANITIZE})
+endif()
+
 if(MSVC)
   # Static CRT (/MT), to match DuckDB. duckdb/CMakeLists.txt sets
   # CMAKE_MSVC_RUNTIME_LIBRARY unconditionally as a plain variable, so it wins
@@ -280,6 +295,8 @@ add_library(erpl_rev_core OBJECT
   src/publish.cpp
   src/metrics.cpp
   src/tui_model.cpp
+  src/tui_graph.cpp
+  src/tui_theme.cpp
   src/cmd_top.cpp
   src/cdc_status.cpp
   src/portion.cpp
@@ -376,6 +393,7 @@ if(TRUE)  # tests always build; DuckDB is in-tree
     test/test_stats_views.cpp
     test/test_metrics.cpp
     test/test_tui_model.cpp
+    test/test_tui_graph.cpp
     test/test_cdc_status.cpp
     test/test_portion.cpp
     test/test_cds_delta.cpp
