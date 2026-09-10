@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <chrono>
 #include <mutex>
 #include <thread>
@@ -102,18 +103,47 @@ int RunTop(Options o) {
     // also a tool a script runs, and an interactive-only monitor cannot be put
     // in a log, a ticket or an e2e assertion.
     bool once = false;
-    for (const auto &a : o.args) if (a == "--once") once = true;
+    // --graph exists so the graph is reachable without a keypress. Without it
+    // the sampling and the whole canvas path cannot be entered by any test,
+    // any script or any sanitizer job -- which is precisely why the wiring had
+    // no coverage while the geometry had plenty.
+    bool want_graph = false;
+    // --refreshes N runs N cycles at the real cadence IN ONE PROCESS.
+    //
+    // One --once frame performs a single refresh, and a rate needs two
+    // samples, so a --once run can never draw a band: a loop of separate
+    // --once processes would pass happily over a binary that freezes after a
+    // handful of samples, which is the failure being guarded against. The
+    // repetition has to happen inside one process to mean anything.
+    int refreshes = 1;
+    for (size_t i = 0; i < o.args.size(); ++i) {
+        if (o.args[i] == "--once") once = true;
+        else if (o.args[i] == "--graph") want_graph = true;
+        else if (o.args[i] == "--refreshes" && i + 1 < o.args.size())
+            refreshes = std::max(1, std::atoi(o.args[++i].c_str()));
+    }
+    if (refreshes > 1) once = true;   // a repeated frame is still a one-shot render
 
     // Re-opened per refresh rather than held: the monitor is expected to survive
     // the server restarting under it, and a held handle would not.
-    auto refresh = [&] {
-        // Loaded OUTSIDE the lock: the read talks to the server and can block
-        // for as long as the network takes, and holding the lock across it
-        // would freeze the display exactly when the server is slow.
+    // refresh() is reachable from the ticker AND from FTXUI's thread via `r`,
+    // `g`, `n` and `u`. Serialised so two cannot be in flight at once: both
+    // would append to the history, and two samples milliseconds apart invent a
+    // rate that flattens the graph for as long as it stays in the window.
+    //
+    // `sample` is false for every key-driven refresh. The history should carry
+    // one clock at one cadence -- the ticker's -- not extra points wherever an
+    // operator happened to press a key.
+    std::mutex refresh_mx;
+    auto refresh = [&](bool sample) {
+        std::lock_guard<std::mutex> rg(refresh_mx);
+        // Loaded OUTSIDE the snapshot lock: the read talks to the server and
+        // can block for as long as the network takes, and holding that lock
+        // across it would freeze the display exactly when the server is slow.
         bool want_counts = false;
         {
             std::lock_guard<std::mutex> g(snap_mx);
-            want_counts = graph_on;
+            want_counts = graph_on && sample;
         }
 
         // ONE connection for both reads. Opening a second one per refresh for
@@ -155,7 +185,8 @@ int RunTop(Options o) {
         if (selected >= static_cast<int>(snap.rows.size()))
             selected = snap.rows.empty() ? 0 : static_cast<int>(snap.rows.size()) - 1;
     };
-    refresh();
+    graph_on = want_graph;
+    refresh(want_graph);
 
     auto screen = ScreenInteractive::Fullscreen();
 
@@ -315,7 +346,7 @@ int RunTop(Options o) {
         // The terminal's real width when there is one; a fixed, readable width
         // for `--once`, whose output is sized to fit the document rather than a
         // screen. `top`'s columns already need 88, so this is the same budget.
-        if (graph_on) panes.push_back(throughput_box(once ? 92 : term_cols.load()));
+        if (graph_on) panes.push_back(throughput_box(once ? 80 : term_cols.load()));
         panes.push_back(window(hbox(head), vbox(body) | flex, ROUNDED) |
                         color(C(th.box_targets)) | flex);
         panes.push_back(hbox(foot));
@@ -351,10 +382,17 @@ int RunTop(Options o) {
                                     : std::string(verb) + " " + target + ": FAILED (rc " +
                                           std::to_string(rc) + ")";
         }
-        refresh();
+        refresh(false);
     };
 
     if (once) {
+        // The extra cycles run at the real cadence, so the samples are spaced
+        // the way they are in a live monitor -- including past the dt floor
+        // that drops a pair taken too close together.
+        for (int i = 1; i < refreshes; ++i) {
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            refresh(want_graph);
+        }
         // No lock here: the ticker has not started, this thread is the only one
         // touching the snapshot, and render() takes the lock itself -- taking it
         // here too would deadlock on a non-recursive mutex.
@@ -370,7 +408,7 @@ int RunTop(Options o) {
     auto component = Renderer([&] { return render(); });
     component |= CatchEvent([&](Event e) {
         if (e == Event::Character('q') || e == Event::Escape) { screen.Exit(); return true; }
-        if (e == Event::Character('r')) { refresh(); return true; }
+        if (e == Event::Character('r')) { refresh(false); return true; }
         // Under the lock too. These read snap.rows.size() while the refresh
         // thread may be replacing the vector -- the same race the render path
         // was fixed for, missed on the branches that move the cursor.
@@ -394,7 +432,7 @@ int RunTop(Options o) {
                 // arrived in between as one enormous spike.
                 if (graph_on) history.clear();
             }
-            refresh();
+            refresh(false);
             return true;
         }
         if (e == Event::Character('n')) { act("run"); return true; }
@@ -410,7 +448,7 @@ int RunTop(Options o) {
             std::this_thread::sleep_for(std::chrono::seconds(2));
             if (!alive.load()) break;
             term_cols.store(std::max(40, screen.dimx()));
-            refresh();
+            refresh(true);   // only the ticker samples: one clock, one cadence
             screen.PostEvent(Event::Custom);
         }
     });

@@ -93,10 +93,11 @@ TEST_CASE("model: SampleCounts reads the row counts it asked for", "[tui][graph]
     CHECK(got[0].first == "stock_moves");
     CHECK(got[0].second == 79500);
     CHECK(got[1].second == 12200);
-    // One small count each, not one combined statement: the combined form
-    // wedged the refresh loop through the quack client.
+    // One query per target, so a missing table costs only its own sample.
+    // This does NOT assert the absence of a UNION: an earlier version did,
+    // enforcing a diagnosis that turned out to be wrong, which is how a
+    // refuted claim outlives the evidence against it.
     CHECK(seen.size() == 2);
-    CHECK(seen[0].find("UNION") == std::string::npos);
 }
 
 TEST_CASE("model: a target with no table yet is skipped, not fatal", "[tui][graph]") {

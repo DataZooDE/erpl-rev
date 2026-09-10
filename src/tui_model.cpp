@@ -69,19 +69,17 @@ void SortForOperator(std::vector<Row> &rows) {
 std::vector<std::pair<std::string, long long>> SampleCounts(
     const QueryFn &q, const std::vector<std::string> &targets) {
     std::vector<std::pair<std::string, long long>> out;
-    // One small count per target, deliberately, rather than a single
-    // UNION ALL over all of them.
+    // One small count per target rather than a single UNION ALL over all of
+    // them, because it needs no catalogue probe: a target registered but never
+    // loaded has no table, its own count throws, and it is skipped. One new
+    // target must not blank the whole graph.
     //
-    // The combined form -- SELECT 'a' AS t, count(*) FROM a UNION ALL ... --
-    // wedged the monitor's refresh loop after a handful of iterations when it
-    // travelled through the quack client, and a stalled monitor looks exactly
-    // like a broken graph. A plain count per target does not, and it costs one
-    // round trip per registered target every couple of seconds, only while the
-    // graph is open.
-    //
-    // It also removes the need to ask the catalogue what exists first: a
-    // target registered but never loaded has no table, that count throws, and
-    // it is skipped. One new target must not blank the whole graph.
+    // An earlier comment here blamed the UNION form for stalling the monitor.
+    // That was wrong -- the stall was a dangling capture in the canvas
+    // callback (see cmd_top.cpp) -- and the claim had a passing test pinning
+    // it, which is how a wrong reason survives. Both are gone. This shape is
+    // kept on its own merit, not as a workaround for something that never
+    // happened.
     for (const auto &t : targets) {
         if (t.empty()) continue;
         // The engine created these names, so they are already safe; checking

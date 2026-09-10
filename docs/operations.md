@@ -109,6 +109,48 @@ rows are missing.
 the provisioning, which would recreate the shadow table and reset the position,
 discarding every change captured since.
 
+## Watching it
+
+```bash
+erpl-rev top                      # the monitor: worst target first, refreshed every 2s
+erpl-rev top --once               # one frame, for a script, a ticket or a log
+erpl-rev top --once --graph --refreshes 3   # …with the throughput graph
+```
+
+Keys: `q` quit, `r` refresh, **`g` throughput graph**, `n` run the selected target now,
+`u` unpark it, `↑`/`↓` select.
+
+### What the throughput graph measures, and what it does not
+
+`g` opens a stacked graph of rows arriving per second, one coloured band per target,
+so several concurrent replications read as contributions to one total.
+
+It is **sampled, not instrumented**. erpl-rev has no internal throughput meter — a full
+load writes one statistics row, at the end, so a graph fed from those would sit flat
+and then jump. Instead the monitor counts each target's rows on every refresh and
+differentiates. Three consequences worth knowing before you read anything into it:
+
+- **A rate needs two samples**, so a target draws nothing on its first one. A target
+  that already holds a million rows is not replicating a million rows per second, and
+  the graph deliberately refuses to say so.
+- **The resolution is the refresh interval**, not the engine's real granularity. A
+  burst finishing between two samples is spread across the interval.
+- **Colour means which target, not how high.** That is a deliberate departure from the
+  tool this borrows its look from, which spends colour on magnitude — one area cannot
+  encode both, and showing concurrent targets is the point here. The height gradients
+  are kept for the lag meter, where magnitude is the only thing being said.
+
+The sampling costs one small count per target per refresh, and runs only while the
+graph is open. That is why it is a key rather than always on.
+
+`--refreshes N` runs N cycles at the real cadence **inside one process** and prints the
+final frame. That is what makes the graph testable: a rate needs two samples, so a loop
+of separate `--once` runs can never draw a band and would pass over a broken binary.
+
+**`LAG` is not freshness.** It is the time since that target last applied something. On
+an idle target it grows, correctly — nothing has changed. For how far behind the data
+actually is, compare `_commit_ts` with `_applied_at` in the change log.
+
 ## When something is wrong
 
 | Symptom | Likely cause | What to do |

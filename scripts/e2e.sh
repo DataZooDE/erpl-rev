@@ -569,6 +569,17 @@ grep -q "TARGET" <<<"$TOP" || fail "top --once drew no table: $(head -c 300 <<<"
 grep -q "t000_cli" <<<"$TOP" || fail "top --once does not show the registered targets: $TOP"
 grep -qE "daemon (RUNNING|STOPPED)" <<<"$TOP" || fail "top --once shows no daemon state: $TOP"
 echo "   top --once renders the targets and the daemon state"
+
+# ...and the throughput graph, which is otherwise reachable only by a keypress.
+#
+# --refreshes runs the cycles INSIDE one process: a rate needs two samples, so
+# a loop of separate --once runs could never draw a band and would pass over a
+# binary that stalls after a handful of samples. That is the failure this is
+# here to notice.
+TOPG="$(cli top --once --graph --refreshes 3 2>&1 || true)"
+grep -q "throughput" <<<"$TOPG" || fail "top --graph drew no throughput box: $(head -c 300 <<<"$TOPG")"
+grep -q "TARGET" <<<"$TOPG"     || fail "top --graph lost the target table: $(head -c 300 <<<"$TOPG")"
+echo "   top --graph samples over several refreshes without stalling"
 fi
 
 # cdc status on a target that is not a trigger target must say so, not crash.

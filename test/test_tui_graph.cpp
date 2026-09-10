@@ -186,3 +186,33 @@ TEST_CASE("graph: nothing to draw yields no spans", "[tui][graph]") {
     idle[1].rates = {{"a", 0}};
     CHECK(BandSpans(idle, {"a"}, 0, 10, 20).empty());
 }
+
+TEST_CASE("graph: two samples an instant apart are not a rate", "[tui][graph]") {
+    // refresh() is reachable from the ticker AND from the key handlers, so a
+    // keypress landing a few milliseconds after a tick can straddle one commit
+    // batch: 50,000 rows over 0.02s reads as 2.5M rows/s. NiceCeiling then
+    // scales the whole window to that, every real bar rounds to zero points,
+    // and the graph draws nothing for as long as the sample stays in the
+    // window -- the same symptom as a hang, from a single stray sample.
+    //
+    // Below the floor the pair is dropped rather than clamped: an interval too
+    // short to measure has no rate, and inventing one is what caused the
+    // damage.
+    const auto buckets = Rates({
+        S(100.00, {{"stock_moves", 100000}}),
+        S(100.02, {{"stock_moves", 150000}}),   // 20ms later, 50k more rows
+    });
+    CHECK(buckets.empty());
+}
+
+TEST_CASE("graph: samples that arrive out of order are ignored, not negated",
+          "[tui][graph]") {
+    // Two threads appending means the history is not guaranteed monotonic.
+    // A pair that goes backwards in time must not produce a negative dt.
+    const auto buckets = Rates({
+        S(100, {{"a", 1000}}),
+        S(98, {{"a", 2000}}),    // earlier than its predecessor
+        S(102, {{"a", 3000}}),
+    });
+    for (const auto &b : buckets) CHECK(b.Total() >= 0);
+}

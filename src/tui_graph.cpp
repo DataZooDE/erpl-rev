@@ -23,7 +23,20 @@ std::vector<RateBucket> Rates(const std::vector<CountSample> &samples) {
         const auto &prev = samples[i - 1];
         const auto &cur = samples[i];
         const double dt = cur.at_epoch - prev.at_epoch;
-        if (dt <= 0) continue;   // a clock that did not move divides nothing
+        // An interval too short to measure has no rate, and inventing one does
+        // real damage: refresh() is reachable from the ticker AND from the key
+        // handlers, so a keypress landing milliseconds after a tick can put two
+        // samples either side of a single commit batch. Fifty thousand rows
+        // over twenty milliseconds reads as 2.5M rows/s, the auto-scale lifts
+        // the whole window to that, and every genuine bar rounds to zero points
+        // for as long as the sample stays in the window. The graph draws
+        // nothing, which looks exactly like the monitor having hung.
+        //
+        // Dropped rather than clamped: there is no honest number for this pair.
+        // Negative dt is dropped by the same test -- two threads appending
+        // means the history is not guaranteed monotonic.
+        constexpr double kMinInterval = 0.5;
+        if (dt < kMinInterval) continue;
 
         RateBucket b;
         for (const auto &c : cur.counts) {
