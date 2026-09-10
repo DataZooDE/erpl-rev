@@ -204,6 +204,9 @@ suite() {  # NAME CLASS file marker-prefix min-pass tag description
     fail "$name ran only $got assertions, expected at least $minpass"
   fi
   echo "   $name OK ($got assertions)"
+  # A @perf suite exists to produce NUMBERS; swallowing its output on success
+  # would leave the lane green and the measurement invisible.
+  case " $tag " in *@perf*) echo "$OUT" | sed -n '/mode  /,/^ *$/p' | sed 's/^/   /' ;; esac
 }
 
 run() {  # cls file -> $OUT (cleaned). Uses ABSOLUTE --file path.
@@ -250,7 +253,7 @@ suite delta ZCL_ERPL_REV_DELTATEST abap/zcl_erpl_rev_deltatest.abap DELTA 54 "" 
 # on the source via the server-generated DDL, physically deletes rows, and proves one
 # CDC cycle reflects the deletes in the DuckDB target; idempotent re-run; teardown
 # leaves no orphan objects. Needs ZCL_ERPL_REV_CDC[TEST] + the CDC FMs (mkfm).
-suite cdc ZCL_ERPL_REV_CDCTEST abap/zcl_erpl_rev_cdctest.abap CDC 30 "" \
+suite cdc ZCL_ERPL_REV_CDCTEST abap/zcl_erpl_rev_cdctest.abap CDC 47 "" \
   "real HANA triggers capture physical deletes; teardown leaves nothing"
 
 
@@ -266,7 +269,7 @@ suite publish ZCL_ERPL_REV_PUBTEST abap/zcl_erpl_rev_pubtest.abap PUBTEST 6 "" \
   "parquet file and dataset, attached catalog full and append"
 
 
-suite watermark ZCL_ERPL_REV_WMTEST abap/zcl_erpl_rev_wmtest.abap WM 8 "" \
+suite watermark ZCL_ERPL_REV_WMTEST abap/zcl_erpl_rev_wmtest.abap WM 15 "" \
   "the corrections: a late commit below the observed max is delivered, DATE never reads today, a DATS+TIMS pair survives midnight, load types I and F"
 
 # The soak reads its duration from the database, so the same suite runs for two
@@ -285,6 +288,13 @@ suite daemon ZCL_ERPL_REV_DAEMONTEST abap/zcl_erpl_rev_daemontest.abap DAEMON 20
 
 suite stress ZCL_ERPL_REV_STREAMSTRESS abap/zcl_erpl_rev_streamstress.abap STRESS 25 "@soak" \
   "a real change workload, then the two anti-joins: nothing lost, nothing invented, nothing stale"
+
+# The @perf lane. Tagged, so it is excluded from the default gate: these arms
+# move real volume through a ~400-column table and the numbers only mean
+# something on a quiet box. Run it deliberately:
+#   ERPL_REV_E2E_ONLY='perf' ./scripts/e2e.sh
+suite perf ZCL_ERPL_REV_PERFTEST abap/zcl_erpl_rev_perftest.abap PERF 7 "@perf" \
+  "P-KEYS: KEYS_IUD vs IMAGE_IUD on a wide table -- timings reported, correctness asserted"
 
 suite cds ZCL_ERPL_REV_CDSTEST abap/zcl_erpl_rev_cdstest.abap CDS 8 "" \
   "CDS view entity as a source: keys, parity, parameters"
@@ -569,6 +579,17 @@ grep -q "TARGET" <<<"$TOP" || fail "top --once drew no table: $(head -c 300 <<<"
 grep -q "t000_cli" <<<"$TOP" || fail "top --once does not show the registered targets: $TOP"
 grep -qE "daemon (RUNNING|STOPPED)" <<<"$TOP" || fail "top --once shows no daemon state: $TOP"
 echo "   top --once renders the targets and the daemon state"
+
+# ...and the throughput graph, which is otherwise reachable only by a keypress.
+#
+# --refreshes runs the cycles INSIDE one process: a rate needs two samples, so
+# a loop of separate --once runs could never draw a band and would pass over a
+# binary that stalls after a handful of samples. That is the failure this is
+# here to notice.
+TOPG="$(cli top --once --graph --refreshes 3 2>&1 || true)"
+grep -q "throughput" <<<"$TOPG" || fail "top --graph drew no throughput box: $(head -c 300 <<<"$TOPG")"
+grep -q "TARGET" <<<"$TOPG"     || fail "top --graph lost the target table: $(head -c 300 <<<"$TOPG")"
+echo "   top --graph samples over several refreshes without stalling"
 fi
 
 # cdc status on a target that is not a trigger target must say so, not crash.

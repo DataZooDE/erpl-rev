@@ -114,7 +114,9 @@ None of these run unless you start them.
   `erpl_rev_xfeld`) are DuckDB macros; an exit written in ABAP has no equivalent and
   is not called. If a field depends on one, transform it downstream.
 - **`doctor` does not verify function-module signatures** (above).
-- **`P-KEYS` has not been run on production-shaped data**, so the choice between
-  `KEYS_IUD` and `IMAGE_IUD` is currently a judgement about your write path rather
-  than a measured one.
+- **`KEYS_IUD` was unusable before this release** — five defects, three of them
+  silent data loss, in a mode no test had ever exercised. It is now covered by a
+  live end-to-end arm and measured; see [`perf-results.md`](perf-results.md). If you
+  provisioned a `KEYS_IUD` target on an earlier build, re-seed it: its cycles
+  deleted rows they should have updated.
 - **Trigger CDC is HANA only.** The dialect seam exists; Oracle/Db2/MSSQL/ASE refuse.

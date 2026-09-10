@@ -9,6 +9,7 @@ CLASS zcl_erpl_rev_cdctest DEFINITION PUBLIC FINAL CREATE PUBLIC.
     METHODS m1_delete_only.
     METHODS m2_full_iud.
     METHODS m3_sflight.
+    METHODS m4_keys_iud.
 ENDCLASS.
 
 CLASS zcl_erpl_rev_cdctest IMPLEMENTATION.
@@ -33,6 +34,7 @@ CLASS zcl_erpl_rev_cdctest IMPLEMENTATION.
         m1_delete_only( ).
         m2_full_iud( ).
         m3_sflight( ).
+        m4_keys_iud( ).
       CATCH cx_root INTO DATA(lx).
         mv_fail = mv_fail + 1.
         out->write( |DUMP: { lx->get_text( ) }| ).
@@ -193,6 +195,122 @@ CLASS zcl_erpl_rev_cdctest IMPLEMENTATION.
 
     DATA(lv_te) = zcl_erpl_rev_cdc=>teardown( 'cdc_iud' ).
     ok( cond = xsdbool( lv_te IS INITIAL ) what = 'CDC(iud) teardown ok' detail = lv_te ).
+  ENDMETHOD.
+
+  METHOD m4_keys_iud.
+    " KEYS_IUD, live, on a COMPOSITE key with a DATS part.
+    "
+    " This mode had no test anywhere -- not here, not in the unit tier -- and it
+    " had never completed a cycle on any system. Three defects sat behind that
+    " silence: the server named the staging table after the log while the
+    " executor named it after the target, the net-key parser turned a composite
+    " key's trailing fragment into a tuple of empty strings, and the apply
+    " re-parsed already-typed image values as text. None of them can reach a
+    " single-column, all-VARCHAR fixture, which is what every existing case was.
+    "
+    " What only a live arm can prove: %STG% substitution, net_key_rows over a
+    " real composite key, key_in_predicate, the __cdcimg re-read staging, the
+    " position advance and the %CONF% prune. All of those exist only in ABAP.
+    DATA: lv_c TYPE s_carr_id, lv_n TYPE s_conn_id, lv_d TYPE s_date.
+    zcl_erpl_rev_deltadrv=>sflight_default(
+      IMPORTING ev_carrid = lv_c ev_connid = lv_n ev_fldate = lv_d ).
+    IF lv_c IS INITIAL. RETURN. ENDIF.
+    DATA(lv_a) = CONV s_date( '20991229' ).
+    DATA(lv_b) = CONV s_date( '20991228' ).
+
+    " Seed with one demo flight present, so the batch below can UPDATE it.
+    zcl_erpl_rev_deltadrv=>sflight_purge_demo( ).
+    zcl_erpl_rev_deltadrv=>sflight_change( iv_kind = 'I' iv_carrid = lv_c
+                                           iv_connid = lv_n iv_fldate = lv_a ).
+    zcl_erpl_rev_util=>replicate( iv_tab = 'SFLIGHT' iv_target = 'sflight_keys' ).
+    " The change log is switched on in _erpl_rev_delta_state, and a CDC target
+    " has no row there unless one is made -- `replicate` does not create one.
+    " An UPDATE therefore matched nothing and the log stayed off, which reads
+    " as "the delete was not logged" rather than "logging was never on".
+    zcl_erpl_rev_util=>query(
+      |DELETE FROM _erpl_rev_delta_state WHERE target='sflight_keys'| ).
+    zcl_erpl_rev_util=>query(
+      |INSERT INTO _erpl_rev_delta_state (target, method, source_from, keys, log_enabled) | &&
+      |VALUES ('sflight_keys','CDC','SFLIGHT','MANDT,CARRID,CONNID,FLDATE',true)| ).
+
+    DATA(lv_pe) = zcl_erpl_rev_cdc=>provision(
+      iv_target = 'sflight_keys' iv_source = 'SFLIGHT'
+      iv_keys = 'MANDT,CARRID,CONNID,FLDATE' iv_mode = 'KEYS_IUD' ).
+    ok( cond = xsdbool( lv_pe IS INITIAL ) what = 'CDC(keys) provision ok' detail = lv_pe ).
+    IF lv_pe IS NOT INITIAL.
+      zcl_erpl_rev_deltadrv=>sflight_purge_demo( ).
+      RETURN.
+    ENDIF.
+
+    " One batch carrying all three ops, so the coalesce and both races are on
+    " the same cycle rather than three tidy ones.
+    zcl_erpl_rev_deltadrv=>sflight_change( iv_kind = 'U' iv_carrid = lv_c
+                                           iv_connid = lv_n iv_fldate = lv_a ).
+    zcl_erpl_rev_deltadrv=>sflight_change( iv_kind = 'I' iv_carrid = lv_c
+                                           iv_connid = lv_n iv_fldate = lv_b ).
+    DATA(r1) = zcl_erpl_rev_cdc=>run( 'sflight_keys' ).
+    ok( cond = xsdbool( r1-error IS INITIAL )
+        what = 'CDC(keys) the cycle ran'
+        detail = |err={ r1-error } applied={ r1-applied } ins={ r1-ins } | &&
+                 |upd={ r1-upd } del={ r1-del } prune={ r1-prune }| ).
+    IF r1-error IS NOT INITIAL.
+      zcl_erpl_rev_cdc=>teardown( 'sflight_keys' ).
+      zcl_erpl_rev_deltadrv=>sflight_purge_demo( ).
+      RETURN.
+    ENDIF.
+
+    " The values came from the RE-READ, not from the log -- the log carries keys
+    " only, so a target that matches SAP here proves the whole images path.
+    SELECT SINGLE price FROM sflight
+      WHERE carrid = @lv_c AND connid = @lv_n AND fldate = @lv_a INTO @DATA(lv_px).
+    DATA(lv_dp) = zcl_erpl_rev_delta=>scalar(
+      |SELECT CAST(round(price) AS BIGINT) AS c FROM sflight_keys | &&
+      |WHERE carrid='{ lv_c }' AND fldate='2099-12-29'| ).
+    ok( cond = xsdbool( lv_dp = CONV i( lv_px ) )
+        what = 'CDC(keys) the updated row carries re-read VALUES, not log text'
+        detail = |duck={ lv_dp } sap={ CONV i( lv_px ) }| ).
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM sflight_keys | &&
+                             |WHERE fldate='2099-12-28'| ) = 1 )
+        what = 'CDC(keys) the inserted row arrived' ).
+
+    " The position advanced, and the SAP-side log was pruned behind it.
+    ok( cond = xsdbool( cnt( |SELECT coalesce(position,0) AS c FROM _erpl_rev_cdc | &&
+                             |WHERE target='sflight_keys'| ) > 0 )
+        what = 'CDC(keys) the position advanced' ).
+
+    " Delete one, and check the change log agrees with what the apply reported.
+    zcl_erpl_rev_deltadrv=>sflight_change( iv_kind = 'D' iv_carrid = lv_c
+                                           iv_connid = lv_n iv_fldate = lv_b ).
+    DATA(r2) = zcl_erpl_rev_cdc=>run( 'sflight_keys' ).
+    ok( cond = xsdbool( r2-error IS INITIAL AND r2-del = 1 )
+        what = 'CDC(keys) a physical delete is captured' detail = |{ r2-error }{ r2-del }| ).
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM sflight_keys | &&
+                             |WHERE fldate='2099-12-28'| ) = 0 )
+        what = 'CDC(keys) the deleted row left the target' ).
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM _erpl_rev_log_sflight_keys | &&
+                             |WHERE _op='D'| ) = 1 )
+        what = 'CDC(keys) the change log recorded the delete'
+        detail = |D rows={ cnt( |SELECT count(*) AS c FROM _erpl_rev_log_sflight_keys | &&
+                                |WHERE _op='D'| ) } all={ cnt( |SELECT count(*) AS c FROM | &&
+                                |_erpl_rev_log_sflight_keys| ) } res.del={ r2-del }| ).
+
+    " And a cycle with nothing to do does nothing -- the property that makes a
+    " crashed cycle safe to simply re-run.
+    DATA(r3) = zcl_erpl_rev_cdc=>run( 'sflight_keys' ).
+    ok( cond = xsdbool( r3-applied = abap_false )
+        what = 'CDC(keys) an empty batch is a no-op' ).
+
+    DATA(lv_te) = zcl_erpl_rev_cdc=>teardown( 'sflight_keys' ).
+    ok( cond = xsdbool( lv_te IS INITIAL ) what = 'CDC(keys) teardown ok' detail = lv_te ).
+    zcl_erpl_rev_deltadrv=>sflight_purge_demo( ).
+    " And the registration row this arm created, or it stays in every operator
+    " view for the rest of the run: the monitor renders a fixed frame, so one
+    " extra target pushed the daemon line out of it and the NEXT lane failed.
+    zcl_erpl_rev_util=>query(
+      |DELETE FROM _erpl_rev_delta_state WHERE target='sflight_keys'| ).
+    zcl_erpl_rev_util=>query( |DROP TABLE IF EXISTS _erpl_rev_log_sflight_keys| ).
+    zcl_erpl_rev_util=>query( |DROP SEQUENCE IF EXISTS _erpl_rev_log_sflight_keys_seq| ).
+    zcl_erpl_rev_util=>query( |DROP TABLE IF EXISTS sflight_keys| ).
   ENDMETHOD.
 
   METHOD m3_sflight.

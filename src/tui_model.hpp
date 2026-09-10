@@ -7,6 +7,7 @@
 
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "duckdb_bridge.hpp"
@@ -40,6 +41,19 @@ struct Snapshot {
 };
 
 Snapshot Load(const QueryFn &q);
+
+// Row counts for the named targets, at one moment.
+//
+// Called ONLY while the throughput graph is open. It is a count per target per
+// refresh -- which DuckDB answers from metadata and is cheap -- but it is still
+// work nobody asked for when the graph is closed, which is the argument for the
+// graph being a key rather than always on.
+//
+// A registered target whose table does not exist yet (registered, never loaded)
+// is skipped rather than erroring: a monitor that goes blank because one target
+// is new is worse than one that shows the rest.
+std::vector<std::pair<std::string, long long>> SampleCounts(
+    const QueryFn &q, const std::vector<std::string> &targets);
 
 // Worst first. An operator opening a monitor is looking for the problem, not
 // for an alphabetical list -- so blocked, then parked, then failing, then the

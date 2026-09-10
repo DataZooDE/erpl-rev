@@ -1,5 +1,7 @@
 #include "tui_model.hpp"
 
+#include <set>
+
 #include <algorithm>
 #include <cstdio>
 
@@ -62,6 +64,38 @@ void SortForOperator(std::vector<Row> &rows) {
         if (a.lag_seconds != b.lag_seconds) return a.lag_seconds > b.lag_seconds;
         return a.target < b.target;
     });
+}
+
+std::vector<std::pair<std::string, long long>> SampleCounts(
+    const QueryFn &q, const std::vector<std::string> &targets) {
+    std::vector<std::pair<std::string, long long>> out;
+    // One small count per target rather than a single UNION ALL over all of
+    // them, because it needs no catalogue probe: a target registered but never
+    // loaded has no table, its own count throws, and it is skipped. One new
+    // target must not blank the whole graph.
+    //
+    // An earlier comment here blamed the UNION form for stalling the monitor.
+    // That was wrong -- the stall was a dangling capture in the canvas
+    // callback (see cmd_top.cpp) -- and the claim had a passing test pinning
+    // it, which is how a wrong reason survives. Both are gone. This shape is
+    // kept on its own merit, not as a workaround for something that never
+    // happened.
+    for (const auto &t : targets) {
+        if (t.empty()) continue;
+        // The engine created these names, so they are already safe; checking
+        // again costs nothing and means a hand-edited registry cannot reach
+        // the SQL.
+        if (t.find_first_not_of("abcdefghijklmnopqrstuvwxyz"
+                                "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_") != std::string::npos)
+            continue;
+        try {
+            const auto r = q("SELECT count(*) AS n FROM " + t);
+            if (!r.rows.empty()) out.emplace_back(t, Num(r.rows[0], "n"));
+        } catch (const std::exception &) {
+            continue;   // no table yet, or gone: a gap, not a failure
+        }
+    }
+    return out;
 }
 
 Snapshot Load(const QueryFn &q) {

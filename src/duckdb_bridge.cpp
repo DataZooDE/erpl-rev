@@ -3,6 +3,7 @@
 #include "cycle.hpp"
 #include "transform_macros.hpp"
 
+#include <map>
 #include <set>
 #include "payload.hpp"
 #include "json_util.hpp"
@@ -1067,11 +1068,13 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
     if (tcols->HasError()) throw std::runtime_error("CDC: target describe failed: " + tcols->GetError());
     auto scols = con.Query("SELECT * FROM " + staging + " LIMIT 0");
     if (scols->HasError()) throw std::runtime_error("CDC: staging describe failed: " + scols->GetError());
-    std::vector<std::string> sset;
-    for (duckdb::idx_t c = 0; c < scols->ColumnCount(); c++) sset.push_back(LowerName(scols->names[c]));
-    auto in_staging = [&](const std::string &n) {
-        for (auto &s : sset) if (s == n) return true; return false;
-    };
+    // The probe already knows every staging column's TYPE; it used to keep only
+    // the names. That discarded fact is exactly what tells the coercion below
+    // whether a value still needs parsing.
+    std::map<std::string, std::string> stype;
+    for (duckdb::idx_t c = 0; c < scols->ColumnCount(); c++)
+        stype[LowerName(scols->names[c])] = scols->types[c].ToString();
+    auto in_staging = [&](const std::string &n) { return stype.count(n) > 0; };
     auto type_of = [&](const std::string &n) -> std::string {
         for (duckdb::idx_t c = 0; c < tcols->ColumnCount(); c++)
             if (LowerName(tcols->names[c]) == n) return tcols->types[c].ToString();
@@ -1081,14 +1084,42 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
     // Cast a log text value to a target column type. SAP dates/times are YYYYMMDD /
     // HHMMSS (not ISO), so parse them with strptime; everything else casts directly
     // (a NUMC key '0017' -> INTEGER 17, a CHAR key as-is, a decimal string -> DECIMAL).
-    auto cast_to = [](const std::string &expr, const std::string &type) -> std::string {
-        std::string T = type;
-        for (char &ch : T) if (ch >= 'a' && ch <= 'z') ch = char(ch - 'a' + 'A');
+    auto upper = [](std::string t) {
+        for (char &ch : t) if (ch >= 'a' && ch <= 'z') ch = char(ch - 'a' + 'A');
+        return t;
+    };
+    auto cast_to = [&upper](const std::string &expr, const std::string &type) -> std::string {
+        const std::string T = upper(type);
         if (T == "DATE") return "try_strptime(" + expr + ", '%Y%m%d')::DATE";
         if (T == "TIME") return "try_strptime(" + expr + ", '%H%M%S')::TIME";
         if (T.rfind("TIMESTAMP", 0) == 0)
             return "try_strptime(" + expr + ", '%Y%m%d%H%M%S')::" + type;
+        // TODO(IMAGE_IUD): a RAW column is logged as NVARCHAR hex, and CAST of
+        // that yields the bytes of the hex TEXT, not the value. Wrong today,
+        // but only on the log side and only for IMAGE_IUD -- fixed under that
+        // story rather than widened into this one.
         return "CAST(" + expr + " AS " + type + ")";
+    };
+
+    // Coerce a value from the type it HAS to the type the target wants.
+    //
+    // cast_to above is a target-type function: it picks try_strptime from the
+    // destination type alone, on the assumption that every source value is
+    // SAP-raw text. That holds for the shadow log, whose columns are HANA
+    // NVARCHAR. It does not hold for the KEYS_IUD images table, which the
+    // ordinary replicate path already typed -- a DATS column arrives as a real
+    // DATE -- and parsing a DATE as text is not merely wasteful, it does not
+    // bind: try_strptime(DATE, VARCHAR) has no overload, so the whole apply
+    // fails. Which is why KEYS_IUD has never completed a cycle.
+    //
+    // So the decision needs the SOURCE type too, and the probes above already
+    // have it.
+    auto coerce = [&upper, &cast_to](const std::string &expr, const std::string &from,
+                                     const std::string &to) -> std::string {
+        if (from.empty()) return cast_to(expr, to);      // unknown: assume text
+        if (upper(from) == upper(to)) return expr;       // already right
+        if (upper(from) != "VARCHAR") return "CAST(" + expr + " AS " + to + ")";
+        return cast_to(expr, to);                        // text: parse it
     };
 
     // Lower-cased key list (DuckDB stores unquoted identifiers lower case).
@@ -1105,11 +1136,33 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
 
     // Key match: target value = the log text cast to the target's key type. `a` is the
     // target side, `b` the (coalesced) staging side.
-    auto key_join = [&](const std::string &a, const std::string &b) {
+    // Images column metadata. Declared here because key_join below needs it;
+    // filled once the keys-mode branch has probed the images relation.
+    std::set<std::string> iset;
+    std::map<std::string, std::string> itype;
+    auto in_images = [&](const std::string &n) { return iset.count(n) > 0; };
+
+    // The type a column HAS on the relation aliased `b`. In keys mode `b` is
+    // upsert_src -- the typed images -- wherever it is built from them; on
+    // every net_del / net_iu / vanished relation it is the log's text. Passing
+    // this to coerce is what keeps one decision in one place instead of two
+    // near-identical projections and three near-identical joins.
+    auto src_type = [&](const std::string &n, bool from_images) -> std::string {
+        const auto &m = from_images ? itype : stype;
+        auto it = m.find(n);
+        return it == m.end() ? std::string() : it->second;
+    };
+
+    // `from_images` says which relation `b` is bound to. It is false for the
+    // log-derived relations (net_del, net_iu, vanished) and true wherever `b`
+    // is upsert_src in keys mode. Getting it wrong is silent on an all-VARCHAR
+    // key and fails to bind the moment a key has a DATS part.
+    auto key_join = [&](const std::string &a, const std::string &b, bool from_images = false) {
         std::string j;
         for (size_t i = 0; i < kl.size(); i++) {
             if (i) j += " AND ";
-            j += a + "." + kl[i] + " = " + cast_to(b + "." + kl[i], type_of(kl[i]));
+            j += a + "." + kl[i] + " = " +
+                 coerce(b + "." + kl[i], src_type(kl[i], from_images), type_of(kl[i]));
         }
         return j;
     };
@@ -1123,15 +1176,15 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
     // still the only authority on WHICH keys changed and what the net op was --
     // the images are only a source of values.
     const bool keys_mode = !images.empty();
-    std::set<std::string> iset;
     if (keys_mode) {
         auto icols = con.Query("SELECT * FROM " + images + " LIMIT 0");
         if (icols->HasError())
             throw std::runtime_error("CDC: images describe failed: " + icols->GetError());
-        for (duckdb::idx_t c = 0; c < icols->ColumnCount(); c++)
+        for (duckdb::idx_t c = 0; c < icols->ColumnCount(); c++) {
             iset.insert(LowerName(icols->names[c]));
+            itype[LowerName(icols->names[c])] = icols->types[c].ToString();
+        }
     }
-    auto in_images = [&](const std::string &n) { return iset.count(n) > 0; };
 
     // Data columns to upsert = target columns also present in the value source
     // (so delete-only staging, which carries only keys, yields a keys-only
@@ -1149,6 +1202,35 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
                 "'; __erpl_ is reserved for replication control columns");
         const bool present = keys_mode ? in_images(n) : in_staging(n);
         if (present) { dcols.push_back(n); dtypes.push_back(tcols->types[c].ToString()); }
+    }
+
+    // A target column the images do not carry would be WIPED, not left stale:
+    // the keys-mode apply is delete-then-insert, so every changed key gets
+    // NULL/default in that column and nothing says so. Refuse instead.
+    //
+    // The images select every source column, so after the drift watchdog is
+    // pointed at the real target this should never fire -- which is exactly why
+    // refusing is safe. It fires only when the target holds something the
+    // source does not (a transform column, a hand-widened target), and silently
+    // emptying that column is not a reasonable reading of the operator's
+    // intent. DELETE_ONLY is excluded: its staging carries keys only by design,
+    // so a keys-only upsert there is a deliberate no-op.
+    if (keys_mode) {
+        std::vector<std::string> missing;
+        for (duckdb::idx_t c = 0; c < tcols->ColumnCount(); c++) {
+            const std::string n = LowerName(tcols->names[c]);
+            if (!n.empty() && n[0] == '_') continue;   // engine-owned
+            if (std::find(dcols.begin(), dcols.end(), n) == dcols.end()) missing.push_back(n);
+        }
+        if (!missing.empty()) {
+            std::string names;
+            for (size_t i = 0; i < missing.size(); i++) { if (i) names += ", "; names += missing[i]; }
+            throw std::runtime_error(
+                "CDC: the re-read images for " + target + " are missing target column(s) " +
+                names + "; a keys-mode apply is delete-then-insert, so applying this batch "
+                "would empty them for every changed key. Check the source still has them, "
+                "or re-seed the target.");
+        }
     }
 
     // The rows to write, in KEYS mode: the images INNER JOINed to the net-I/U key
@@ -1211,10 +1293,14 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
                 "SELECT "
                 "(SELECT count(*) FROM " + vanished + " c WHERE EXISTS (SELECT 1 FROM " + target +
                   " t WHERE " + dj + ")) AS gone,"
+                // `c` is upsert_src here -- the IMAGES -- while dj above is
+                // bound to `vanished`, which is log text. One query, two
+                // relations, two source types: the same dj served both and was
+                // wrong for one of them.
                 "(SELECT count(*) FROM " + upsert_src + " c WHERE NOT EXISTS (SELECT 1 FROM " +
-                  target + " t WHERE " + key_join("t", "c") + ")) AS ins,"
+                  target + " t WHERE " + key_join("t", "c", true) + ")) AS ins,"
                 "(SELECT count(*) FROM " + upsert_src + " c WHERE EXISTS (SELECT 1 FROM " +
-                  target + " t WHERE " + key_join("t", "c") + ")) AS upd");
+                  target + " t WHERE " + key_join("t", "c", true) + ")) AS upd");
             if (kr->HasError())
                 throw std::runtime_error("CDC: keys-mode count failed: " + kr->GetError());
             res.del += kr->GetValue(0, 0).GetValue<int64_t>();
@@ -1240,7 +1326,8 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
             collist += dcols[i];
             // The log delivers every value as SAP-raw text; cast it to the target
             // column type for the insert (keys included, harmless for delete-only).
-            sellist += cast_to("c." + dcols[i], dtypes[i]) + " AS " + dcols[i];
+            sellist += coerce("c." + dcols[i], src_type(dcols[i], keys_mode), dtypes[i]) +
+                       " AS " + dcols[i];
         }
         del_iu_sql = "DELETE FROM " + target + " t WHERE EXISTS (SELECT 1 FROM " + net_iu +
                      " c WHERE " + key_join("t", "c") + ")";
@@ -1293,7 +1380,7 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
                 for (size_t i = 0; i < dcols.size(); ++i) {
                     if (i) { cl += ","; sl += ","; }
                     cl += dcols[i];
-                    sl += cast_to("c." + dcols[i], dtypes[i]);
+                    sl += coerce("c." + dcols[i], src_type(dcols[i], keys_mode), dtypes[i]);
                 }
                 if (!cl.empty()) {
                     const std::string src = keys_mode ? upsert_src : net_iu;
@@ -1341,7 +1428,8 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
                     // presence test is exactly the one res.ins/res.upd use.
                     (void)op_src;
                     const std::string tgt_has =
-                        "EXISTS (SELECT 1 FROM " + target + " t WHERE " + key_join("t", "c") + ")";
+                        "EXISTS (SELECT 1 FROM " + target + " t WHERE " +
+                        key_join("t", "c", keys_mode) + ")";
                     log_sql = "INSERT INTO " + logtab + " (" + cl +
                               ", _seq, _op, _run_id, _commit_ts, _applied_at) SELECT " + sl +
                               ", nextval('" + logtab + "_seq'), CASE WHEN " + tgt_has +

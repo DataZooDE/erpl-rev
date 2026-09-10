@@ -168,6 +168,66 @@ CLASS zcl_erpl_rev_wmtest IMPLEMENTATION.
     ok( cond = xsdbool( wm( 'zdelta_wm_late' ) = lv_wm )
         what = 'load type F repairs data without moving the watermark'
         detail = |{ lv_wm } -> { wm( 'zdelta_wm_late' ) }| ).
+
+    " --- L: seed AND load, once ------------------------------------------
+    "
+    " L had no live arm at all. This method covered I and F and stopped; D is
+    " every other cycle in this suite; and the CLI lane only checked that
+    " load_type_default='L' survives the command queue, which is a field
+    " round-tripping rather than the behaviour happening. That gap was found by
+    " the variant coverage matrix, not by anything failing -- which is the
+    " point of having one.
+    "
+    " L is the combination the other two are not: it moves the watermark (F
+    " deliberately does not) AND transfers rows (I deliberately does not). And
+    " it is ONE-SHOT: the engine spends it, so the next tick runs an ordinary
+    " delta instead of re-seeding forever. The spend is keyed on the run's load
+    " type matching load_type_default, so the default has to be set for the
+    " engine's half to fire at all.
+    zcl_erpl_rev_util=>query(
+      |UPDATE _erpl_rev_delta_state SET load_type_default='L', one_shot_spent=false | &&
+      |WHERE target='zdelta_wm_late'| ).
+    " The watermark is cleared first so the target starts from nothing.
+    "
+    " Note what this does NOT prove. Substituting F for L here still passes the
+    " seed assertion, because F also establishes a watermark when there is none
+    " -- a first load has to leave a position behind whatever its load type.
+    " "L seeds and F does not" is simply false from empty, and an assertion
+    " named that way would have been describing something that does not happen.
+    " What actually separates the two is the SPEND, below, and that one is
+    " proven to go red when L is replaced by F.
+    zcl_erpl_rev_util=>query(
+      |UPDATE _erpl_rev_delta_state SET wm_value=NULL WHERE target='zdelta_wm_late'| ).
+    zcl_erpl_rev_util=>query( |DELETE FROM zdelta_wm_late| ).
+
+    zcl_erpl_rev_delta=>run( iv_target = 'zdelta_wm_late' iv_load_type = 'L' ).
+
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM zdelta_wm_late| ) > 0 )
+        what = 'load type L transfers rows, unlike I'
+        detail = |{ cnt( |SELECT count(*) AS c FROM zdelta_wm_late| ) } rows| ).
+    ok( cond = xsdbool( wm( 'zdelta_wm_late' ) IS NOT INITIAL )
+        what = 'load type L leaves the target loaded and positioned'
+        detail = |cleared -> { wm( 'zdelta_wm_late' ) }| ).
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM _erpl_rev_delta_state | &&
+                             |WHERE target='zdelta_wm_late' AND one_shot_spent| ) = 1 )
+        what = 'load type L is spent once it has run' ).
+
+    " And spent means spent: a second run under the same default must not
+    " seed again. Unspent, a one-shot default re-seeds on every due tick and
+    " the target never advances past its first load.
+    DATA(lv_wm_after_l) = wm( 'zdelta_wm_late' ).
+    zcl_erpl_rev_delta=>run( iv_target = 'zdelta_wm_late' ).
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM _erpl_rev_delta_state | &&
+                             |WHERE target='zdelta_wm_late' AND one_shot_spent| ) = 1 )
+        what = 'load type L stays spent across the next cycle' ).
+    ok( cond = xsdbool( wm( 'zdelta_wm_late' ) >= lv_wm_after_l )
+        what = 'the next cycle is an ordinary delta: the watermark never rewinds'
+        detail = |{ lv_wm_after_l } -> { wm( 'zdelta_wm_late' ) }| ).
+
+    " Leave the registration as the other suites expect to find it.
+    zcl_erpl_rev_util=>query(
+      |UPDATE _erpl_rev_delta_state SET load_type_default=NULL, one_shot_spent=false | &&
+      |WHERE target='zdelta_wm_late'| ).
   ENDMETHOD.
 
 ENDCLASS.

@@ -439,6 +439,7 @@ drop the request silently with zero impact. Details: [`docs/telemetry.md`](docs/
 - [`docs/operations.md`](docs/operations.md) — the operator's verbs, the monitor, and the metrics endpoint
 - [`docs/control-tables.md`](docs/control-tables.md) — the control schema as a versioned interface
 - [`docs/stats.md`](docs/stats.md) — what each run records
+- [`docs/perf-results.md`](docs/perf-results.md) — measured numbers, dated, with the box they came from
 
 **Installing and upgrading**
 
