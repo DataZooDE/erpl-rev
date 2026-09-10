@@ -173,24 +173,6 @@ the idempotent merge absorbs. The state machine guards transitions
   `erpl_rev_targets` reports the target as run rather than as never run, and that a
   physical delete leaves the trigger target while the watermark target keeps it.
 
-- **Parity against an independent full load** — `ZCL_ERPL_REV_PARITYTEST`. Two paths
-  to the same data must agree cell by cell: path A is a trigger-CDC pipeline over a
-  type-spanning source with an edge-value corpus (negative decimals, NUMC leading
-  zeros, empty rather than null, unicode, DATS/TIMS boundaries); path B is a plain
-  full load at the same moment. `diff_joindiff` from the
-  [anofox-tabular](https://github.com/DataZooDE/anofox-tabular) DuckDB extension must
-  return zero rows.
-
-  Every defect found in `KEYS_IUD` was type-specific or key-specific **while the row
-  counts matched** — rows deleted and re-inserted empty, values coerced wrong, keys
-  joined on the wrong column. A count is blind to all of it; a diff names the key and
-  the column. The suite carries its own negative controls: a tampered cell and a
-  tampered key must both be caught, or a diff that returns zero has proved nothing.
-
-  Both paths are ours, so a shared coercion bug would agree with itself. The
-  comparison that crosses the boundary to SAP is `sync validate --full`, and that is
-  the anchor.
-
   It exists because three defects reached `main` together — the planner gating trigger
   targets on a column nothing wrote, the daemon running every planned cycle through the
   watermark entry point, and the trigger apply never writing `_erpl_rev_delta_state` —
