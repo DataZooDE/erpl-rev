@@ -283,7 +283,7 @@ suite watermark ZCL_ERPL_REV_WMTEST abap/zcl_erpl_rev_wmtest.abap WM 15 "" \
 suite soak ZCL_ERPL_REV_SOAKTEST abap/zcl_erpl_rev_soaktest.abap SOAK 6 "@soak" \
   "the daemon under continuous change: no stall, no parking, nothing lost"
 
-suite daemon ZCL_ERPL_REV_DAEMONTEST abap/zcl_erpl_rev_daemontest.abap DAEMON 20 "@soak" \
+suite daemon ZCL_ERPL_REV_DAEMONTEST abap/zcl_erpl_rev_daemontest.abap DAEMON 28 "@soak" \
   "the daemon as a real background job: it ticks, it replicates with nobody calling run(), a second one refuses to start, and the stop flag ends it"
 
 suite stress ZCL_ERPL_REV_STREAMSTRESS abap/zcl_erpl_rev_streamstress.abap STRESS 25 "@soak" \
@@ -589,7 +589,15 @@ echo "   top --once renders the targets and the daemon state"
 TOPG="$(cli top --once --graph --refreshes 3 2>&1 || true)"
 grep -q "throughput" <<<"$TOPG" || fail "top --graph drew no throughput box: $(head -c 300 <<<"$TOPG")"
 grep -q "TARGET" <<<"$TOPG"     || fail "top --graph lost the target table: $(head -c 300 <<<"$TOPG")"
-echo "   top --graph samples over several refreshes without stalling"
+# The operation split, on both surfaces. Asserted in ASCII rather than by the
+# glyphs themselves so the check does not depend on the CI runner's locale --
+# the glyphs are covered by the unit tier, which owns what a triangle means.
+grep -q "LAST CYCLE" <<<"$TOPG" || fail "top lost the per-operation column: $(head -c 300 <<<"$TOPG")"
+# The full word, on its own line. "ins" matched half a dozen other things and
+# would have gone green on a key squeezed down to a fragment, which is exactly
+# what FTXUI did to it when the legend shared the row.
+grep -q "insert"     <<<"$TOPG" || fail "top --graph drew no operation key: $(head -c 400 <<<"$TOPG")"
+echo "   top --graph samples over several refreshes without stalling, split by operation"
 fi
 
 # cdc status on a target that is not a trigger target must say so, not crash.

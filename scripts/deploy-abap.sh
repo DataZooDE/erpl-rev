@@ -71,12 +71,14 @@ tabl ZDELTA_D   zdelta_d.ddl   "DATE watermark test table (complete-day rule)"
 tabl ZDELTA_ALL zdelta_all.ddl "one column per replication strategy (BSEG-shaped)"
 tabl ZDELTA_AUDIT zdelta_audit.ddl "change-generator audit (the loss/latency oracle)"
 tabl ZDELTA_DT  zdelta_dt.ddl  "DATS+TIMS watermark test table (pair comparison)"
+tabl ZSTOCK_MOVE zstock_move.ddl "goods movements, MSEG-shaped (the demo fixture)"
 
 echo "== interfaces (before util -- replicate's signature references it) =="
 intf ZIF_ERPL_REV_PROGRESS zif_erpl_rev_progress.intf.abap "replicate progress callback"
 
 echo "== runtime classes (typemap before util -- util depends on it) =="
 cls ZCL_WIDE_BSEG          zcl_wide_bseg.abap          "populate ZWIDE_BSEG"
+cls ZCL_STOCK_MOVE_FILL   zcl_stock_move_fill.abap    "populate ZSTOCK_MOVE"
 cls ZCL_ERPL_REV_TYPEMAP   zcl_erpl_rev_typemap.abap   "DDIC<->DuckDB type map"
 cls ZCL_ERPL_REV_UTIL      zcl_erpl_rev_util.abap      "query/describe/replicate"
 cls ZCL_ERPL_REV_DELTA     zcl_erpl_rev_delta.abap     "delta engine (state + 4 readers)"
@@ -132,6 +134,12 @@ else echo "  WARN RFC FMs (Z_DUCKDB_*)"; rc=1; fi
 # cell, so an unseeded table fails it with `rows=0 cols=390` -- a result that points
 # at nothing. The class DELETEs first, so this is idempotent; 100k rows is ~20s.
 echo "== seed ZWIDE_BSEG =="
+# A million rows, ~10s. The demo's initial sync is the point of it, and a
+# hundred thousand loads in one second -- too fast to watch.
+echo "== seed ZSTOCK_MOVE =="
+if adt object run ZCL_STOCK_MOVE_FILL 2>&1 | grep -aqE 'populated'; then echo "  OK   ZSTOCK_MOVE seeded"
+else echo "  WARN ZSTOCK_MOVE seed"; rc=1; fi
+
 if adt object run ZCL_WIDE_BSEG 2>&1 | grep -aqE 'populated'; then echo "  OK   ZWIDE_BSEG seeded"
 else echo "  WARN ZWIDE_BSEG seed"; rc=1; fi
 

@@ -46,6 +46,24 @@ makes DuckDB call *into* SAP, **erpl-rev has SAP call out into DuckDB.**
   **watermark, change-document (CDHDR/CDPOS), and snapshot-diff (deletes)** methods,
   all merging server-side, idempotent and re-runnable. Customer-owned Open SQL only
   (no ODP / SAPI / `RFC_READ_TABLE`). See [`docs/delta.md`](docs/delta.md).
+- **Real time, when you want it.** A daemon at a two-second cadence, and a
+  trigger tier that catches physical deletes a watermark cannot see. Three
+  minutes, unedited: a million goods movements synced in ten seconds, then a
+  material document posted, transferred and archived in SAP — each change in
+  DuckDB a second or two later — and finally thirty seconds of continuous mixed
+  traffic at a few dozen rows a second:
+
+![A million goods movements sync in ten seconds, then a material document is posted, transferred between storage locations and archived in SAP, and finally thirty seconds of continuous mixed traffic; each change appears in DuckDB a second or two later while erpl-rev top graphs the throughput, one glyph per operation](demo/realtime.gif)
+
+  The right-hand pane is `erpl-rev top`, started once and never touched again:
+  **colour is the target, the glyph is the operation** — `▲` insert, `◆` update,
+  `▼` delete — and the `LAST CYCLE` column carries the exact per-cycle split.
+  The clip ends by measuring itself: SAP's change time against the apply time,
+  per row, from two independent clocks.
+
+  See [`docs/demo.md`](docs/demo.md) for what it proves and what it does not.
+  Re-render it with `bash demo/setup.sh && vhs demo/realtime.tape`, or package it
+  as a single shareable HTML file with `bash demo/package-html.sh`.
 - **Land in the open lakehouse.** parquet / partitioned datasets, **DuckLake** or
   **Iceberg**, on local disk or **cloud object storage** (S3 / GCS / Azure).
 - **Publish into a warehouse.** `ATTACH` **Postgres / MySQL / BigQuery / MotherDuck**
@@ -440,6 +458,7 @@ drop the request silently with zero impact. Details: [`docs/telemetry.md`](docs/
 - [`docs/control-tables.md`](docs/control-tables.md) — the control schema as a versioned interface
 - [`docs/stats.md`](docs/stats.md) — what each run records
 - [`docs/perf-results.md`](docs/perf-results.md) — measured numbers, dated, with the box they came from
+- [`docs/demo.md`](docs/demo.md) — the recorded session, what it proves and what it does not
 
 **Installing and upgrading**
 

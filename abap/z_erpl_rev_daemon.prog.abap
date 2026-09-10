@@ -255,6 +255,15 @@ FORM run_planned_cycles USING iv_plan TYPE string.
     IF sy-subrc <> 0 OR lv_target IS INITIAL. CONTINUE. ENDIF.
     FIND PCRE '"load_type"\s*:\s*"([^"]*)"' IN lv_obj SUBMATCHES lv_load.
     IF lv_load IS INITIAL. lv_load = 'D'. ENDIF.
+    " The plan has always said which METHOD each cycle is, and nothing read it:
+    " every planned cycle went to zcl_erpl_rev_delta=>run, the watermark and
+    " snapshot entry point. So even once the planner started returning trigger
+    " targets they were run through the wrong door -- the trigger tier was
+    " never driven by the daemon at all, and its cycles only ever happened
+    " because a test called zcl_erpl_rev_cdc=>run itself.
+    DATA lv_method TYPE string.
+    CLEAR lv_method.
+    FIND PCRE '"method"\s*:\s*"([^"]*)"' IN lv_obj SUBMATCHES lv_method.
 
     " The plan's own size decision, honoured.
     "
@@ -272,7 +281,17 @@ FORM run_planned_cycles USING iv_plan TYPE string.
     CLEAR lv_worker.
     FIND PCRE '"worker"\s*:\s*(true|false)' IN lv_obj SUBMATCHES lv_worker.
 
-    IF lv_worker = 'true'.
+    IF lv_method = 'CDC'.
+      " Inline, and deliberately not detachable: the per-target worker report
+      " runs a DELTA cycle, so detaching a trigger cycle through it would run
+      " the wrong thing. A trigger cycle is a staged read of what the triggers
+      " have already captured -- small by construction -- so it belongs on the
+      " tick thread.
+      DATA(ls_cdc) = zcl_erpl_rev_cdc=>run( lv_target ).
+      IF ls_cdc-error IS NOT INITIAL.
+        WRITE: / |DAEMON CDC { lv_target }: { ls_cdc-error }|.
+      ENDIF.
+    ELSEIF lv_worker = 'true'.
       " Its own background job, through the existing per-target report -- no new
       " SAP object, which the footprint gate requires.
       DATA lv_wjn TYPE tbtcjob-jobname VALUE 'ERPL_REV_CYCLE'.

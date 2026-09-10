@@ -68,7 +68,7 @@ GENERATOR := $(shell command -v ninja >/dev/null 2>&1 && echo Ninja || echo "Uni
 
 DIST ?= dist
 
-.PHONY: all build configure test ctest run run-mem run-no-quack e2e duckdb-dist submodules start-sap clean bundle
+.PHONY: all build configure test ctest run run-mem run-no-quack e2e e2e-full e2e-perf duckdb-dist submodules start-sap clean bundle
 
 all: build
 
@@ -155,6 +155,23 @@ run-no-quack: build
 
 e2e: build
 	./scripts/e2e.sh
+
+# EVERYTHING except the perf lane, in one pass. This is the release gate.
+#
+# `make e2e` skips @soak -- the daemon running for real, the soak, the streaming
+# stress -- because those take minutes rather than seconds. They are also the
+# only lanes that drive the product the way a customer does, and every defect
+# that has reached main from this tree so far was invisible to the rest.
+#
+# One pass rather than ONLY='@soak', so a release is gated on everything having
+# been green TOGETHER, on one system, in one state. Two lanes that each pass
+# alone say nothing about the order they run in.
+e2e-full: build
+	ERPL_REV_E2E_SKIP='@perf' ./scripts/e2e.sh
+
+# The measured-numbers lane behind docs/perf-results.md.
+e2e-perf: build
+	ERPL_REV_E2E_ONLY='@perf' ./scripts/e2e.sh
 
 start-sap:
 	./scripts/start-sap.sh

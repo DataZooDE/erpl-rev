@@ -275,6 +275,20 @@ DuckDbBridge::DuckDbBridge(const std::string &path, const std::string &init_sql)
         "CASE WHEN last_run_ts IS NULL THEN NULL "
         "     ELSE CAST(epoch(now()) - epoch(last_run_ts) AS BIGINT) END AS lag_seconds, "
         "last_run_ts, coalesce(rows_applied,0) AS last_rows, "
+        // What the last cycle actually DID, three ways. rows_applied is their
+        // sum, and a sum cannot tell a target that loaded a million rows from
+        // one that deleted them -- which is the single most consequential
+        // distinction an operator can draw from this view.
+        //
+        // Read from the run statistics rather than stored on the registry: a
+        // stored copy is a second place for the truth to live, and the one
+        // thing every surface here agrees on is that these are views over what
+        // the engine already wrote. The cost is one windowed scan of a table
+        // with one row per cycle, shared by the CLI, the TUI, the metrics
+        // endpoint and the ABAP screen because they all read this view.
+        "coalesce(r.rows_ins,0) AS last_ins, "
+        "coalesce(r.rows_upd,0) AS last_upd, "
+        "coalesce(r.rows_del,0) AS last_del, "
         "coalesce(fail_count,0) AS fail_count, last_error, "
         "coalesce(log_enabled,false) AS log_enabled, "
         "coalesce(wm_value,'') AS watermark, "
@@ -288,7 +302,14 @@ DuckDbBridge::DuckDbBridge(const std::string &path, const std::string &init_sql)
         "(last_run_ts IS NOT NULL AND coalesce(fail_count,0) = 0 "
         " AND coalesce(status,'') <> 'BLOCKED' "
         " AND (parked_until IS NULL OR parked_until <= now())) AS is_healthy "
-        "FROM _erpl_rev_delta_state");
+        "FROM _erpl_rev_delta_state "
+        // LEFT JOIN, and the subquery renames its key: a target registered but
+        // never run must still appear, with zeros rather than vanishing.
+        "LEFT JOIN (SELECT target AS rs_target, rows_ins, rows_upd, rows_del, "
+        "                  row_number() OVER (PARTITION BY target "
+        "                                     ORDER BY run_id DESC) AS rn "
+        "           FROM _erpl_rev_run_stats) r "
+        "  ON r.rs_target = _erpl_rev_delta_state.target AND r.rn = 1");
     if (tview->HasError())
         throw std::runtime_error("DuckDB targets view init failed: " + tview->GetError());
 
@@ -1528,6 +1549,18 @@ CdcApplyResult DuckDbBridge::CdcApply(const std::string &target, const std::stri
                   std::to_string(res.del) + ")");
         Exec(con, "UPDATE _erpl_rev_cdc SET position=" + std::to_string(max_seq) +
                   ", last_run_ts=now(), status='ACTIVE' WHERE target=" + SqlLit(target));
+        // ...and the same fields the watermark tier's commit sets, because
+        // erpl_rev_targets -- the view behind `top`, `sync ls`, the Prometheus
+        // gauges and the ALV report -- is built from _erpl_rev_delta_state, and
+        // this path never wrote it. A trigger target replicated correctly and
+        // reported "IDLE, never run, 0 rows" to every operator surface for as
+        // long as it existed. shadow_rows is filled here too: the tick planner
+        // uses it as the fast path for "work is waiting", and nothing had ever
+        // assigned it.
+        Exec(con, "UPDATE _erpl_rev_delta_state SET last_run_ts=now(), rows_applied=" +
+                  std::to_string(res.ins + res.upd + res.del) +
+                  ", status='IDLE', fail_count=0, last_error=NULL WHERE target=" +
+                  SqlLit(target));
         Exec(con, "DROP TABLE " + staging);
         if (keys_mode) Exec(con, "DROP TABLE IF EXISTS " + images);
         Exec(con, "COMMIT");

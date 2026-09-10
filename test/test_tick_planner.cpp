@@ -448,3 +448,31 @@ TEST_CASE("tick_planner: load type I is not planned forever", "[plan]") {
     t.one_shot_spent = true;
     CHECK(PlanTick({t}, {}, Daemon(2), kNow).cycles[0].load_type == "D");
 }
+
+TEST_CASE("plan: a trigger target still runs on its cadence when nothing reports pending rows",
+          "[planner][cdc]") {
+    // shadow_rows is the fast path -- "work is known to be waiting, run it now"
+    // -- and it was also the ONLY path. Nothing in the tree ever writes that
+    // column (it is created by migration v3, read here and in the TICK handler,
+    // and assigned nowhere), so it is always 0 and a trigger target was never
+    // due. The daemon could not drive the trigger tier at all: registered,
+    // provisioned, triggers firing, shadow table filling, and the planner
+    // silently skipping it forever.
+    //
+    // So the gate is now "known-pending OR the cadence has elapsed". A cycle on
+    // an empty shadow table is already a cheap, tested no-op, which is what
+    // makes polling an acceptable floor rather than a cost.
+    auto t = T("cdc", "micro:2", kNow - 30);   // long past its cadence
+    t.method = "CDC";
+    CdcRow c;
+    c.target = "cdc";
+    c.status = "ACTIVE";
+    c.shadow_rows = 0;                          // nothing has told us otherwise
+    CHECK(Has(PlanTick({t}, {c}, Daemon(), kNow), "cdc"));
+
+    // ...and it is still skipped when the cadence has NOT elapsed and nothing
+    // is known to be waiting, so the fast path keeps its meaning.
+    auto fresh = T("cdc", "micro:60", kNow - 1);
+    fresh.method = "CDC";
+    CHECK_FALSE(Has(PlanTick({fresh}, {c}, Daemon(), kNow), "cdc"));
+}

@@ -82,6 +82,11 @@ TEST_CASE("model: SampleCounts reads the row counts it asked for", "[tui][graph]
     auto q = [&](const std::string &sql) {
         seen.push_back(sql);
         QueryResult r;
+        if (sql.find("erpl_rev_run_stats") != std::string::npos) {
+            r.rows = {R"({"target":"stock_moves","ins":1000000,"upd":40,"del":7})"};
+            r.row_count = 1;
+            return r;
+        }
         r.rows = {sql.find("stock_moves") != std::string::npos ? R"({"n":79500})"
                                                               : R"({"n":12200})"};
         r.row_count = 1;
@@ -90,20 +95,52 @@ TEST_CASE("model: SampleCounts reads the row counts it asked for", "[tui][graph]
 
     const auto got = tui::SampleCounts(q, {"stock_moves", "material_master"});
     REQUIRE(got.size() == 2);
-    CHECK(got[0].first == "stock_moves");
-    CHECK(got[0].second == 79500);
-    CHECK(got[1].second == 12200);
-    // One query per target, so a missing table costs only its own sample.
+    CHECK(got[0].target == "stock_moves");
+    CHECK(got[0].rows == 79500);
+    CHECK(got[1].rows == 12200);
+    // The operation counters travel with the count, so one sample is one
+    // moment: reading them on a separate pass would let the two halves of a
+    // bucket come from different instants.
+    CHECK(got[0].ins == 1000000);
+    CHECK(got[0].upd == 40);
+    CHECK(got[0].del == 7);
+    // A target that has never completed a cycle keeps zeros rather than
+    // inheriting its neighbour's.
+    CHECK(got[1].upd == 0);
+    // One aggregate for every target's operation counters, then one count per
+    // target -- so a missing table costs only its own sample.
+    //
     // This does NOT assert the absence of a UNION: an earlier version did,
     // enforcing a diagnosis that turned out to be wrong, which is how a
     // refuted claim outlives the evidence against it.
-    CHECK(seen.size() == 2);
+    CHECK(seen.size() == 3);
+}
+
+TEST_CASE("model: run statistics that cannot be read cost only the updates",
+          "[tui][graph]") {
+    // The operation counters come from a view; the row counts do not. If the
+    // view is missing -- an older database file, a permission -- the graph
+    // should lose its update bands and keep everything else, rather than going
+    // blank at the moment someone opened it to find out what was happening.
+    auto q = [&](const std::string &sql) -> QueryResult {
+        if (sql.find("erpl_rev_run_stats") != std::string::npos)
+            throw std::runtime_error("Catalog Error: view erpl_rev_run_stats does not exist");
+        QueryResult r;
+        r.rows = {R"({"n":500})"};
+        r.row_count = 1;
+        return r;
+    };
+    const auto got = tui::SampleCounts(q, {"stock_moves"});
+    REQUIRE(got.size() == 1);
+    CHECK(got[0].rows == 500);
+    CHECK(got[0].upd == 0);
 }
 
 TEST_CASE("model: a target with no table yet is skipped, not fatal", "[tui][graph]") {
     // Registered but never loaded. Counting it throws, and one new target must
     // not blank the whole graph.
     auto q = [&](const std::string &sql) -> QueryResult {
+        if (sql.find("erpl_rev_run_stats") != std::string::npos) return QueryResult{};
         if (sql.find("material_master") != std::string::npos)
             throw std::runtime_error("Catalog Error: Table with name material_master does not exist");
         QueryResult r;
@@ -112,16 +149,22 @@ TEST_CASE("model: a target with no table yet is skipped, not fatal", "[tui][grap
     };
     const auto got = tui::SampleCounts(q, {"stock_moves", "material_master"});
     REQUIRE(got.size() == 1);
-    CHECK(got[0].first == "stock_moves");
+    CHECK(got[0].target == "stock_moves");
 }
 
 TEST_CASE("model: a target name that is not a plain identifier is refused", "[tui][graph]") {
-    bool asked = false;
-    auto q = [&](const std::string &) {
-        asked = true;
+    // The name is interpolated into SQL because a table name cannot be bound.
+    // The engine wrote these names, so they are already safe -- but a
+    // hand-edited registry must not reach the query builder, and the check
+    // that stops it needs a test of its own.
+    std::vector<std::string> seen;
+    auto q = [&](const std::string &sql) {
+        seen.push_back(sql);
         return QueryResult{};
     };
     const auto got = tui::SampleCounts(q, {"a; DROP TABLE x"});
     CHECK(got.empty());
-    CHECK_FALSE(asked);
+    // The fixed aggregate over the run statistics carries no target name and
+    // is issued regardless; nothing built from the rejected one is.
+    for (const auto &sql : seen) CHECK(sql.find("DROP TABLE") == std::string::npos);
 }

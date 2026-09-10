@@ -9,10 +9,46 @@
 namespace erpl_rev {
 namespace tui {
 
+const char *OpGlyph(Op op) {
+    // Direction is the mnemonic: a row arriving points up, a row leaving points
+    // down, and a row changed in place is neither. Chosen over I/U/D letters
+    // because a column of letters reads as text and stops looking like a bar.
+    switch (op) {
+        case Op::kInsert: return "▲";
+        case Op::kUpdate: return "◆";
+        case Op::kDelete: return "▼";
+    }
+    return " ";
+}
+
+const char *OpName(Op op) {
+    switch (op) {
+        case Op::kInsert: return "ins";
+        case Op::kUpdate: return "upd";
+        case Op::kDelete: return "del";
+    }
+    return "";
+}
+
+double OpRate::At(Op op) const {
+    switch (op) {
+        case Op::kInsert: return ins;
+        case Op::kUpdate: return upd;
+        case Op::kDelete: return del;
+    }
+    return 0;
+}
+
 double RateBucket::Total() const {
     double t = 0;
-    for (const auto &r : rates) t += r.second;
+    for (const auto &r : rates) t += r.Total();
     return t;
+}
+
+double RateBucket::TotalFor(const std::string &target) const {
+    for (const auto &r : rates)
+        if (r.target == target) return r.Total();
+    return 0;
 }
 
 std::vector<RateBucket> Rates(const std::vector<CountSample> &samples) {
@@ -44,21 +80,69 @@ std::vector<RateBucket> Rates(const std::vector<CountSample> &samples) {
             // for the first time here contributes nothing to this bucket --
             // its whole existing size is not throughput, and drawing it as
             // such is the single most flattering bug this file could have.
-            const auto at_prev =
-                std::find_if(prev.counts.begin(), prev.counts.end(),
-                             [&](const std::pair<std::string, long long> &p) {
-                                 return p.first == c.first;
-                             });
+            const auto at_prev = std::find_if(
+                prev.counts.begin(), prev.counts.end(),
+                [&](const TargetCount &p) { return p.target == c.target; });
             if (at_prev == prev.counts.end()) continue;
 
-            // A count can legitimately fall: a reload truncates before it
-            // loads. That is not negative throughput.
-            const long long delta = c.second - at_prev->second;
-            b.rates.emplace_back(c.first, delta > 0 ? static_cast<double>(delta) / dt : 0.0);
+            OpRate r;
+            r.target = c.target;
+
+            const long long dn = c.rows - at_prev->rows;
+            const long long du = c.upd - at_prev->upd;
+            const long long dd = c.del - at_prev->del;
+
+            // Inserts from the ROW COUNT, which is the only signal that moves
+            // while a load is still running -- a cycle reports nothing until it
+            // finishes, so a graph fed from reports alone sits flat for the
+            // whole load and then jumps.
+            r.ins = dn > 0 ? static_cast<double>(dn) / dt : 0.0;
+
+            // Deletes from whichever signal sees MORE of them: the count, which
+            // sees a delete only when nothing else was inserted alongside it,
+            // or the cycle's own report, which is exact.
+            //
+            // Under continuous traffic the count sees none at all. Twenty-two
+            // inserts and seven deletes in one interval net to fifteen, and
+            // fifteen is all a count can tell you -- so a table being written
+            // and pruned at the same time, which is what an ordinary working
+            // day looks like, drew no deletes whatsoever. The report fixes
+            // that, and taking the larger of the two keeps a delete visible in
+            // the interval it happened even when the cycle has not reported yet.
+            const long long shrank = dn < 0 ? -dn : 0;
+            const long long del = std::max(dd, shrank);
+            r.del = del > 0 ? static_cast<double>(del) / dt : 0.0;
+
+            // Updates from the report and only from the report: an update
+            // changes no row count, so counting cannot see it at all.
+            r.upd = du > 0 ? static_cast<double>(du) / dt : 0.0;
+
+            // Reported INSERTS stay deliberately unused. A full load writes one
+            // statistics row, at the end, carrying the whole million; adding it
+            // to the count that already drew those rows arriving would draw
+            // them twice, the second time as one spike at a rate the machine
+            // never reached. Nothing is added back into the insert band for the
+            // same reason: in an interval that both inserted and deleted, the
+            // insert band stays NET, which is a lower bound and never an
+            // invention. The exact figures are in the target table.
+
+            b.rates.push_back(std::move(r));
         }
         out.push_back(std::move(b));
     }
     return out;
+}
+
+double ScaleFor(const std::vector<RateBucket> &buckets, int px) {
+    if (buckets.empty() || px <= 0) return 0.0;
+    // Only the buckets that are drawn. The history is longer than the window,
+    // and scaling to a load that scrolled off the left is what made every
+    // subsequent change round to nothing.
+    const size_t n = std::min<size_t>(buckets.size(), static_cast<size_t>(px));
+    double peak = 0;
+    for (size_t i = buckets.size() - n; i < buckets.size(); ++i)
+        peak = std::max(peak, buckets[i].Total());
+    return NiceCeiling(peak);
 }
 
 double NiceCeiling(double peak) {
@@ -70,17 +154,19 @@ double NiceCeiling(double peak) {
     return step * mag;
 }
 
-std::string FormatRate(double rows_per_sec) {
+std::string FormatCount(double rows) {
     char buf[32];
-    if (rows_per_sec < 1000) {
-        std::snprintf(buf, sizeof(buf), "%lld/s", static_cast<long long>(rows_per_sec + 0.5));
-    } else if (rows_per_sec < 1000000) {
-        std::snprintf(buf, sizeof(buf), "%.1fk/s", rows_per_sec / 1000.0);
+    if (rows < 1000) {
+        std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(rows + 0.5));
+    } else if (rows < 1000000) {
+        std::snprintf(buf, sizeof(buf), "%.1fk", rows / 1000.0);
     } else {
-        std::snprintf(buf, sizeof(buf), "%.1fM/s", rows_per_sec / 1000000.0);
+        std::snprintf(buf, sizeof(buf), "%.1fM", rows / 1000000.0);
     }
     return buf;
 }
+
+std::string FormatRate(double rows_per_sec) { return FormatCount(rows_per_sec) + "/s"; }
 
 std::vector<int> BandHeights(const std::vector<double> &rates, double ceiling, int height) {
     std::vector<int> out(rates.size(), 0);
@@ -93,7 +179,11 @@ std::vector<int> BandHeights(const std::vector<double> &rates, double ceiling, i
     // divides this up -- so the stack can never disagree with the bar it is.
     int bar = static_cast<int>(std::lround(total / ceiling * height));
     bar = std::clamp(bar, 0, height);
-    if (bar == 0) return out;
+    // Rounded UP, never away. On an axis set by a bulk load, every ordinary
+    // change rounds to zero and the graph reads as idle while replication is
+    // working. One cell says "some, below the resolution of this scale"; the
+    // legend says how much.
+    if (bar == 0) bar = 1;
 
     // Largest remainder: floor every share, then hand the leftover points to
     // whoever was cut by the most. Rounding each share on its own loses or
@@ -128,24 +218,39 @@ std::vector<BandSpan> BandSpans(const std::vector<RateBucket> &buckets,
         const auto &b = buckets[buckets.size() - n + i];
         const int x = px - static_cast<int>(n) + static_cast<int>(i);
 
-        std::vector<double> rates;
-        rates.reserve(names.size());
-        for (const auto &nm : names) {
-            double v = 0;
-            for (const auto &r : b.rates)
-                if (r.first == nm) v = r.second;
-            rates.push_back(v);
-        }
+        std::vector<double> totals;
+        totals.reserve(names.size());
+        for (const auto &nm : names) totals.push_back(b.TotalFor(nm));
+
+        // Level one: divide the column between targets.
+        const auto heights = BandHeights(totals, ceiling, py);
 
         // Stack from the baseline up, so the bands sit on one another and the
         // top of the stack is the total.
-        const auto heights = BandHeights(rates, ceiling, py);
         int y = py - 1;
         for (size_t k = 0; k < heights.size() && y >= 0; ++k) {
             if (heights[k] <= 0) continue;
-            const int top = std::max(0, y - heights[k] + 1);
-            out.push_back({x, top, y, static_cast<int>(k)});
-            y = top - 1;
+
+            const OpRate *r = nullptr;
+            for (const auto &cand : b.rates)
+                if (cand.target == names[k]) r = &cand;
+            if (r == nullptr) continue;
+
+            // Level two: divide this target's slice between its operations,
+            // with the target's own total as the ceiling so the three parts sum
+            // to exactly the height level one already granted it. Inserts sit
+            // at the base and deletes on top: inserts are the bulk in almost
+            // every workload, so putting them at the bottom keeps the part of
+            // the bar that moves least at the part of the graph that moves
+            // least.
+            const std::vector<double> ops{r->ins, r->upd, r->del};
+            const auto sub = BandHeights(ops, r->Total(), heights[k]);
+            for (int o = 0; o < kOps && y >= 0; ++o) {
+                if (sub[o] <= 0) continue;
+                const int top = std::max(0, y - sub[o] + 1);
+                out.push_back({x, top, y, static_cast<int>(k), static_cast<Op>(o)});
+                y = top - 1;
+            }
         }
     }
     return out;

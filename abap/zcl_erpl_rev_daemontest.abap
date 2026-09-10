@@ -112,6 +112,15 @@ CLASS zcl_erpl_rev_daemontest IMPLEMENTATION.
     COMMIT WORK AND WAIT.
     sql( |DROP TABLE IF EXISTS dmn_wm| ).
     sql( |DROP TABLE IF EXISTS _erpl_rev_log_dmn_wm| ).
+    " Triggers first: the ZCDC_* object names derive from the SOURCE, so a set
+    " left over from a previous run writing into a log table that no longer
+    " exists makes every INSERT on ZDELTA_ALL dump -- including seed_rows below.
+    zcl_erpl_rev_cdc=>teardown( 'dmn_cdc' ).
+    sql( |DELETE FROM _erpl_rev_cdc WHERE target='dmn_cdc'| ).
+    sql( |DROP TABLE IF EXISTS dmn_cdc| ).
+    sql( |DROP TABLE IF EXISTS _erpl_rev_log_dmn_cdc| ).
+    sql( |DROP SEQUENCE IF EXISTS _erpl_rev_log_dmn_cdc_seq| ).
+    sql( |DELETE FROM _erpl_rev_run_stats WHERE target='dmn_cdc'| ).
     sql( |DELETE FROM _erpl_rev_delta_state WHERE target LIKE 'dmn\\_%' ESCAPE '\\'| ).
     sql( |UPDATE _erpl_rev_daemon SET status='STOPPED', stop=false, instance_id=NULL, | &&
          |heartbeat_ts=NULL, ticks=0 WHERE id=1| ).
@@ -140,6 +149,37 @@ CLASS zcl_erpl_rev_daemontest IMPLEMENTATION.
       safety_secs = 2
       log_enabled = 'true'
       cadence     = 'micro:2' ) ).
+
+    " The SAME source on the trigger tier, so the two methods run side by side
+    " under one daemon. That is what makes DAEMON-CDC-DELETE below possible:
+    " one physical delete, at one moment, leaving one target and not the other.
+    " The order matters and is the operator's, not a convenience: SEED the
+    " target, register it, then provision the triggers.
+    "
+    " A cycle applies a DELTA. Without the target table it has nothing to apply
+    " to, the first cycle errors, _erpl_rev_cdc goes to ERROR, and the planner's
+    " status gate then skips the target on every tick for ever after -- which
+    " presents as a trigger tier that silently does nothing, the exact symptom
+    " this stage exists to catch. The first version of this test made that
+    " mistake and spent a run proving the product right.
+    DATA(ls_seed) = zcl_erpl_rev_util=>replicate(
+      iv_tab = 'ZDELTA_ALL' iv_target = 'dmn_cdc' iv_where = |BELNR = '9999999999'| ).
+    ok( cond = xsdbool( ls_seed-error IS INITIAL )
+        what = 'DAEMON-CDC: the trigger target was seeded' detail = ls_seed-error ).
+
+    zcl_erpl_rev_delta=>register( VALUE #(
+      target      = 'dmn_cdc'
+      method      = 'CDC'
+      source_from = 'ZDELTA_ALL'
+      keys        = 'CLIENT,BUKRS,BELNR,GJAHR,BUZEI'
+      cadence     = 'micro:2'
+      log_enabled = 'true' ) ).
+
+    DATA(lv_cpe) = zcl_erpl_rev_cdc=>provision(
+      iv_target = 'dmn_cdc' iv_source = 'ZDELTA_ALL'
+      iv_keys = 'CLIENT,BUKRS,BELNR,GJAHR,BUZEI' iv_mode = 'KEYS_IUD' ).
+    ok( cond = xsdbool( lv_cpe IS INITIAL )
+        what = 'DAEMON-CDC: the trigger target provisioned' detail = lv_cpe ).
 
     seed_rows( iv_from = 0 iv_count = 5 ).
 
@@ -204,6 +244,87 @@ CLASS zcl_erpl_rev_daemontest IMPLEMENTATION.
     ok( cond = xsdbool( lv_rows2 >= 10 )
         what = 'DAEMON-STREAM: rows committed while it ran were picked up'
         detail = |{ lv_rows2 }/10| ).
+
+    " --- DAEMON-CDC: the trigger tier, driven by nothing but the daemon -----
+    "
+    " Three defects reached main together because every automated test drove
+    " this tier by calling zcl_erpl_rev_cdc=>run() itself. The planner gated
+    " trigger targets on _erpl_rev_cdc.shadow_rows, a column nothing wrote, so
+    " a trigger target was never due. The daemon ran every planned cycle
+    " through the WATERMARK entry point, because nothing read the method the
+    " plan had always carried. And the trigger apply never wrote
+    " _erpl_rev_delta_state, so `top`, `sync ls`, the Prometheus gauges and the
+    " ALV report all showed a busy target as IDLE, never run, 0 rows.
+    "
+    " Every one of them is invisible to a test that calls run() itself, and
+    " none of them survives a test that refuses to. A recorded demo found them,
+    " which is a slow and expensive way to find anything.
+    DATA(lv_cdc_rows) = wait_until( iv_sql = |SELECT count(*) AS c FROM dmn_cdc|
+                                    iv_want = 5 iv_secs = 90 ).
+    ok( cond = xsdbool( lv_cdc_rows >= 5 )
+        what = 'DAEMON-CDC-WORK: the trigger target replicated, with no run() call'
+        detail = |{ lv_cdc_rows }/5 shadow={ cnt( |SELECT coalesce(shadow_rows,0) AS c | &&
+                 |FROM _erpl_rev_cdc WHERE target='dmn_cdc'| ) }| ).
+
+    " The daemon DISPATCHED it as CDC. A watermark cycle against this target
+    " could also move rows -- it is the same source -- so "rows arrived" alone
+    " does not distinguish a working dispatch from the bug. The run statistics
+    " name the entry point that ran.
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM _erpl_rev_run_stats | &&
+                             |WHERE target='dmn_cdc' AND method='CDC' | &&
+                             |AND status='SUCCESS'| ) >= 1 )
+        what = 'DAEMON-CDC-METHOD: the daemon ran it through the CDC entry point'
+        detail = |methods={ scalar( |SELECT string_agg(DISTINCT method) AS m | &&
+                                    |FROM _erpl_rev_run_stats WHERE target='dmn_cdc'| ) }| ).
+
+    " And the operator can see it. This is the assertion that would have caught
+    " the third defect on its own: the rows were arriving correctly the whole
+    " time, and every surface an operator looks at said nothing was happening.
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM erpl_rev_targets | &&
+                             |WHERE target='dmn_cdc' AND lag_seconds IS NOT NULL | &&
+                             |AND last_rows > 0| ) = 1 )
+        what = 'DAEMON-CDC-STATE: the operator views show it as run, not as never run'
+        detail = |lag={ scalar( |SELECT CAST(lag_seconds AS VARCHAR) AS v | &&
+                                |FROM erpl_rev_targets WHERE target='dmn_cdc'| ) } | &&
+                 |rows={ cnt( |SELECT coalesce(last_rows,0) AS c FROM erpl_rev_targets | &&
+                              |WHERE target='dmn_cdc'| ) }| ).
+
+    " --- the reason the tier exists, stated as a difference -----------------
+    " One physical delete, one moment, one daemon, two targets on the same
+    " source. The trigger target loses the row. The watermark target cannot
+    " see it leave and keeps it. If this ever passes for both, the tier has
+    " stopped being worth its cost.
+    DATA(lv_gone) = |{ 3 WIDTH = 10 ALIGN = RIGHT PAD = '0' }|.
+
+    " Present in both FIRST, or "it left" is satisfied by a target that never
+    " had it. Reintroducing the planner defect to check this stage was
+    " load-bearing turned the other three assertions red and left this one
+    " GREEN -- because nothing had replicated at all, and an empty target
+    " trivially contains no deleted row. An assertion that passes hardest when
+    " the feature is most broken is worse than no assertion.
+    DATA(lv_before) = wait_until(
+      iv_sql = |SELECT count(*) AS c FROM dmn_cdc WHERE belnr='{ lv_gone }'|
+      iv_want = 1 iv_secs = 60 ).
+    ok( cond = xsdbool( lv_before = 1 AND cnt( |SELECT count(*) AS c FROM dmn_wm | &&
+                                               |WHERE belnr='{ lv_gone }'| ) = 1 )
+        what = 'DAEMON-CDC-DELETE: the row was in both targets before it was deleted'
+        detail = |cdc={ lv_before } wm={ cnt( |SELECT count(*) AS c FROM dmn_wm | &&
+                                              |WHERE belnr='{ lv_gone }'| ) }| ).
+
+    DELETE FROM zdelta_all WHERE belnr = @lv_gone.
+    COMMIT WORK AND WAIT.
+    DATA(lv_left) = wait_until(
+      iv_sql = |SELECT 1 - count(*) AS c FROM dmn_cdc WHERE belnr='{ lv_gone }'|
+      iv_want = 1 iv_secs = 90 ).
+    ok( cond = xsdbool( lv_left = 1 )
+        what = 'DAEMON-CDC-DELETE: a physical delete left the trigger target'
+        detail = |still there={ cnt( |SELECT count(*) AS c FROM dmn_cdc | &&
+                                     |WHERE belnr='{ lv_gone }'| ) }| ).
+    ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM dmn_wm | &&
+                             |WHERE belnr='{ lv_gone }'| ) = 1 )
+        what = 'DAEMON-CDC-DELETE: the watermark target on the same source kept it'
+        detail = |a watermark cannot see a row leave; if this fails the | &&
+                 |comparison has stopped meaning anything| ).
 
     " --- DAEMON-LAT: how far behind the source the daemon actually is -------
     "
@@ -341,8 +462,16 @@ CLASS zcl_erpl_rev_daemontest IMPLEMENTATION.
     " Leave nothing behind. dmn_broken points at a table that does not exist on
     " purpose; left registered, every later daemon or batch tick keeps failing
     " it and piling up fail_count on a system that is not under test.
+    " The triggers go first and unconditionally: a trigger set left on
+    " ZDELTA_ALL writing into a log table this suite is about to drop makes
+    " every later INSERT on that table dump, in suites that have nothing to do
+    " with CDC.
+    zcl_erpl_rev_cdc=>teardown( 'dmn_cdc' ).
+    sql( |DELETE FROM _erpl_rev_cdc WHERE target='dmn_cdc'| ).
     sql( |DELETE FROM _erpl_rev_delta_state WHERE target LIKE 'dmn\\_%' ESCAPE '\\'| ).
     sql( |DROP TABLE IF EXISTS dmn_wm| ).
+    sql( |DROP TABLE IF EXISTS dmn_cdc| ).
+    sql( |DROP TABLE IF EXISTS _erpl_rev_log_dmn_cdc| ).
 
     out->write( |DAEMON RESULT pass={ mv_pass } fail={ mv_fail }| ).
   ENDMETHOD.

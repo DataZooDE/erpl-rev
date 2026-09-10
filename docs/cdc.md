@@ -85,6 +85,46 @@ zcl_erpl_rev_cdc=>teardown( 'cdc_wm' ).
 `run` is what a periodic job calls (like the watermark/snapshot tiers). Provisioning is
 idempotent — it best-effort drops any leftover objects first, so it is safe to re-run.
 
+## Letting the daemon drive it
+
+Step 3 above is for a job you schedule yourself. Register the target with
+`method = 'CDC'` and a micro cadence, and the daemon runs the cycles instead — nobody
+calls `run` at all:
+
+```abap
+zcl_erpl_rev_delta=>register( VALUE #(
+  target = 'cdc_wm'  method = 'CDC'  source_from = 'ZDELTA_WM'
+  keys = 'CLIENT,ID'  cadence = 'micro:2'  log_enabled = 'true' ) ).
+```
+
+A trigger target is **not polled on a clock**: it is due the moment a row appears in the
+shadow table, and the cadence is a floor on how often it is checked rather than a
+polling interval. `micro:2` is a ceiling on latency.
+
+**The order in the previous section is not a suggestion.** The planner only schedules a
+trigger target whose `_erpl_rev_cdc.status` is `SEEDED` or `ACTIVE`. Provision before
+the DuckDB target exists and the first cycle has nothing to apply to: it errors, the
+status leaves that set, and every later tick skips the target **silently** — no
+failure, no backoff, nothing on any operator surface. Seed first.
+
+To confirm the daemon really is driving it, rather than assuming:
+
+```sql
+-- the entry point that actually ran; a trigger target should show CDC, not FULL
+SELECT method, status, count(*) FROM erpl_rev_run_stats
+WHERE target = 'cdc_wm' GROUP BY 1, 2;
+
+-- and the operator views, which is what `top` and `sync ls` read
+SELECT target, status, lag_seconds, last_ins, last_upd, last_del
+FROM erpl_rev_targets WHERE target = 'cdc_wm';
+
+-- if it is being skipped, this says why
+SELECT status, error, shadow_rows FROM _erpl_rev_cdc WHERE target = 'cdc_wm';
+```
+
+`erpl-rev top` shows the same thing per cycle in its `LAST CYCLE` column, and the
+throughput graph draws one glyph per operation.
+
 ## Correctness contract
 
 Every cycle is **at-least-once and idempotent**: the server stages the new log rows
@@ -126,6 +166,19 @@ the idempotent merge absorbs. The state machine guards transitions
   SFLIGHT** (the flight-booking demo — composite DATE+NUMC keys), physically changes
   rows, and proves one CDC cycle reflects them in the DuckDB target; idempotent re-run;
   `run_due` heartbeat; teardown leaves no orphan objects. Prints `CDC RESULT pass=N fail=0`.
+- **E2E, driven by the daemon** — the `DAEMON-CDC` stage of `ZCL_ERPL_REV_DAEMONTEST`.
+  This one never calls `run`. It registers a trigger target beside a watermark target on
+  the *same source*, starts the real background daemon, and asserts that rows arrive,
+  that the run statistics name `CDC` as the entry point that ran, that
+  `erpl_rev_targets` reports the target as run rather than as never run, and that a
+  physical delete leaves the trigger target while the watermark target keeps it.
+
+  It exists because three defects reached `main` together — the planner gating trigger
+  targets on a column nothing wrote, the daemon running every planned cycle through the
+  watermark entry point, and the trigger apply never writing `_erpl_rev_delta_state` —
+  and **all three were invisible to every test above**, because every one of them drove
+  the tier by calling `run` itself. A recorded demo found them instead. Verified
+  load-bearing by reintroducing the planner defect: the stage goes red.
 
 See ADR-0004 in the design study for the rationale, and for how the three
 established approaches compare: table-level trigger CDC, delete-only triggers
