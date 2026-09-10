@@ -162,14 +162,17 @@ invisible because every test drove the tier by calling it directly:
    ALV report all reported a busy target as *IDLE, never run, 0 rows*.
 4. And `KEYS_IUD` itself had five defects and had never completed a cycle anywhere.
 
-A fifth turned up while re-recording, and is **not fixed**: two daemons driving the same
-target run the same cycle concurrently, DuckDB rejects the second with `TransactionContext
-Error: Conflict on update`, and `_erpl_rev_cdc.status` goes to `ERROR` with the reason
-stored — but `erpl_rev_targets` is built from `_erpl_rev_delta_state`, which never ran, so
-`top` reports the target as *healthy 0, never run* and shows no error at all. The registry
-knows; the operator's screen does not. `demo/setup.sh` now refuses to record unless exactly
-one daemon is ticking, which stops the demo lying about it, and nothing yet stops the
-product doing so.
+A fifth turned up while re-recording: two daemons driving the same target run the same
+cycle concurrently, DuckDB rejects the second with `TransactionContext Error: Conflict on
+update`, and `_erpl_rev_cdc.status` goes to `ERROR` with the reason stored — but
+`erpl_rev_targets` is built from `_erpl_rev_delta_state`, which never ran, so `top`
+reported the target as *healthy 0, never run* with no error at all. The registry knew;
+the operator's screen did not.
+
+**Since fixed**, in both directions: a failed apply now writes `_erpl_rev_delta_state`
+as well as the registry, and `erpl_rev_targets` carries `cdc_status`/`cdc_error` so a
+trigger fault is visible even when no cycle has failed. `demo/setup.sh` still refuses to
+record unless exactly one daemon is ticking.
 
 Each is fixed, with a test. A demo that runs the product the way a customer would is a
 test nobody thought to write.

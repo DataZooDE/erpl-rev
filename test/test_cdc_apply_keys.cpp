@@ -467,3 +467,49 @@ TEST_CASE("cdc_keys: a trigger cycle is visible on the operator surface",
     CHECK(db.Query("SELECT last_rows AS c FROM erpl_rev_targets WHERE target='t'").rows[0]
           == R"({"c":1})");
 }
+
+TEST_CASE("cdc_keys: a failed cycle reaches the operator surface, not only the registry",
+          "[bridge][cdc][keys]") {
+    // The apply's catch has always recorded the reason in _erpl_rev_cdc and
+    // stopped the planner rescheduling the target. Both correct. Both
+    // invisible: erpl_rev_targets -- which `top`, `sync ls`, the Prometheus
+    // gauges and the ABAP ALV report are ALL built from -- comes from
+    // _erpl_rev_delta_state, and this path never touched it.
+    //
+    // So a target whose every cycle was failing reported IDLE, never run, 0
+    // rows, no error, to four surfaces at once. The registry knew; the operator
+    // was told nothing.
+    DuckDbBridge db;
+    SetupKeysTarget(db);
+    db.Execute("INSERT INTO _erpl_rev_delta_state "
+               "(target, method, source_from, keys, cadence, status, fail_count) "
+               "VALUES ('t','CDC','SFLIGHT','mandt,carrid,fldate','micro:2','IDLE',0)");
+    db.Execute("INSERT INTO klog VALUES ('100','LH','20240101','U',1,'20240115090000')");
+
+    // Fails for a reason the engine refuses on purpose: the images are missing
+    // a column the target carries.
+    db.Execute("CREATE TABLE kimg(mandt VARCHAR, carrid VARCHAR, fldate DATE, "
+               "price DECIMAL(23,2), note VARCHAR)");
+    db.Execute("INSERT INTO kimg VALUES ('100','LH',DATE '2024-01-01',150.00,'new-a')");
+    REQUIRE_THROWS(db.CdcApply("t", "klog", kKeys, "kimg"));
+
+    // The registry, as before.
+    CHECK(db.Query("SELECT status FROM _erpl_rev_cdc WHERE target='t'").rows[0]
+          == R"({"status":"ERROR"})");
+
+    // And now the row every operator surface is built from.
+    const auto v = db.Query("SELECT status, fail_count, is_healthy FROM erpl_rev_targets "
+                            "WHERE target='t'");
+    REQUIRE(v.rows.size() == 1);
+    CHECK(v.rows[0].find(R"("status":"ERROR")") != std::string::npos);
+    CHECK(v.rows[0].find(R"("fail_count":1)") != std::string::npos);
+    CHECK(v.rows[0].find(R"("is_healthy":false)") != std::string::npos);
+
+    // The reason, not just the fact. A status with no reason is a status
+    // nobody can act on, which is what sent this to a live bisection the first
+    // time it happened.
+    const auto err = db.Query("SELECT last_error FROM erpl_rev_targets WHERE target='t'")
+                         .rows[0];
+    INFO("last_error was: " << err);
+    CHECK(err.find("dep") != std::string::npos);
+}

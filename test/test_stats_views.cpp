@@ -116,3 +116,61 @@ TEST_CASE("stats: health reports whether the daemon is actually beating", "[stat
                            "FROM erpl_rev_health");
     CHECK(r.find("\"stale\":true") != std::string::npos);
 }
+
+TEST_CASE("stats: a trigger target whose registry is broken is not healthy", "[stats]") {
+    // The gap this closes. A trigger set dropped by a transport, a log table
+    // removed, a provisioning that never finished -- each leaves
+    // _erpl_rev_cdc outside ACTIVE/SEEDED, which silently stops the tick
+    // planner scheduling the target. Nothing in _erpl_rev_delta_state changes:
+    // it still holds whatever the last SUCCESSFUL cycle wrote. So the target
+    // stops replicating and every operator surface reports it healthy, with a
+    // lag that ages and a status that reads IDLE.
+    //
+    // The registry knew the whole time. Nobody who needed to know was told.
+    DuckDbBridge db;
+    SeedHealthy(db, "trg");
+    db.Execute("UPDATE _erpl_rev_delta_state SET method='CDC' WHERE target='trg'");
+    db.Execute("INSERT INTO _erpl_rev_cdc (target, source, keys, mode, status, error) "
+               "VALUES ('trg','ZSRC','id','KEYS_IUD','ERROR','trigger ZCDC_ZSRC_TRG is missing')");
+
+    CHECK(One(db, "SELECT is_healthy FROM erpl_rev_targets WHERE target='trg'") ==
+          R"({"is_healthy":false})");
+    CHECK(One(db, "SELECT cdc_status FROM erpl_rev_targets WHERE target='trg'") ==
+          R"({"cdc_status":"ERROR"})");
+    // The reason travels with it, so the surface can say WHY rather than only
+    // that something is wrong.
+    CHECK(One(db, "SELECT cdc_error FROM erpl_rev_targets WHERE target='trg'").find(
+              "ZCDC_ZSRC_TRG") != std::string::npos);
+}
+
+TEST_CASE("stats: a provisioned trigger target that is running is healthy", "[stats]") {
+    // The other half, and the one that stops the check above being a check that
+    // simply fails everything on the trigger tier. ACTIVE and SEEDED are both
+    // states the planner schedules, so both are healthy.
+    DuckDbBridge db;
+    SeedHealthy(db, "act");
+    db.Execute("INSERT INTO _erpl_rev_cdc (target, source, keys, mode, status) "
+               "VALUES ('act','ZSRC','id','KEYS_IUD','ACTIVE')");
+    CHECK(One(db, "SELECT is_healthy FROM erpl_rev_targets WHERE target='act'") ==
+          R"({"is_healthy":true})");
+
+    SeedHealthy(db, "sd");
+    db.Execute("INSERT INTO _erpl_rev_cdc (target, source, keys, mode, status) "
+               "VALUES ('sd','ZSRC','id','KEYS_IUD','SEEDED')");
+    CHECK(One(db, "SELECT is_healthy FROM erpl_rev_targets WHERE target='sd'") ==
+          R"({"is_healthy":true})");
+}
+
+TEST_CASE("stats: a watermark target is not judged by a trigger registry it has none of",
+          "[stats]") {
+    // The join is a LEFT one and the columns come back NULL. A target that was
+    // never on the trigger tier must read as "no registry", not as "registry
+    // broken" -- otherwise this change would mark every watermark target in
+    // the system unhealthy at once.
+    DuckDbBridge db;
+    SeedHealthy(db, "wm");
+    CHECK(One(db, "SELECT is_healthy FROM erpl_rev_targets WHERE target='wm'") ==
+          R"({"is_healthy":true})");
+    CHECK(One(db, "SELECT cdc_status FROM erpl_rev_targets WHERE target='wm'") ==
+          R"({"cdc_status":null})");
+}
