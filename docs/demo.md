@@ -96,7 +96,7 @@ SAP, the engine and DuckDB at once.
 
 | | |
 |---|---|
-| Initial sync | **1,000,000 rows in 10 s, ~100k rows/s, peaking at 118k** |
+| Initial sync | **1,000,000 rows in 11 s, ~91k rows/s, peaking at 94k** |
 | Change latency | **0.7–2.4 s** single changes, **up to 4.9 s** under sustained load |
 | Source | `ZSTOCK_MOVE`, 24 columns, MSEG-shaped |
 | Machine | a laptop A4H trial over loopback RFC |
@@ -118,9 +118,20 @@ to the clock rather than the clock explained away.
 - **The throughput graph is sampled, not instrumented.** It counts rows per refresh and
   differentiates, so it observes arrival rate; a target's first sample deliberately
   draws nothing, and colour there means *which target*, not *how high*. The glyph is
-  the operation — `▲` insert, `◆` update, `▼` delete — and within one bucket that split
-  is **net**: inserts and deletes come from the row count, updates from the cycle's own
-  report, because an update changes no count. The `LAST CYCLE` column in the table
+  the operation — `▲` insert, `◆` update, `▼` delete — and the three are not measured
+  the same way:
+
+  | | |
+  |---|---|
+  | insert | the row count, and **net within a bucket** |
+  | delete | whichever sees more of them — the row count, or the cycle's own report |
+  | update | the cycle's report only, because an update changes no row count |
+
+  So an interval that inserted twenty-two rows and deleted seven draws seven deletes
+  and **fifteen** inserts, not twenty-two: the insert band is a lower bound, never an
+  invention. Deletes take the larger of the two signals because under traffic that also
+  inserts the row count sees none at all — which is how they went missing from this
+  graph entirely until the closing workload was recorded. The `LAST CYCLE` column
   carries the exact per-cycle figures.
 - **A laptop trial**, not a sized system.
 - **The subtitles are commentary, not evidence.** They are burned in by a separate
@@ -137,6 +148,11 @@ a watermark is structurally blind to it; only triggers or a full snapshot see th
 leave. SAP archiving really does remove rows, which makes it the honest logistics
 example rather than a contrived one.
 
+That blindness is asserted rather than argued: `ZCL_ERPL_REV_PARITYTEST` requires a
+watermark target to match a full load after inserts and updates, and to **diverge by
+exactly the deleted rows** after a physical delete. If it ever stops diverging, either
+the workload stopped deleting or the diff stopped comparing.
+
 `KEYS_IUD` logs the key of a changed row and the cycle re-reads the values, keeping the
 write a customer's transaction pays for narrow — measured at 14x cheaper on the write
 path than logging a full row image, in [`perf-results.md`](perf-results.md).
@@ -147,8 +163,9 @@ than a polling interval.
 
 ## Defects this demo found
 
-Building it turned up four things that made trigger CDC unusable in production, all
-invisible because every test drove the tier by calling it directly:
+Building it turned up five things that made trigger CDC unusable in production, all
+invisible for the same reason: every automated test drove the tier by calling
+`zcl_erpl_rev_cdc=>run()` itself, and not one of these defects is on that path.
 
 1. **The planner gated trigger targets on a column nothing writes.**
    `_erpl_rev_cdc.shadow_rows` was created by migration v3, read as the "work is
@@ -160,22 +177,35 @@ invisible because every test drove the tier by calling it directly:
    statistics and the CDC registry but never `_erpl_rev_delta_state`, which is what
    `erpl_rev_targets` is built from, so `top`, `sync ls`, the Prometheus gauges and the
    ALV report all reported a busy target as *IDLE, never run, 0 rows*.
-4. And `KEYS_IUD` itself had five defects and had never completed a cycle anywhere.
+4. **`KEYS_IUD` itself had five defects** and had never completed a cycle anywhere.
+5. **A failed cycle was recorded in the registry and nowhere else.** Two daemons
+   driving one target run the same cycle concurrently; DuckDB rejects the second with
+   `TransactionContext Error: Conflict on update` and `_erpl_rev_cdc.status` goes to
+   `ERROR` with the reason stored. But `erpl_rev_targets` is built from
+   `_erpl_rev_delta_state`, which never ran — so `top` reported the target as *healthy
+   0, never run*, with no error anywhere. The registry knew; the operator's screen did
+   not.
 
-A fifth turned up while re-recording: two daemons driving the same target run the same
-cycle concurrently, DuckDB rejects the second with `TransactionContext Error: Conflict on
-update`, and `_erpl_rev_cdc.status` goes to `ERROR` with the reason stored — but
-`erpl_rev_targets` is built from `_erpl_rev_delta_state`, which never ran, so `top`
-reported the target as *healthy 0, never run* with no error at all. The registry knew;
-the operator's screen did not.
+Each is fixed, and each now has a test that would have caught it — which is the part
+that matters, because the demo found them only by accident:
 
-**Since fixed**, in both directions: a failed apply now writes `_erpl_rev_delta_state`
-as well as the registry, and `erpl_rev_targets` carries `cdc_status`/`cdc_error` so a
-trigger fault is visible even when no cycle has failed. `demo/setup.sh` still refuses to
-record unless exactly one daemon is ticking.
+- **`ZCL_ERPL_REV_DAEMONTEST`, the `DAEMON-CDC` stage** drives a trigger target through
+  the real background daemon and never calls `run()`. It covers the first three: rows
+  must arrive, the run statistics must name `CDC` as the entry point that ran, and
+  `erpl_rev_targets` must report the target as run rather than as never run. Verified
+  load-bearing by reintroducing the planner defect.
+- **`ZCL_ERPL_REV_PARITYTEST`** diffs every incremental method against an independent
+  full load, cell by cell, which is what the fourth needed: every `KEYS_IUD` defect was
+  type- or key-specific while the row counts matched.
+- **The fifth is fixed in both directions.** A failed apply now writes
+  `_erpl_rev_delta_state` as well as the registry — including the refusals thrown
+  before the transaction opens, which reached neither record and so re-refused on every
+  cycle for ever — and `erpl_rev_targets` carries `cdc_status`/`cdc_error`, so a
+  trigger fault is visible even when no cycle has failed. `demo/setup.sh` still refuses
+  to record unless exactly one daemon is ticking.
 
-Each is fixed, with a test. A demo that runs the product the way a customer would is a
-test nobody thought to write.
+A demo that runs the product the way a customer would is a test nobody thought to
+write. The lesson was not to record more demos; it was to write those tests.
 
 ## The pieces
 
