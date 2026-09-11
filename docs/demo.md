@@ -163,49 +163,10 @@ than a polling interval.
 
 ## Defects this demo found
 
-Building it turned up five things that made trigger CDC unusable in production, all
-invisible for the same reason: every automated test drove the tier by calling
-`zcl_erpl_rev_cdc=>run()` itself, and not one of these defects is on that path.
-
-1. **The planner gated trigger targets on a column nothing writes.**
-   `_erpl_rev_cdc.shadow_rows` was created by migration v3, read as the "work is
-   waiting" signal, and assigned nowhere — so a trigger target was never due and the
-   daemon could not drive the tier at all.
-2. **The daemon ran every planned cycle through the watermark entry point.** The tick
-   plan has always said which method each cycle is; nothing read it.
-3. **Trigger cycles were invisible to every operator surface** — the apply wrote run
-   statistics and the CDC registry but never `_erpl_rev_delta_state`, which is what
-   `erpl_rev_targets` is built from, so `top`, `sync ls`, the Prometheus gauges and the
-   ALV report all reported a busy target as *IDLE, never run, 0 rows*.
-4. **`KEYS_IUD` itself had five defects** and had never completed a cycle anywhere.
-5. **A failed cycle was recorded in the registry and nowhere else.** Two daemons
-   driving one target run the same cycle concurrently; DuckDB rejects the second with
-   `TransactionContext Error: Conflict on update` and `_erpl_rev_cdc.status` goes to
-   `ERROR` with the reason stored. But `erpl_rev_targets` is built from
-   `_erpl_rev_delta_state`, which never ran — so `top` reported the target as *healthy
-   0, never run*, with no error anywhere. The registry knew; the operator's screen did
-   not.
-
-Each is fixed, and each now has a test that would have caught it — which is the part
-that matters, because the demo found them only by accident:
-
-- **`ZCL_ERPL_REV_DAEMONTEST`, the `DAEMON-CDC` stage** drives a trigger target through
-  the real background daemon and never calls `run()`. It covers the first three: rows
-  must arrive, the run statistics must name `CDC` as the entry point that ran, and
-  `erpl_rev_targets` must report the target as run rather than as never run. Verified
-  load-bearing by reintroducing the planner defect.
-- **`ZCL_ERPL_REV_PARITYTEST`** diffs every incremental method against an independent
-  full load, cell by cell, which is what the fourth needed: every `KEYS_IUD` defect was
-  type- or key-specific while the row counts matched.
-- **The fifth is fixed in both directions.** A failed apply now writes
-  `_erpl_rev_delta_state` as well as the registry — including the refusals thrown
-  before the transaction opens, which reached neither record and so re-refused on every
-  cycle for ever — and `erpl_rev_targets` carries `cdc_status`/`cdc_error`, so a
-  trigger fault is visible even when no cycle has failed. `demo/setup.sh` still refuses
-  to record unless exactly one daemon is ticking.
-
-A demo that runs the product the way a customer would is a test nobody thought to
-write. The lesson was not to record more demos; it was to write those tests.
+Building it turned up five defects that made trigger CDC unusable in production, and
+every one of them was invisible to the automated tests of the day. That story, and
+the tests written since so it cannot repeat, are in
+[`testing.md`](testing.md#the-trigger-tier).
 
 ## The pieces
 

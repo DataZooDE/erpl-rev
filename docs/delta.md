@@ -275,18 +275,5 @@ debug exactly what was loaded. (This is the scenario the M5 E2E section verifies
 
 ## Testing
 
-- **Server merge engine** — Catch2 (`test/test_duckdb_bridge.cpp`, run by `make test`):
-  the `MODE=MERGE` I/U/D apply, the snapshot diff, the state table at boot, atomic
-  rollback, and the composite-key + cast-column upsert.
-- **E2E on A4H** — `ZCL_ERPL_REV_DELTATEST` (run by `make e2e`) proves, against real
-  SAP transactions: WATERMARK merge + idempotent re-run, SNAPSHOT physical-delete
-  reconciliation, the orchestration lease / granularity-gate / catch-up, and the
-  **SFLIGHT** insert/update/delete demo scenario end-to-end. It prints
-  `DELTA RESULT pass=N fail=0`. (CHANGEDOC/INSERT_ONLY are exercised against a real
-  `BAPI_MATERIAL_SAVEDATA` change document on an MM-equipped system; on a bare ABAP
-  Platform trial without Materials Management that section skips.)
-
-Every cycle (and every full load) is recorded in `_erpl_rev_run_stats` for a
-replication dashboard — see [`stats.md`](stats.md).
-
-See the design study (HLD + ADRs) for the rationale behind each decision.
+The suites that cover the delta methods are in
+[`testing.md`](testing.md#delta-methods).

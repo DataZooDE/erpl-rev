@@ -187,44 +187,7 @@ actually is, compare `_commit_ts` with `_applied_at` in the change log.
 
 ## Before a release
 
-`make e2e` skips two lanes, and they are the two that matter most:
-
-```bash
-make e2e         # 13 suites against a live ABAP system, minutes
-make e2e-full    # …plus the daemon running for real: soak, daemon, stress
-make e2e-perf    # the measured numbers behind docs/perf-results.md
-```
-
-CI does **not** run a sanitized build. When a symptom looks like memory rather than
-logic — a hang with no query behind it, a value that is wrong in a way no branch
-explains, a crash that moves when you add a print — build the tests with
-AddressSanitizer by hand and run them:
-
-```bash
-cmake -S . -B build-asan -G Ninja -DERPL_REV_SANITIZE=address,undefined
-cmake --build build-asan --target erpl_rev_tests
-ASAN_OPTIONS=detect_leaks=0 ./build-asan/erpl_rev_tests
-```
-
-It only sees code that actually runs, so pair it with a test that drives the suspect
-path — `top --once --graph --refreshes 3` exists for exactly that reason.
-
-**`make e2e-full` is the release gate.** It is where the product is driven the way
-a customer drives it — a background job that stays up and replicates things nobody
-asked it to replicate, including a trigger target end to end. Every defect that has
-reached `main` from this tree so far was invisible to the other lanes. It is opt-in
-because it takes minutes, not because it is optional.
-
-Run it as one pass rather than filtering to the slow suites with
-`ERPL_REV_E2E_ONLY='@soak'`. Two lanes that each pass on their own say nothing
-about the order they run in, and this suite has a history of one suite's leftovers
-deciding the next one's verdict.
-
-**Expect timing assertions to be load-dependent on a laptop.** `SOAK` fails the
-daemon if its heartbeat ever stalls for more than five ticks; on a box that has
-been running SAP, the engine and a full e2e for an hour, a seventeen-second gap
-at a two-second tick is the machine, not the daemon. Re-run it on a quiet system
-before treating it as a defect — and if it reproduces there, it is one.
+The release gate and the full test lanes are in [`testing.md`](testing.md).
 
 ## When something is wrong
 

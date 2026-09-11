@@ -469,7 +469,6 @@ Full detail, event by event and property by property:
 - [`docs/daemon.md`](docs/daemon.md) — continuous replication in one background work process
 - [`docs/operations.md`](docs/operations.md) — the operator's verbs, the monitor, and the metrics endpoint
 - [`docs/control-tables.md`](docs/control-tables.md) — the control schema as a versioned interface
-- [`docs/stats.md`](docs/stats.md) — what each run records
 - [`docs/perf-results.md`](docs/perf-results.md) — measured numbers, dated, with the box they came from
 - [`docs/demo.md`](docs/demo.md) — the recorded session, what it proves and what it does not
 
