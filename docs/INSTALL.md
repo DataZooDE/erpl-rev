@@ -23,16 +23,21 @@ Two parts: (1) get the **ABAP objects** into the SAP system, (2) install the
 > contact SAP at all.
 >
 > `setup` deploys the production ABAP objects over ADT, creates the function group,
-> the type-T destination and the eight `Z_DUCKDB_*` modules, and writes
+> the type-T destination and the nine `Z_DUCKDB_*` modules, and writes
 > `erpl-rev-basis-handout.md` with the two things a client genuinely cannot do — the
 > `reginfo` line and the RFC user. Re-running it is idempotent. The rest of this
 > document is the manual path, and what the handout refers to.
 
 ## 0. Prerequisites
 - SAP NetWeaver AS ABAP **7.40 SP05+** (tested on A4H / ABAP 7.5x).
-- A host for the external server (Linux) with: the **SAP NW RFC SDK** (`libsapnwrfc.so`
-  trio + ICU), the vendored **DuckDB 1.5.4** libs, network access to the SAP **gateway**
+- A host for the external server (Linux) with network access to the SAP **gateway**
   (`sapgw<nr>`, default port 33<nr>).
+  **A released bundle needs nothing else** — since `v2026.08.30` the RFC protocol is
+  `erpl-proto`, linked statically, and DuckDB is linked statically too: one file, no
+  SAP NW RFC SDK, no ICU, no `LD_LIBRARY_PATH`. Only a **from-source** build needs the
+  SDK, because `make` still defaults to `RFC_BACKEND=sdk`
+  (see [Provide the SDK + DuckDB](../README.md#1-provide-the-sdk--duckdb) — or build
+  with `RFC_BACKEND=proto`, which reproduces what ships).
 - Transport import authority (Basis) and a dedicated RFC user (see security.md §4).
 
 ## 1. Import the ABAP transport (the package `ZERPL`)
@@ -59,7 +64,7 @@ to, and the one other SAP add-ons document.)
 ## 2. Post-import setup (run once)
 1. Run classrun **`ZCL_ERPL_REV_SETUP`**: creates the type-T **`ERPL_REV`**
    destination in **registration mode** (`method='R'`), pointing at your gateway.
-   Then run **`ZCL_ERPL_REV_MKFM`**, which creates the eight `Z_DUCKDB_*` function
+   Then run **`ZCL_ERPL_REV_MKFM`**, which creates the nine `Z_DUCKDB_*` function
    modules in function group `ZERPL_REV` (create the group in SE80 first).
    For the `reginfo` line filled in for your host, run `erpl-rev setup
    --print-runbook`, or compose it from security.md §2.
@@ -69,7 +74,6 @@ to, and the one other SAP add-ons document.)
 ## 3. Install + start the external server
 ```
 # on the server host (as the service account)
-export LD_LIBRARY_PATH=$NWRFC/lib:/path/to/duckdb-1.5.4
 export ERPL_REV_GWHOST=<gateway-host> ERPL_REV_GWSERV=sapgw<nr>
 export ERPL_REV_PROGRAM_ID=ERPL_REV ERPL_REV_DB_PATH=/var/lib/erpl/erpl.duckdb
 # external publish targets (optional): ATTACH/secrets in an init file (chmod 600)

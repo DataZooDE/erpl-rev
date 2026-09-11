@@ -39,7 +39,7 @@ RFC_LINK ?= shared
 ERPL_PROTO_ROOT ?=
 # Override DUCKDB_URL/DUCKDB_SHA256 for non-Linux dists (osx-universal / windows-amd64).
 DUCKDB_URL ?= https://github.com/duckdb/duckdb/releases/download/v$(DUCKDB_VERSION)/libduckdb-linux-amd64.zip
-# Pinned SHA256 of libduckdb-linux-amd64.zip v1.5.4 — verified on download (supply
+# Pinned SHA256 of libduckdb-linux-amd64.zip v1.5.5 — verified on download (supply
 # DUCKDB_SHA256= for another version).
 DUCKDB_SHA256 ?= 838d98a85e697bab9935010c88a8c67d3312ccedcab4cb4a0ba01da65113bb70
 DUCKDB_LIB := $(DUCKDB_DIST)

@@ -43,8 +43,9 @@ makes DuckDB call *into* SAP, **erpl-rev has SAP call out into DuckDB.**
   source-side `WHERE`, column selection and idempotent `UPSERT`. Built for
   **>100M-row** loads.
 - **Delta (incremental) too.** Keep a target in sync loading only what changed —
-  **watermark, change-document (CDHDR/CDPOS), and snapshot-diff (deletes)** methods,
-  all merging server-side, idempotent and re-runnable. Customer-owned Open SQL only
+  **watermark, insert-only, change-document (CDHDR/CDPOS), snapshot-diff and
+  trigger-CDC (both catch deletes)** methods, all merging server-side, idempotent
+  and re-runnable. Customer-owned Open SQL only
   (no ODP / SAPI / `RFC_READ_TABLE`). See [`docs/delta.md`](docs/delta.md).
 - **Real time, when you want it.** A daemon at a two-second cadence, and a
   trigger tier that catches physical deletes a watermark cannot see. Three
@@ -190,7 +191,7 @@ confirmation or an explicit `--yes`.
 ## Then set up the SAP side
 
 Getting the binary was always easy; getting SAP ready used to be an afternoon
-across four documents — a type-T destination, a function group, eight
+across four documents — a type-T destination, a function group, nine
 `Z_DUCKDB_*` modules, fourteen ABAP objects, a `reginfo` line. Two commands now
 do what a client can do, and hand over what it cannot:
 
@@ -376,10 +377,13 @@ ABAP ──CALL FUNCTION 'Z_DUCKDB_QUERY'/'Z_DUCKDB_INGEST' DESTINATION 'ERPL_RE
 
 A registered RFC server (`RfcCreateServer`/`RfcLaunchServer`) hosts a handful of
 function modules whose payloads are **JSON / binary-sXML over scalar `STRING`
-params** — schema-generic, so no custom DDIC structures. It links the official
-prebuilt **DuckDB 1.5.5** (`libduckdb.so`, parquet+json+quack built in); our code
-plus libstdc++/libgcc are static, leaving only `libduckdb.so` and the SAP `.so`
-trio dynamic.
+params** — schema-generic, so no custom DDIC structures.
+
+**DuckDB 1.5.5** (parquet + json + quack built in) is linked **statically**, as are
+libstdc++/libgcc and — in the released bundles — the `erpl-proto` RFC implementation.
+That is what makes a bundle a single file with nothing beside it. A from-source build
+differs: `make` defaults to `RFC_BACKEND=sdk` and then does need the SAP NW RFC SDK at
+runtime; `make build RFC_BACKEND=proto` reproduces what ships.
 
 <details>
 <summary><b>Configuration (env vars & flags)</b></summary>
@@ -398,7 +402,7 @@ CLI flags override env (**flag > env > default**); `--help` prints the full surf
 | Quack bind / token | `--quack-listen` / `--quack-token` | `ERPL_REV_QUACK_LISTEN` / `ERPL_REV_QUACK_TOKEN` | `quack:localhost` (port 9494) / random |
 | DuckDB file | `--db <path>` | `ERPL_REV_DB_PATH` | `erpl-rev.duckdb` (`:memory:` for in-mem) |
 | Boot init SQL | `--init-sql` / `--init-file` | `ERPL_REV_DUCKDB_INIT` | — (ATTACH/secrets for external/cloud targets) |
-| Telemetry opt-out | `--no-telemetry` | `ERPL_REV_NO_TELEMETRY` / `DATAZOO_DISABLE_TELEMETRY` | on by default ([docs](docs/telemetry.md)) |
+| Telemetry opt-out | `--no-telemetry` | `ERPL_REV_NO_TELEMETRY` / `DATAZOO_DISABLE_TELEMETRY` | on by default ([what is sent](TELEMETRY.md)) |
 | Self-check & exit | `--smoke` | — | — |
 | Logging | — | `ERPL_REV_LOG_{LEVEL,FORMAT,COLOR}` | `info` / `console` / `auto` |
 
@@ -440,12 +444,21 @@ with `DATAZOO_NO_BANNER=1`.
 
 ## Telemetry
 
-The server sends **anonymous** usage telemetry (`application_start` /
-`application_stop` with app/version/platform/DuckDB-version only — **no SAP
-data, query text, or table/field names**) to help us understand adoption. It is
-**on by default** and disabled by any one of `--no-telemetry`,
-`ERPL_REV_NO_TELEMETRY`, or `DATAZOO_DISABLE_TELEMETRY`. Air-gapped SAP hosts
-drop the request silently with zero impact. Details: [`docs/telemetry.md`](docs/telemetry.md).
+The server sends **anonymous** usage telemetry to help us understand which bridge
+operations are used and where they break. Three events: `server_started` once at
+boot, **`rfc_call` on every bridge function-module invocation** (which module,
+success or failure, how long — sampled), and `$exception` when one fails.
+
+What never leaves the machine: **SAP data, SQL text, table or field names,
+target names, connection strings and error messages.** Only bounded
+enumerations and numbers.
+
+It is **on by default** and disabled by any one of `--no-telemetry`,
+`ERPL_REV_NO_TELEMETRY`, or `DATAZOO_DISABLE_TELEMETRY`;
+`ERPL_REV_TELEMETRY_SAMPLE_RATE` thins `rfc_call` without silencing it.
+Air-gapped hosts drop the request silently with zero impact.
+Full detail, event by event and property by property:
+[`TELEMETRY.md`](TELEMETRY.md).
 
 ## Docs
 
@@ -471,7 +484,7 @@ drop the request silently with zero impact. Details: [`docs/telemetry.md`](docs/
 - [`docs/security.md`](docs/security.md) — Basis hardening, RFC user, SNC, ACLs
 - [`docs/tunnel.md`](docs/tunnel.md) — optional: reaching the gateway when this host has no route to it
 - [`docs/sql-console.md`](docs/sql-console.md) — the in-GUI DuckDB SQL console
-- [`docs/telemetry.md`](docs/telemetry.md) — what's collected, where, and the three opt-outs
+- [`TELEMETRY.md`](TELEMETRY.md) — every event and property that leaves the machine, and the opt-outs
 - [`docs/docker.md`](docs/docker.md) — running the container image from ghcr.io
 
 ## License
