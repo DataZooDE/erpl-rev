@@ -3,7 +3,7 @@
 ![erpl-rev replicating a million goods movements, then live ones](../demo/realtime.gif)
 
 Three minutes: a million rows before, one material document in the middle, and a working
-day after. An initial sync of **1,000,000 goods movements in 10 seconds**; then an
+day after. An initial sync of **1,000,000 goods movements in 11 seconds**; then an
 operator posts a goods receipt, transfers two items to another storage location, and an
 archiving run physically removes a third, each reaching DuckDB in a second or two with
 nobody running anything; then **thirty seconds of continuous mixed traffic** at a few

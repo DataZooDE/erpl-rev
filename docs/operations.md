@@ -1,8 +1,9 @@
 # Running erpl-rev
 
-The day-to-day runbook. Every command here goes through the SAP command queue,
-so none of them needs `S_DEVELOP` or generated ABAP, and every one of them is
-recorded.
+The day-to-day runbook. Anything here that makes SAP *do* something goes through the
+SAP command queue, so it needs no `S_DEVELOP` and no generated ABAP, and it is
+recorded. The read-only ones — `sync ls`, `sync show`, `top` — read DuckDB directly
+and do not contact SAP at all.
 
 ## Registering a target
 
@@ -189,7 +190,7 @@ actually is, compare `_commit_ts` with `_applied_at` in the change log.
 `make e2e` skips two lanes, and they are the two that matter most:
 
 ```bash
-make e2e         # 15 suites against a live ABAP system, minutes
+make e2e         # 13 suites against a live ABAP system, minutes
 make e2e-full    # …plus the daemon running for real: soak, daemon, stress
 make e2e-perf    # the measured numbers behind docs/perf-results.md
 ```

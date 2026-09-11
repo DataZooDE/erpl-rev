@@ -27,9 +27,10 @@ Rules the migration list keeps:
 - **Only the server migrates.** The CLI reaches DuckDB over quack while the server
   holds the file lock.
 
-Two things are deliberately *not* migrations, because a migration cannot be corrected
-on a file that already has it: the `erpl_rev_run_stats` view and the transformation
-macros are `CREATE OR REPLACE`d on every open.
+Some things are deliberately *not* migrations, because a migration cannot be corrected
+on a file that already has it: the **three views** and the transformation and currency
+macros are `CREATE OR REPLACE`d on every open, so a fix to any of them reaches an
+existing database with no version bump.
 
 ## The tables
 
@@ -38,7 +39,7 @@ macros are `CREATE OR REPLACE`d on every open.
 | `_erpl_rev_schema_version` | migration | which binary applied what, and when |
 | `_erpl_rev_delta_state` | target | method, source, keys, watermark, safety window, cadence, load type, backoff and parking, logging, transform, validation policy, lease and `active_run_id` |
 | `_erpl_rev_run_stats` | run | status, counts, duration, watermarks, load type, validation status, lag |
-| `_erpl_rev_cdc` | trigger target | dialect, mode, log/sequence names, position, status, shadow depth, tuning |
+| `_erpl_rev_cdc` | trigger target | platform, mode, log and trigger table names, position, status, shadow depth, tuning |
 | `_erpl_rev_daemon` | server (one row) | instance, heartbeat, tick interval, worker budget, full-load share, stop flag, ticks |
 | `_erpl_rev_cli_cmd` | queued command | the CLI's queue, drained by the ABAP driver |
 | `_erpl_rev_log_<target>` | applied change | opt-in change log: `_seq`, `_op`, `_run_id`, `_commit_ts`, `_applied_at`, plus the target's own columns |
@@ -100,8 +101,19 @@ crossed out the operator's value — so a re-registration for an unrelated reaso
 cancelled a pending seed, and a manual `sync run --load-type F` consumed one.
 The planner combines them: a one-shot type that has been spent plans as `D`.
 
-Two views are the reading surface: `erpl_rev_run_stats` (derived counts, rates and
-durations) and the per-target change logs.
+**Three views are the reading surface**, recreated at every open so a fix reaches an
+existing database without a migration:
+
+| view | answers |
+|---|---|
+| `erpl_rev_run_stats` | what each run did — derived counts, rates and durations |
+| `erpl_rev_targets` | per target: method, cadence, status, lag, last cycle's inserts/updates/deletes, health, and the trigger registry's own state |
+| `erpl_rev_health` | one row: how many targets, how many healthy, worst lag, daemon heartbeat |
+
+`erpl_rev_targets` and `erpl_rev_health` are what `erpl-rev top`, `sync ls`, the
+Prometheus endpoint and the ABAP ALV report all read — so four surfaces cannot
+disagree about whether a target is healthy. The per-target change logs
+(`_erpl_rev_log_<target>`) are the fourth reading surface, for subscribers.
 
 ## Naming
 

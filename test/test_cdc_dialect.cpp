@@ -160,7 +160,9 @@ TEST_CASE("CDC dialect: AnyDB refuses in v1; bad spec throws", "[cdc][dialect]")
 }
 
 // ---------------------------------------------------------------------------
-// KEYS_IUD -- the default trigger mode.
+// KEYS_IUD. NOT the default -- DELETE_ONLY is (control_schema.cpp's v3
+    // migration, and every provisioning entry point). KEYS_IUD is what a caller
+    // asks for when it wants inserts and updates as well as deletes.
 //
 // The shadow log carries key + op + sequence only; the cycle re-reads the source
 // for the row values. Cheaper on the write path of a wide hot table than logging
