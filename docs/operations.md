@@ -96,6 +96,7 @@ not something to recover, it is something to repeat.
 ## Trigger targets
 
 ```bash
+erpl-rev cdc provision --target sales --mode KEYS_IUD   # create the triggers
 erpl-rev cdc status --target sales
 erpl-rev cdc repair --target sales
 ```

@@ -13,6 +13,8 @@
 
 #include "abap_codegen.hpp"
 #include "abap_skeletons.hpp"
+#include <cctype>
+
 #include "commands.hpp"
 #include "load_type.hpp"
 #include "db_client.hpp"
@@ -733,7 +735,42 @@ int RunCdc(Options o) {
             return rc;
         return RunViaDriver(o, "cdc_repair", BuildParams({{"target", target}}));
     }
-    std::fprintf(stderr, "erpl-rev cdc: expected status or repair.\n");
+    // provision: the one step of the trigger tier that had no CLI at all, so the
+    // tier a data engineer needs for physical deletes could only be reached by
+    // writing ABAP. The source and the keys are NOT parameters here -- they are
+    // already in the registry from `sync create`, and asking for them twice is
+    // asking for two answers that can disagree.
+    if (sub == "provision") {
+        if (target.empty()) {
+            std::fprintf(stderr,
+                         "erpl-rev cdc provision --target T [--mode MODE]\n"
+                         "  Register the target first:\n"
+                         "    erpl-rev sync create --target T --method CDC "
+                         "--source ZTAB --keys CLIENT,ID\n");
+            return 2;
+        }
+        std::string mode = Field(o, "--mode", "DELETE_ONLY");
+        for (auto &c : mode) c = static_cast<char>(::toupper(static_cast<unsigned char>(c)));
+        if (mode != "DELETE_ONLY" && mode != "KEYS_IUD" && mode != "IMAGE_IUD") {
+            std::fprintf(stderr,
+                         "erpl-rev cdc provision: --mode must be DELETE_ONLY, KEYS_IUD "
+                         "or IMAGE_IUD (got '%s').\n"
+                         "  DELETE_ONLY  deletes only; pair it with a watermark target\n"
+                         "  KEYS_IUD     all three ops; logs the key, re-reads the row\n"
+                         "  IMAGE_IUD    all three ops; logs the whole row image\n",
+                         mode.c_str());
+            return 2;
+        }
+        // This creates real database triggers on a real source table, which is
+        // the most consequential thing any CLI verb here does to SAP.
+        if (const int rc = ConsentGate(o, "Create " + mode +
+                                              " database triggers on the source of '" +
+                                              target + "' (" + o.host + ")"))
+            return rc;
+        return RunViaDriver(o, "cdc_provision",
+                            BuildParams({{"target", target}, {"mode", mode}}));
+    }
+    std::fprintf(stderr, "erpl-rev cdc: expected provision, status or repair.\n");
     return 2;
 }
 
