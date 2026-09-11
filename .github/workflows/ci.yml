@@ -52,6 +52,11 @@ jobs:
       - name: Transport completeness
         run: ./scripts/check-transport-complete.sh
 
+      # A moved heading or a deleted document otherwise rots quietly, and the
+      # first person to find it is a reader who wanted the thing it pointed at.
+      - name: Doc links
+        run: ./scripts/check-doc-links.sh
+
       - name: Build (server + tests)
         run: make build
 

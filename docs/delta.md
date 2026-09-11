@@ -43,8 +43,39 @@ to snapshot, by the opt-in **trigger-CDC** tier (see [`cdc.md`](cdc.md)).
 
 ## Registering a target
 
-A target is one row in `_erpl_rev_delta_state`. Use `zcl_erpl_rev_delta=>register( )`
-(or one INSERT via `Z_DUCKDB_QUERY`):
+A target is one row in `_erpl_rev_delta_state`. From the CLI:
+
+```bash
+erpl-rev sync create sales \
+    --method WATERMARK --source VBAK --keys MANDT,VBELN \
+    --chg-col AEDAT --wm-kind DATE --cadence hourly --log
+```
+
+`sync create` is **create-or-update**: re-running it on an existing target changes
+only the fields you pass. The flags map one-to-one onto the registry:
+
+| flag | field | |
+|---|---|---|
+| *(positional)* | `target` | the DuckDB table to fill |
+| `--method` | `method` | `WATERMARK` \| `INSERT_ONLY` \| `CHANGEDOC` \| `SNAPSHOT` \| `CDC` |
+| `--source` | `source_from` | the SAP table, CDS view or calc view |
+| `--keys` | `keys` | the key columns, comma-separated |
+| `--chg-col` | `chg_col` | the column a watermark advances on |
+| `--wm-kind` | `wm_kind` | how that column is read — see the table below |
+| `--wm-value` | `wm_value` | start from here instead of the beginning |
+| `--cadence` | `cadence` | `hourly`, `micro:2`, `manual` |
+| `--safety-secs` | `safety_secs` | overlap re-read, against late commits |
+| `--log` / `--no-log` | `log_enabled` | keep a per-target change log |
+| `--load-type-default` | `load_type_default` | `D`, `I`, `L` or `F` |
+| `--allow-empty-reload` | `allow_empty_reload` | permit an `F` that reads nothing |
+
+Trigger-CDC targets need one more step after this — `erpl-rev cdc provision` — see
+[`cdc.md`](cdc.md).
+
+### The same from ABAP
+
+`zcl_erpl_rev_delta=>register( )` (or one INSERT via `Z_DUCKDB_QUERY`) is what the
+CLI ends up calling, and is still the way to reach anything the flags do not cover:
 
 ```abap
 zcl_erpl_rev_delta=>register( VALUE #(
@@ -101,6 +132,17 @@ numeric partition column is available (or no free batch work processes), the cyc
 read only the changed slice and don't use this.
 
 ## Running cycles
+
+```bash
+erpl-rev sync run sales            # one cycle, now
+erpl-rev sync ls                   # what is registered, and how far behind
+erpl-rev sync show sales           # one target in detail
+```
+
+To have cycles run without being asked, use the daemon
+([`daemon.md`](daemon.md)) or the periodic job below.
+
+### The same from ABAP
 
 - `zcl_erpl_rev_delta=>run( iv_target )` runs one cycle for one target
   (lease → dispatch by method → commit watermark → release).
@@ -275,18 +317,5 @@ debug exactly what was loaded. (This is the scenario the M5 E2E section verifies
 
 ## Testing
 
-- **Server merge engine** — Catch2 (`test/test_duckdb_bridge.cpp`, run by `make test`):
-  the `MODE=MERGE` I/U/D apply, the snapshot diff, the state table at boot, atomic
-  rollback, and the composite-key + cast-column upsert.
-- **E2E on A4H** — `ZCL_ERPL_REV_DELTATEST` (run by `make e2e`) proves, against real
-  SAP transactions: WATERMARK merge + idempotent re-run, SNAPSHOT physical-delete
-  reconciliation, the orchestration lease / granularity-gate / catch-up, and the
-  **SFLIGHT** insert/update/delete demo scenario end-to-end. It prints
-  `DELTA RESULT pass=N fail=0`. (CHANGEDOC/INSERT_ONLY are exercised against a real
-  `BAPI_MATERIAL_SAVEDATA` change document on an MM-equipped system; on a bare ABAP
-  Platform trial without Materials Management that section skips.)
-
-Every cycle (and every full load) is recorded in `_erpl_rev_run_stats` for a
-replication dashboard — see [`stats.md`](stats.md).
-
-See the design study (HLD + ADRs) for the rationale behind each decision.
+The suites that cover the delta methods are in
+[`testing.md`](testing.md#delta-methods).

@@ -1,8 +1,18 @@
-# Enabling external RFC server registration on SAP (A4H trial)
+# Appendix: RFC registration on an A4H trial
+
+> **This is a contributor's notebook for the A4H developer trial, not the gateway
+> guide.** It is written for a throwaway system you control, and its shortcuts —
+> `gw/acl_mode = 0`, permissive `reginfo` — are not things to put on a system that
+> matters.
+>
+> **For a real system, the gateway reference is
+> [`security.md` §2](security.md).** `erpl-rev setup` also writes a ready-made
+> handout for your Basis team, with the least-privilege `reginfo` line already
+> filled in; `erpl-rev setup --print-runbook` prints it without deploying anything.
 
 To let `erpl-rev` (an external registered-server program) receive
 `CALL FUNCTION … DESTINATION …` from ABAP, **two independent things** must be in
-place. Both blocked the first E2E attempt.
+place. Both blocked the first E2E attempt on this trial.
 
 ## 1. Gateway registration ACL — lets the program attach to the gateway
 
@@ -41,13 +51,18 @@ gw/reg_info = /usr/sap/reginfo
 ```
 
 ```
-# /usr/sap/reginfo   — first match wins
+# /usr/sap/reginfo   — first match wins. TRIAL ONLY.
 #VERSION=2
 P TP=ERPL_REV HOST=* ACCESS=* CANCEL=*
 # trial convenience: keep internal registrations working
 P TP=*
-# production instead: explicit P entries, then a final  D TP=*
 ```
+
+> `HOST=*` and a trailing `P TP=*` let **anything** register, which is the point of a
+> throwaway trial and the opposite of what you want anywhere else. The
+> least-privilege form — the host pinned, and a closing `D TP=*` that denies
+> everything not named above it — is in [`security.md` §2](security.md), and it is
+> what `erpl-rev setup` puts in the Basis handout. Copy that one, not this one.
 
 Reloading the **reginfo file** needs no restart: **SMGW → Goto → Expert
 Functions → External Security → Reread** (or `gwmon` reread). Changing the

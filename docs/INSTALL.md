@@ -36,7 +36,7 @@ Two parts: (1) get the **ABAP objects** into the SAP system, (2) install the
   `erpl-proto`, linked statically, and DuckDB is linked statically too: one file, no
   SAP NW RFC SDK, no ICU, no `LD_LIBRARY_PATH`. Only a **from-source** build needs the
   SDK, because `make` still defaults to `RFC_BACKEND=sdk`
-  (see [Provide the SDK + DuckDB](../README.md#1-provide-the-sdk--duckdb) — or build
+  (see [building.md](building.md#1-provide-the-sdk--duckdb) — or build
   with `RFC_BACKEND=proto`, which reproduces what ships).
 - Transport import authority (Basis) and a dedicated RFC user (see security.md §4).
 
