@@ -713,8 +713,8 @@ int main(int argc, char **argv) {
         ShutdownHandlers();
         return 0;
     } catch (const std::exception &e) {
-        // Startup failed before application_start was emitted — don't send an
-        // orphan application_stop.
+        // Startup failed before server_started was emitted, so there is no
+        // session for this to belong to.
         log::get().Error("server", "fatal", {{"error", e.what()}});
         // A fatal is the one moment an operator definitely wants the tracker.
         // Routine per-request errors are deliberately left unannotated: this

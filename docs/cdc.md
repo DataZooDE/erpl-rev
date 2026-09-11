@@ -179,12 +179,12 @@ the idempotent merge absorbs. The state machine guards transitions
 ## Testing
 
 - **Server engine** — Catch2 (`test/test_cdc_dialect.cpp` + `[cdc]` cases in
-  `test/test_duckdb_bridge.cpp`): the dialect golden strings (delete-only + full-IUD,
+  `test/test_duckdb_bridge.cpp`): the dialect golden strings (delete-only + IMAGE_IUD,
   namespace guard, AnyDB refusal), the `_erpl_rev_cdc` state machine (transitions,
   monotonic position, restart-safe), log coalescing, and the apply (delete reflected,
-  full-IUD I/U/D, idempotent, rollback-on-error).
+  IMAGE_IUD I/U/D, idempotent, rollback-on-error).
 - **E2E on A4H (real HANA triggers)** — `ZCL_ERPL_REV_CDCTEST` (run by `make e2e`):
-  provisions real HANA triggers on `ZDELTA_WM` (delete-only + full-IUD) **and on
+  provisions real HANA triggers on `ZDELTA_WM` (delete-only + IMAGE_IUD) **and on
   SFLIGHT** (the flight-booking demo — composite DATE+NUMC keys), physically changes
   rows, and proves one CDC cycle reflects them in the DuckDB target; idempotent re-run;
   `run_due` heartbeat; teardown leaves no orphan objects. Prints `CDC RESULT pass=N fail=0`.

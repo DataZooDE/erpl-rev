@@ -18,7 +18,7 @@ summary it already holds.
 | `ts` | when the run was recorded (server clock — same source as the delta state) |
 | `target` / `source` | DuckDB target table / SAP source entity |
 | `run_type` | `FULL` \| `DELTA` |
-| `method` | `FULL` \| `WATERMARK` \| `SNAPSHOT` \| `CHANGEDOC` \| `INSERT_ONLY` |
+| `method` | `FULL` \| `WATERMARK` \| `SNAPSHOT` \| `CHANGEDOC` \| `INSERT_ONLY` \| `CDC` |
 | `status` | `SUCCESS` \| `ERROR` |
 | `duration_ms` | wall-clock of the run |
 | `rows_read` | rows pulled from SAP |
@@ -26,6 +26,11 @@ summary it already holds.
 | `wm_from` / `wm_to` | watermark / position before and after (delta) |
 | `jobs` | parallel workers used (parallel full load / parallel snapshot) |
 | `error_text` | on failure |
+| `load_type` | the load type this run used — see [`delta.md`](delta.md) |
+| `portion_count` | portions a mass/split load was cut into |
+| `validation_status` | result of a post-run `sync validate`, when one ran |
+| `lag_ms` | source change time to apply time, where the method can know it |
+| `clock_skew_secs` | SAP's clock minus the server's, recorded per run, because a wall-clock change value cannot be read without it |
 
 One row per run: a full load is recorded once by `replicate` / `replicate_parallel`
 (the internal delta sub-step reloads and the parallel workers pass `iv_record=false`),
@@ -36,6 +41,8 @@ double-count.
 
 `erpl_rev_run_stats` (created at boot) adds the derived columns a dashboard wants:
 
+- `finished_at` — the raw table calls this `ts`; the view renames it, and the
+  example queries below use the new name
 - `started_at` = `finished_at − duration_ms`
 - `rows_applied` = `rows_ins + rows_upd + rows_del`
 - `rows_per_sec`

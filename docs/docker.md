@@ -50,9 +50,9 @@ Everything is driven by environment variables (CLI flags override them):
 | `ERPL_REV_PROGRAM_ID` | `ERPL_REV` | registered program id (must match `reginfo`) |
 | `ERPL_REV_REG_COUNT` | `5` | parallel gateway registrations |
 | `ERPL_REV_DB_PATH` | `/data/erpl-rev.duckdb` | DuckDB file (set `:memory:` for throwaway) |
-| `ERPL_REV_QUACK` / `ERPL_REV_QUACK_LISTEN` / `ERPL_REV_QUACK_TOKEN` | off | DuckDB network server |
+| `ERPL_REV_NO_QUACK` / `ERPL_REV_QUACK_LISTEN` / `ERPL_REV_QUACK_TOKEN` | **on**, `quack:localhost`, random | DuckDB network server. It is on by default and bound to loopback; `ERPL_REV_NO_QUACK=1` disables it. `sql` and `sync ls\|show` use it to read the live database. |
 | `ERPL_REV_LOG_LEVEL` / `ERPL_REV_LOG_FORMAT` | `info` / `json` | logging (image defaults to `json`) |
-| `ERPL_REV_NO_TELEMETRY` / `DATAZOO_DISABLE_TELEMETRY` | — | opt out of telemetry ([docs/telemetry.md](telemetry.md)) |
+| `ERPL_REV_NO_TELEMETRY` / `DATAZOO_DISABLE_TELEMETRY` | — | opt out of telemetry ([TELEMETRY.md](../TELEMETRY.md)) |
 
 ## Networking
 

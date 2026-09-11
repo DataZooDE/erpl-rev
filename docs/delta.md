@@ -25,7 +25,7 @@ Config **and** runtime state live in one DuckDB table, `_erpl_rev_delta_state`
 (created at server boot), read/written through the existing `Z_DUCKDB_QUERY` — there
 is **no new `Z` table in SAP**.
 
-## The four methods
+## The five methods
 
 | Method | Use when | How it reads | Apply |
 |--------|----------|--------------|-------|
@@ -33,6 +33,7 @@ is **no new `Z` table in SAP**.
 | **INSERT_ONLY** | append-only, driven by change documents (e.g. `CDPOS`) | CDHDR feed → `CHANGENR` list → `CDPOS WHERE CHANGENR IN (…)` (2-step, portable across ECC cluster / S4 transparent) | keyed upsert (DDIC key dedups re-delivered rows) |
 | **CHANGEDOC** | weak/absent change column (e.g. `MARA`, `MAKT`) | CDHDR `WHERE objectclas=… AND (udate>… OR (udate=… AND utime>…))` → business keys → **re-read** current rows from the source by key | keyed upsert |
 | **SNAPSHOT** | physical deletes, or bounded column-less tables | full reload into `<target>__snap` (the normal full-load path) | server anti-join: upsert all of staging **and DELETE target keys absent from it** |
+| **CDC** | physical deletes on a table too large to snapshot | database triggers on the source write a shadow log; the cycle drains it | delete-then-upsert per net operation — see [`cdc.md`](cdc.md) |
 
 Rule of thumb: **timestamp present → WATERMARK; append-only huge → INSERT_ONLY;
 no/weak change column → CHANGEDOC for I/U + nightly SNAPSHOT for deletes; bounded &

@@ -650,7 +650,7 @@ std::string RenderBasisHandout(const Diagnosis &d, const Options &o,
       << "something a deployment tool should do.\n\n"
       << "- SU01: a user of type **Communications Data** (not Dialog).\n"
       << "- PFCG role with `S_RFC`: `ACTVT=16`, `RFC_TYPE=FUGR`, `RFC_NAME=ZERPL_REV`.\n"
-      << "  That grants exactly the eight `Z_DUCKDB_*` modules and nothing else.\n\n"
+      << "  That grants exactly the nine `Z_DUCKDB_*` modules and nothing else.\n\n"
       << "This is the user the *running server* connects as. It is a different user\n"
       << "from the one in section 4, and it deliberately needs no developer rights.\n\n"
 
@@ -829,7 +829,7 @@ int RunSetup(Options o) {
             std::cout << "  · run ZCL_ERPL_REV_SETUP  (destination " << o.program_id
                       << ", gateway " << GwService(o.gwserv) << ", registration mode)\n";
         if (p.run_mkfm)
-            std::cout << "  · run ZCL_ERPL_REV_MKFM   (the eight Z_DUCKDB_* function modules)\n";
+            std::cout << "  · run ZCL_ERPL_REV_MKFM   (the nine Z_DUCKDB_* function modules)\n";
         std::cout << "\n";
     }
     if (!p.manual_steps.empty()) {
