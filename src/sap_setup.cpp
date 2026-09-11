@@ -131,6 +131,7 @@ bool ParseOption(const std::string &key, bool, const std::function<std::string()
     else if (key == "--gwhost")     { o.gwhost = take();     o.gwhost_set = true; }
     else if (key == "--gwserv")     { o.gwserv = take();     o.gwserv_set = true; }
     else if (key == "--tunnel-secret") { o.tunnel_secret = take(); o.tunnel_secret_set = true; }
+    else if (key == "--server-host")   { o.server_host = take(); o.server_host_set = true; }
     else if (key == "--print-runbook")  { o.print_runbook = true; }
     else if (key == "--save-password")  { o.save_password = true; }
     else return false;
@@ -158,6 +159,9 @@ void PrintHelp() {
         "  --program-id <id>        Gateway PROGRAM_ID (default ERPL_REV)\n"
         "  --gwhost <h>             Gateway host (default: the SAP host)\n"
         "  --gwserv <p>             Gateway service/port (default 3300)\n"
+        "  --server-host <h>        The host the SERVER registers from. This is what the\n"
+        "                           Basis handout's reginfo HOST= names. Defaults to this\n"
+        "                           machine -- correct only when the server runs here too.\n"
         "  --tunnel-secret <name>   The erpl-tunnel secret the SERVER reaches the gateway\n"
         "                           through, if any. doctor then reports gateway\n"
         "                           reachability as unknown instead of probing a local\n"
@@ -651,8 +655,10 @@ std::string RenderBasisHandout(const Diagnosis &d, const Options &o,
       << "- SU01: a user of type **Communications Data** (not Dialog).\n"
       << "- PFCG role with `S_RFC`: `ACTVT=16`, `RFC_TYPE=FUGR`, `RFC_NAME=ZERPL_REV`.\n"
       << "  That grants exactly the nine `Z_DUCKDB_*` modules and nothing else.\n\n"
-      << "This is the user the *running server* connects as. It is a different user\n"
-      << "from the one in section 4, and it deliberately needs no developer rights.\n\n"
+      << "This is an ABAP-side authorisation, not a login for the server. The server\n"
+      << "registers at the gateway with a PROGRAM_ID and supplies no SAP credentials\n"
+      << "at all -- `S_RFC` governs invoking the function group from inside SAP. It is\n"
+      << "a different user from the one in section 4, and needs no developer rights.\n\n"
 
       << "## 4. The user that runs `erpl-rev setup` needs S_DEVELOP\n\n"
       << "`setup` creates and activates ABAP objects over ADT, and `erpl-rev sync` /\n"
@@ -797,7 +803,14 @@ int RunSetup(Options o) {
 
     if (interactive) OfferToSave(o);
 
-    const std::string server_host = cli::LocalHostname();
+    // The machine the SERVER registers from, not the one running setup. They are
+    // the same often enough that defaulting to this hostname is right most of the
+    // time, and wrong in exactly the layout the documentation draws: CLI on a
+    // laptop, server on a host near SAP. When they differ, the handout named the
+    // laptop -- so Basis allowed a machine that never registers and refused the
+    // one that does, and the server still logs "listening" either way.
+    const std::string server_host =
+        o.server_host_set ? o.server_host : cli::LocalHostname();
 
     if (o.print_runbook) {
         Diagnosis empty;
