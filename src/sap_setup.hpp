@@ -36,9 +36,14 @@ namespace erpl_rev::setup {
 // without confusing an explicit empty value with an absent one.
 struct Options : cli::ConnOptions {
     std::string package;      // "$TMP" or e.g. ZERPL_CORE; empty = decide by diagnosis
+    // The workbench request every created object is recorded on. Required for a
+    // transportable package and meaningless for $TMP: SAP refuses to record a
+    // local object on a request, and refuses to create a transportable one
+    // without one -- with an HTTP 500 that names neither cause.
+    std::string transport;
     std::string program_id;   // gateway PROGRAM_ID, default ERPL_REV
     std::string gwhost, gwserv;
-    bool package_set = false, program_set = false;
+    bool package_set = false, program_set = false, transport_set = false;
     bool gwhost_set = false, gwserv_set = false;
     // Name of the erpl-tunnel secret the SERVER reaches the gateway through,
     // if any. Empty is the normal case. doctor cannot probe such a gateway --
@@ -118,12 +123,22 @@ struct Plan {
     bool run_mkfm = false;
     bool run_setup_class = false;
     std::string target_package;        // resolved "$TMP" or ZERPL_CORE
-    bool needs_transport = false;
+    bool needs_transport = false;      // the package is transportable
+    std::string transport;             // the request to record on; empty for $TMP
+    // Why setup must not run at all. Non-empty means the flags contradict each
+    // other badly enough that proceeding would half-create objects on the SAP
+    // system -- which is exactly what a missing transport does.
+    std::string blocked;
     std::vector<std::string> manual_steps;  // what a human must still do, in order
     bool nothing_to_do = false;
 };
 
 Plan MakePlan(const Diagnosis &d, const Options &o);
+
+// Why --package and --transport cannot both be honoured, or "" when they can.
+// Pure and diagnosis-free, so setup can refuse a bad pair of flags before it
+// spends twenty seconds interrogating the SAP system about it.
+std::string TransportConflict(const std::string &package, const std::string &transport);
 
 // The Basis handout, rendered from the diagnosis. `server_host` is how the SAP
 // gateway will see this machine -- it goes into the reginfo line verbatim.

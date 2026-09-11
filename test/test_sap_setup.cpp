@@ -125,6 +125,58 @@ TEST_CASE("package selection follows STMS, and --package overrides it", "[setup]
     }
 }
 
+// Verified against the A4H trial before this was written: creating a class in a
+// transportable package with no --transport answers HTTP 500 -- *after* creating
+// the object and recording it on a request SAP invented, which then holds the
+// name so the retry fails too. None of that is visible in the error. Refusing
+// beforehand is the only way the operator learns what is actually wrong.
+TEST_CASE("a transportable package without a request is refused, not attempted", "[setup]") {
+    Diagnosis d;
+    d.have_uvx = true;
+    d.adt_reachable = true;
+
+    SECTION("transportable package, no transport: blocked") {
+        Options o = DefaultOptions();
+        o.package = "ZERPL_CORE";
+        o.package_set = true;
+        const Plan p = MakePlan(d, o);
+        CHECK(p.needs_transport);
+        CHECK(p.transport.empty());
+        CHECK_FALSE(p.blocked.empty());
+        CHECK_THAT(p.blocked, Catch::Matchers::ContainsSubstring("--transport"));
+        CHECK_THAT(p.blocked, Catch::Matchers::ContainsSubstring("ZERPL_CORE"));
+    }
+
+    SECTION("transportable package with a request: allowed, and carried") {
+        Options o = DefaultOptions();
+        o.package = "ZERPL_CORE";
+        o.package_set = true;
+        o.transport = "A4HK900160";
+        o.transport_set = true;
+        const Plan p = MakePlan(d, o);
+        CHECK(p.blocked.empty());
+        CHECK(p.transport == "A4HK900160");
+    }
+
+    SECTION("$TMP with a request: blocked, because local objects never transport") {
+        Options o = DefaultOptions();
+        o.package = "$TMP";
+        o.package_set = true;
+        o.transport = "A4HK900160";
+        o.transport_set = true;
+        const Plan p = MakePlan(d, o);
+        CHECK_FALSE(p.needs_transport);
+        CHECK_FALSE(p.blocked.empty());
+        CHECK_THAT(p.blocked, Catch::Matchers::ContainsSubstring("A4HK900160"));
+    }
+
+    SECTION("the default path is untouched: $TMP, no request, not blocked") {
+        const Plan p = MakePlan(d, DefaultOptions());
+        CHECK(p.target_package == "$TMP");
+        CHECK(p.blocked.empty());
+    }
+}
+
 TEST_CASE("an unreachable gateway is called out as a blocker", "[setup]") {
     Diagnosis d = HealthyDiagnosis();
     d.gateway_reachable = false;

@@ -74,6 +74,10 @@ int RunRetain(Options o);   // prune a target's change log
 int RunCdc(Options o);      // status | repair
 int RunMass(Options o);     // run --split
 int RunTop(Options o);      // the replication monitor
+
+// `abap export <dir>` -- write the embedded ABAP sources out as files, for any
+// delivery route that is not `setup` pushing them over ADT.
+int RunAbap(Options o);
 int RunReplicate(Options o);
 
 } // namespace erpl_rev::cmd

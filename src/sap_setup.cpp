@@ -127,6 +127,7 @@ bool ParseOption(const std::string &key, bool, const std::function<std::string()
     // setup-specific ones are decided here.
     if (cli::ParseConnOption(key, take, o)) return true;
     if (key == "--package")         { o.package = take();    o.package_set = true; }
+    else if (key == "--transport")  { o.transport = take();  o.transport_set = true; }
     else if (key == "--program-id") { o.program_id = take(); o.program_set = true; }
     else if (key == "--gwhost")     { o.gwhost = take();     o.gwhost_set = true; }
     else if (key == "--gwserv")     { o.gwserv = take();     o.gwserv_set = true; }
@@ -148,6 +149,7 @@ void PrintHelp() {
         "  sync <ls|show|create|run|run-due|schedule>\n"
         "                           Manage and run delta sync jobs.\n"
         "  replicate --table T      Full-load a SAP table (submits a background job).\n"
+        "  abap export <dir>        Write the embedded ABAP sources out as files.\n"
         "\nsetup / doctor options:\n"
         "  --sap-host <h>           ADT host   (env SAP_HOST, default localhost)\n"
         "  --sap-port <p>           ADT port   (env SAP_PORT, default 50000)\n"
@@ -156,6 +158,10 @@ void PrintHelp() {
         "                           The password comes from SAP_PASSWORD or a prompt --\n"
         "                           never a flag, which the process list would expose.\n"
         "  --package <pkg>          Target ABAP package ($TMP, or e.g. ZERPL_CORE)\n"
+        "  --transport <id>         Workbench request to record the objects on. Required\n"
+        "                           whenever --package is transportable, and rejected for\n"
+        "                           $TMP. The package and the request must already exist;\n"
+        "                           an ABAP developer creates both (SE80 / SE09).\n"
         "  --program-id <id>        Gateway PROGRAM_ID (default ERPL_REV)\n"
         "  --gwhost <h>             Gateway host (default: the SAP host)\n"
         "  --gwserv <p>             Gateway service/port (default 3300)\n"
@@ -346,11 +352,34 @@ Diagnosis Diagnose(const Options &o) {
 // Planning -- pure, so every branch is testable without an SAP system
 // ---------------------------------------------------------------------------
 
+std::string TransportConflict(const std::string &package, const std::string &transport) {
+    const bool transportable = package != "$TMP";
+    // Verified on A4H: SAP answers a transportable create with no request by
+    // creating the object anyway, recording it on a request it invents, and
+    // returning HTTP 500 that names neither cause. The invented request then
+    // holds the name, so the retry fails too. Refuse before touching anything.
+    if (transportable && transport.empty()) {
+        return package + " is a transportable package, so every object created in "
+               "it has to be recorded on a workbench request. Pass --transport <id>.\n"
+               "        An ABAP developer creates the package and the request (SE80 / SE09);\n"
+               "        both must exist before setup runs. To evaluate without a transport,\n"
+               "        use --package $TMP (the default).";
+    }
+    if (!transportable && !transport.empty()) {
+        return "$TMP is a local package: its objects are never transported, so they cannot "
+               "be recorded on " + transport + ".\n"
+               "        Drop --transport, or name a transportable package with --package.";
+    }
+    return "";
+}
+
 Plan MakePlan(const Diagnosis &d, const Options &o) {
     Plan p;
     p.target_package = o.package.empty() ? (d.stms_available ? "ZERPL_CORE" : "$TMP")
                                          : o.package;
     p.needs_transport = p.target_package != "$TMP";
+    p.transport = o.transport;
+    p.blocked = TransportConflict(p.target_package, p.transport);
 
     // Deploy when anything is missing OR when the round-trip probe specifically
     // is absent: checking one representative object is enough to notice a bare
@@ -801,6 +830,18 @@ int RunSetup(Options o) {
         return 2;
     }
 
+    // Before the diagnosis, not after: this needs no SAP system to decide, and
+    // making the operator wait out a full interrogation to be told a flag is
+    // wrong is a poor trade.
+    if (o.package_set || o.transport_set) {
+        const std::string conflict = TransportConflict(
+            o.package.empty() ? "$TMP" : o.package, o.transport);
+        if (!conflict.empty()) {
+            std::cout << "Refusing to run: " << conflict << "\n";
+            return 2;
+        }
+    }
+
     if (interactive) OfferToSave(o);
 
     // The machine the SERVER registers from, not the one running setup. They are
@@ -829,15 +870,23 @@ int RunSetup(Options o) {
 
     const Plan p = MakePlan(d, o);
 
+    if (!p.blocked.empty()) {
+        std::cout << "Refusing to run: " << p.blocked << "\n";
+        return 2;
+    }
+
     std::cout << "Planned changes\n\n";
     if (p.nothing_to_do) {
         std::cout << "  nothing — the SAP side is already set up.\n\n";
     } else {
+        const std::string on_request =
+            p.transport.empty() ? "" : " on request " + p.transport;
         if (p.deploy_objects)
             std::cout << "  · deploy " << abap::ProductionAssets().size()
-                      << " ABAP objects into " << p.target_package << "\n";
+                      << " ABAP objects into " << p.target_package << on_request << "\n";
         if (p.create_function_group)
-            std::cout << "  · create function group ZERPL_REV\n";
+            std::cout << "  · create function group ZERPL_REV in " << p.target_package
+                      << on_request << "\n";
         if (p.run_setup_class)
             std::cout << "  · run ZCL_ERPL_REV_SETUP  (destination " << o.program_id
                       << ", gateway " << GwService(o.gwserv) << ", registration mode)\n";
@@ -907,9 +956,9 @@ int RunSetup(Options o) {
         for (const auto &a : abap::ProductionAssets()) {
             const auto file = Materialise(a, o, tmp);
             adt::CreateObject(conn, std::string(a.adt_type), std::string(a.name),
-                              p.target_package, std::string(a.description));
+                              p.target_package, std::string(a.description), p.transport);
             auto w = adt::WriteSource(conn, std::string(a.name), file.string(),
-                                      std::string(a.src_type));
+                                      std::string(a.src_type), p.transport);
             const bool ok = adt::ActivationSucceeded(w);
             std::cout << (ok ? "  ok   " : "  FAIL ") << a.name << "\n";
             if (!ok) {
@@ -921,8 +970,12 @@ int RunSetup(Options o) {
     if (p.create_function_group) {
         // Must exist before MKFM: RS_FUNCTIONMODULE_INSERT fails with
         // invalid_function_pool otherwise, and nothing else creates it.
+        // The function group carries the transport for the nine RFC modules too:
+        // RS_FUNCTIONMODULE_INSERT records nothing of its own (verified on A4H --
+        // e071 has no row for the module), but a function module is a sub-object
+        // of its group, so the group's R3TR entry takes the whole pool along.
         adt::CreateObject(conn, "FUGR/F", "ZERPL_REV", p.target_package,
-                          "erpl-rev RFC function group");
+                          "erpl-rev RFC function group", p.transport);
         std::cout << "  ok   function group ZERPL_REV\n";
     }
     if (p.run_setup_class) {

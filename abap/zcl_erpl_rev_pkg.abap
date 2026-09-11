@@ -7,11 +7,16 @@ CLASS zcl_erpl_rev_pkg DEFINITION PUBLIC FINAL CREATE PUBLIC.
 ENDCLASS.
 
 CLASS zcl_erpl_rev_pkg IMPLEMENTATION.
-  " Bootstrap the transportable package hierarchy for a transport delivery:
-  "   ZERPL (root) -> ZERPL_CORE (production) + ZERPL_TEST (tests/demos/fixtures)
-  " Software component HOME (transportable). Idempotent (reuse if present). Emits the
-  " workbench request it recorded the packages on, so a packaging script can reuse it.
   METHOD mkpkg.
+    " Bootstrap the transportable package hierarchy for a transport delivery:
+    "   ZERPL (root) -> ZERPL_CORE (production) + ZERPL_TEST (tests/demos/fixtures)
+    " Software component HOME (transportable). Idempotent (reuse if present). Emits the
+    " workbench request it recorded the packages on, so a packaging script can reuse it.
+    "
+    " These comments live INSIDE the method on purpose. ADT rejects a comment
+    " between CLASS ... IMPLEMENTATION. and the first METHOD with "the class
+    " contains unknown comments which can't be stored" -- an HTTP 400 that
+    " package-transport.sh swallowed, so step 1 silently created no packages.
     DATA: ls TYPE scompkdtln, li TYPE REF TO if_package.
     ls-devclass = name. ls-ctext = txt. ls-as4user = sy-uname. ls-dlvunit = 'HOME'.
     IF parent IS NOT INITIAL. ls-parentcl = parent. ENDIF.

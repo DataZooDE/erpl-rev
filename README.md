@@ -192,8 +192,10 @@ Basis — it contains the least-privilege `reginfo` line already filled in.
 > ```
 (`erpl-rev setup --print-runbook` prints the same handout **without deploying
 anything**, which is what you want on a system where you will never have
-`S_DEVELOP`; there, the ABAP arrives by transport instead — see
-[`INSTALL.md`](docs/INSTALL.md).)
+`S_DEVELOP`; there, the ABAP arrives by transport instead. The binary builds that
+transport too — `setup --package ZERPL_CORE --transport <request>` on your own DEV
+system — and `erpl-rev abap export <dir>` writes the fourteen sources out as files.
+See [`INSTALL.md`](docs/INSTALL.md).)
 
 Then start the server and go round again:
 
