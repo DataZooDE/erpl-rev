@@ -114,6 +114,10 @@ Five steps. The third one is a loop, and it is the only part that surprises peop
 
 ### 1. See it run — no SAP needed
 
+`uvx` runs a published tool without installing it, and comes with
+[uv](https://docs.astral.sh/uv/). erpl-rev's CLI shells out to it, so install uv
+first — or `pip install erpl-rev` and drop the `uvx` prefix from everything below.
+
 ```bash
 uvx erpl-rev --smoke
 ```
@@ -177,6 +181,15 @@ registration.
 
 **That is not a failure.** It also writes `erpl-rev-basis-handout.md`. Give that to
 Basis — it contains the least-privilege `reginfo` line already filled in.
+
+> **If the server will run on a different machine from the one you just typed on,
+> pass `--server-host`.** The `reginfo` line names the host allowed to register, and
+> it defaults to *this* machine. Get it wrong and Basis allows your laptop while the
+> real server is refused:
+>
+> ```bash
+> erpl-rev setup --print-runbook --server-host sapbridge01.corp
+> ```
 (`erpl-rev setup --print-runbook` prints the same handout **without deploying
 anything**, which is what you want on a system where you will never have
 `S_DEVELOP`; there, the ABAP arrives by transport instead — see
@@ -184,12 +197,33 @@ anything**, which is what you want on a system where you will never have
 
 Then start the server and go round again:
 
+Leave the server running in one terminal:
+
 ```bash
 erpl-rev --gwhost <gateway-host> --gwserv sapgw<NN>
-# INFO [server] listening (Ctrl-C to stop) program_id="ERPL_REV" ...
-
-erpl-rev doctor                 # now the round trip should pass
 ```
+
+**Watch for `to="running"`, not for "listening".**
+
+```
+INFO [server] registration state from="starting" to="running"     <- the gateway accepted
+INFO [server] listening (Ctrl-C to stop) program_id="ERPL_REV" ...
+```
+
+"listening" is printed as soon as the process starts serving, whether or not the
+gateway let it register; the state line is the one that tells you. If it says
+`broken`, the `reginfo` does not allow this host and program ID — that is the loop
+above not closed yet.
+
+Then, in another terminal:
+
+```bash
+erpl-rev doctor                 # the round trip should now pass
+```
+
+`doctor` and `setup` take `--gwhost`/`--gwserv` too, and they are *not* the server's
+defaults: `setup` assumes the gateway is on the SAP host. Pass them explicitly if your
+gateway is somewhere else.
 
 On a throwaway trial with `gw/acl_mode = 0` there is no ACL to satisfy and the two
 halves can happen in either order — see the [A4H appendix](docs/enable-rfc-registration.md).
@@ -217,6 +251,12 @@ erpl-rev sync create mara --method WATERMARK --source MARA \
 erpl-rev sync run mara            # one cycle now
 erpl-rev sync ls                  # what is registered, and how far behind
 ```
+
+> `wm-kind DATE` reads **whole days, and never today** — so once the backfill is done,
+> a run made the same day returns nothing. That is the complete-day rule doing its job,
+> not a fault: a day still being written to cannot be safely marked as read. Sources
+> with a timestamp column use `NUMTS` and do not wait. The table of kinds is in
+> [`delta.md`](docs/delta.md).
 
 Which method to choose, and how to catch **physical deletes** a change column cannot
 see, is [`docs/delta.md`](docs/delta.md) and [`docs/cdc.md`](docs/cdc.md). To have it
