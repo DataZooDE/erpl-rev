@@ -26,15 +26,11 @@ for which column is which.
 
 ## Seeding and repairing
 
-| Load type | Meaning | Watermark |
-|---|---|---|
-| `D` | delta (the default) | advances to the ceiling |
-| `I` | adopt a position, transfer nothing | seeded from the source |
-| `L` | initial load, then delta | advances |
-| `F` | repair: replace the target | **untouched** — a repair fixes data, it does not re-seed |
-
-`F`, `I` and `L` are **one-shot**. Set as a target's default they run once and
-the target reverts to delta; they are not a schedule.
+There are four load types — `D` delta, `I` adopt a position, `L` initial load then
+delta, `F` repair — and `F`, `I` and `L` are **one-shot**: set as a target's default
+they run once and the target reverts to delta. What each does to the watermark, which
+is the part that catches people out, is in
+[`delta.md`](delta.md#load-types).
 
 ```bash
 erpl-rev sync run sales --load-type F        # repair now
@@ -44,10 +40,10 @@ erpl-rev sync set-wm sales --wm-value 20260101000000   # re-deliver a window
 `set-wm` records a run of its own. A watermark that moved with no record of who
 moved it is the hardest kind of replication question to answer later.
 
-**A reload will not empty a target by accident.** If the read produced no rows
-and the target is not empty, `F` is refused rather than deleting a replica
-because a filter matched nothing. When the source really has been emptied, set
-`allow_empty_reload` on the target.
+**A reload will not empty a target by accident**: an `F` whose read produced no rows
+is refused rather than deleting a replica because a filter matched nothing. Set
+`allow_empty_reload` when the source really has been emptied — the reasoning is in
+[`delta.md`](delta.md).
 
 ## Checking the data
 
