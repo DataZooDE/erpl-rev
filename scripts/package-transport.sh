@@ -85,9 +85,22 @@ deploy() {           # <pkg> <req> "<NAME> <TYPE> <file>"
 }
 
 echo "== 1. bootstrap packages (ZERPL / ZERPL_CORE / ZERPL_TEST) =="
-adt object create --type CLAS/OC --name ZCL_ERPL_REV_PKG --package '$TMP' --description bootstrap >/dev/null 2>&1
-adt source write ZCL_ERPL_REV_PKG --file "$AB/zcl_erpl_rev_pkg.abap" --activate >/dev/null 2>&1
-adt object run ZCL_ERPL_REV_PKG 2>&1 | clean | grep -aiE 'created|exists|REQ='
+# Not >/dev/null: this step used to discard its own errors, and when ADT started
+# rejecting the class over a misplaced comment it kept printing nothing while
+# creating no packages at all. Every later step then failed for a reason that
+# named the symptom and not the cause.
+adt object create --type CLAS/OC --name ZCL_ERPL_REV_PKG --package '$TMP' --description bootstrap 2>&1 \
+    | clean | grep -aiE 'created|exists|error|forbidden|bad request' | head -1
+adt source write ZCL_ERPL_REV_PKG --file "$AB/zcl_erpl_rev_pkg.abap" --activate 2>&1 \
+    | clean | grep -aiE 'activated|error|cannot|bad request' | head -1
+PKGOUT=$(adt object run ZCL_ERPL_REV_PKG 2>&1 | clean)
+echo "$PKGOUT" | grep -aiE 'created|exists|REQ='
+for want in ZERPL ZERPL_CORE ZERPL_TEST; do
+  echo "$PKGOUT" | grep -qE "^$want (created|exists)" || {
+    echo "FATAL: package $want was not created -- refusing to build a transport without it."
+    exit 1
+  }
+done
 
 echo "== 2. transport request for the production set =="
 REQ=$(adt transport create --package ZERPL_CORE --desc "erpl-rev ${VERSION:-dev} production" 2>&1 | clean | grep -aoE 'A4HK[0-9]+|[A-Z0-9]{3}K[0-9]+' | head -1)
@@ -97,8 +110,12 @@ echo "== 3. deploy production objects -> ZERPL_CORE =="
 for o in "${CORE[@]}"; do echo -n "   $o -> "; deploy ZERPL_CORE "$REQ" "$o"; done
 
 echo "== 4. function group ZERPL_REV + RFC FMs (transported) =="
-# create empty FUGR in ZERPL_CORE first (SE80/erpl-adt), then MKFM inserts the FMs
-# with the transport so they ride ZERPL_CORE rather than landing in \$TMP.
+# Create the empty FUGR in ZERPL_CORE ON the request first, then let MKFM insert
+# the FMs. MKFM records nothing itself -- verified on A4H: after
+# RS_FUNCTIONMODULE_INSERT there is no e071 row for the module name. It does not
+# need one. A function module is a sub-object of its group, so the group's R3TR
+# entry carries the whole pool. Take the FUGR out of the request and the nine
+# modules quietly stop travelling with it.
 adt object create --type FUGR/F --name ZERPL_REV --package ZERPL_CORE --transport "$REQ" \
     --description "erpl-rev RFC FMs" 2>&1 | clean | tail -1
 adt object run ZCL_ERPL_REV_MKFM 2>&1 | clean | grep -aiE 'insert|tfdir' | head -6

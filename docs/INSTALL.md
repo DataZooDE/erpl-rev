@@ -42,11 +42,52 @@ Two parts: (1) get the **ABAP objects** into the SAP system, (2) install the
 
 ## 1. Import the ABAP transport (the package `ZERPL_CORE`)
 
-> **There is no prebuilt transport to download.** A transport request is produced
-> from a system you control: run `scripts/package-transport.sh` against a DEV system
-> with STMS routes configured, and release the request it creates. That is a
-> deliberate constraint — a transport carries the originating system's object
-> directory, so a generic one is not something we can publish.
+> **There is no prebuilt transport to download**, and there cannot be: a transport
+> carries the originating system's object directory, so a generic one is not
+> something we can publish. You build it on a system you control — which the binary
+> can do for you.
+
+### 1.0 Producing the request on your own DEV system
+
+The fourteen ABAP sources are compiled into the `erpl-rev` binary, so the machine
+that builds the transport needs no git checkout — only ADT access to a DEV system
+with STMS routes.
+
+An ABAP developer creates the package and an empty workbench request first
+(SE80 / SE09 — `setup` will not create either, and says so if they are missing).
+Then:
+
+```bash
+erpl-rev setup --package ZERPL_CORE --transport A4HK900123
+```
+
+Every object `setup` creates is recorded on that request. Release it in SE09 and
+STMS moves it to QA and production in the normal way.
+
+**`--transport` is required whenever `--package` is transportable**, and refused
+for `$TMP`. This is not pedantry: SAP answers a transportable create with no
+request by half-creating the object, recording it on a request it invents, and
+returning an HTTP 500 that names neither cause — after which the name is locked
+and the retry fails too. `setup` refuses before touching the system instead.
+
+The nine `Z_DUCKDB_*` modules need no separate handling. They are sub-objects of
+the function group `ZERPL_REV`, which `setup` puts on the request; the group's
+entry carries the whole pool.
+
+`scripts/package-transport.sh` does the same from a checkout and additionally
+deploys the `ZERPL_TEST` set, which is what a development system wants.
+
+### 1.0a Taking the sources out instead
+
+For abapGit, a code review, or an import by hand:
+
+```bash
+erpl-rev abap export ./abap-out
+```
+
+Fourteen files plus a `MANIFEST.txt` giving the **deployment order** — which is not
+alphabetical and matters: an interface has to exist before the class whose
+signature names it.
 
 Once built, the delivery is a standard transport request: a **cofile
 `K9xxxxx.<SID>`** + a **data file `R9xxxxx.<SID>`**. Production objects live in

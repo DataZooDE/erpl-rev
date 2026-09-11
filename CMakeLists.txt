@@ -327,6 +327,7 @@ add_library(erpl_rev_core OBJECT
   src/table_render.cpp
   src/cmd_sql.cpp
   src/cmd_sync.cpp
+  src/cmd_abap.cpp
   src/abap_skeletons.cpp
   src/cli_common.cpp
   src/tunnel.cpp
@@ -422,6 +423,7 @@ if(TRUE)  # tests always build; DuckDB is in-tree
     test/test_cmd_queue.cpp
     test/test_table_render.cpp
     test/test_sap_setup.cpp
+    test/test_cmd_abap.cpp
     test/test_tunnel.cpp
     test/bench_ingest.cpp
     test/bench_cycle.cpp)
