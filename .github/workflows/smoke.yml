@@ -89,13 +89,24 @@ jobs:
           tar -xzf "${{ matrix.archive }}"
           chmod +x "${{ matrix.bin }}"
           echo "::group::./${{ matrix.bin }} --smoke (no LD_LIBRARY_PATH / DYLD_LIBRARY_PATH)"
-          # Strip any inherited loader paths: the bundle must resolve its SAP SDK +
-          # DuckDB entirely from its own self-extracted directory.
+          # Strip any inherited loader paths: the bundle must resolve DuckDB
+          # entirely from its own self-extracted directory, and must not be
+          # quietly picking up an RFC library from the runner.
           out=$(env -u LD_LIBRARY_PATH -u DYLD_LIBRARY_PATH "./${{ matrix.bin }}" --smoke)
           echo "$out"
           echo "::endgroup::"
-          echo "$out" | grep -q "smoke ok"        || { echo "FAIL: no 'smoke ok' line"; exit 1; }
-          echo "$out" | grep -q "SAP NW RFC SDK"   || { echo "FAIL: SAP NW RFC SDK not reported loaded"; exit 1; }
+          echo "$out" | grep -q "smoke ok" || { echo "FAIL: no 'smoke ok' line"; exit 1; }
+          # The backend, not the SDK. Since v2026.08.30 the bundles talk RFC
+          # through erpl-proto, linked statically, and carry no SAP NW RFC SDK at
+          # all -- so the old "SAP NW RFC SDK" assertion had been failing every
+          # smoke run on all three platforms since that release. It ran after
+          # publication, gated nothing, and so went unread for six releases.
+          echo "$out" | grep -q "RFC backend erpl-proto" \
+            || { echo "FAIL: RFC backend is not erpl-proto"; exit 1; }
+          # And prove the negative the bundle actually promises.
+          echo "$out" | grep -q "SAP NW RFC SDK" \
+            && { echo "FAIL: bundle reports an SAP NW RFC SDK; it must carry none"; exit 1; }
+          true
 
       - name: Smoke-test the published bundle (windows)
         if: runner.os == 'Windows'
@@ -109,6 +120,12 @@ jobs:
           Expand-Archive -Force "${{ matrix.archive }}" -DestinationPath .
           $out = & ".\${{ matrix.bin }}" --smoke 2>&1 | Out-String
           Write-Host $out
-          if ($LASTEXITCODE -ne 0)            { Write-Error "smoke exited $LASTEXITCODE"; exit 1 }
-          if ($out -notmatch 'smoke ok')      { Write-Error "no 'smoke ok' line"; exit 1 }
-          if ($out -notmatch 'SAP NW RFC SDK'){ Write-Error "SAP NW RFC SDK not reported loaded"; exit 1 }
+          if ($LASTEXITCODE -ne 0)       { Write-Error "smoke exited $LASTEXITCODE"; exit 1 }
+          if ($out -notmatch 'smoke ok') { Write-Error "no 'smoke ok' line"; exit 1 }
+          # See the comment on the unix step: erpl-proto, and no SDK.
+          if ($out -notmatch 'RFC backend erpl-proto') {
+            Write-Error "RFC backend is not erpl-proto"; exit 1
+          }
+          if ($out -match 'SAP NW RFC SDK') {
+            Write-Error "bundle reports an SAP NW RFC SDK; it must carry none"; exit 1
+          }
