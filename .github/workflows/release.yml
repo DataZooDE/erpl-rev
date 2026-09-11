@@ -397,8 +397,9 @@ jobs:
             no ICU — DuckDB is the only bundled library.
 
             The Linux build is additionally exercised against a live ABAP
-            system: fifteen suites in `make e2e`, plus the opt-in `make e2e-full`
-            lane where a real background daemon replicates for minutes on end.
+            system: thirteen suites in `make e2e`, plus four more in the opt-in
+            `make e2e-full` lane, where a real background daemon replicates for
+            minutes on end.
             macOS and Windows are verified to build, link and start, but not yet
             against a live SAP system.
 
