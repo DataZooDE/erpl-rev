@@ -46,6 +46,13 @@ struct Options : cli::ConnOptions {
     // to stop it claiming it can.
     std::string tunnel_secret;
     bool tunnel_secret_set = false;
+    // The host the SERVER will register from, which is what the Basis handout's
+    // reginfo HOST= must name. Defaults to this machine's hostname, which is
+    // right only when the CLI and the server run in the same place -- and the
+    // documented layout is that they often do not. Getting this wrong hands
+    // Basis a line that allows the wrong machine and refuses the right one.
+    std::string server_host;
+    bool server_host_set = false;
 
     bool print_runbook = false;
     bool save_password = false;

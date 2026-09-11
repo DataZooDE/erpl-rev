@@ -15,7 +15,7 @@ building it).
 | `erpl_rev_server` | external C++ process, registers `PROGRAM_ID=ERPL_REV` at the gateway |
 | RFC destination `ERPL_REV` | type **T**, **registration mode** (`method='R'`), points at the gateway |
 | Function group `ZERPL_REV` | the 9 RFC FMs ABAP calls (`Z_DUCKDB_QUERY/INGEST/SNAPSHOT_MERGE/OPEN/FETCH/CLOSE/PLAN/CDC_PLAN/CDC_APPLY`) |
-| RFC user | the user under which ABAP→server calls run / the server is reached |
+| RFC user | the ABAP-side identity for calls into the function group. **Not** a login for the server: a registered RFC server supplies no SAP credentials — it presents a PROGRAM_ID and the gateway's `reginfo` decides |
 
 ABAP→server traffic carries **table data** (SAP business data leaving the system),
 so it must be access-controlled and, off-box, encrypted (SNC).
@@ -125,7 +125,7 @@ S_RFC: ACTVT=16, RFC_TYPE=FUGR, RFC_NAME=ZERPL_REV
   as the DuckDB file itself.
 
 ## 6a. Two different users, two different authorisations
-- The **RFC service user** the running server connects as needs only `S_RFC`
+- The **RFC user** needs only `S_RFC`
   (`ACTVT=16`, `RFC_TYPE=FUGR`, `RFC_NAME=ZERPL_REV`) — the nine `Z_DUCKDB_*`
   modules and nothing else. It needs **no** developer rights.
 - The user who runs **`erpl-rev setup`** needs **`S_DEVELOP`** (`OBJTYPE=CLAS`,

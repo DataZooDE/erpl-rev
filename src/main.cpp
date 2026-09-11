@@ -421,10 +421,42 @@ int RunSmoke() {
     return 0;
 }
 
+// The names the SDK's numeric states actually mean, because "new=3" tells an
+// operator nothing at the moment they most need telling.
+const char *ServerStateName(RFC_SERVER_STATE s) {
+    switch (s) {
+        case RFC_SERVER_INITIAL:  return "initial";
+        case RFC_SERVER_STARTING: return "starting";
+        case RFC_SERVER_RUNNING:  return "running";
+        case RFC_SERVER_BROKEN:   return "broken";
+        case RFC_SERVER_STOPPING: return "stopping";
+        case RFC_SERVER_STOPPED:  return "stopped";
+        default:                  return "unknown";
+    }
+}
+
 void SAP_API OnStateChange(RFC_SERVER_HANDLE, RFC_STATE_CHANGE *c) {
     if (c->oldState == c->newState) return;   // ignore reconnect heartbeats
-    log::get().Debug("server", "state change",
-                     {{"old", (long long)c->oldState}, {"new", (long long)c->newState}});
+
+    // INFO, not Debug. "listening" is printed the moment RfcLaunchServer
+    // returns, which is BEFORE the gateway has accepted -- or refused -- the
+    // registration. An operator reading that line as success is exactly what a
+    // reginfo naming the wrong host looks like: a server that says it is
+    // listening and a SAP system that never calls it. The state change is the
+    // only signal that distinguishes the two, and it was only ever logged at
+    // Debug, which nobody runs at.
+    // Built at each call site rather than hoisted into a local: log::Fields is a
+    // std::initializer_list, whose backing array lifetime is a thing worth not
+    // having to reason about.
+    if (c->newState == RFC_SERVER_BROKEN)
+        log::get().Error("server", "gateway registration is broken -- check that the "
+                                   "gateway reginfo allows this host and PROGRAM_ID",
+                         {{"from", ServerStateName(c->oldState)},
+                          {"to", ServerStateName(c->newState)}});
+    else
+        log::get().Info("server", "registration state",
+                        {{"from", ServerStateName(c->oldState)},
+                         {"to", ServerStateName(c->newState)}});
 }
 
 } // namespace
