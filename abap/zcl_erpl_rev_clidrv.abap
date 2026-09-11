@@ -401,6 +401,43 @@ CLASS zcl_erpl_rev_clidrv IMPLEMENTATION.
           ENDIF.
         ENDIF.
 
+      WHEN 'cdc_provision'.
+        " Provisioning the trigger tier from the CLI. Until this existed the one
+        " tier that catches physical deletes could only be reached by writing
+        " ABAP -- a data engineer had to find an ABAP developer for the feature
+        " they most likely came for.
+        "
+        " The SOURCE and the KEYS are read from the registry, not taken as
+        " parameters. `sync create` already recorded them, and a trigger set
+        " provisioned against a different source or a different key list than
+        " the cycle reads is not a mistake anyone would spot until rows went
+        " missing.
+        DATA(lv_pt) = jstr( iv_json = iv_params iv_key = 'target' ).
+        DATA(lv_pm) = jstr( iv_json = iv_params iv_key = 'mode' ).
+        IF lv_pm IS INITIAL. lv_pm = 'DELETE_ONLY'. ENDIF.
+
+        DATA(ls_pregq) = zcl_erpl_rev_util=>query(
+          |SELECT source_from, keys FROM _erpl_rev_delta_state | &&
+          |WHERE target='{ q( lv_pt ) }'| ).
+        DATA(lv_psrc) = jstr( iv_json = ls_pregq-rows iv_key = 'source_from' ).
+        DATA(lv_pkey) = jstr( iv_json = ls_pregq-rows iv_key = 'keys' ).
+
+        IF lv_psrc IS INITIAL OR lv_pkey IS INITIAL.
+          " Naming the fix, not just the fault: this is the commonest way to
+          " arrive here, and "not registered" on its own tells the operator
+          " nothing about what to do next.
+          ev_error = |CDC provision: '{ lv_pt }' has no source/keys in the | &&
+                     |registry. Register it first: erpl-rev sync create | &&
+                     |--target { lv_pt } --method CDC --source <TABLE> --keys <K1,K2>|.
+        ELSE.
+          ev_error = zcl_erpl_rev_cdc=>provision(
+            iv_target = lv_pt iv_source = lv_psrc
+            iv_keys   = lv_pkey iv_mode  = lv_pm ).
+          IF ev_error IS INITIAL.
+            ev_result = |{ lv_pm } triggers provisioned on { lv_psrc } for { lv_pt }|.
+          ENDIF.
+        ENDIF.
+
       WHEN 'cdc_status' OR 'cdc_repair'.
         " Two round trips, because the catalogue lives in HANA and the registry
         " lives in DuckDB and neither can see the other. The server says what to

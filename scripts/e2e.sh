@@ -104,6 +104,9 @@ fail() { echo "E2E FAIL: $*" >&2; srv_kill; exit 1; }
 # violation should cost a second rather than a full e2e run.
 echo "== compliance (static) =="
 "$HERE/scripts/compliance-scan.sh" || fail "compliance scan"
+# The transport must deliver exactly what the footprint says we deliver. Static,
+# so it runs before anything is built or connected to.
+"$HERE/scripts/check-transport-complete.sh" || fail "transport does not match the delivered footprint"
 
 echo "== build =="
 if [ -n "$REMOTE" ]; then
@@ -623,6 +626,20 @@ fi
 CS="$(cli cdc status --target t000_cli --yes 2>&1 || true)"
 grep -qiE "not a registered trigger target|no registration" <<<"$CS"   || fail "cdc status on a non-CDC target gave no usable message: $CS"
 echo "   cdc status on a non-CDC target reports it cleanly"
+
+# `cdc provision` is the verb that used to not exist, so the trigger tier -- the
+# only one that catches physical deletes -- could be reached only by writing
+# ABAP. The full round trip is covered by the CDC suite; what is asserted here
+# are the two ways a person gets this wrong, both of which must name the fix
+# rather than the fault.
+CPM="$(cli cdc provision --target t000_cli --mode NONSENSE --yes 2>&1 || true)"
+grep -q "DELETE_ONLY" <<<"$CPM"  || fail "cdc provision took a bad mode, or did not list the valid ones: $CPM"
+grep -q "KEYS_IUD"    <<<"$CPM"  || fail "cdc provision's mode error does not name KEYS_IUD: $CPM"
+echo "   cdc provision refuses an unknown mode and names the three"
+
+CPU="$(cli cdc provision --target never_registered_xyz --yes 2>&1 || true)"
+grep -q "sync create" <<<"$CPU"  || fail "cdc provision on an unregistered target did not name the fix: $CPU"
+echo "   cdc provision on an unregistered target points at sync create"
 
 srv_kill; sleep 1
 on_server rm -f "$E2E_DB" "$E2E_DB".wal /tmp/erpl_taxi.parquet

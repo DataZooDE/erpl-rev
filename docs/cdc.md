@@ -66,6 +66,33 @@ trade; where the table is not hot, `IMAGE_IUD` moves fewer bytes overall.
 
 ## Using it
 
+From the CLI, which is where most of this belongs:
+
+```bash
+# 1. seed the DuckDB target (a normal full load)
+erpl-rev replicate --table ZDELTA_WM --target cdc_wm
+
+# 2. register it on the trigger tier
+erpl-rev sync create cdc_wm --method CDC --source ZDELTA_WM --keys CLIENT,ID \
+    --cadence micro:2 --log
+
+# 3. provision the triggers (creates the ZCDC_* log, sequence and triggers in
+#    the SAP database). Source and keys come from the registry -- they were
+#    given once, at step 2.
+erpl-rev cdc provision --target cdc_wm --mode KEYS_IUD
+
+# 4. from here the daemon runs the cycles; or drive one by hand:
+erpl-rev sync run cdc_wm
+```
+
+**Step 1 is not optional and its order matters.** A cycle applies a *delta*; with
+no target table the first one errors, the registry leaves `SEEDED`/`ACTIVE`, and
+the tick planner then skips the target silently on every tick — a trigger tier
+that looks provisioned and does nothing. `cdc status` is what tells you.
+
+The same from ABAP, which is still the only way to reach some of the tuning
+parameters:
+
 ```abap
 " 1. seed the DuckDB target (a normal full load)
 zcl_erpl_rev_util=>replicate( iv_tab = 'ZDELTA_WM' iv_target = 'cdc_wm' ).
