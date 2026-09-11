@@ -69,7 +69,7 @@ makes DuckDB call *into* SAP, **erpl-rev has SAP call out into DuckDB.**
   **Iceberg**, on local disk or **cloud object storage** (S3 / GCS / Azure).
 - **Publish into a warehouse.** `ATTACH` **Postgres / MySQL / BigQuery / MotherDuck**
   and push a SAP slice in with one SQL statement — see
-  [Push to MotherDuck](#push-to-motherduck-duckdbs-cloud) below.
+  [`docs/publishing.md`](docs/publishing.md).
 - **Fast & parallel** — a live 10M-row run (50-of-400-column BSEG-shaped table,
   BELNR-partitioned, on the A4H trial / loopback):
 
@@ -85,43 +85,6 @@ makes DuckDB call *into* SAP, **erpl-rev has SAP call out into DuckDB.**
 key range with a DuckDB `Appender` (~230× a naive per-row path); memory is bounded
 by batch size, and loads are restartable and idempotent
 ([`test/bench_ingest.cpp`](test/bench_ingest.cpp)).
-
-### Push to MotherDuck (DuckDB's cloud)
-
-[MotherDuck](https://motherduck.com) is just another DuckDB-attachable catalog, so
-the embedded engine reaches it exactly like Postgres / BigQuery / Iceberg — only the
-`ATTACH` and credentials differ. Point the server's boot init at MotherDuck once,
-then replicate or publish SAP slices straight into the cloud.
-
-**1. Boot the server attached to MotherDuck.** Supply the token via the
-`motherduck_token` env var (or a `CREATE SECRET` in an `--init-file`) — never commit it:
-```bash
-export motherduck_token='<your-md-token>'
-ERPL_REV_GWHOST=<gw> ERPL_REV_GWSERV=sapgw00 \
-  ./build/erpl_rev_server --db erpl-rev.duckdb \
-  --init-sql "INSTALL motherduck; LOAD motherduck; ATTACH 'md:';"
-```
-Your MotherDuck databases now appear as catalogs (e.g. `my_db.main.<table>`).
-
-**2. Push a SAP slice from ABAP** — stage locally, then publish to the cloud:
-```abap
-zcl_erpl_rev_util=>replicate( iv_tab = 'MARA' iv_target = 'mara' ).
-zcl_erpl_rev_util=>publish(                       " FULL = overwrite, APPEND = insert
-  iv_source = 'mara' iv_kind = 'TABLE'
-  iv_dest   = 'my_db.main.mara' iv_mode = 'FULL' ).
-```
-The *publish* field of `Z_ERPL_REV_REPLICATE` does the same from the GUI.
-
-**3. Query MotherDuck from the SQL console.** `Z_ERPL_REV_SQL` ships an **example
-dropdown** with ready-to-run queries: the classic NYC-taxi public-Parquet aggregate,
-MotherDuck's shared `sample_data` (taxi + Hacker News), a `SUMMARIZE`, and a
-push-a-table round-trip — pick one and hit *Execute*.
-
-> The released bundle ships DuckDB with `parquet` / `json` built in; `motherduck`
-> (and `httpfs`) auto-install from `extensions.duckdb.org` on first use, so the host
-> needs outbound HTTPS — or pre-stage the extension for air-gapped systems.
-
----
 
 ## Why it fits the SAP data stack
 
@@ -145,289 +108,137 @@ native/ADBC BW path reads cross-client). Full guide: [`docs/security.md`](docs/s
 
 ---
 
-## Install & setup
+## Getting started
 
-**Just want to run it?** Use `uvx` — nothing to download, nothing to unpack:
+Five steps. The third one is a loop, and it is the only part that surprises people.
 
-```bash
-uvx erpl-rev --help          # runs the server; no install, no clone
-uvx erpl-rev --smoke         # prove the RFC backend and DuckDB both load
-```
-
-or `pip install erpl-rev` if you would rather have it on `PATH`. Wheels are
-published for Linux x86-64, macOS arm64 and Windows x64.
-
-#### Then operate it from the shell
-
-Everything the SAP GUI reports do is also a command, so a headless server is a
-first-class place to work from:
+### 1. See it run — no SAP needed
 
 ```bash
-uvx erpl-rev sql "SELECT count(*) FROM mara"      # the Z_ERPL_REV_SQL console
-uvx erpl-rev replicate --table MARA --target mara # the Z_ERPL_REV_REPLICATE report
-uvx erpl-rev sync ls                              # registered delta jobs
-uvx erpl-rev sync run mara                        # one delta cycle
-uvx erpl-rev sync schedule --every 5              # the periodic background job
+uvx erpl-rev --smoke
 ```
 
-`sql` and `sync ls|show` read the live DuckDB directly — over the server's quack
-listener when one is running, or the file when it is not, and they always print
-which. Anything that needs SAP to *read source data* submits the same report the
-GUI submits as a background job, so a load that takes hours is not bounded by an
-HTTP timeout.
+Loads the RFC stack and DuckDB and prints their versions. If that works, the binary
+is fine and everything from here is about SAP. (`pip install erpl-rev` if you would
+rather have it on `PATH`; a container image and standalone bundles are in
+[Install options](#install-options) below.)
 
-Add `--print-abap` to any of them to see the ABAP instead of running it, and
-`--dry-run` to see the plan. Nothing writes to SAP or DuckDB without a terminal
-confirmation or an explicit `--yes`.
+### 2. Collect what you need
 
-> Parameters reach SAP as *data*: the CLI writes the command into a DuckDB table
-> and the pre-deployed `ZCL_ERPL_REV_CLIDRV` executes it, so these commands need
-> **no SAP authorisation** and create nothing. `--queue-only` does not contact
-> SAP at all — the periodic `ERPL_REV_DELTA` job picks the command up.
->
-> Where the driver is not deployed they fall back to generating a temporary
-> class, which does need `S_DEVELOP`. `erpl-rev doctor` reports which applies.
-
-## Then set up the SAP side
-
-Getting the binary was always easy; getting SAP ready used to be an afternoon
-across four documents — a type-T destination, a function group, nine
-`Z_DUCKDB_*` modules, fourteen ABAP objects, a `reginfo` line. Two commands now
-do what a client can do, and hand over what it cannot:
-
-```bash
-uvx erpl-rev doctor          # read-only: what is missing, and the fix for each
-uvx erpl-rev setup --dry-run # the exact change set, nothing written
-uvx erpl-rev setup           # deploy, then prove a round trip before claiming success
-```
-
-`setup` deploys the ABAP over ADT, creates the destination and the function
-modules, and **only reports success once ABAP has actually called back out
-through the registered server** — "the objects exist" is not the same claim.
-Re-running it changes nothing. Every write needs a terminal confirmation or an
-explicit `--yes`.
-
-Two things genuinely cannot be done from a client: the gateway `reginfo`
-allow-list and the `gw/acl_mode` profile parameters. For those `setup` writes
-`erpl-rev-basis-handout.md`, filled in for your system, with nothing left to
-compose. See [docs/INSTALL.md](docs/INSTALL.md) for the manual path.
-
-Three ways to get the same server, pick whichever suits:
-
-| | how | notes |
-|---|---|---|
-| **PyPI** | `uvx erpl-rev` / `pip install erpl-rev` | fastest; any Python 3 |
-| **Release binary** | download from [releases](https://github.com/DataZooDE/erpl-rev/releases) | one self-extracting file, no Python |
-| **Docker** | `docker pull ghcr.io/datazoode/erpl-rev:latest` | bakes the same bundle — see [Run with Docker](#run-with-docker) |
-
-All three carry **DuckDB and nothing else**: since `v2026.08.30` the RFC protocol
-is [`erpl-proto`](https://erpl.io/blog/sap-rfc-protocol-byte-by-byte), our pure-Rust
-implementation, linked statically — so there is no SAP NW RFC SDK, no ICU, and no
-`LD_LIBRARY_PATH` to set.
-
-Whichever you pick you still do the one-time SAP-side wiring (**step 3**) and then
-run it (**step 4**).
-
-> The numbered steps below **build from source** — only needed to develop erpl-rev
-> or to produce the bundle yourself (`make bundle` → `dist/erpl-rev`).
-
-### Prerequisites
-- Linux host with **CMake ≥ 3.16**, a **C++17** compiler, **Ninja**, and **vcpkg**
-  (supplies Catch2 for the tests).
-- The proprietary **SAP NW RFC SDK** (not redistributed — see below).
-- A reachable SAP **gateway** (any NetWeaver ABAP; a local A4H docker trial works).
-
-### 1. Provide the SDK + DuckDB
-The NW RFC SDK lives in a repo-local, gitignored `nwrfcsdk/linux/` (same convention
-as `erpl`). Download it from the SAP Software Center, or copy it from an `erpl`
-checkout. DuckDB is fetched as an official prebuilt:
-```bash
-cp -a /path/to/nwrfcsdk ./nwrfcsdk     # provides nwrfcsdk/linux/{include,lib}
-make duckdb-dist                       # fetch prebuilt libduckdb 1.5.5 into vendor/
-```
-
-### 2. Build & test
-```bash
-make build      # -> build/erpl_rev_server + build/erpl_rev_tests
-make test       # the Catch2 suite against real DuckDB (no mocks)
-```
-`make build` also initialises the `third_party/posthog-telemetry` submodule, so a
-fresh clone needs no extra `git submodule` step.
-
-### 3. Wire up the SAP side (one-time)
-Production = import the ABAP transport and run the setup classrun — full guide in
-[`docs/INSTALL.md`](docs/INSTALL.md). You need three things in the SAP system:
-- a **type-T `ERPL_REV` destination** in registration mode (`method='R'`) — created by `ZCL_ERPL_REV_SETUP`;
-- the **`ZERPL_REV` function group + FMs** (`Z_DUCKDB_*`) — created by `ZCL_ERPL_REV_MKFM`;
-- gateway registration allowed for the server's host — [`docs/enable-rfc-registration.md`](docs/enable-rfc-registration.md).
-
-### 4. Run the server
-Running the **downloaded release binary** (or the Docker image) needs no setup —
-just `./erpl-rev-linux-amd64` with the `ERPL_REV_*` env below; the bundle
-self-extracts and sets its own loader path. The `LD_LIBRARY_PATH` line is **only**
-for the from-source `build/erpl_rev_server`, whose libs live elsewhere in the tree:
-```bash
-export LD_LIBRARY_PATH=$PWD/nwrfcsdk/linux/lib:$PWD/vendor/duckdb-1.5.5
-ERPL_REV_GWHOST=<gateway-host> ERPL_REV_GWSERV=sapgw00 \
-ERPL_REV_DB_PATH=erpl-rev.duckdb \
-  ./build/erpl_rev_server            # add --quack for the network server
-# convenience: `make run` (quack on), `make run-mem` (in-memory), or `make run-no-quack`
-```
-Easiest is **[`scripts/run-rfc-server.sh`](scripts/run-rfc-server.sh)**: it sets
-`LD_LIBRARY_PATH`, registers as `ERPL_REV`, and — opt-in via the environment —
-attaches **MotherDuck** (`motherduck_token`) and/or **BigQuery**
-(`ERPL_REV_BQ_PROJECT`). Pass `-r` to restart.
-
-To publish to **external / cloud catalogs** (parquet, postgres, ducklake,
-bigquery, motherduck), give DuckDB boot SQL that runs `INSTALL`/`LOAD`/`ATTACH`
-(and `CREATE SECRET`) once on a global connection — via `--init-sql "<sql>"`,
-`--init-file <path>`, or the `ERPL_REV_DUCKDB_INIT` env var.
-
-For production, run it as a **systemd service** ([`deploy/erpl-rev.service`](deploy/erpl-rev.service))
-or via **Docker** (image below).
-
-#### Run with Docker
-
-Prebuilt `linux/amd64` images are published to GitHub Container Registry:
-
-```bash
-docker run -d --name erpl-rev \
-  -e ERPL_REV_GWHOST=<gateway-host> -e ERPL_REV_GWSERV=sapgw00 \
-  -e ERPL_REV_PROGRAM_ID=ERPL_REV \
-  -v erpl-data:/data \
-  ghcr.io/datazoode/erpl-rev:latest
-# add `--quack` (and `-p 9494:9494`) for the DuckDB network server
-```
-
-Config is entirely via `ERPL_REV_*` env vars; the DuckDB file lives on the
-`/data` volume. RFC registration is **outbound** to the gateway, so no inbound
-port is needed — the gateway's `reginfo` ACL must allow `ERPL_REV_PROGRAM_ID`
-from the container's host. Add `--quack` and publish `-p 9494:9494` for the
-network server; `docker run --rm ghcr.io/datazoode/erpl-rev:latest --smoke`
-checks a pulled image loads with no gateway. See [`docs/docker.md`](docs/docker.md).
-
-### 5. Smoke test
-- `./build/erpl_rev_server --smoke` (or the bundled binary) — loads the SAP NW RFC
-  SDK + DuckDB and prints their versions; needs no gateway.
-- `Z_ERPL_REV_SQL` (`SE38`) → run `SELECT 42` to confirm the ABAP → server → DuckDB
-  round-trip (server must be running and registered).
-- Run `Z_ERPL_REV_REPLICATE` (`SE38`) on a small table and check row parity.
-
----
-
-## Quick start
-
-**Start the server** — from PyPI, with nothing installed beforehand:
-
-```bash
-uvx erpl-rev                              # file-backed in ./erpl-rev.duckdb
-uvx erpl-rev --db :memory:                # throwaway, nothing on disk
-uvx erpl-rev --quack                      # + expose DuckDB to external clients
-```
-
-It registers its `PROGRAM_ID` at the SAP gateway and waits for ABAP to call out to
-it. The SAP side (destination + the `Z_DUCKDB_*` function modules) is the one-time
-setup in **step 3** above.
-
-**Query SAP data with SQL** — `Z_ERPL_REV_SQL` (`SE38`) opens a DuckDB SQL console
-in the SAP GUI: type any query (over replicated SAP data, cloud parquet, or
-attached catalogs) and get an ALV grid back; or call the query FM from ABAP and
-receive typed rows. From an external DuckDB client (with `--quack`):
-```sql
--- from any DuckDB client
-INSTALL quack; LOAD quack;
-SELECT * FROM quack_query('quack:host:9494',
-                          'SELECT * FROM <table>',
-                          token => '<token>');   -- the live in-process data
-```
-
-**Replicate a table** — `Z_ERPL_REV_REPLICATE` (`SE38`): pick the source (F4 to
-search the DDIC), optionally pick columns (F4) and a `WHERE`, choose a target; keys
-are auto-kept so re-runs dedup. For >100M rows, tick *parallel* and run in
-background. Mirrors SLT's `LTRS` knobs — details below.
-
-<details>
-<summary><b>Replicating SAP tables — the SLT-style detail</b></summary>
-
-`Z_ERPL_REV_REPLICATE` maps to the three per-table controls of SAP SLT (`LTRS`):
-
-| SLT concept | Parameter | Behaviour |
-|---|---|---|
-| Table selection | `p_tab` | source SAP table / CDS view (F4 search). |
-| Field selection | `p_cols` | columns to replicate (blank = all); keys always kept. |
-| Filter (at source) | `p_where` | OpenSQL `WHERE`, applied in the SAP `SELECT` so non-matching rows never transfer. |
-| target / init / mode | `p_target` `p_init` `p_mode` `p_maxrow` `p_verify` | DuckDB table name; pre-SQL; `UPSERT`/`INSERT`; row cap; count-parity check. |
-
-Reads are **package-wise** (keyset pagination, 50k/batch) so memory is bounded;
-full-load-replace makes a crashed run safely re-runnable. The data-identity test
-(`zcl_erpl_rev_difftest`) compares target vs source cell-by-cell (SFLIGHT,
-ZWIDE_BSEG, REPOSRC + a negative control), **byte for byte including trailing
-zeros** — `RAW` columns replicate faithfully.
-</details>
-
----
-
-## How it works
+erpl-rev makes **two different connections**, and mixing them up is the commonest
+early confusion:
 
 ```
-ABAP ──CALL FUNCTION 'Z_DUCKDB_QUERY'/'Z_DUCKDB_INGEST' DESTINATION 'ERPL_REV'──►
-   SAP gateway (registered-server routing, RFCOPTIONS H=RFCSERVER)
-      └──► erpl_rev_server (C++) ──► DuckDbBridge ──► DuckDB (parquet / lakehouse)
+  your laptop ──── ADT, HTTP :50000 ────▶  SAP   (the CLI: doctor, setup, sync, replicate)
+  the server  ◀─── RFC, gateway :3300 ──▶  SAP   (registers OUTBOUND; SAP never dials in)
+  your laptop ──── quack, loopback ─────▶  the server   (sql, sync ls)
 ```
 
-A registered RFC server (`RfcCreateServer`/`RfcLaunchServer`) hosts a handful of
-function modules whose payloads are **JSON / binary-sXML over scalar `STRING`
-params** — schema-generic, so no custom DDIC structures.
+For the **CLI**, an ABAP Development Tools login:
 
-**DuckDB 1.5.5** (parquet + json + quack built in) is linked **statically**, as are
-libstdc++/libgcc and — in the released bundles — the `erpl-proto` RFC implementation.
-That is what makes a bundle a single file with nothing beside it. A from-source build
-differs: `make` defaults to `RFC_BACKEND=sdk` and then does need the SAP NW RFC SDK at
-runtime; `make build RFC_BACKEND=proto` reproduces what ships.
-
-<details>
-<summary><b>Configuration (env vars & flags)</b></summary>
-
-12-factor: config from the environment, logs to stderr, graceful `SIGINT`/`SIGTERM`.
-CLI flags override env (**flag > env > default**); `--help` prints the full surface.
-
-| Concern | Flag | Env var | Default |
+| | flag | env | default |
 |---|---|---|---|
-| Gateway PROGRAM_ID | `--program-id` | `ERPL_REV_PROGRAM_ID` | `ERPL_REV` |
-| Gateway host / service | `--gwhost` / `--gwserv` | `ERPL_REV_GWHOST` / `ERPL_REV_GWSERV` | `localhost` / `3300` |
-| Parallel registrations | — | `ERPL_REV_REG_COUNT` | `5` |
-| Reach the gateway through a tunnel | `--tunnel-secret <name>` | `ERPL_REV_TUNNEL_SECRET` | — (off; see [docs/tunnel.md](docs/tunnel.md)) |
-| Tunnel far end / near end | `--tunnel-target` / `--tunnel-local-port` | `ERPL_REV_TUNNEL_TARGET` / `ERPL_REV_TUNNEL_LOCAL_PORT` | the gateway / a free loopback port |
-| Disable quack | `--no-quack` | `ERPL_REV_NO_QUACK` | quack is **on**, bound to loopback |
-| Quack bind / token | `--quack-listen` / `--quack-token` | `ERPL_REV_QUACK_LISTEN` / `ERPL_REV_QUACK_TOKEN` | `quack:localhost` (port 9494) / random |
-| DuckDB file | `--db <path>` | `ERPL_REV_DB_PATH` | `erpl-rev.duckdb` (`:memory:` for in-mem) |
-| Boot init SQL | `--init-sql` / `--init-file` | `ERPL_REV_DUCKDB_INIT` | — (ATTACH/secrets for external/cloud targets) |
-| Telemetry opt-out | `--no-telemetry` | `ERPL_REV_NO_TELEMETRY` / `DATAZOO_DISABLE_TELEMETRY` | on by default ([what is sent](TELEMETRY.md)) |
-| Self-check & exit | `--smoke` | — | — |
-| Logging | — | `ERPL_REV_LOG_{LEVEL,FORMAT,COLOR}` | `info` / `console` / `auto` |
+| host | `--sap-host` | `SAP_HOST` | `localhost` |
+| HTTP port | `--sap-port` | `SAP_PORT` | `50000` |
+| client | `--sap-client` | `SAP_CLIENT` | `001` |
+| user | `--sap-user` | `SAP_USER` | prompted |
+| password | — | `SAP_PASSWORD` | prompted |
 
-A file-backed `--db` makes ingested (and quack-served) data durable across
-restarts. The quack token is a bearer credential — pin a high-entropy value via
-`--quack-token` (it's redacted from the log) and keep the listener on loopback
-unless you intend remote access.
-</details>
+ADT must be reachable (`/sap/bc/adt`, ICF active). `uvx`/`uv` must be installed —
+the CLI shells out to it.
 
-<details>
-<summary><b>Build internals & troubleshooting</b></summary>
+For the **server**, the gateway: `--gwhost` and `--gwserv` (`sapgw<NN>`, port
+`33<NN>`). Terms in that paragraph you do not recognise are in the
+[glossary](docs/glossary.md).
 
-- The build resolves the SDK from `nwrfcsdk/linux` (override `-DSAPNWRFC_HOME=…` /
-  `make build NWRFC_HOME=…`); Catch2 via **vcpkg** manifest mode (`VCPKG_ROOT`).
-- CI builds the server + runs tests on every push; it pulls the SDK from S3 via the
-  same GitHub-OIDC→AWS role as `erpl` (`scripts/download_and_extract_nwrfc.sh`).
-- **Registered destination must be `method='R'`** (`H=RFCSERVER`) — "start" mode
-  makes the gateway try to launch an executable and the call never reaches us.
-- **The FM interface must exist in the backend** or ABAP marshalling returns
-  `SYSTEM_FAILURE` — `ZCL_ERPL_REV_MKFM` creates them.
-- **Run with `LD_LIBRARY_PATH=$NWRFC_HOME/lib`** — `libsapnwrfc.so` `dlopen`s ICU by
-  name, so rpath alone is insufficient.
-</details>
+And from your Basis team, eventually: a `reginfo` line allowing the program ID, an
+RFC user, and — on a development system — `S_DEVELOP` for the account that runs
+`setup`. Step 3 generates the exact request.
 
----
+### 3. Deploy the ABAP, and get the gateway to accept you
+
+This is a **loop**, not a sequence. `setup` finishes by making ABAP call back out
+through the server, which cannot happen until the gateway lets the server register,
+and the `reginfo` line that allows it is written by `setup`. So you go round once:
+
+```bash
+erpl-rev doctor                 # read-only: what is missing, and the fix for each
+erpl-rev setup --dry-run        # the exact change set, nothing written
+erpl-rev setup                  # deploy, then try the round trip
+```
+
+`setup` will deploy the ABAP and then say:
+
+```
+Deployed, but the round trip did NOT complete yet. That is expected if the
+server is not running, or if the gateway has not been told to accept the
+registration.
+```
+
+**That is not a failure.** It also writes `erpl-rev-basis-handout.md`. Give that to
+Basis — it contains the least-privilege `reginfo` line already filled in.
+(`erpl-rev setup --print-runbook` prints the same handout **without deploying
+anything**, which is what you want on a system where you will never have
+`S_DEVELOP`; there, the ABAP arrives by transport instead — see
+[`INSTALL.md`](docs/INSTALL.md).)
+
+Then start the server and go round again:
+
+```bash
+erpl-rev --gwhost <gateway-host> --gwserv sapgw<NN>
+# INFO [server] listening (Ctrl-C to stop) program_id="ERPL_REV" ...
+
+erpl-rev doctor                 # now the round trip should pass
+```
+
+On a throwaway trial with `gw/acl_mode = 0` there is no ACL to satisfy and the two
+halves can happen in either order — see the [A4H appendix](docs/enable-rfc-registration.md).
+
+### 4. Get your first table out
+
+```bash
+erpl-rev replicate --table MARA --target mara     # full load, as a background job
+erpl-rev sql "SELECT count(*) FROM mara"          # read it back
+erpl-rev sql "SELECT * FROM mara LIMIT 10"
+```
+
+`sql` reads the live database through the server, so it works while the server is
+running. Stop the server and the DuckDB file is an ordinary DuckDB file — open it
+with anything.
+
+### 5. Keep it in sync
+
+A full load is a snapshot. To keep a target current, register how it should find
+what changed:
+
+```bash
+erpl-rev sync create mara --method WATERMARK --source MARA \
+    --keys MANDT,MATNR --chg-col AEDAT --wm-kind DATE --cadence hourly --log
+erpl-rev sync run mara            # one cycle now
+erpl-rev sync ls                  # what is registered, and how far behind
+```
+
+Which method to choose, and how to catch **physical deletes** a change column cannot
+see, is [`docs/delta.md`](docs/delta.md) and [`docs/cdc.md`](docs/cdc.md). To have it
+run continuously rather than on demand, [`docs/daemon.md`](docs/daemon.md); to watch
+it, `erpl-rev top` and [`docs/operations.md`](docs/operations.md).
+
+## Install options
+
+| | | |
+|---|---|---|
+| **PyPI** | `uvx erpl-rev` / `pip install erpl-rev` | wheels for Linux x86-64, macOS arm64, Windows x64 |
+| **Bundle** | a single file per OS, from [Releases](https://github.com/DataZooDE/erpl-rev/releases) | verify with `SHA256SUMS.txt` |
+| **Docker** | `ghcr.io/datazoode/erpl-rev:latest` | see [`docs/docker.md`](docs/docker.md) |
+
+All of them carry **DuckDB and nothing else**: since `v2026.08.30` the RFC protocol
+is [`erpl-proto`](https://erpl.io/blog/sap-rfc-protocol-byte-by-byte), our pure-Rust
+implementation, linked statically — no SAP NW RFC SDK, no ICU, no `LD_LIBRARY_PATH`.
+Building from source is different and is [`docs/building.md`](docs/building.md).
+
+Everything the SAP GUI reports do is also a CLI command, and `--print-abap` on any of
+them shows the ABAP instead of running it. Nothing writes to SAP or DuckDB without a
+confirmation or an explicit `--yes`.
 
 ## Feedback
 
@@ -462,29 +273,39 @@ Full detail, event by event and property by property:
 
 ## Docs
 
-**Replicating**
+**Getting it working**
 
-- [`docs/delta.md`](docs/delta.md) — incremental extraction (watermark / change-doc / snapshot), the read window, and the four load types
-- [`docs/cdc.md`](docs/cdc.md) — the opt-in trigger tier, for physical deletes
-- [`docs/daemon.md`](docs/daemon.md) — continuous replication in one background work process
-- [`docs/operations.md`](docs/operations.md) — the operator's verbs, the monitor, and the metrics endpoint
-- [`docs/control-tables.md`](docs/control-tables.md) — the control schema as a versioned interface
+- [`docs/glossary.md`](docs/glossary.md) — the SAP words, if you do not use them daily
+- [`docs/INSTALL.md`](docs/INSTALL.md) — the transport path, for a system where you will never have `S_DEVELOP`
+- [`docs/security.md`](docs/security.md) — **what your Basis team will ask**: the trust boundary, `reginfo`, the RFC user, SNC
+- [`docs/docker.md`](docs/docker.md) — running the container image
+- [`docs/tunnel.md`](docs/tunnel.md) — only if this host has no route to the gateway
+
+**Keeping data in sync**
+
+- [`docs/delta.md`](docs/delta.md) — the five incremental methods, and how to choose
+- [`docs/cdc.md`](docs/cdc.md) — the trigger tier, for physical deletes
+- [`docs/daemon.md`](docs/daemon.md) — continuous replication in one background job
+- [`docs/operations.md`](docs/operations.md) — the operator's runbook and the monitor
+- [`docs/upgrading.md`](docs/upgrading.md) — **what changes for a system already replicating**
+
+**Reading and publishing the data**
+
+- [`docs/sql-console.md`](docs/sql-console.md) — the DuckDB SQL console inside SAP GUI
+- [`docs/publishing.md`](docs/publishing.md) — parquet, DuckLake, Iceberg, or an attached warehouse
+- [`docs/control-tables.md`](docs/control-tables.md) — the control schema as a versioned interface, and what each run records
+
+**How it behaves, and how fast**
+
+- [`docs/demo.md`](docs/demo.md) — the recorded session: what it proves and what it does not
 - [`docs/perf-results.md`](docs/perf-results.md) — measured numbers, dated, with the box they came from
-- [`docs/demo.md`](docs/demo.md) — the recorded session, what it proves and what it does not
-
-**Installing and upgrading**
-
-- [`docs/INSTALL.md`](docs/INSTALL.md) — SAP transport import + server install + upgrade/uninstall
-- [`docs/upgrading.md`](docs/upgrading.md) — **what changes for a system that is already replicating**
-
-**The system around it**
-
-- [`docs/enable-rfc-registration.md`](docs/enable-rfc-registration.md) — gateway registration / `reginfo`
-- [`docs/security.md`](docs/security.md) — Basis hardening, RFC user, SNC, ACLs
-- [`docs/tunnel.md`](docs/tunnel.md) — optional: reaching the gateway when this host has no route to it
-- [`docs/sql-console.md`](docs/sql-console.md) — the in-GUI DuckDB SQL console
 - [`TELEMETRY.md`](TELEMETRY.md) — every event and property that leaves the machine, and the opt-outs
-- [`docs/docker.md`](docs/docker.md) — running the container image from ghcr.io
+
+**Working on erpl-rev**
+
+- [`docs/building.md`](docs/building.md) — building from source
+- [`docs/testing.md`](docs/testing.md) — the test lanes and the release gate
+- [`docs/enable-rfc-registration.md`](docs/enable-rfc-registration.md) — appendix: RFC registration on an A4H trial
 
 ## License
 
