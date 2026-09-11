@@ -20,18 +20,34 @@ clean() { sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g' | tr -d '\r'; }
 
 # --- production objects -> ZERPL_CORE ---------------------------------------
 #   "<NAME> <TYPE> <file>"   TYPE in {INTF,CLAS,PROG}
+# This list MUST equal zcl_erpl_rev_footprint.abap's `expected` list, which is the
+# checked-in statement of everything erpl-rev delivers into a customer system. It did
+# not: the transport carried seven of the fourteen, and the six it omitted were the
+# ones that make the product work without S_DEVELOP --
+# ZCL_ERPL_REV_CLIDRV above all, whose absence silently turned every CLI verb back
+# into the temporary-class path the docs promise it avoids. ZCL_ERPL_REV_DIAG was
+# missing too, which is what docs/INSTALL.md tells you to run as the smoke test.
+#
+# scripts/check-transport-complete.sh asserts the equality, and e2e runs it, so the
+# two lists cannot drift apart again.
 CORE=(
   "ZIF_ERPL_REV_PROGRESS INTF zif_erpl_rev_progress.intf.abap"
   "ZCL_ERPL_REV_TYPEMAP  CLAS zcl_erpl_rev_typemap.abap"
   "ZCL_ERPL_REV_UTIL     CLAS zcl_erpl_rev_util.abap"
+  "ZCL_ERPL_REV_DELTA    CLAS zcl_erpl_rev_delta.abap"
+  "ZCL_ERPL_REV_CDC      CLAS zcl_erpl_rev_cdc.abap"
   "ZCL_ERPL_REV_SETUP    CLAS zcl_erpl_rev_setup.abap"
   "ZCL_ERPL_REV_MKFM     CLAS zcl_erpl_rev_mkfm.abap"
+  "ZCL_ERPL_REV_DIAG     CLAS zcl_erpl_rev_diag.abap"
+  "ZCL_ERPL_REV_CLIDRV   CLAS zcl_erpl_rev_clidrv.abap"
   "Z_ERPL_REV_REPLICATE   PROG z_erpl_rev_replicate.prog.abap"
   "Z_ERPL_REV_SQL         PROG z_erpl_rev_sql.prog.abap"
   "Z_ERPL_REV_REPL_WORKER PROG z_erpl_rev_repl_worker.prog.abap"
+  "Z_ERPL_REV_DELTA       PROG z_erpl_rev_delta.prog.abap"
+  "Z_ERPL_REV_DAEMON      PROG z_erpl_rev_daemon.prog.abap"
 )
-# Function group ZERPL_REV + its 5 RFC FMs are created by ZCL_ERPL_REV_MKFM (run with
-# the transport so they land in ZERPL_CORE as transported objects — see step 4).
+# Function group ZERPL_REV + its nine RFC FMs are created by ZCL_ERPL_REV_MKFM (run
+# with the transport so they land in ZERPL_CORE as transported objects — see step 4).
 
 # --- test/demo/fixtures -> ZERPL_TEST (NOT in the production transport) ------
 TEST=(

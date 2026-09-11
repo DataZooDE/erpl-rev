@@ -104,6 +104,9 @@ fail() { echo "E2E FAIL: $*" >&2; srv_kill; exit 1; }
 # violation should cost a second rather than a full e2e run.
 echo "== compliance (static) =="
 "$HERE/scripts/compliance-scan.sh" || fail "compliance scan"
+# The transport must deliver exactly what the footprint says we deliver. Static,
+# so it runs before anything is built or connected to.
+"$HERE/scripts/check-transport-complete.sh" || fail "transport does not match the delivered footprint"
 
 echo "== build =="
 if [ -n "$REMOTE" ]; then

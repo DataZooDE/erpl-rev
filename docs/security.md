@@ -144,7 +144,7 @@ S_RFC: ACTVT=16, RFC_TYPE=FUGR, RFC_NAME=ZERPL_REV
   `S_DEVELOP` is present so the gap is visible before anyone tries to deploy.
 
 ## 7. What erpl-rev does NOT do (assurances for Basis)
-- **Non-modifying**: ships only `Z*` objects in package `ZERPL`; modifies **no** SAP
+- **Non-modifying**: ships only `Z*` objects in package `ZERPL_CORE`; modifies **no** SAP
   standard repository/customizing objects; no kernel/core changes.
 - No background daemons inside SAP; the only persistent process is the external
   server you control.

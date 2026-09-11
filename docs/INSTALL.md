@@ -35,11 +35,24 @@ Two parts: (1) get the **ABAP objects** into the SAP system, (2) install the
   (`sapgw<nr>`, default port 33<nr>).
 - Transport import authority (Basis) and a dedicated RFC user (see security.md §4).
 
-## 1. Import the ABAP transport (the package `ZERPL`)
-The delivery is a standard transport request: a **cofile `K9xxxxx.<SID>`** + a
-**data file `R9xxxxx.<SID>`** (in `transport/`). Production objects live in package
-**`ZERPL_CORE`**; tests/demos/fixtures (`ZERPL_TEST`) are **not** part of the
-production delivery.
+## 1. Import the ABAP transport (the package `ZERPL_CORE`)
+
+> **There is no prebuilt transport to download.** A transport request is produced
+> from a system you control: run `scripts/package-transport.sh` against a DEV system
+> with STMS routes configured, and release the request it creates. That is a
+> deliberate constraint — a transport carries the originating system's object
+> directory, so a generic one is not something we can publish.
+
+Once built, the delivery is a standard transport request: a **cofile
+`K9xxxxx.<SID>`** + a **data file `R9xxxxx.<SID>`**. Production objects live in
+package **`ZERPL_CORE`**; tests, demos and fixtures (`ZERPL_TEST`) are **not** part
+of it.
+
+The transport carries the same **fourteen** objects `erpl-rev setup` deploys — the
+list is checked against `ZCL_ERPL_REV_FOOTPRINT`'s by
+`scripts/check-transport-complete.sh`, which CI runs, so the two cannot drift. That
+includes `ZCL_ERPL_REV_CLIDRV`, which is what lets the CLI work without
+`S_DEVELOP`, and `ZCL_ERPL_REV_DIAG`, the smoke test in step 4.
 
 ### 1a. With filesystem access to the SAP transport directory (preferred)
 ```
@@ -88,5 +101,5 @@ SAP system upgrade does not touch them. Restart the server on a new binary.
 ## 6. Uninstall
 - Stop + disable the server service; remove `reginfo` line; delete destination
   `ERPL_REV` (SM59) and the RFC user/role.
-- Remove the ABAP objects: delete package **`ZERPL`** (and subpackages) — e.g. via a
+- Remove the ABAP objects: delete packages **`ZERPL_CORE`** (and `ZERPL_TEST` on a dev system) — e.g. via a
   transport of copies / object deletion. Non-modifying, so nothing else is affected.

@@ -124,7 +124,7 @@ push-a-table round-trip — pick one and hit *Execute*.
 
 ## Why it fits the SAP data stack
 
-- **No SLT, no SDI, no Data Services, no add-on** — a transport (package `ZERPL`)
+- **No SLT, no SDI, no Data Services, no add-on** — a transport (package `ZERPL_CORE`)
   plus a registered RFC server. No core modification, no HANA license, no BTP.
   Runs against any NetWeaver ABAP stack (ECC, S/4HANA, BW/4HANA).
 - **Reads what you model** — tables, CDS views (keys auto-detected), BW/HANA calc
