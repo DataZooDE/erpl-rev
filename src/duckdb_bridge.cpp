@@ -1201,10 +1201,18 @@ CdcApplyResult DuckDbBridge::CdcApplyInner(const std::string &target,
         if (T == "TIME") return "try_strptime(" + expr + ", '%H%M%S')::TIME";
         if (T.rfind("TIMESTAMP", 0) == 0)
             return "try_strptime(" + expr + ", '%Y%m%d%H%M%S')::" + type;
-        // TODO(IMAGE_IUD): a RAW column is logged as NVARCHAR hex, and CAST of
-        // that yields the bytes of the hex TEXT, not the value. Wrong today,
-        // but only on the log side and only for IMAGE_IUD -- fixed under that
-        // story rather than widened into this one.
+        // A RAW/LRAW column is a BLOB on the target (typemap: RAW -> BLOB), but
+        // the shadow log types every column NVARCHAR, and HANA renders a binary
+        // value into that as hex text. CAST('A1B2C3' AS BLOB) reinterprets the
+        // characters -- six ASCII bytes spelling the word, not the three bytes
+        // it names. unhex() reads it as what it is.
+        //
+        // unhex throws on a non-hex digit rather than returning NULL, so a log
+        // cell that is not hex fails the apply instead of writing a plausible
+        // wrong value. That is the trade we want: the wrapper records the reason
+        // on the target (cdc_error), and a corrupt payload that applies quietly
+        // is the failure this whole case exists to stop.
+        if (T == "BLOB") return "unhex(" + expr + ")";
         return "CAST(" + expr + " AS " + type + ")";
     };
 
