@@ -141,10 +141,23 @@ START-OF-SELECTION.
           ls-sgtxt       = |generated { lv_done }|.
           ls-budat       = sy-datum.
           ls-bldat       = sy-datum.
+          " The binary column. Maintained on write like every strategy column,
+          " so a binary defect has somewhere to show up.
+          TRY.
+              ls-xguid = cl_system_uuid=>create_uuid_x16_static( ).
+            CATCH cx_uuid_error.
+              CLEAR ls-xguid.
+          ENDTRY.
           MODIFY zdelta_all FROM ls.
           IF sy-subrc = 0. lv_ins = lv_ins + 1. PERFORM audit USING lv_key 'I'. ENDIF.
 
         WHEN 'U'.
+          DATA lv_guid TYPE sysuuid_x16.
+          TRY.
+              lv_guid = cl_system_uuid=>create_uuid_x16_static( ).
+            CATCH cx_uuid_error.
+              CLEAR lv_guid.
+          ENDTRY.
           UPDATE zdelta_all
              SET chg_tstamp  = @lv_now_ts,
                  chg_dats    = @sy-datum,
@@ -152,7 +165,8 @@ START-OF-SELECTION.
                  chg_time    = @sy-uzeit,
                  chg_counter = @lv_done,
                  dmbtr       = @lv_done,
-                 sgtxt       = 'updated'
+                 sgtxt       = 'updated',
+                 xguid       = @lv_guid
            WHERE bukrs = '1000' AND belnr = @lv_belnr
              AND gjahr = '2026' AND buzei = '001'.
           IF sy-subrc = 0. lv_upd = lv_upd + 1. PERFORM audit USING lv_key 'U'. ENDIF.

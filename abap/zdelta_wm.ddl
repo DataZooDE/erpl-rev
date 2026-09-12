@@ -10,5 +10,6 @@ define table zdelta_wm {
   name           : abap.char(40);
   val            : abap.int4;
   changed_at     : abap.dec(21,7);
+  xguid          : abap.raw(16);
 
 }

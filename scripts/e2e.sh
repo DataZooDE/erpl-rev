@@ -275,8 +275,8 @@ suite parity ZCL_ERPL_REV_PARITYTEST abap/zcl_erpl_rev_paritytest.abap PARITY 10
   "every method against a full load, cell by cell -- and the watermark's blindness"
 
 # leaves no orphan objects. Needs ZCL_ERPL_REV_CDC[TEST] + the CDC FMs (mkfm).
-suite cdc ZCL_ERPL_REV_CDCTEST abap/zcl_erpl_rev_cdctest.abap CDC 47 "" \
-  "real HANA triggers capture physical deletes; teardown leaves nothing"
+suite cdc ZCL_ERPL_REV_CDCTEST abap/zcl_erpl_rev_cdctest.abap CDC 49 "" \
+  "real HANA triggers capture physical deletes; a RAW column survives the log as bytes"
 
 
 suite partition ZCL_ERPL_REV_PARTEST abap/zcl_erpl_rev_partest.abap PARTITION 9 "" \

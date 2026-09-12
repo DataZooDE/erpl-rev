@@ -131,6 +131,26 @@ std::string UpperOf(std::string s) {
     for (char &c : s) if (c >= 'a' && c <= 'z') c = char(c - 'a' + 'A');
     return s;
 }
+// Fill in what only the seeded DuckDB target can say: the image column list and,
+// in every mode, which columns hold bytes.
+//
+// Taken from the target rather than asked of SAP because `replicate` already
+// applied the DDIC type map on the way in -- a BLOB here IS a RAW/LRAW/RSTR
+// there, and there is no second mapping to disagree with the first.
+//
+// The binary list is not conditional on the mode. A binary KEY column breaks a
+// DELETE_ONLY trigger exactly as a binary data column breaks an IMAGE_IUD one,
+// and CDC_REPAIR runs through here too: a repair that rebuilt the log table
+// without this would re-create the NVARCHAR column and make the source table
+// unwritable again, while reporting that it had fixed something.
+void DescribeIntoSpec(const std::string &target, CdcSpec &spec) {
+    QueryResult tc = g_bridge->Query("SELECT * FROM " + target + " LIMIT 0");
+    for (auto &c : tc.columns) {
+        if (spec.mode == CdcMode::ImageIud) spec.columns.push_back(UpperOf(c.name));
+        if (UpperOf(c.type) == "BLOB") spec.binary_columns.push_back(UpperOf(c.name));
+    }
+}
+
 CdcMode CdcModeOf(const std::string &m) {
     const auto u = UpperOf(m);
     // FULL_IUD is the pre-rename spelling. It stays accepted permanently: it is a
@@ -405,10 +425,7 @@ extern "C" RFC_RC SAP_API ZCdcPlanImpl(RFC_CONNECTION_HANDLE,
         // IMAGE_IUD logs the full row image: take the column set from the (seeded)
         // DuckDB target and upper-case it to the SAP/HANA column names the triggers
         // reference (replicate lower-cases on the way in).
-        if (spec.mode == CdcMode::ImageIud) {
-            QueryResult tc = g_bridge->Query("SELECT * FROM " + target + " LIMIT 0");
-            for (auto &c : tc.columns) spec.columns.push_back(UpperOf(c.name));
-        }
+        DescribeIntoSpec(target, spec);
         CdcPlan plan = MakeDialect(plat)->Plan(spec);
 
         if (action == "PROVISION")
@@ -786,10 +803,7 @@ extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE,
             spec.source = cst.source;
             spec.keys = SplitCsv(cst.keys);
             spec.mode = CdcModeOf(cst.mode.empty() ? "DELETE_ONLY" : cst.mode);
-            if (spec.mode == CdcMode::ImageIud) {
-                QueryResult tc = g_bridge->Query("SELECT * FROM " + target + " LIMIT 0");
-                for (auto &c : tc.columns) spec.columns.push_back(UpperOf(c.name));
-            }
+            DescribeIntoSpec(target, spec);
             auto dia_p = MakeDialect(cst.platform.empty() ? "HANA" : cst.platform);
             const CdcDialect &dia = *dia_p;
             const auto plan_ddl = dia.Plan(spec);
@@ -864,10 +878,7 @@ extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE,
             spec.source = cst.source;
             spec.keys = SplitCsv(cst.keys);
             spec.mode = CdcModeOf(cst.mode.empty() ? "DELETE_ONLY" : cst.mode);
-            if (spec.mode == CdcMode::ImageIud) {
-                QueryResult tc = g_bridge->Query("SELECT * FROM " + target + " LIMIT 0");
-                for (auto &c : tc.columns) spec.columns.push_back(UpperOf(c.name));
-            }
+            DescribeIntoSpec(target, spec);
             auto dia_r = MakeDialect(cst.platform.empty() ? "HANA" : cst.platform);
             const auto full = dia_r->Plan(spec);
 

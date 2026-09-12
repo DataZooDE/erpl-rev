@@ -202,6 +202,14 @@ the idempotent merge absorbs. The state machine guards transitions
   cast (`'0017'` → `17`), `DATS`/`TIMS` via `strptime` (`'20991231'` → a `DATE`). So
   composite keys like SFLIGHT's `MANDT,CARRID,CONNID,FLDATE` (a NUMC + a date) work
   unchanged — the flight-booking demo is wired to CDC and proven E2E.
+- **Binary columns** (`RAW`, `LRAW`, `RSTR`) get a binary log column and are
+  hex-encoded on the way out, because everything between the log and the server is
+  text. This is not cosmetic: HANA does not render bytes as text, so a binary value
+  in a character log column is rejected as invalid Unicode — which fails the
+  trigger, and a failed `AFTER` trigger fails the `INSERT` that fired it. Before
+  this was handled, provisioning such a table left it refusing every write until the
+  triggers were dropped. **Upper bound 5000 bytes**, HANA's `VARBINARY` ceiling; a
+  longer column fails at provision time rather than silently truncating.
 
 ## Testing
 

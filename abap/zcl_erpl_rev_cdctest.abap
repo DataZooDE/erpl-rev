@@ -186,6 +186,35 @@ CLASS zcl_erpl_rev_cdctest IMPLEMENTATION.
         what = 'CDC(iud) inserted row 11 present' ).
     ok( cond = has( iv_sql = |SELECT name FROM cdc_iud WHERE id='0000000002'| iv_sub = 'touched' )
         what = 'CDC(iud) updated row 2 carries the new value' ).
+
+    " The binary column, on both the update and the insert.
+    "
+    " A RAW value reaches the shadow log as hex TEXT (the log types every column
+    " NVARCHAR and HANA renders binary that way) but reaches a full load as
+    " bytes. Casting that text straight to BLOB reinterprets the characters --
+    " 'A1B2C3' becomes the six ASCII bytes spelling the word, not the three it
+    " names -- and the row still applies, with the right count and a corrupt
+    " payload. Nothing here could see that: every column of this fixture was
+    " character, numeric or a date until ZDELTA_WM gained XGUID.
+    "
+    " Compared against whatever SAP actually stored, not a literal: the string
+    " template renders an X field as uppercase hex, which is the same
+    " canonicalisation zcl_erpl_rev_util=>fingerprint_cell uses for RAW, and
+    " DuckDB's hex() is its counterpart. One canonicalisation, not a second one
+    " written here to agree with itself.
+    SELECT SINGLE xguid FROM zdelta_wm
+      WHERE id = '0000000002' INTO @DATA(lv_x_upd).
+    ok( cond = has( iv_sql = |SELECT hex(xguid) AS h FROM cdc_iud WHERE id='0000000002'|
+                    iv_sub = |{ lv_x_upd }| )
+        what = 'CDC(iud) updated row 2 carries the binary column as bytes'
+        detail = |sap={ lv_x_upd }| ).
+
+    SELECT SINGLE xguid FROM zdelta_wm
+      WHERE id = '0000000011' INTO @DATA(lv_x_ins).
+    ok( cond = has( iv_sql = |SELECT hex(xguid) AS h FROM cdc_iud WHERE id='0000000011'|
+                    iv_sub = |{ lv_x_ins }| )
+        what = 'CDC(iud) inserted row 11 carries the binary column as bytes'
+        detail = |sap={ lv_x_ins }| ).
     ok( cond = xsdbool( cnt( |SELECT count(*) AS c FROM cdc_iud WHERE id='0000000004'| ) = 0 )
         what = 'CDC(iud) deleted row 4 absent' ).
 

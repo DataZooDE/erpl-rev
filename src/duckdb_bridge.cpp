@@ -1201,18 +1201,26 @@ CdcApplyResult DuckDbBridge::CdcApplyInner(const std::string &target,
         if (T == "TIME") return "try_strptime(" + expr + ", '%H%M%S')::TIME";
         if (T.rfind("TIMESTAMP", 0) == 0)
             return "try_strptime(" + expr + ", '%Y%m%d%H%M%S')::" + type;
-        // A RAW/LRAW column is a BLOB on the target (typemap: RAW -> BLOB), but
-        // the shadow log types every column NVARCHAR, and HANA renders a binary
-        // value into that as hex text. CAST('A1B2C3' AS BLOB) reinterprets the
-        // characters -- six ASCII bytes spelling the word, not the three bytes
+        // A RAW/LRAW column is a BLOB on the target (typemap: RAW -> BLOB), and
+        // it reaches this side as HEX TEXT -- the log column is binary, but
+        // everything between the log and here is text, so the read wraps it in
+        // BINTOHEX (cdc_dialect.cpp). CAST('A1B2C3' AS BLOB) would reinterpret
+        // the characters: six ASCII bytes spelling the word, not the three bytes
         // it names. unhex() reads it as what it is.
         //
+        // The empty string is how a NULL arrives: the whole path is text, a
+        // decoded BXML cell is always present, and BINTOHEX(NULL) renders as "".
+        // Without this it would land as a zero-length BLOB, which is a different
+        // value from absent -- the same distinction the DATE branch keeps by
+        // letting try_strptime('') return NULL.
+        //
         // unhex throws on a non-hex digit rather than returning NULL, so a log
-        // cell that is not hex fails the apply instead of writing a plausible
-        // wrong value. That is the trade we want: the wrapper records the reason
-        // on the target (cdc_error), and a corrupt payload that applies quietly
-        // is the failure this whole case exists to stop.
-        if (T == "BLOB") return "unhex(" + expr + ")";
+        // cell that is neither empty nor hex fails the apply instead of writing
+        // a plausible wrong value. That is the trade we want: the wrapper
+        // records the reason on the target (cdc_error), and a corrupt payload
+        // that applies quietly is the failure this whole case exists to stop.
+        if (T == "BLOB")
+            return "CASE WHEN " + expr + " = '' THEN NULL ELSE unhex(" + expr + ") END";
         return "CAST(" + expr + " AS " + type + ")";
     };
 

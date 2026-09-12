@@ -104,12 +104,32 @@ CLASS zcl_erpl_rev_deltadrv DEFINITION PUBLIC FINAL CREATE PUBLIC.
     "! Touch every ZDELTA_ALL row, maintaining all strategy columns at once.
     CLASS-METHODS touch_all.
 
+  PRIVATE SECTION.
+    "! A fresh 16-byte binary value, for the fixtures' one binary column.
+    CLASS-METHODS new_guid RETURNING VALUE(rv) TYPE sysuuid_x16.
+
 ENDCLASS.
 
 CLASS zcl_erpl_rev_deltadrv IMPLEMENTATION.
 
   METHOD now_ts.
     GET TIME STAMP FIELD rv.
+  ENDMETHOD.
+
+  METHOD new_guid.
+    " A binary value that differs per row and per update, so a replicated
+    " column that is stale, truncated or re-encoded shows up as a mismatch
+    " rather than coincidentally matching a constant.
+    "
+    " cl_system_uuid rather than converting a number: assigning hex characters
+    " to a byte field is not a conversion Unicode ABAP performs, and the exact
+    " value is irrelevant here -- every assertion compares the replica against
+    " whatever SAP actually stored.
+    TRY.
+        rv = cl_system_uuid=>create_uuid_x16_static( ).
+      CATCH cx_uuid_error.
+        CLEAR rv.
+    ENDTRY.
   ENDMETHOD.
 
   METHOD seed_wm.
@@ -122,7 +142,8 @@ CLASS zcl_erpl_rev_deltadrv IMPLEMENTATION.
       APPEND VALUE zdelta_wm( id = lv_id
                              name = |row { sy-index }|
                              val = sy-index
-                             changed_at = lv_ts ) TO lt.
+                             changed_at = lv_ts
+                             xguid = new_guid( ) ) TO lt.
     ENDDO.
     INSERT zdelta_wm FROM TABLE @lt.
     COMMIT WORK AND WAIT.
@@ -133,10 +154,12 @@ CLASS zcl_erpl_rev_deltadrv IMPLEMENTATION.
     DATA(lv_ts) = now_ts( ).
     DATA lv_id TYPE zdelta_wm-id.
     lv_id = iv_id.
+    DATA(lv_guid) = new_guid( ).
     UPDATE zdelta_wm
       SET name = @( |touched { lv_ts }| ),
           val = val + 1,
-          changed_at = @lv_ts
+          changed_at = @lv_ts,
+          xguid = @lv_guid
       WHERE id = @lv_id.
     COMMIT WORK AND WAIT.
   ENDMETHOD.
@@ -146,6 +169,7 @@ CLASS zcl_erpl_rev_deltadrv IMPLEMENTATION.
     ls-id = iv_id.
     ls-name = |inserted|.
     ls-val = 1.
+    ls-xguid = new_guid( ).
     IF iv_offset_secs = 0.
       ls-changed_at = now_ts( ).
     ELSE.
@@ -333,9 +357,11 @@ CLASS zcl_erpl_rev_deltadrv IMPLEMENTATION.
 
   METHOD touch_all.
     GET TIME STAMP FIELD DATA(lv_ts).
+    DATA(lv_guid) = new_guid( ).
     UPDATE zdelta_all SET chg_tstamp = @lv_ts, chg_dats = @sy-datum,
                           chg_date2 = @sy-datum, chg_time = @sy-uzeit,
-                          chg_counter = chg_counter + 1.
+                          chg_counter = chg_counter + 1,
+                          xguid = @lv_guid.
     COMMIT WORK AND WAIT.
   ENDMETHOD.
 

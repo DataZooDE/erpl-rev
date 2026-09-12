@@ -235,10 +235,32 @@ TEST_CASE("cdc_image: a RAW column arrives as bytes, not as the text of its hex"
           R"({"h":"FFFE"})");
 }
 
-TEST_CASE("cdc_image: a NULL RAW column stays NULL", "[bridge][cdc][keys]") {
-    // unhex(NULL) is NULL, but only if the NULL survives the projection -- an
-    // empty-string coalesce on the way in would turn an absent value into a
-    // zero-length BLOB, which is a different value.
+TEST_CASE("cdc_image: an absent RAW value is NULL, not a zero-length BLOB",
+          "[bridge][cdc][keys]") {
+    // This is how an absent binary value ACTUALLY arrives: as the empty string.
+    // The whole path from the log to here is text -- BINTOHEX(NULL) renders as
+    // "", the ABAP reader binds a string, and a decoded BXML cell is always
+    // present -- so SQL NULL never survives the trip. unhex('') is a zero-length
+    // BLOB, which is a different value from absent, and the difference is
+    // invisible in a row count.
+    DuckDbBridge db;
+    db.Execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB)");
+    db.Execute("INSERT INTO t VALUES (1, unhex('AA'))");
+    db.CdcRegister("t", "T", "id", "HANA", "IMAGE_IUD", "ZCDC_T_LOG");
+    db.CdcSetStatus("t", "SEEDED");
+    db.Execute("CREATE TABLE ilog(id VARCHAR, payload VARCHAR, "
+               "\"_op\" VARCHAR, \"_seq\" BIGINT)");
+    db.Execute("INSERT INTO ilog VALUES ('1','','U',1)");
+
+    auto r = db.CdcApply("t", "ilog", {"id"});
+    REQUIRE(r.applied);
+    CHECK(db.Query("SELECT payload IS NULL AS n FROM t WHERE id=1").rows[0] ==
+          R"({"n":true})");
+}
+
+TEST_CASE("cdc_image: a SQL NULL RAW column stays NULL", "[bridge][cdc][keys]") {
+    // The same guarantee from the other direction, for any path that does keep
+    // a real NULL: the CASE must not turn it into a zero-length BLOB either.
     DuckDbBridge db;
     db.Execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB)");
     db.Execute("INSERT INTO t VALUES (1, unhex('AA'))");
