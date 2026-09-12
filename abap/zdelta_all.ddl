@@ -24,6 +24,11 @@
 * field for their currency/unit, which is DDIC machinery unrelated to what is
 * being tested.
 *
+* xguid is the one binary column. Every other column here is character, numeric
+* or a date, and a table of those alone cannot see a binary defect: a RAW value
+* travels as hex text through the shadow log and as bytes through the full load,
+* and the two paths disagreed for a whole release without any fixture noticing.
+*
 * NOTE: the lines above are stripped before deployment. SAP's DDL parser rejects
 * comments inside the table body, which is why they live here as a header.
 @EndUserText.label : 'erpl-rev: one column per replication strategy'
@@ -66,5 +71,6 @@ define table zdelta_all {
   xnegp           : abap.char(1);
   budat           : abap.dats;
   bldat           : abap.dats;
+  xguid           : abap.raw(16);
 
 }

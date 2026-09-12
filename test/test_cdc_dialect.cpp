@@ -251,3 +251,71 @@ TEST_CASE("cdc_dialect: KEYS_IUD emits the net-key query, other modes do not",
     s.mode = CdcMode::DeleteOnly;
     CHECK(d.Plan(s).netkeys_sql.empty());
 }
+
+// A binary column cannot share the others' NVARCHAR log column. HANA does not
+// render bytes as text on the way in -- it passes them through and NVARCHAR
+// rejects them ("invalid CESU-8 encoding for Unicode string"), which fails the
+// trigger, and a failed AFTER trigger fails the INSERT that fired it. The
+// customer's own table then refuses every write until the triggers are dropped.
+//
+// Verified against a live HANA before these were written, with plain DDL and no
+// erpl-rev in the picture: NVARCHAR log column -> the INSERT fails; VARBINARY
+// log column -> it succeeds and BINTOHEX reads it back as uppercase hex.
+TEST_CASE("cdc_dialect: a binary column gets a binary log column", "[cdc][keys]") {
+    CdcSpec s;
+    s.source = "ZDELTA_WM";
+    s.keys = {"CLIENT", "ID"};
+    s.columns = {"CLIENT", "ID", "NAME", "XGUID"};
+    s.binary_columns = {"XGUID"};
+    s.mode = CdcMode::ImageIud;
+    const CdcPlan p = HanaDialect().Plan(s);
+
+    std::string ddl;
+    for (const auto &d : p.provision_ddl)
+        if (d.find("CREATE COLUMN TABLE") != std::string::npos) ddl = d;
+    REQUIRE_FALSE(ddl.empty());
+    CHECK(Contains(ddl, "\"XGUID\" VARBINARY"));
+    // and the text columns are untouched
+    CHECK(Contains(ddl, "\"NAME\" NVARCHAR"));
+    CHECK_FALSE(Contains(ddl, "\"XGUID\" NVARCHAR"));
+}
+
+TEST_CASE("cdc_dialect: a binary column is hex-encoded on the way out", "[cdc][keys]") {
+    // Everything between the log and the server is text: the ABAP ADBC reader
+    // binds a string and the BXML payload carries characters. A VARBINARY column
+    // that is not encoded cannot cross that, so both read paths wrap it.
+    CdcSpec s;
+    s.source = "ZDELTA_WM";
+    s.keys = {"CLIENT", "ID"};
+    s.columns = {"CLIENT", "ID", "NAME", "XGUID"};
+    s.binary_columns = {"XGUID"};
+    s.mode = CdcMode::ImageIud;
+    const CdcPlan p = HanaDialect().Plan(s);
+
+    CHECK(Contains(p.read_sql, "BINTOHEX(\"XGUID\")"));
+    CHECK(Contains(p.read_from, "BINTOHEX(\"XGUID\")"));
+    // A text column must NOT be wrapped -- BINTOHEX of an NVARCHAR is not the
+    // identity, and wrapping everything would corrupt every other column.
+    CHECK_FALSE(Contains(p.read_sql, "BINTOHEX(\"NAME\")"));
+}
+
+TEST_CASE("cdc_dialect: a binary KEY column is covered in every mode", "[cdc][keys]") {
+    // DELETE_ONLY and KEYS_IUD log the keys only -- so a table keyed on a RAW
+    // column breaks their triggers exactly as an image column breaks IMAGE_IUD's.
+    // Scoping the binary handling to IMAGE_IUD would leave that whole case broken.
+    for (auto mode : {CdcMode::DeleteOnly, CdcMode::KeysIud}) {
+        CdcSpec s;
+        s.source = "ZGUIDKEY";
+        s.keys = {"CLIENT", "GUID"};
+        s.binary_columns = {"GUID"};
+        s.mode = mode;
+        const CdcPlan p = HanaDialect().Plan(s);
+
+        std::string ddl;
+        for (const auto &d : p.provision_ddl)
+            if (d.find("CREATE COLUMN TABLE") != std::string::npos) ddl = d;
+        INFO("mode " << static_cast<int>(mode));
+        CHECK(Contains(ddl, "\"GUID\" VARBINARY"));
+        CHECK(Contains(p.read_from, "BINTOHEX(\"GUID\")"));
+    }
+}

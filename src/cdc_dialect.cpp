@@ -69,9 +69,23 @@ CdcPlan HanaDialect::Plan(const CdcSpec &spec) const {
     // 2) log table: key columns as NVARCHAR (HANA converts the source types on
     //    insert; the server casts back to the target's key types when applying)
     //    + op flag + monotonic seq + commit timestamp.
+    // A binary column gets a binary log column. It cannot share the NVARCHAR
+    // one: HANA does not render bytes as text on the way in, it passes them
+    // through, and NVARCHAR rejects them as invalid Unicode -- which fails the
+    // trigger, and a failed AFTER trigger fails the INSERT that fired it. The
+    // source table then refuses every write until the triggers are dropped.
+    //
+    // 5000 is HANA's VARBINARY ceiling. A binary column longer than that is not
+    // supported here; the DDL fails at provision time, which is the right place
+    // for it to fail.
+    auto is_binary = [&spec](const std::string &c) {
+        for (const auto &b : spec.binary_columns) if (b == c) return true;
+        return false;
+    };
     std::string cols;
     for (const auto &k : p.log_cols)
-        cols += Quote(k) + " NVARCHAR(" + std::to_string(spec.key_len) + "),";
+        cols += Quote(k) + (is_binary(k) ? " VARBINARY(5000),"
+                                         : " NVARCHAR(" + std::to_string(spec.key_len) + "),");
     cols += Quote(p.op_col) + " NVARCHAR(1)," + Quote(p.seq_col) + " BIGINT,\"_TS\" TIMESTAMP";
     p.provision_ddl.push_back("CREATE COLUMN TABLE " + Quote(p.log_table) + " (" + cols + ")");
 
@@ -90,8 +104,16 @@ CdcPlan HanaDialect::Plan(const CdcSpec &spec) const {
 
     // read (incremental by position) + prune (watermark-driven, bounded by the
     // server-confirmed position). %POS% / %CONF% are substituted per cycle.
+    // BINTOHEX on the way out, for the same reason the log column is binary on
+    // the way in: everything between here and the server is text. The ABAP ADBC
+    // reader binds a string, the BXML payload carries characters, and the apply
+    // unhexes it back to bytes. Uppercase hex, and NULL arrives as the empty
+    // string -- which is what the apply reads as "no value".
+    auto hex_of = [&](const std::string &c) {
+        return is_binary(c) ? "BINTOHEX(" + Quote(c) + ") AS " + Quote(c) : Quote(c);
+    };
     std::string sel;
-    for (const auto &k : p.log_cols) sel += Quote(k) + ",";
+    for (const auto &k : p.log_cols) sel += hex_of(k) + ",";
     sel += Quote(p.op_col) + "," + Quote(p.seq_col);
     p.read_sql = "SELECT " + sel + " FROM " + Quote(p.log_table) +
                  " WHERE " + Quote(p.seq_col) + " > %POS% ORDER BY " + Quote(p.seq_col);
@@ -105,7 +127,7 @@ CdcPlan HanaDialect::Plan(const CdcSpec &spec) const {
     // the real end-to-end latency. Without it the trigger tier could only ever
     // report how long a cycle took, not how stale the data was.
     std::string rcols;
-    for (const auto &k : p.log_cols) rcols += Quote(k) + ",";
+    for (const auto &k : p.log_cols) rcols += hex_of(k) + ",";
     rcols += Quote(p.op_col) + ",CAST(" + Quote(p.seq_col) + " AS INTEGER) AS " + Quote(p.seq_col);
     rcols += ",TO_VARCHAR(\"_TS\", 'YYYYMMDDHH24MISS') AS \"_TS\"";
     p.read_from = "(SELECT " + rcols + " FROM " + Quote(p.log_table) + ") AS LOGREAD";

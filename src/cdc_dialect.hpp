@@ -38,6 +38,16 @@ struct CdcSpec {
     // All columns to log for IMAGE_IUD (so inserts/updates carry the row image the
     // server upserts). DELETE_ONLY and KEYS_IUD log keys only.
     std::vector<std::string> columns;
+    // Of `keys` + `columns`, the ones holding bytes rather than text (SAP RAW /
+    // LRAW / RSTR, which `replicate` typed BLOB on the target).
+    //
+    // They cannot share the others' NVARCHAR log column. HANA does not render a
+    // binary value as text on the way in: it passes the bytes through and the
+    // NVARCHAR column rejects them -- "invalid CESU-8 encoding for Unicode
+    // string" -- which fails the trigger, and a failed AFTER trigger fails the
+    // INSERT that fired it. Provisioning then leaves the customer's own table
+    // unwritable until the triggers are dropped. Verified on a live system.
+    std::vector<std::string> binary_columns;
     CdcMode mode = CdcMode::DeleteOnly;
     std::string log_table;            // override; default ZCDC_<source>_LOG
     std::string seq_name;             // override; default ZCDC_<source>_SEQ
