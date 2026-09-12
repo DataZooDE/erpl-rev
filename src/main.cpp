@@ -411,14 +411,12 @@ int RunSmoke() {
         return 1;
     }
 
-#ifdef ERPL_RFC_BACKEND_PROTO
-    const char *backend = "RFC backend";   // the version string already names erpl-proto
-#else
-    const char *backend = "SAP NW RFC SDK";
-#endif
+    // "RFC backend" rather than a product name: the version string already
+    // names erpl-proto. smoke.yml asserts on this line and on the ABSENCE of
+    // any SAP NW RFC SDK, which is the promise the bundle makes.
     std::fprintf(stdout,
-                 "erpl-rev smoke ok: %s %s (%u.%u.%u); DuckDB %s\n",
-                 backend, sapver.c_str(), maj, min, patch, duckver.c_str());
+                 "erpl-rev smoke ok: RFC backend %s (%u.%u.%u); DuckDB %s\n",
+                 sapver.c_str(), maj, min, patch, duckver.c_str());
     std::fflush(stdout);
     return 0;
 }

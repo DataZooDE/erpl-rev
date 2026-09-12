@@ -8,10 +8,10 @@ ghcr.io/datazoode/erpl-rev:latest        # newest release
 ghcr.io/datazoode/erpl-rev:<version>     # a specific release, e.g. 2026.06.13
 ```
 
-The image **bakes the exact `erpl-rev-linux-amd64` self-extracting bundle from the
-same release** (server + SAP NW RFC SDK libs + ICU + DuckDB). On start the bundle's
-launcher extracts to a temp dir and sets its own loader path — so the image needs
-no `LD_LIBRARY_PATH`, and what you `docker pull` is the same artifact you'd download.
+The image **bakes the exact `erpl-rev-linux-amd64` binary from the same release** —
+one self-contained file, with the `erpl-proto` RFC implementation and DuckDB both
+linked in. There is no SAP NW RFC SDK and no ICU in it, and nothing to unpack or put
+on a loader path; what you `docker pull` is the same artifact you'd download.
 CI smoke-tests the built image (`docker run --rm … --smoke`) before pushing. It runs
 as a non-root user (`uid 10001`) and stores its DuckDB file on a `/data` volume.
 
@@ -76,12 +76,14 @@ gateway — handy as a post-pull sanity check:
 
 ```bash
 docker run --rm ghcr.io/datazoode/erpl-rev:latest --smoke
-# -> erpl-rev smoke ok: SAP NW RFC SDK 750 ...; DuckDB {"v":"v1.5.5"}
+# -> erpl-rev smoke ok: RFC backend erpl-proto 0.0.1 (0.0.1); DuckDB {"v":"v1.5.5"}
 ```
 
 ## Notes
 
-- **Platform:** `linux/amd64` only (the SAP NW RFC SDK is not available for
-  linux/arm64 in our build pipeline).
-- **SAP SDK:** the image embeds the SAP NW RFC SDK runtime libraries, identical
-  to what the published release bundles already ship.
+- **Platform:** `linux/amd64` only — the release pipeline builds no arm64 bundle
+  to bake. Nothing about the RFC layer prevents it: erpl-proto is pure Rust and
+  cross-compiles; this is a pipeline gap, not a dependency.
+- **No SAP SDK:** the image carries none, because the bundle it bakes carries
+  none. `--smoke` reports the backend, and the release pipeline asserts that no
+  SAP-shaped library is linked at all.

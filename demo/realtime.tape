@@ -32,7 +32,7 @@ Set Theme       "Catppuccin Mocha"
 Hide
 Type "cd $(git rev-parse --show-toplevel)" Enter
 Type "export PATH=$PWD/demo/bin:$PATH PS1='$ ' PROMPT_COMMAND=" Enter
-Type "export LD_LIBRARY_PATH=$PWD/nwrfcsdk/linux/lib DATAZOO_NO_BANNER=1" Enter
+Type "export DATAZOO_NO_BANNER=1" Enter
 Type "export SAP_HOST=localhost SAP_PORT=50000 SAP_CLIENT=001 SAP_USER=DEVELOPER" Enter
 # Read from the gitignored credentials file, in the hidden block, so the value
 # never reaches the frame and never reaches a process list. Without it the sync

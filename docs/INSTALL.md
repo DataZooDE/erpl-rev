@@ -34,10 +34,9 @@ Two parts: (1) get the **ABAP objects** into the SAP system, (2) install the
   (`sapgw<nr>`, default port 33<nr>).
   **A released bundle needs nothing else** — since `v2026.08.30` the RFC protocol is
   `erpl-proto`, linked statically, and DuckDB is linked statically too: one file, no
-  SAP NW RFC SDK, no ICU, no `LD_LIBRARY_PATH`. Only a **from-source** build needs the
-  SDK, because `make` still defaults to `RFC_BACKEND=sdk`
-  (see [building.md](building.md#1-provide-the-sdk--duckdb) — or build
-  with `RFC_BACKEND=proto`, which reproduces what ships).
+  SAP NW RFC SDK, no ICU, no `LD_LIBRARY_PATH`. A from-source build is the same
+  configuration (see [building.md](building.md#1-submodules)); there is no SAP SDK
+  anywhere in erpl-rev.
 - Transport import authority (Basis) and a dedicated RFC user (see security.md §4).
 
 ## 1. Import the ABAP transport (the package `ZERPL_CORE`)

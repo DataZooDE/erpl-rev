@@ -57,99 +57,68 @@ if(NOT DEFINED ERPL_REV_VERSION OR ERPL_REV_VERSION STREQUAL "")
   set(ERPL_REV_VERSION "dev")
 endif()
 
-# Platform sub-dir of the repo-local NW RFC SDK (gitignored; provided locally or
-# fetched from S3 in CI — same convention as DataZooDE/erpl).
-if(WIN32)
-  set(_sdk_sub win)
-elseif(APPLE)
-  set(_sdk_sub osx)
-else()
-  set(_sdk_sub linux)
-endif()
-
-# --- RFC backend -------------------------------------------------------------
-# Which implementation of the NW RFC C ABI to build against:
-#   sdk   - SAP's closed-source libsapnwrfc (+ libsapucum, + ICU), downloaded
-#           from SAP and vendored under nwrfcsdk/.
-#   proto - erpl-proto's pure-Rust drop-in shim, which exports the same C ABI
-#           and ships its own sapnwrfc.h, so building needs no SAP download at
-#           all.
+# --- RFC backend: erpl-proto ------------------------------------------------
+# erpl-proto's pure-Rust implementation of the NW RFC C ABI, built from the
+# pinned `erpl-proto/` submodule. It exports the same C ABI as SAP's closed
+# libsapnwrfc and ships its own sapnwrfc.h, so nothing here needs a download
+# from SAP -- which is why the released bundles carry no SDK and no ICU.
 #
-# The two are ABI-identical, so this is purely a change of header and link
-# target: not one source file has an #ifdef for it.
-set(RFC_BACKEND "sdk" CACHE STRING "RFC implementation: sdk | proto")
-set_property(CACHE RFC_BACKEND PROPERTY STRINGS sdk proto)
-if(NOT RFC_BACKEND MATCHES "^(sdk|proto)$")
-  message(FATAL_ERROR "RFC_BACKEND must be 'sdk' or 'proto', got '${RFC_BACKEND}'")
-endif()
-# Shared or static, for the proto backend only: SAP ships no static library.
-set(RFC_LINK "shared" CACHE STRING "How to link the RFC backend: shared | static")
+# There is no second backend. erpl-rev built against SAP's SDK until 2026-09;
+# that path is gone rather than kept as a default nobody selected, which is how
+# the build, the live suite and every CI check ended up exercising an
+# implementation the product does not ship.
+set(ERPL_PROTO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/erpl-proto"
+    CACHE PATH "Path to an erpl-proto checkout (default: the submodule)")
+
+# Shared or static. Static is the default and what ships: it puts the shim
+# inside the binary, so `ldd` shows no RFC library at all.
+set(RFC_LINK "static" CACHE STRING "How to link the RFC backend: shared | static")
 set_property(CACHE RFC_LINK PROPERTY STRINGS shared static)
-if(RFC_BACKEND STREQUAL "sdk" AND RFC_LINK STREQUAL "static")
-  message(FATAL_ERROR "RFC_LINK=static needs RFC_BACKEND=proto; SAP ships no static libsapnwrfc")
+if(NOT RFC_LINK MATCHES "^(shared|static)$")
+  message(FATAL_ERROR "RFC_LINK must be 'shared' or 'static', got '${RFC_LINK}'")
 endif()
 
-if(RFC_BACKEND STREQUAL "proto")
-  # erpl-proto's shim, built by `cargo build --release -p erpl-proto-nwrfc`. The
-  # shared object is named libsapnwrfc.so on purpose - a consumer resolves it by
-  # SONAME - and the crate emits a staticlib beside it.
-  set(ERPL_PROTO_ROOT "" CACHE PATH "Path to an erpl-proto checkout")
-  if(NOT ERPL_PROTO_ROOT)
-    message(FATAL_ERROR "RFC_BACKEND=proto needs -DERPL_PROTO_ROOT=<erpl-proto checkout>")
-  endif()
-  set(RFC_INCLUDE "${ERPL_PROTO_ROOT}/crates/erpl-proto-nwrfc/include")
-  if(NOT EXISTS "${RFC_INCLUDE}/sapnwrfc.h")
-    message(FATAL_ERROR "erpl-proto's sapnwrfc.h not found at ${RFC_INCLUDE}")
-  endif()
-  if(RFC_LINK STREQUAL "static")
-    set(_rfc_lib "${ERPL_PROTO_ROOT}/target/release/${CMAKE_STATIC_LIBRARY_PREFIX}sapnwrfc${CMAKE_STATIC_LIBRARY_SUFFIX}")
-  else()
-    set(_rfc_lib "${ERPL_PROTO_ROOT}/target/release/${CMAKE_SHARED_LIBRARY_PREFIX}sapnwrfc${CMAKE_SHARED_LIBRARY_SUFFIX}")
-  endif()
-  if(NOT EXISTS "${_rfc_lib}")
-    message(FATAL_ERROR
-      "${_rfc_lib} is missing.\n"
-      "Build it with: cargo build --release -p erpl-proto-nwrfc --manifest-path ${ERPL_PROTO_ROOT}/Cargo.toml")
-  endif()
-  set(SAP_LIBS "${_rfc_lib}")
-  # A Rust staticlib does not carry its own dependencies: the C++ consumer must
-  # name them or the link fails with unresolved symbols that read like our bug.
-  # Linux got away with nothing here only because its set is implicit. These are
-  # the lists `cargo rustc -- --print native-static-libs` reports for the shim,
-  # captured per platform by erpl-proto's `cross` CI job.
-  if(RFC_LINK STREQUAL "static")
-    if(WIN32)
-      # kernel32 ntdll userenv ws2_32 dbghelp, plus /defaultlib:msvcrt -- the
-      # DYNAMIC CRT, which is what the x64-windows-static-md triplet also uses,
-      # so the two agree. A mismatch here shows up as duplicate CRT symbols.
-      list(APPEND SAP_LIBS ntdll userenv ws2_32 dbghelp)
-    elseif(APPLE)
-      # -lSystem -lc -lm, all implicit in the default macOS link line.
-    else()
-      # -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc, all implicit on Linux; the
-      # explicit Threads/dl links elsewhere in this file already cover them.
-    endif()
-  endif()
-  message(STATUS "erpl-rev RFC backend: proto (${_rfc_lib}), link=${RFC_LINK}")
-else()
-  # --- SAP NW RFC SDK --------------------------------------------------------
-  set(SAPNWRFC_HOME "" CACHE PATH "Path to the SAP NW RFC SDK platform dir")
-  if(NOT SAPNWRFC_HOME)
-    get_filename_component(SAPNWRFC_HOME "${CMAKE_CURRENT_SOURCE_DIR}/nwrfcsdk/${_sdk_sub}" ABSOLUTE)
-  endif()
-  if(NOT EXISTS "${SAPNWRFC_HOME}/include/sapnwrfc.h")
-    message(FATAL_ERROR "NW RFC SDK not found at ${SAPNWRFC_HOME}; provide nwrfcsdk/${_sdk_sub}, set -DSAPNWRFC_HOME=..., or build with -DRFC_BACKEND=proto")
-  endif()
-  # Names resolve across platforms: lib{sapnwrfc,sapucum}.{so,dylib} / {sapnwrfc,libsapucum}.lib
-  find_library(SAP_NWRFC_LIB sapnwrfc PATHS "${SAPNWRFC_HOME}/lib" NO_DEFAULT_PATH)
-  find_library(SAP_UCUM_LIB  sapucum  PATHS "${SAPNWRFC_HOME}/lib" NO_DEFAULT_PATH)
-  if(NOT SAP_NWRFC_LIB OR NOT SAP_UCUM_LIB)
-    message(FATAL_ERROR "Could not find sapnwrfc/sapucum under ${SAPNWRFC_HOME}/lib")
-  endif()
-  set(SAP_LIBS ${SAP_NWRFC_LIB} ${SAP_UCUM_LIB})
-  set(RFC_INCLUDE "${SAPNWRFC_HOME}/include")
-  message(STATUS "erpl-rev RFC backend: sdk (${SAPNWRFC_HOME})")
+set(RFC_INCLUDE "${ERPL_PROTO_ROOT}/crates/erpl-proto-nwrfc/include")
+if(NOT EXISTS "${RFC_INCLUDE}/sapnwrfc.h")
+  message(FATAL_ERROR
+    "erpl-proto's sapnwrfc.h not found at ${RFC_INCLUDE}.\n"
+    "The submodule is probably not checked out: git submodule update --init erpl-proto\n"
+    "(or point -DERPL_PROTO_ROOT=<checkout> somewhere else).")
 endif()
+
+# The crate emits a staticlib beside the shared object; both are named
+# sapnwrfc on purpose -- a consumer resolves the shim by SONAME.
+if(RFC_LINK STREQUAL "static")
+  set(_rfc_lib "${ERPL_PROTO_ROOT}/target/release/${CMAKE_STATIC_LIBRARY_PREFIX}sapnwrfc${CMAKE_STATIC_LIBRARY_SUFFIX}")
+else()
+  set(_rfc_lib "${ERPL_PROTO_ROOT}/target/release/${CMAKE_SHARED_LIBRARY_PREFIX}sapnwrfc${CMAKE_SHARED_LIBRARY_SUFFIX}")
+endif()
+if(NOT EXISTS "${_rfc_lib}")
+  message(FATAL_ERROR
+    "${_rfc_lib} is missing.\n"
+    "Build it with: cargo build --release -p erpl-proto-nwrfc --manifest-path ${ERPL_PROTO_ROOT}/Cargo.toml")
+endif()
+set(SAP_LIBS "${_rfc_lib}")
+
+# A Rust staticlib does not carry its own dependencies: the C++ consumer must
+# name them or the link fails with unresolved symbols that read like our bug.
+# Linux got away with nothing here only because its set is implicit. These are
+# the lists `cargo rustc -- --print native-static-libs` reports for the shim,
+# captured per platform by erpl-proto's `cross` CI job.
+if(RFC_LINK STREQUAL "static")
+  if(WIN32)
+    # kernel32 ntdll userenv ws2_32 dbghelp, plus /defaultlib:msvcrt -- the
+    # DYNAMIC CRT, which is what the x64-windows-static-md triplet also uses,
+    # so the two agree. A mismatch here shows up as duplicate CRT symbols.
+    list(APPEND SAP_LIBS ntdll userenv ws2_32 dbghelp)
+  elseif(APPLE)
+    # -lSystem -lc -lm, all implicit in the default macOS link line.
+  else()
+    # -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc, all implicit on Linux; the
+    # explicit Threads/dl links elsewhere in this file already cover them.
+  endif()
+endif()
+message(STATUS "erpl-rev RFC backend: erpl-proto (${_rfc_lib}), link=${RFC_LINK}")
 
 # --- DuckDB -----------------------------------------------------------------
 # Static by default, from the pinned `duckdb/` submodule.
@@ -262,24 +231,11 @@ add_subdirectory(third_party/datazoo-banner)
 
 # --- SAP build definitions (64-bit Unicode, per platform) --------------------
 #
-# Only for the SDK backend. Without SAPwithUNICODE, sapucrfc.h silently typedefs
-# SAP_UC to a one-byte char while the library keeps writing UTF-16, and every
-# string API overruns its buffer by 2x. erpl-proto's header has no such switch -
-# SAP_UC is uint16_t unconditionally - so under the proto backend these are not
-# merely unnecessary but a per-platform detail to get wrong for no gain.
-if(RFC_BACKEND STREQUAL "proto")
-  # No SAP platform switches. One define, so --smoke can name the backend it
-  # actually contains rather than claiming SAP's SDK.
-  add_compile_definitions(ERPL_RFC_BACKEND_PROTO)
-elseif(WIN32)
-  add_compile_definitions(SAPonNT WIN32 SAPwithUNICODE SAPwithTHREADS
-                          UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
-elseif(APPLE)
-  add_compile_definitions(SAPonUNIX SAPonDARW SAPwithUNICODE SAPwithTHREADS)
-else()
-  add_compile_definitions(SAPonUNIX SAPonLIN SAPonLINUX SAPwithUNICODE SAPwithTHREADS
-                          __NO_MATH_INLINES)
-endif()
+# No SAP platform switches at all. SAP's sapucrfc.h needs SAPwithUNICODE or it
+# silently typedefs SAP_UC to a one-byte char while the library keeps writing
+# UTF-16, overrunning every string buffer by 2x. erpl-proto's header has no such
+# switch -- SAP_UC is uint16_t unconditionally -- so the whole per-platform
+# define set went with the SDK.
 
 # Statically link the C++/gcc runtime on Linux so the bundle needs no toolchain
 # libs on the target. (clang/macOS uses libc++; MSVC handled below.)

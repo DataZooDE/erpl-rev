@@ -7,17 +7,19 @@ only to develop erpl-rev itself.
 ### Prerequisites
 - Linux host with **CMake ≥ 3.16**, a **C++17** compiler, **Ninja**, and **vcpkg**
   (supplies Catch2 for the tests).
-- The proprietary **SAP NW RFC SDK** (not redistributed — see below).
+- **Rust** (stable), to build the RFC shim.
+- Read access to **`DataZooDE/erpl-proto`**, which is a private submodule.
 - A reachable SAP **gateway** (any NetWeaver ABAP; a local A4H docker trial works).
 
-### 1. Provide the SDK + DuckDB
-The NW RFC SDK lives in a repo-local, gitignored `nwrfcsdk/linux/` (same convention
-as `erpl`). Download it from the SAP Software Center, or copy it from an `erpl`
-checkout. DuckDB is fetched as an official prebuilt:
+### 1. Submodules
+There is no SAP NW RFC SDK to obtain. The RFC layer is
+[erpl-proto](https://github.com/DataZooDE/erpl-proto), a pure-Rust implementation
+of the same C ABI, pinned as the `erpl-proto/` submodule and compiled by `make`:
 ```bash
-cp -a /path/to/nwrfcsdk ./nwrfcsdk     # provides nwrfcsdk/linux/{include,lib}
-make duckdb-dist                       # fetch prebuilt libduckdb 1.5.5 into vendor/
+git submodule update --init erpl-proto   # `make build` does this too
 ```
+DuckDB is built from its own pinned submodule and linked statically, so there is
+nothing to download for it either.
 
 ### 2. Build & test
 ```bash
@@ -36,18 +38,17 @@ Production = import the ABAP transport and run the setup classrun — full guide
 
 ### 4. Run the server
 Running the **downloaded release binary** (or the Docker image) needs no setup —
-just `./erpl-rev-linux-amd64` with the `ERPL_REV_*` env below; the bundle
-self-extracts and sets its own loader path. The `LD_LIBRARY_PATH` line is **only**
-for the from-source `build/erpl_rev_server`, whose libs live elsewhere in the tree:
+just `./erpl-rev-linux-amd64` with the `ERPL_REV_*` env below. A from-source build
+needs nothing either: the RFC shim and DuckDB are both linked in, so there is no
+`LD_LIBRARY_PATH` to set.
 ```bash
-export LD_LIBRARY_PATH=$PWD/nwrfcsdk/linux/lib:$PWD/vendor/duckdb-1.5.5
 ERPL_REV_GWHOST=<gateway-host> ERPL_REV_GWSERV=sapgw00 \
 ERPL_REV_DB_PATH=erpl-rev.duckdb \
   ./build/erpl_rev_server            # add --quack for the network server
 # convenience: `make run` (quack on), `make run-mem` (in-memory), or `make run-no-quack`
 ```
-Easiest is **[`scripts/run-rfc-server.sh`](../scripts/run-rfc-server.sh)**: it sets
-`LD_LIBRARY_PATH`, registers as `ERPL_REV`, and — opt-in via the environment —
+Easiest is **[`scripts/run-rfc-server.sh`](../scripts/run-rfc-server.sh)**: it
+registers as `ERPL_REV`, and — opt-in via the environment —
 attaches **MotherDuck** (`motherduck_token`) and/or **BigQuery**
 (`ERPL_REV_BQ_PROJECT`). Pass `-r` to restart.
 
@@ -103,10 +104,9 @@ function modules whose payloads are **JSON / binary-sXML over scalar `STRING`
 params** — schema-generic, so no custom DDIC structures.
 
 **DuckDB 1.5.5** (parquet + json + quack built in) is linked **statically**, as are
-libstdc++/libgcc and — in the released bundles — the `erpl-proto` RFC implementation.
-That is what makes a bundle a single file with nothing beside it. A from-source build
-differs: `make` defaults to `RFC_BACKEND=sdk` and then does need the SAP NW RFC SDK at
-runtime; `make build RFC_BACKEND=proto` reproduces what ships.
+libstdc++/libgcc and the `erpl-proto` RFC implementation. That is what makes a bundle
+a single file with nothing beside it — and a from-source build is the same
+configuration, so what you build locally is what ships.
 
 <details>
 <summary><b>Configuration (env vars & flags)</b></summary>
@@ -138,16 +138,23 @@ unless you intend remote access.
 <details>
 <summary><b>Build internals & troubleshooting</b></summary>
 
-- The build resolves the SDK from `nwrfcsdk/linux` (override `-DSAPNWRFC_HOME=…` /
-  `make build NWRFC_HOME=…`); Catch2 via **vcpkg** manifest mode (`VCPKG_ROOT`).
-- CI builds the server + runs tests on every push; it pulls the SDK from S3 via the
-  same GitHub-OIDC→AWS role as `erpl` (`scripts/download_and_extract_nwrfc.sh`).
+- The RFC shim comes from the `erpl-proto/` submodule (override with
+  `-DERPL_PROTO_ROOT=…`); `make` runs the `cargo build` for you. Catch2 via
+  **vcpkg** manifest mode (`VCPKG_ROOT`).
+- `RFC_LINK=static` (the default) puts the shim inside the binary; `shared` links
+  erpl-proto's `libsapnwrfc.so`, which then needs `target/release` on the loader
+  path. The name is deliberate — the shim is resolved by SONAME — so an `ldd`
+  check for "sapnwrfc" cannot tell the two implementations apart. Match on the
+  resolved path, or assert there is no RFC shared object at all.
+- CI builds the server + runs tests on every push, on all three platforms, in the
+  same configuration the release builds.
 - **Registered destination must be `method='R'`** (`H=RFCSERVER`) — "start" mode
   makes the gateway try to launch an executable and the call never reaches us.
 - **The FM interface must exist in the backend** or ABAP marshalling returns
   `SYSTEM_FAILURE` — `ZCL_ERPL_REV_MKFM` creates them.
-- **Run with `LD_LIBRARY_PATH=$NWRFC_HOME/lib`** — `libsapnwrfc.so` `dlopen`s ICU by
-  name, so rpath alone is insufficient.
+- **Nothing needs `LD_LIBRARY_PATH`** in the default static build. SAP's SDK did:
+  its `libsapnwrfc.so` `dlopen`s ICU by name, so rpath alone was insufficient.
+  erpl-proto has no such dependency, which is why the bundles carry no ICU.
 </details>
 
 ---

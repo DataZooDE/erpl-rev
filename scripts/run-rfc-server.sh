@@ -77,7 +77,9 @@ else
 fi
 
 # --- run --------------------------------------------------------------------
-export LD_LIBRARY_PATH="$HERE/nwrfcsdk/linux/lib:$HERE/vendor/duckdb-1.5.4${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# Nothing to put on the loader path: the RFC shim and DuckDB are both linked
+# into the binary. This used to name the SAP SDK and a DuckDB 1.5.4 that has not
+# been vendored for some time.
 export ERPL_REV_PROGRAM_ID ERPL_REV_GWHOST ERPL_REV_GWSERV
 
 echo "erpl-rev: program_id=$ERPL_REV_PROGRAM_ID gw=$ERPL_REV_GWHOST:$ERPL_REV_GWSERV db=$ERPL_REV_DB_PATH"

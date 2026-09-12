@@ -1,10 +1,10 @@
+nwrfcsdk/
 # The Docker build context is a small staging dir holding just the release bundle
 # (the `erpl-rev` self-extracting file) + this Dockerfile. If ever built from the
 # repo root instead, keep the heavy/irrelevant trees out of the context.
 build/
 vendor/
 third_party/
-nwrfcsdk/
 dist/
 staged/
 .git/

@@ -1,7 +1,10 @@
+# erpl-rev needs no SAP NW RFC SDK -- the RFC layer is erpl-proto. This stays
+# so that a developer's leftover local copy can never be committed: it is
+# licensed SAP software and redistributing it is not ours to do.
+nwrfcsdk/
 build/
 vendor/
 # SAP NW RFC SDK — proprietary, not redistributable (provide locally; see README)
-nwrfcsdk/
 sap/
 sap/*.generated
 *.trc
