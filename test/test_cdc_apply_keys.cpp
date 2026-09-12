@@ -202,6 +202,58 @@ TEST_CASE("cdc_keys: image mode still works with no images table", "[bridge][cdc
     CHECK(db.Query("SELECT v FROM t WHERE id=1").rows[0] == R"({"v":"from-log"})");
 }
 
+// A RAW/LRAW column maps to BLOB (zcl_erpl_rev_typemap.abap:44, drift.cpp:40),
+// but the shadow log types every column NVARCHAR (cdc_dialect.cpp:69), and HANA
+// renders a binary column into that as hex text. Casting that text straight to
+// BLOB reinterprets the characters: 'A1B2C3' becomes the six ASCII bytes of the
+// word, not the three bytes it spells. The value is wrong and nothing says so --
+// the row applies, the count is right, and the payload is silently corrupt.
+//
+// Typed with a real BLOB column on purpose. An all-VARCHAR fixture degenerates
+// every coercion to CAST(x AS x) and cannot see this at all.
+TEST_CASE("cdc_image: a RAW column arrives as bytes, not as the text of its hex",
+          "[bridge][cdc][keys]") {
+    DuckDbBridge db;
+    db.Execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB)");
+    db.Execute("INSERT INTO t VALUES (1, unhex('0000'))");
+    db.CdcRegister("t", "T", "id", "HANA", "IMAGE_IUD", "ZCDC_T_LOG");
+    db.CdcSetStatus("t", "SEEDED");
+    db.Execute("CREATE TABLE ilog(id VARCHAR, payload VARCHAR, "
+               "\"_op\" VARCHAR, \"_seq\" BIGINT)");
+    db.Execute("INSERT INTO ilog VALUES ('1','A1B2C3','U',1),('2','FFFE','I',2)");
+
+    auto r = db.CdcApply("t", "ilog", {"id"});
+    REQUIRE(r.applied);
+
+    // Length first: it is the assertion that fails loudest on the old behaviour
+    // (six bytes instead of three) and needs no hex round trip to read.
+    CHECK(db.Query("SELECT octet_length(payload) AS n FROM t WHERE id=1").rows[0] ==
+          R"({"n":3})");
+    CHECK(db.Query("SELECT hex(payload) AS h FROM t WHERE id=1").rows[0] ==
+          R"({"h":"A1B2C3"})");
+    CHECK(db.Query("SELECT hex(payload) AS h FROM t WHERE id=2").rows[0] ==
+          R"({"h":"FFFE"})");
+}
+
+TEST_CASE("cdc_image: a NULL RAW column stays NULL", "[bridge][cdc][keys]") {
+    // unhex(NULL) is NULL, but only if the NULL survives the projection -- an
+    // empty-string coalesce on the way in would turn an absent value into a
+    // zero-length BLOB, which is a different value.
+    DuckDbBridge db;
+    db.Execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB)");
+    db.Execute("INSERT INTO t VALUES (1, unhex('AA'))");
+    db.CdcRegister("t", "T", "id", "HANA", "IMAGE_IUD", "ZCDC_T_LOG");
+    db.CdcSetStatus("t", "SEEDED");
+    db.Execute("CREATE TABLE ilog(id VARCHAR, payload VARCHAR, "
+               "\"_op\" VARCHAR, \"_seq\" BIGINT)");
+    db.Execute("INSERT INTO ilog VALUES ('1',NULL,'U',1)");
+
+    auto r = db.CdcApply("t", "ilog", {"id"});
+    REQUIRE(r.applied);
+    CHECK(db.Query("SELECT payload IS NULL AS n FROM t WHERE id=1").rows[0] ==
+          R"({"n":true})");
+}
+
 TEST_CASE("cdc_keys: a log-enabled trigger target actually gets a change log",
           "[bridge][cdc][keys]") {
     // The trigger tier had no log provisioner at all. It probed for the table
