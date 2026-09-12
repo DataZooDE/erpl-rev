@@ -64,6 +64,11 @@ jobs:
       # hosted runner has no key. The token goes through the environment so it
       # never reaches a command line.
       - name: Check out submodules
+        # shell: bash explicitly -- the Windows runner defaults to PowerShell,
+        # where $TOKEN is not an environment variable ($env:TOKEN is). Without
+        # this the rewrite below gets an empty password and GitHub answers
+        # "Invalid username or token" on the one private submodule.
+        shell: bash
         env:
           TOKEN: ${{ steps.proto_token.outputs.token }}
         run: |
@@ -150,6 +155,11 @@ jobs:
           repositories: "erpl-proto"
 
       - name: Check out submodules
+        # shell: bash explicitly -- the Windows runner defaults to PowerShell,
+        # where $TOKEN is not an environment variable ($env:TOKEN is). Without
+        # this the rewrite below gets an empty password and GitHub answers
+        # "Invalid username or token" on the one private submodule.
+        shell: bash
         env:
           TOKEN: ${{ steps.proto_token.outputs.token }}
         run: |
