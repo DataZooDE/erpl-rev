@@ -11,8 +11,11 @@ Type=simple
 User=erpl
 Group=erpl
 
-# NW RFC SDK (libsapnwrfc/ICU) + vendored DuckDB 1.5.4 must be on the library path
-Environment=LD_LIBRARY_PATH=/opt/nwrfcsdk/lib:/opt/erpl/duckdb-1.5.4
+# No LD_LIBRARY_PATH. The released binary is one self-contained file: the RFC
+# implementation (erpl-proto) and DuckDB are both linked in. This unit used to
+# set a path to an SAP NW RFC SDK and a DuckDB 1.5.4 that the bundle has not
+# needed since v2026.08.30 -- an operator following it was pointing systemd at
+# directories that do not exist.
 
 # Gateway / registration (match the reginfo allow-list)
 Environment=ERPL_REV_PROGRAM_ID=ERPL_REV

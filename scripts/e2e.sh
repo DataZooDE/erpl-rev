@@ -34,16 +34,14 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-NW="${SAPNWRFC_HOME:-$HERE/nwrfcsdk/linux}/lib"
-# Which NW RFC C ABI to exercise: `sdk` (SAP's) or `proto` (erpl-proto's
-# pure-Rust shim). Both must produce identical results -- that equality is the
-# acceptance test for removing the SDK.
-RFC_BACKEND="${RFC_BACKEND:-sdk}"
-# shared or static, proto backend only. Static puts the shim inside the binary,
-# so `ldd` shows no RFC library at all.
-RFC_LINK="${RFC_LINK:-shared}"
-ERPL_PROTO_ROOT="${ERPL_PROTO_ROOT:-}"
-if [ "$RFC_BACKEND" = proto ]; then RFC_LIB_DIR="$ERPL_PROTO_ROOT/target/release"; else RFC_LIB_DIR="$NW"; fi
+# The RFC C ABI is erpl-proto's, from the pinned submodule. There is no SDK
+# arm any more: this lane used to default to SAP's SDK, so the suite that is
+# meant to accept the product exercised an implementation it does not ship.
+ERPL_PROTO_ROOT="${ERPL_PROTO_ROOT:-$HERE/erpl-proto}"
+# shared or static. Static puts the shim inside the binary, so `ldd` shows no
+# RFC library at all -- which is what the released bundles do.
+RFC_LINK="${RFC_LINK:-static}"
+RFC_LIB_DIR="$ERPL_PROTO_ROOT/target/release"
 VCPKG="${VCPKG_ROOT:-$HOME/.local/share/vcpkg}"
 TRIPLET="${VCPKG_TRIPLET:-x64-linux}"
 # Credentials come from the environment — never hardcode. Export SAP_PASSWORD before
@@ -116,14 +114,13 @@ if [ -n "$REMOTE" ]; then
   on_server "$REMOTE_BIN" --smoke || fail "--smoke on $REMOTE"
   echo "   remote binary smoke OK on $REMOTE (build + unit tests are CI's, not ours)"
 else
-  if [ "$RFC_BACKEND" = proto ]; then
-    cargo build --release -p erpl-proto-nwrfc \
-          --manifest-path "$ERPL_PROTO_ROOT/Cargo.toml" >/dev/null 2>&1 \
-      || fail "build erpl-proto's nwrfc shim"
-  fi
+  [ -f "$ERPL_PROTO_ROOT/Cargo.toml" ] \
+    || fail "erpl-proto is missing at $ERPL_PROTO_ROOT (git submodule update --init erpl-proto)"
+  cargo build --release -p erpl-proto-nwrfc \
+        --manifest-path "$ERPL_PROTO_ROOT/Cargo.toml" >/dev/null 2>&1 \
+    || fail "build erpl-proto's nwrfc shim"
   cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-        -DRFC_BACKEND="$RFC_BACKEND" -DRFC_LINK="$RFC_LINK" \
-        -DERPL_PROTO_ROOT="$ERPL_PROTO_ROOT" \
+        -DRFC_LINK="$RFC_LINK" -DERPL_PROTO_ROOT="$ERPL_PROTO_ROOT" \
         -DCMAKE_TOOLCHAIN_FILE="$VCPKG/scripts/buildsystems/vcpkg.cmake" \
         -DVCPKG_TARGET_TRIPLET="$TRIPLET" -DVCPKG_HOST_TRIPLET="$TRIPLET" \
         >/dev/null 2>&1 || fail "configure"
@@ -643,20 +640,14 @@ echo "   cdc provision on an unregistered target points at sync create"
 
 srv_kill; sleep 1
 on_server rm -f "$E2E_DB" "$E2E_DB".wal /tmp/erpl_taxi.parquet
-# ldd and the SDK path are this box's; a remote binary is a different platform's
-# and was linked by CI, which has its own check.
-if [ "$RFC_BACKEND" = proto ] && [ -z "$REMOTE" ]; then
+# ldd is this box's; a remote binary is a different platform's and was linked by
+# CI, which has its own check.
+if [ -z "$REMOTE" ]; then
   echo "== SDK-absence check =="
-  # Matched on the resolved *path*, not the SONAME: erpl-proto's shim is called
-  # libsapnwrfc.so on purpose, so a name check cannot tell it from SAP's and
-  # would fail on exactly the binary we want.
-  if ldd ./build/erpl_rev_server | grep -F "$NW/"; then
-    fail "a library is still being loaded from the SAP NW RFC SDK at $NW"
-  fi
   if ldd ./build/erpl_rev_server | grep -Ei 'libsapucum|libicu'; then
     fail "libsapucum or ICU is still linked"
   fi
-  echo "   nothing loaded from $NW; no libsapucum, no ICU"
+  echo "   no libsapucum, no ICU"
   if [ "$RFC_LINK" = static ]; then
     # The shim is inside the binary, so there must be no RFC shared object at
     # all -- not even erpl-proto's own.

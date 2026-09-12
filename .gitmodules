@@ -7,3 +7,7 @@
 [submodule "duckdb"]
 	path = duckdb
 	url = https://github.com/duckdb/duckdb.git
+[submodule "erpl-proto"]
+	path = erpl-proto
+	url = https://github.com/DataZooDE/erpl-proto.git
+	branch = main

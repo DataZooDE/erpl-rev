@@ -40,7 +40,8 @@ say() { printf '  %s\n' "$*"; }
 mkdir -p demo/bin
 ln -sf "$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")" demo/bin/erpl-rev
 export PATH="$PWD/demo/bin:$PATH"
-export LD_LIBRARY_PATH="${ERPL_RFC_LIB_DIR:-$PWD/nwrfcsdk/linux/lib}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# No loader path: the RFC shim is linked into the binary, so a demo that set one
+# would be demonstrating a requirement the product does not have.
 export ERPL_REV_GWHOST=localhost ERPL_REV_GWSERV=3300
 export SAP_HOST=localhost SAP_PORT=50000 SAP_CLIENT=001 SAP_USER=DEVELOPER
 
