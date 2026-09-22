@@ -10,7 +10,24 @@
 #include <thread>
 #include <vector>
 
+#if defined(__linux__) || defined(__APPLE__)
+#include <unistd.h>
+#endif
+
 #include "temp_path.hpp"
+
+// Hermetic quack URI: the fixed quack:localhost:9494 collides with any running
+// erpl_rev_server, which answers with the wrong token and fails the query with
+// a flaky "Authentication failed". A PID-derived port keeps test processes and
+// a live server apart (StopQuack still releases it for sequential cases).
+static std::string QuackTestUri() {
+#if defined(__linux__) || defined(__APPLE__)
+    const long port = 20000L + (static_cast<long>(::getpid()) % 30000L);
+#else
+    const long port = 24949L;
+#endif
+    return "quack:localhost:" + std::to_string(port);
+}
 
 using namespace erpl_rev;
 
@@ -250,12 +267,13 @@ TEST_CASE("Quack serves this in-process DuckDB to a remote client", "[bridge][qu
     DuckDbBridge db;  // in-memory; quack exposes exactly this instance
     db.Execute("CREATE TABLE t(id INTEGER, v VARCHAR)");
     db.Execute("INSERT INTO t VALUES (1,'hello'),(2,'world')");
+    const std::string uri = QuackTestUri();
 
     // StartQuack must INSTALL/LOAD the extension from the public repo; if that
     // is unavailable (offline, or engine < 1.5.3) skip loudly rather than fail.
     std::string details;
     try {
-        details = db.StartQuack("quack:localhost", /*allow_other_host=*/false);
+        details = db.StartQuack(uri, /*allow_other_host=*/false);
     } catch (const std::exception &e) {
         SKIP(std::string("quack extension unavailable: ") + e.what());
     }
@@ -270,20 +288,21 @@ TEST_CASE("Quack serves this in-process DuckDB to a remote client", "[bridge][qu
     // Query the running server back over the loopback HTTP transport: a remote
     // DuckDB client sees the rows ingested into this process.
     auto r = db.Query(
-        "FROM quack_query('quack:localhost', "
+        "FROM quack_query('" + uri + "', "
         "'SELECT count(*) AS n, max(v) AS mv FROM t', token = '" + token + "')");
     REQUIRE(r.rows.size() == 1);
     REQUIRE(r.rows[0] == R"({"n":2,"mv":"world"})");
 
-    db.StopQuack("quack:localhost");
+    db.StopQuack(uri);
 }
 
 TEST_CASE("Quack honours a pinned auth token", "[bridge][quack]") {
     DuckDbBridge db;
     const std::string pinned = "MYFIXEDTOKEN0123456789ABCDEF";
+    const std::string uri = QuackTestUri();
     std::string details;
     try {
-        details = db.StartQuack("quack:localhost", /*allow_other_host=*/false, pinned);
+        details = db.StartQuack(uri, /*allow_other_host=*/false, pinned);
     } catch (const std::exception &e) {
         SKIP(std::string("quack extension unavailable: ") + e.what());
     }
@@ -297,10 +316,10 @@ TEST_CASE("Quack honours a pinned auth token", "[bridge][quack]") {
 
     // And that exact token authenticates a query.
     auto r = db.Query(
-        "FROM quack_query('quack:localhost', 'SELECT 7 AS v', token = '" + pinned + "')");
+        "FROM quack_query('" + uri + "', 'SELECT 7 AS v', token = '" + pinned + "')");
     REQUIRE(r.rows[0] == R"({"v":7})");
 
-    db.StopQuack("quack:localhost");
+    db.StopQuack(uri);
 }
 
 TEST_CASE("Typed ingest: init_sql + ddl + UPSERT round-trips typed values", "[bridge][ingest][typed]") {
