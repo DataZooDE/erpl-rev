@@ -266,6 +266,12 @@ std::vector<RegisterField> RegisterFields(const SyncState &s) {
         str("log_enabled", s.log_enabled, "--log"),
         str("load_type_default", s.load_type_default, "--load-type-default"),
         str("allow_empty_reload", s.allow_empty_reload, "--allow-empty-reload"),
+        // APE knobs (BRD FR-1). Same rule: unset travels as empty, and the
+        // server coalesces it to the stored value on re-registration.
+        str("subscriber_process", s.subscriber_process, "--subscriber-process"),
+        num("chunk_size", s.chunk_size),
+        str("wireformat", s.wireformat, "--wireformat"),
+        str("allow_unreleased", s.allow_unreleased, "--allow-unreleased"),
     };
 }
 

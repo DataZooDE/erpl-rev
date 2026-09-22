@@ -36,6 +36,10 @@ struct ReplicateParams {
 // One delta target, as zcl_erpl_rev_delta=>register takes it.
 struct SyncState {
     std::string target, method, source_from, keys, chg_col, wm_kind, wm_value;
+    // APE registration (BRD FR-1): the named SAP-side subscription plus the
+    // graph knobs. chunk_size 0 = engine default.
+    std::string subscriber_process, wireformat;
+    long long chunk_size = 0;
     // The TIMS half of a DATETIME pair. Absent from the skeleton path for its
     // whole life, which is how a DATETIME target could register cleanly,
     // replicate one batch and then silently stop.
@@ -50,6 +54,9 @@ struct SyncState {
     std::string log_enabled;              // "true" | "false" | ""
     std::string load_type_default;        // D | F | I | L; F and L are one-shot
     std::string allow_empty_reload;       // "true" | "false" | ""
+    // FR-2 release-gate override: "true" | "". No "false": absence IS false,
+    // and a re-registration that does not restate it re-enforces the gate.
+    std::string allow_unreleased;
 };
 
 // One field of the register call, in both the forms its two writers need:

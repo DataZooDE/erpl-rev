@@ -42,6 +42,14 @@ struct Derived {
 
 Derived Derive(const Annotations &a);
 
+// BR-6: APE needs @Analytics.dataExtraction.enabled: true. Eligibility is
+// capability-agnostic on purpose -- whether APE exists on the system is the
+// live probe's answer, not the model's. A merely enabled view (no
+// changeDataCapture) is still eligible: it can seed via APE_FULL, only
+// APE_DELTA replication needs capture. Explicit `enabled: false` or no
+// annotation at all is never eligible. Never throws.
+bool IsApeEligible(const Annotations &a);
+
 // DDIC element type -> the watermark kind that compares it correctly.
 std::string WmKindForType(const std::string &ddic_type);
 

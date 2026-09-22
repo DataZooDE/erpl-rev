@@ -91,5 +91,11 @@ Derived Derive(const Annotations &a) {
     return d;   // no delta annotation: still replicable by full load or snapshot
 }
 
+bool IsApeEligible(const Annotations &a) {
+    const auto enabled = Get(a, "Analytics.dataExtraction.enabled");
+    if (enabled.empty()) return false;
+    return Upper(enabled) != "FALSE";
+}
+
 }  // namespace cds
 }  // namespace erpl_rev

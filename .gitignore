@@ -3,6 +3,7 @@
 # licensed SAP software and redistributing it is not ours to do.
 nwrfcsdk/
 build/
+build-sandbox/
 vendor/
 # SAP NW RFC SDK — proprietary, not redistributable (provide locally; see README)
 sap/

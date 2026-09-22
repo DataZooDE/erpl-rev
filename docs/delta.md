@@ -41,6 +41,58 @@ column-less → just SNAPSHOT.** Physical deletes are reflected **only** by SNAP
 (no change column can report a row that no longer exists) — or, for a table too large
 to snapshot, by the opt-in **trigger-CDC** tier (see [`cdc.md`](cdc.md)).
 
+## The sixth path: APE_FULL / APE_DELTA (SAP DHAPE extraction)
+
+For **CDS views** with `@Analytics.dataExtraction.enabled: true`, erpl-rev can
+extract through SAP's own DHAPE engine instead of Open SQL. Two methods, same
+registry, same scheduler:
+
+| Method | Use when | How it reads | Apply |
+|--------|----------|--------------|-------|
+| **APE_FULL** | snapshot of a CDS view | unique-per-scan subscription, ends on `lastBatch` | staging → snapshot merge; subscription erased afterwards |
+| **APE_DELTA** | ongoing replication of a CDS view (`...delta.changeDataCapture.automatic: true` additionally required) | named subscription, resume-or-create; ends after 3 consecutive rowless polls | per-package spill → keyed merge (`U` upsert, `D` delete by key) |
+
+Register from the CLI (not from the Delta tab):
+
+```bash
+erpl-rev sync create ape_flights \
+    --method APE_DELTA --source ZERPL_APE_D --keys RID \
+    --subscriber-process ERPLREV99 --chunk-size 20000 \
+    --wireformat 'Required Conversions Plus Time Format and Currency' \
+    --cadence hourly --allow-unreleased
+```
+
+`--subscriber-process` names the SAP-side subscription (unique-per-scan names are
+minted for `APE_FULL`, the name is resumed for `APE_DELTA`); `--chunk-size`
+sizes engine handovers (default 20000); `--allow-unreleased` accepts `$TMP`/unreleased
+views with a WARN logged on the row; `micro:*` cadences are refused. Re-running
+`sync create` on an existing target is create-or-update, as with the five methods.
+
+Cycle order for `APE_DELTA` is lease → stale-graph GC → seed → spill replay
+(`APE_RECOVER`, no SAP contact) → poll → release. The seed-first snapshot means
+state converges even when a stream handover clips: measured on A4H, one cycle
+window carries a commit's first two DMLs, so a delete lands within 1–2 cycles
+while counts and keys stay exact. Every spilled package replays after a crash;
+a second replay is a no-op.
+
+Retire a target with the explicit drop (FR-9):
+
+```bash
+erpl-rev sync drop ape_flights
+```
+
+This erases the SAP-side subscription and deletes the state row plus its spill,
+and refuses while a cycle holds a fresh lease. Dropping an unknown target
+reports instead of failing. The DuckDB table itself is kept.
+
+One operator note: amounts under `...Plus Currency` wire formats are
+**currency-shifted by design** — compare against APE semantics, not Open-SQL
+values (cell-for-cell parity excludes `AMOUNT`).
+
+Live proof on A4H is the `ZCL_ERPL_REV_APETEST` milestones, split across
+classruns for the dialog budget: A (converge), B (surgery + carry + restore),
+C (spill replay + stale graph + drop), V (100k rows, key-count == row-count).
+
 ## Registering a target
 
 A target is one row in `_erpl_rev_delta_state`. From the CLI:

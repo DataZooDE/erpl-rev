@@ -249,3 +249,42 @@ TEST_CASE("migrate: v8 does not re-seed a target that was already seeded",
     CHECK(one("SELECT load_type_default FROM _erpl_rev_delta_state "
               "WHERE target='still_pending'") == "L");
 }
+
+TEST_CASE("migrate: v9 adds the APE registration and spill state", "[schema][ape]") {
+    // HLD §5: position = subscription, so the registry carries the named
+    // SAP-side subscription plus the graph knobs; the spill table is the only
+    // copy of handed-over packages after a crash (ADR-2).
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    schema::Migrate(con, "test");
+
+    for (const auto *col : {"subscriber_process", "chunk_size", "wireformat",
+                            "last_batch_index", "spill_batch"}) {
+        INFO(col);
+        CHECK(HasColumn(con, "_erpl_rev_delta_state", col));
+    }
+    // The spill table exists and is keyed so a replay re-applies one batch.
+    auto r = con.Query("SELECT count(*) FROM _erpl_rev_ape_spill");
+    REQUIRE_FALSE(r->HasError());
+    // Re-running stays a no-op: the version row is written only after every
+    // step succeeded.
+    REQUIRE_NOTHROW(schema::Migrate(con, "test"));
+    CHECK(schema::CurrentVersion(con) == schema::LatestVersion());
+    CHECK(schema::LatestVersion() >= 9);
+}
+
+TEST_CASE("migrate: v10 adds the release-gate override and warning", "[schema][ape]") {
+    // BRD §6 AC-4: the override is present-tense intent stored on the row
+    // (set-semantics: an unstated re-registration re-enforces the gate), and
+    // the WARN from the last register() stays observable via state().
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    schema::Migrate(con, "test");
+    for (const auto *col : {"allow_unreleased", "last_warning"}) {
+        INFO(col);
+        CHECK(HasColumn(con, "_erpl_rev_delta_state", col));
+    }
+    REQUIRE_NOTHROW(schema::Migrate(con, "test"));
+    CHECK(schema::CurrentVersion(con) == schema::LatestVersion());
+    CHECK(schema::LatestVersion() >= 10);
+}

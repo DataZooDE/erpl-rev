@@ -122,3 +122,38 @@ TEST_CASE("cds_delta: annotation names are matched case-insensitively", "[cds]")
     CHECK(d.kind == DeltaKind::Watermark);
     CHECK(d.chg_col == "CHANGED_AT");
 }
+
+TEST_CASE("cds_delta: an extraction-enabled CDS view is APE-eligible", "[cds][ape]") {
+    // BR-6: APE needs @Analytics.dataExtraction.enabled: true. Eligibility is
+    // capability-agnostic (the probe decides availability); derivation itself
+    // is unchanged by this.
+    Annotations a;
+    a.entity = "ZERPL_APE_D";
+    a.values["Analytics.dataExtraction.enabled"] = "true";
+    a.values["Analytics.dataExtraction.delta.changeDataCapture.automatic"] = "true";
+    a.mappings = {{"ZERPL_APE_D", "MANDT,ID"}};
+    CHECK(IsApeEligible(a));
+}
+
+TEST_CASE("cds_delta: enabled without capture is APE-eligible (full-only)", "[cds][ape]") {
+    // BR-6: changeDataCapture.automatic is needed for *replication*; a merely
+    // enabled view can still seed via APE_FULL.
+    Annotations a;
+    a.entity = "W";
+    a.values["Analytics.dataExtraction.enabled"] = "true";
+    CHECK(IsApeEligible(a));
+}
+
+TEST_CASE("cds_delta: extraction-disabled views are never APE-eligible", "[cds][ape]") {
+    Annotations a;
+    a.entity = "V";
+    a.values["Analytics.dataExtraction.enabled"] = "false";
+    CHECK_FALSE(IsApeEligible(a));
+}
+
+TEST_CASE("cds_delta: a view with no extraction annotation is not APE-eligible",
+          "[cds][ape]") {
+    Annotations a;
+    a.entity = "PLAIN_VIEW";
+    CHECK_FALSE(IsApeEligible(a));
+}

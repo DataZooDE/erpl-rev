@@ -141,6 +141,16 @@ CLASS zcl_erpl_rev_mkfm IMPLEMENTATION.
               exps = VALUE #( ( `EV_INS` ) ( `EV_UPD` ) ( `EV_DEL` ) ( `EV_ERROR` ) )
               txt  = 'erpl-rev: snapshot diff merge' ).
 
+        " APE per-package endpoint: ABAP drives the DHAPE session and posts
+        " each raw PORT_DATA envelope; the server decodes, stages and -- on
+        " lastBatch -- reconciles. EV_DONE='X' ends the scan.
+        make( out  = out
+              name = 'Z_DUCKDB_APE_RUN'
+              imps = VALUE #( ( `IV_TARGET` ) ( `IV_PACKAGE` ) ( `IV_BATCH_INDEX` ) )
+              exps = VALUE #( ( `EV_ROWS` ) ( `EV_INS` ) ( `EV_UPD` ) ( `EV_DEL` )
+                              ( `EV_DONE` ) ( `EV_ERROR` ) )
+              txt  = 'erpl-rev: APE package apply + reconcile' ).
+
         " Trigger-CDC FMs (opt-in physical-delete tier). CDC_PLAN returns the whole
         " platform plan as one JSON string (EV_PLAN); CDC_APPLY applies one staged
         " log batch and returns counts + the prune bound.

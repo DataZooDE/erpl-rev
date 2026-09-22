@@ -263,6 +263,17 @@ CLASS zcl_erpl_rev_clidrv IMPLEMENTATION.
           ev_result = 'nothing due'.
         ENDIF.
 
+      WHEN 'sync_drop'.
+        DATA(lv_drop_tgt) = jstr( iv_json = iv_params iv_key = 'target' ).
+        IF lv_drop_tgt IS INITIAL.
+          ev_error = 'ERROR: sync drop needs a target'.
+        ELSE.
+          ev_result = zcl_erpl_rev_delta=>drop( lv_drop_tgt ).
+          IF ev_result CS 'ERROR:'.
+            ev_error = ev_result.
+          ENDIF.
+        ENDIF.
+
       WHEN 'daemon_status'.
         " The singleton row, as the operator sees it. A plain read, so it goes
         " through Z_DUCKDB_QUERY rather than a plan action.

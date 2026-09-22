@@ -38,6 +38,15 @@ const std::vector<RfcFm> &RfcContract() {
          {Imp("IV_TARGET"), Imp("IV_STAGING"), Imp("IV_KEYS"), Exp("EV_INS"), Exp("EV_UPD"),
           Exp("EV_DEL"), Exp("EV_ERROR")}},
 
+        // APE per-package endpoint (ABAP drives the DHAPE session; the server
+        // decodes, stages and -- on the envelope's lastBatch -- reconciles).
+        // EV_DONE='X' when this package ended the scan; EV_INS/UPD/DEL carry
+        // the reconcile counts then, zeros otherwise.
+        {"Z_DUCKDB_APE_RUN",
+         {Imp("IV_TARGET"), Imp("IV_PACKAGE"), Imp("IV_BATCH_INDEX"), Exp("EV_ROWS"),
+          Exp("EV_INS"), Exp("EV_UPD"), Exp("EV_DEL"), Exp("EV_DONE"),
+          Exp("EV_ERROR")}},
+
         {"Z_DUCKDB_CDC_PLAN",
          {Imp("IV_TARGET"), Imp("IV_SOURCE"), Imp("IV_KEYS"), Imp("IV_MODE"),
           Imp("IV_PLATFORM"), Imp("IV_ACTION"), Exp("EV_PLAN"), Exp("EV_ERROR")}},

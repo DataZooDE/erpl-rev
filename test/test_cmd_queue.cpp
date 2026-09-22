@@ -162,6 +162,15 @@ TEST_CASE("positionals are not flags", "[args]") {
               .empty());
 }
 
+TEST_CASE("args: sync create accepts the APE flags", "[args][ape]") {
+    CHECK(cmd::UnknownFlag({"create", "tgt", "--method", "APE_DELTA", "--source",
+                            "ZERPL_APE_D", "--keys", "MANDT,ID",
+                            "--subscriber-process", "ERPLREV01", "--chunk-size",
+                            "20000", "--wireformat", "W", "--allow-unreleased"},
+                           "sync create")
+              .empty());
+}
+
 TEST_CASE("each sync subcommand has its own flag set", "[args]") {
     CHECK(cmd::UnknownFlag({"schedule", "--every", "5"}, "sync schedule").empty());
     CHECK(cmd::UnknownFlag({"schedule", "--remove"}, "sync schedule").empty());

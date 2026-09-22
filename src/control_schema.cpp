@@ -159,6 +159,27 @@ const std::vector<Migration> &Migrations() {
         "SELECT 1",
     }},
 
+    // v9 -- APE as a sixth delta path (BRD §2, HLD §5).
+    //
+    // Position = subscription: the registry carries the named SAP-side
+    // subscription plus the graph knobs. The spill table is the only copy of
+    // handed-over packages after a crash (ADR-2: spill-before-merge), keyed
+    // so a recover replay re-applies one batch without touching SAP.
+    {9, "ape: subscription registry and package spill", {
+        "CREATE TABLE IF NOT EXISTS _erpl_rev_ape_spill ("
+        "target VARCHAR NOT NULL, batch_index BIGINT NOT NULL, "
+        "payload VARCHAR NOT NULL, spilled_ts TIMESTAMPTZ DEFAULT now(), "
+        "PRIMARY KEY (target, batch_index))",
+    }},
+
+    // v10 -- FR-2 release gate (BRD §6 AC-4): the override is present-tense
+    // intent stored on the row, and the WARN from the last register() stays
+    // observable. Set-semantics, not coalesce: a re-registration that does
+    // not restate the override re-enforces the gate (fail closed).
+    {10, "ape: release-gate override and warning", {
+        "SELECT 1",
+    }},
+
     };
     // clang-format on
     return kMigrations;
@@ -220,6 +241,19 @@ void ApplyColumnAdds(duckdb::Connection &con, int version) {
     } else if (version == 8) {
         AddColumnIfMissing(con, "_erpl_rev_delta_state", "one_shot_spent",
                            "BOOLEAN DEFAULT false");
+    } else if (version == 9) {
+        const char *st = "_erpl_rev_delta_state";
+        AddColumnIfMissing(con, st, "subscriber_process", "VARCHAR");
+        // 0 = engine default; the knob stays throughput-only (HLD §6).
+        AddColumnIfMissing(con, st, "chunk_size", "INTEGER DEFAULT 0");
+        AddColumnIfMissing(con, st, "wireformat", "VARCHAR");
+        // -1 = no batch handed over yet on this target.
+        AddColumnIfMissing(con, st, "last_batch_index", "BIGINT DEFAULT -1");
+        AddColumnIfMissing(con, st, "spill_batch", "BIGINT DEFAULT -1");
+    } else if (version == 10) {
+        const char *st = "_erpl_rev_delta_state";
+        AddColumnIfMissing(con, st, "allow_unreleased", "BOOLEAN DEFAULT false");
+        AddColumnIfMissing(con, st, "last_warning", "VARCHAR");
     }
 }
 

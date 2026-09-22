@@ -272,6 +272,11 @@ add_library(erpl_rev_core OBJECT
   src/cdc_status.cpp
   src/portion.cpp
   src/cds_delta.cpp
+  src/ape_validate.cpp
+  src/ape_decode.cpp
+  src/ape_graph.cpp
+  src/ape_envelope.cpp
+  src/ape_cycle.cpp
   src/latency.cpp
   src/cdc_dialect.cpp
   src/json_util.cpp
@@ -369,6 +374,11 @@ if(TRUE)  # tests always build; DuckDB is in-tree
     test/test_cdc_status.cpp
     test/test_portion.cpp
     test/test_cds_delta.cpp
+    test/test_ape_register.cpp
+    test/test_ape_decode.cpp
+    test/test_ape_graph.cpp
+    test/test_ape_envelope.cpp
+    test/test_ape_cycle.cpp
     test/test_footprint.cpp
     test/test_latency.cpp
     test/test_sxml_binary.cpp

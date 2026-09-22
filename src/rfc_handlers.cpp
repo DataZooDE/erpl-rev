@@ -1,4 +1,6 @@
 #include "rfc_handlers.hpp"
+#include "ape_cycle.hpp"
+#include "ape_graph.hpp"
 #include "cycle.hpp"
 #include "drift.hpp"
 #include "load_type.hpp"
@@ -95,6 +97,7 @@ std::vector<std::string> SplitCsv(const std::string &s) {
 // Build a JSON array string from the row JSON objects.
 // A SQL string literal, quotes doubled. The target and the watermark reach here
 // from an operator's command line.
+
 std::string SqlLit(const std::string &v) {
     std::string q = "'";
     for (char c : v) { if (c == '\'') q += "''"; else q += c; }
@@ -197,6 +200,8 @@ void InstallHandlers(const std::string &db_path, const std::string &init_sql) {
         throw_rfc("RfcInstallServerFunction(Z_DUCKDB_INGEST)", info);
     if (RfcInstallServerFunction(nullptr, BuildSnapshotMergeDesc(), ZSnapshotMergeImpl, &info) != RFC_OK)
         throw_rfc("RfcInstallServerFunction(Z_DUCKDB_SNAPSHOT_MERGE)", info);
+    if (RfcInstallServerFunction(nullptr, BuildApeRunDesc(), ZApeRunImpl, &info) != RFC_OK)
+        throw_rfc("RfcInstallServerFunction(Z_DUCKDB_APE_RUN)", info);
     if (RfcInstallServerFunction(nullptr, BuildOpenDesc(), ZOpenImpl, &info) != RFC_OK)
         throw_rfc("RfcInstallServerFunction(Z_DUCKDB_OPEN)", info);
     if (RfcInstallServerFunction(nullptr, BuildFetchDesc(), ZFetchImpl, &info) != RFC_OK)
@@ -212,7 +217,7 @@ void InstallHandlers(const std::string &db_path, const std::string &init_sql) {
 
     log::get().Debug("rfc", "handlers installed",
                      {{"functions", "STFC_CONNECTION,Z_DUCKDB_QUERY,Z_DUCKDB_INGEST,"
-                                    "Z_DUCKDB_SNAPSHOT_MERGE,Z_DUCKDB_CDC_PLAN,Z_DUCKDB_CDC_APPLY,"
+                                    "Z_DUCKDB_SNAPSHOT_MERGE,Z_DUCKDB_APE_RUN,Z_DUCKDB_CDC_PLAN,Z_DUCKDB_CDC_APPLY,"
                                     "Z_DUCKDB_OPEN,Z_DUCKDB_FETCH,Z_DUCKDB_CLOSE,Z_DUCKDB_PLAN", true},
                       {"db", db_path.empty() ? ":memory:" : db_path}});
 }
@@ -529,6 +534,72 @@ std::string JsonField(const std::string &json, const std::string &key) {
     return out;
 }
 
+// APE per-package endpoint. ABAP owns the DHAPE session (create/poll/stop in
+// one SAP session, so affinity holds without an outbound client here) and
+// posts each raw PORT_DATA envelope; the server decodes it with the tested
+// codec, stages the rows, and -- when the envelope carries lastBatch --
+// reconciles the staging onto the target (CURR semantics for FULL). One
+// package per call keeps server memory bounded by package size (NFR-1).
+extern "C" RFC_RC SAP_API ZApeRunImpl(RFC_CONNECTION_HANDLE,
+                                      RFC_FUNCTION_HANDLE funcHandle,
+                                      RFC_ERROR_INFO *) {
+    RfcCallScope _tc("ape_run");
+    try {
+        std::string target  = GetString(funcHandle, "IV_TARGET");
+        std::string package = GetString(funcHandle, "IV_PACKAGE");
+        long long batch     = std::atoll(GetString(funcHandle, "IV_BATCH_INDEX").c_str());
+        log::get().Info("rfc", "Z_DUCKDB_APE_RUN", {{"target", target}, {"batch", batch}});
+
+        QueryResult qr = g_bridge->Query(
+            "SELECT method AS method, keys AS keys FROM _erpl_rev_delta_state "
+            "WHERE target=" + SqlLit(target));
+        if (qr.row_count == 0)
+            throw std::runtime_error("APE_RUN: no delta registration for " + target);
+        const std::string method = JsonField(qr.rows[0], "method");
+        if (method != "APE_FULL" && method != "APE_DELTA")
+            throw std::runtime_error("APE_RUN: method " + method + " is not an APE method");
+        const std::vector<std::string> keys = SplitCsv(JsonField(qr.rows[0], "keys"));
+
+        long long rows = 0, ins = 0, upd = 0, del = 0;
+        std::string done;
+        if (method == "APE_FULL") {
+            const auto a = ape::ApeApplyFullPackage(*g_bridge, target, package, batch);
+            rows = a.rows_staged;
+            if (a.last_batch) {
+                const auto c = ape::ApeFinalizeFull(*g_bridge, target, keys);
+                ins = c.ins; upd = c.upd; del = c.del;
+                done = "X";
+                auto con = g_bridge->Connect();
+                Exec(con, "UPDATE _erpl_rev_delta_state SET last_batch_index=" +
+                          std::to_string(batch) + " WHERE target=" + SqlLit(target));
+            }
+        } else {
+            // DELTA: spill-before-merge per package, U = upsert, D = delete by
+            // key. Replication graphs never send lastBatch -- the ABAP loop
+            // ends the scan after K consecutive empty polls -- so EV_DONE
+            // stays empty here; the clean cycle end purges the spill (APE_PURGE).
+            const auto d = ape::ApeApplyDeltaPackage(*g_bridge, target, keys, package, batch);
+            rows = d.rows_applied;
+            ins = d.upserted;
+            del = d.deleted;
+        }
+        SetString(funcHandle, "EV_ROWS", std::to_string(rows));
+        SetString(funcHandle, "EV_INS",  std::to_string(ins));
+        SetString(funcHandle, "EV_UPD",  std::to_string(upd));
+        SetString(funcHandle, "EV_DEL",  std::to_string(del));
+        SetString(funcHandle, "EV_DONE", done);
+        SetString(funcHandle, "EV_ERROR", "");
+        log::get().Debug("rfc", "Z_DUCKDB_APE_RUN ok",
+                         {{"rows", rows}, {"ins", ins}, {"upd", upd},
+                          {"del", del}, {"done", done}});
+    } catch (const std::exception &e) {
+        _tc.fail("sql_error");
+        log::get().Error("rfc", "Z_DUCKDB_APE_RUN failed", {{"error", e.what()}});
+        SetString(funcHandle, "EV_ERROR", e.what());
+    }
+    return RFC_OK;
+}
+
 // The ARRAY token for a key, brackets included, or empty.
 //
 // JsonField stops at the first ',' or '}' for a non-string value, so asking it
@@ -676,6 +747,58 @@ extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE,
                    "\"logged\":" + std::to_string(r.logged) + "," +
                    "\"wm\":" + json::QuoteString(r.new_watermark) +
                    "}";
+        } else if (action == "APE_GRAPH") {
+            // The v6 graph JSON for an APE target, built from the registration
+            // row by the tested builder (HLD §4 reuse). ABAP drives the DHAPE
+            // session with it (create/poll/stop in one SAP session). An
+            // optional iv_params subscription_name mints a unique-per-scan
+            // name for FULL (the engine refuses create on a reused name,
+            // protocol §11); empty keeps subscriber_process.
+            QueryResult qr = g_bridge->Query(
+                "SELECT method AS method, coalesce(source_from,'') AS source_from, "
+                "coalesce(subscriber_process,'') AS subscriber_process, "
+                "coalesce(chunk_size,0) AS chunk_size, coalesce(wireformat,'') AS wireformat "
+                "FROM _erpl_rev_delta_state WHERE target=" + SqlLit(target));
+            if (qr.row_count == 0)
+                throw std::runtime_error("APE_GRAPH: no delta registration for " + target);
+            const std::string method = JsonField(qr.rows[0], "method");
+            if (method != "APE_FULL" && method != "APE_DELTA")
+                throw std::runtime_error("APE_GRAPH: method " + method + " is not an APE method");
+            const auto spec = ape::MakeGraphSpec(
+                method, JsonField(qr.rows[0], "source_from"),
+                JsonField(qr.rows[0], "subscriber_process"),
+                JsonField(params, "subscription_name"),
+                std::atoll(JsonField(qr.rows[0], "chunk_size").c_str()),
+                JsonField(qr.rows[0], "wireformat"),
+                JsonField(params, "subscription_id"));
+            // Raw, deliberately: the graph JSON is itself the plan, and no
+            // flat extractor (ABAP jstr included) survives a nested escaped
+            // string -- wrapping it in {"graph":...} hands the caller one
+            // backslash instead of a graph.
+            plan = ape::BuildGraphJson(spec);
+        } else if (action == "APE_RECOVER") {
+            // Crash replay without SAP contact (a graph would advance the
+            // subscription past owed changes): re-apply the spilled tail,
+            // then discard it. A clean state is a no-op. ABAP runs this
+            // first in every DELTA cycle (FR-6/AC-2).
+            QueryResult qr = g_bridge->Query(
+                "SELECT keys AS keys FROM _erpl_rev_delta_state WHERE target=" +
+                SqlLit(target));
+            if (qr.row_count == 0)
+                throw std::runtime_error("APE_RECOVER: no delta registration for " + target);
+            const auto r = ape::ApeRecover(*g_bridge, target,
+                                           SplitCsv(JsonField(qr.rows[0], "keys")));
+            plan = std::string("{\"rows\":") + std::to_string(r.rows_applied) +
+                   ",\"upserted\":" + std::to_string(r.upserted) +
+                   ",\"deleted\":" + std::to_string(r.deleted) + "}";
+        } else if (action == "APE_PURGE") {
+            // End-of-cycle spill cleanup (best-effort): every spilled batch
+            // of a clean cycle merged, so the spill is garbage. A crash
+            // before this leaves rows behind, and the next cycle's
+            // APE_RECOVER replays them idempotently before purging again.
+            auto con = g_bridge->Connect();
+            Exec(con, "DELETE FROM _erpl_rev_ape_spill WHERE target=" + SqlLit(target));
+            plan = "{\"purged\":true}";
         } else if (action == "CDC_APPLY") {
             // The KEYS_IUD apply. It is an action rather than a parameter on
             // Z_DUCKDB_CDC_APPLY because that FM's interface cannot be extended

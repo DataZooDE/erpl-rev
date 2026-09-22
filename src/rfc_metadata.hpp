@@ -25,6 +25,7 @@ RFC_FUNCTION_DESC_HANDLE BuildIngestDesc();
 // EV_INS, EV_UPD, EV_DEL, EV_ERROR. All TYPE STRING. Diff-merges a fresh full
 // snapshot onto the target (upsert + delete-missing) for the SNAPSHOT method.
 RFC_FUNCTION_DESC_HANDLE BuildSnapshotMergeDesc();
+RFC_FUNCTION_DESC_HANDLE BuildApeRunDesc();
 
 // Streaming cursor FMs (fixed-memory paging; BXML payload is XSTRING):
 //  Z_DUCKDB_OPEN : IMPORTING IV_SQL → EXPORTING EV_HANDLE, EV_COLUMNS, EV_ERROR.

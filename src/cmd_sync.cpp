@@ -17,6 +17,7 @@
 
 #include "commands.hpp"
 #include "load_type.hpp"
+#include "ape_validate.hpp"
 #include "db_client.hpp"
 #include "json_util.hpp"
 
@@ -53,6 +54,8 @@ std::string UnknownFlag(const std::vector<std::string> &args, const std::string 
         {"--log", false},     {"--no-log", false},
         {"--load-type-default", true},
         {"--allow-empty-reload", false}, {"--no-allow-empty-reload", false},
+        {"--subscriber-process", true}, {"--chunk-size", true},
+        {"--wireformat", true}, {"--allow-unreleased", false},
     };
     static const Spec kSyncSchedule[] = {
         {"--every", true}, {"--remove", false},
@@ -90,6 +93,8 @@ std::string UnknownFlag(const std::vector<std::string> &args, const std::string 
     else if (sub == "sync validate") { known = kSyncValidate; count = std::size(kSyncValidate); }
     // unpark takes a target and nothing else, so any flag is unknown.
     else if (sub == "sync unpark")   { known = nullptr;      count = 0; }
+    // drop takes a target and nothing else, so any flag is unknown.
+    else if (sub == "sync drop")     { known = nullptr;      count = 0; }
     else if (sub.rfind("daemon", 0) == 0) { known = kDaemon; count = std::size(kDaemon); }
     else if (sub.rfind("sub", 0) == 0)    { known = kSub;    count = std::size(kSub); }
     else if (sub == "retain")             { known = kRetain; count = std::size(kRetain); }
@@ -375,6 +380,13 @@ static int SyncCreate(Options &o, const std::string &target) {
     };
     st.log_enabled        = tri("--log", "--no-log");
     st.allow_empty_reload = tri("--allow-empty-reload", "--no-allow-empty-reload");
+    st.subscriber_process = Field(o, "--subscriber-process");
+    const std::string chunk = Field(o, "--chunk-size");
+    if (!chunk.empty()) st.chunk_size = std::atoll(chunk.c_str());
+    st.wireformat         = Field(o, "--wireformat");
+    // Present-tense opt-in (BRD §6 AC-4): stated on this call or the release
+    // gate re-enforces. No --no- form: absence is the safe default.
+    st.allow_unreleased   = HasFlag(o, "--allow-unreleased") ? "true" : "";
     st.load_type_default  = Field(o, "--load-type-default");
     if (!st.load_type_default.empty() && st.load_type_default != "D" &&
         st.load_type_default != "F" && st.load_type_default != "I" &&
@@ -388,6 +400,26 @@ static int SyncCreate(Options &o, const std::string &target) {
         std::fprintf(stderr,
                      "erpl-rev sync create: --method, --source and --keys are required.\n");
         return 2;
+    }
+
+    // Static APE rules fire here, before any consent prompt or SAP contact: a
+    // typo should cost an error, not a password prompt and a prepared graph.
+    // sync create has no filter channel, so has_filter stays false; the
+    // refusal is armed for the graph-spec builder that does (Phase 2).
+    if (ape::IsApeMethod(st.method)) {
+        ape::ApeRegistration ar;
+        ar.method = st.method;
+        ar.source = st.source_from;
+        ar.keys = st.keys;
+        ar.subscriber_process = st.subscriber_process;
+        ar.cadence = st.cadence;
+        ar.wireformat = st.wireformat;
+        ar.chunk_size = st.chunk_size;
+        const std::string err = ape::ValidateRegistration(ar);
+        if (!err.empty()) {
+            std::fprintf(stderr, "erpl-rev sync create: %s\n", err.c_str());
+            return 2;
+        }
     }
 
     if (!o.print_abap && !o.dry_run && (o.queue_only || DriverAvailable(o))) {
@@ -550,6 +582,7 @@ int SyncSetWm(Options &o, const std::string &target);
 int SyncPreview(Options &o, const std::string &target);
 int SyncValidate(Options &o, const std::string &target);
 int SyncUnpark(Options &o, const std::string &target);
+int SyncDrop(Options &o, const std::string &target);
 
 int RunSync(Options o) {
     const std::string sub = o.args.empty() ? "" : o.args.front();
@@ -575,6 +608,7 @@ int RunSync(Options o) {
         if (sub == "preview")       return SyncPreview(o, arg);
         if (sub == "validate")      return SyncValidate(o, arg);
         if (sub == "unpark")        return SyncUnpark(o, arg);
+        if (sub == "drop")          return SyncDrop(o, arg);
     } catch (const abapgen::UnsafeValue &e) {
         std::fprintf(stderr, "erpl-rev: %s\n", e.what());
         return 2;
@@ -584,7 +618,7 @@ int RunSync(Options o) {
     }
     std::fprintf(stderr,
                  "erpl-rev sync: expected ls, show, create, run, run-due, schedule, "
-                 "set-wm, preview, validate or unpark.\n");
+                 "set-wm, preview, validate, unpark or drop.\n");
     return 2;
 }
 
@@ -630,6 +664,17 @@ int SyncUnpark(Options &o, const std::string &target) {
         return 2;
     }
     return RunViaDriver(o, "unpark", BuildParams({{"target", target}}));
+}
+
+int SyncDrop(Options &o, const std::string &target) {
+    if (target.empty()) {
+        std::fprintf(stderr, "erpl-rev sync drop <target>\n"
+                             "  Erases the SAP-side subscription and removes the local\n"
+                             "  state row (FR-9). Refuses a target with a cycle in flight.\n"
+                             "  The DuckDB target table itself is kept.\n");
+        return 2;
+    }
+    return RunViaDriver(o, "sync_drop", BuildParams({{"target", target}}));
 }
 
 // ---------------------------------------------------------------------------

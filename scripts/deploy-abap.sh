@@ -72,6 +72,7 @@ tabl ZDELTA_ALL zdelta_all.ddl "one column per replication strategy (BSEG-shaped
 tabl ZDELTA_AUDIT zdelta_audit.ddl "change-generator audit (the loss/latency oracle)"
 tabl ZDELTA_DT  zdelta_dt.ddl  "DATS+TIMS watermark test table (pair comparison)"
 tabl ZSTOCK_MOVE zstock_move.ddl "goods movements, MSEG-shaped (the demo fixture)"
+tabl ZERPL_APE_V zerpl_ape_v.ddl "APE volume fixture table, 100k source (erpl-rev)"
 
 echo "== interfaces (before util -- replicate's signature references it) =="
 intf ZIF_ERPL_REV_PROGRESS zif_erpl_rev_progress.intf.abap "replicate progress callback"
@@ -90,6 +91,7 @@ cls ZCL_ERPL_REV_SETUP     zcl_erpl_rev_setup.abap     "create registered dest"
 echo "== CDS fixtures (before CDSTEST, which selects from them) =="
 ddls ZERPL_C_FLIGHTS  zerpl_c_flights.ddls.abap  "CDS view over SFLIGHT (erpl-rev fixture)"
 ddls ZERPL_CP_FLIGHTS zerpl_cp_flights.ddls.abap "CDS view WITH PARAMETERS (erpl-rev fixture)"
+ddls ZERPL_APE_VOL zerpl_ape_vol.ddls.abap "APE volume source, extraction-enabled no capture (erpl-rev fixture)"
 
 echo "== test drivers =="
 cls ZCL_ERPL_REV_TYPETEST    zcl_erpl_rev_typetest.abap    "typemap tests"
@@ -105,6 +107,11 @@ cls ZCL_ERPL_REV_CDSTEST     zcl_erpl_rev_cdstest.abap     "CDS view source test
 cls ZCL_ERPL_REV_BWTEST      zcl_erpl_rev_bwtest.abap      "BW/native (ADBC) source tests"
 cls ZCL_ERPL_REV_DELTATEST   zcl_erpl_rev_deltatest.abap   "delta E2E"
 cls ZCL_ERPL_REV_CDCTEST     zcl_erpl_rev_cdctest.abap     "trigger-CDC E2E"
+cls ZCL_ERPL_REV_APETEST    zcl_erpl_rev_apetest.abap    "APE gates + FULL (m1-m3)"
+cls ZCL_ERPL_REV_APEDLTA    zcl_erpl_rev_apedlta.abap    "APE DELTA converge (m4a)"
+cls ZCL_ERPL_REV_APEDLTB    zcl_erpl_rev_apedltb.abap    "APE DELTA carry+restore (m4b)"
+cls ZCL_ERPL_REV_APEDLTC    zcl_erpl_rev_apedltc.abap    "APE recover + stale graph (m5-m6) + drop (m8)"
+cls ZCL_ERPL_REV_APEDLTV    zcl_erpl_rev_apedltv.abap    "APE 100k volume (m7)"
 
 echo "== reports (worker before the report -- the parallel branch SUBMITs it) =="
 prog Z_ERPL_REV_REPL_WORKER   z_erpl_rev_repl_worker.prog.abap   "parallel-replication worker"

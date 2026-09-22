@@ -1,5 +1,13 @@
 # Test fixtures
 
+## `ape_graph_v6_initial_load.json`
+
+The known-good v6 graph description for `com.sap.abap.cds.reader.v2`
+(Initial Load over `ZERPL_APE_FLIGHT`), byte-identical to the fixture the
+erpl spike verified live against A4H (APE 2.7.0). The graph-spec builder's
+golden test must reproduce it exactly: the engine parses this JSON, so a
+drifted key is not a cosmetic diff but a failed graph.
+
 ## `control_schema_v1.duckdb`
 
 A control-schema **version 1** DuckDB file: the shape `DuckDbBridge`'s constructor produced at

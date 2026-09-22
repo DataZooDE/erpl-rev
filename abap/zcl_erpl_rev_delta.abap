@@ -43,6 +43,18 @@ CLASS zcl_erpl_rev_delta DEFINITION PUBLIC FINAL CREATE PUBLIC.
              log_enabled       TYPE string,      " keep a per-target change log
              load_type_default TYPE string,      " D | F | I | L; F and L are one-shot
              allow_empty_reload TYPE string,     " let a reload empty the target
+             " APE registration (BRD FR-1): the named SAP-side subscription plus
+             " the graph knobs. chunk_size 0 = engine default. The driver maps
+             " these by RTTI, so they travel the queue path from the day they
+             " are added here.
+             subscriber_process TYPE string,    " SAP-side subscription name
+             chunk_size      TYPE i,             " graph package size, 0 = default
+             wireformat      TYPE string,        " graph wire format
+             " FR-2 release gate (ARS catalog, not XCO, not CDS_PUBLISHED).
+             " allow_unreleased is INPUT, last_warning is register()'s answer:
+             " never set last_warning by hand, it is rewritten on every call.
+             allow_unreleased TYPE string,      " 'true' = accept unreleased API
+             last_warning  TYPE string,         " WARN from the last register()
              status      TYPE string,
            END OF ty_state.
 
@@ -176,6 +188,17 @@ CLASS zcl_erpl_rev_delta DEFINITION PUBLIC FINAL CREATE PUBLIC.
     CLASS-METHODS run_due
       RETURNING VALUE(rt) TYPE tt_run.
 
+    "! Drop a target (FR-9): erase the SAP-side subscription when the target
+    "! has one, then delete the local state row and its spill (a spill without
+    "! state is orphaned: RECOVER refuses unregistered targets). Refuses when a
+    "! cycle holds a fresh RUNNING lease. Idempotent: unknown targets report,
+    "! they do not fail. The DuckDB target table itself stays (data retention
+    "! is the operator's call, not the drop's). 'ERROR:' prefix on failure,
+    "! following schedule().
+    CLASS-METHODS drop
+      IMPORTING iv_target    TYPE csequence
+      RETURNING VALUE(rv_msg) TYPE string.
+
     "! Current CDHDR high-water for an object class as 14-char YYYYMMDDHHMMSS
     "! (latest UDATE+UTIME). Use it to seed a CHANGEDOC/INSERT_ONLY watermark so the
     "! first cycle only picks up changes made AFTER registration.
@@ -238,6 +261,57 @@ CLASS zcl_erpl_rev_delta DEFINITION PUBLIC FINAL CREATE PUBLIC.
     CLASS-METHODS run_changedoc   IMPORTING is_state TYPE ty_state RETURNING VALUE(rs) TYPE ty_run.
     CLASS-METHODS run_insert_only IMPORTING is_state TYPE ty_state RETURNING VALUE(rs) TYPE ty_run.
     CLASS-METHODS run_snapshot    IMPORTING is_state TYPE ty_state RETURNING VALUE(rs) TYPE ty_run.
+    "! One APE FULL scan (seed path): seed the target, run a DHAPE initial load
+    "! in THIS session (affinity by construction), forward every PORT_DATA
+    "! envelope to Z_DUCKDB_APE_RUN, and let the server reconcile on lastBatch.
+    "! rs-rows = staged rows, ins/upd/del = reconcile verdict. A scan ending
+    "! without lastBatch is an error and leaves the target untouched (the server
+    "! only merges on lastBatch). Cleanup (stop, subscription erase) is
+    "! best-effort and never fails the cycle (HLD FR-4).
+    CLASS-METHODS run_ape_full IMPORTING is_state TYPE ty_state RETURNING VALUE(rs) TYPE ty_run.
+    "! Thin wrapper over the Z_DUCKDB_APE_RUN FM (per-package server endpoint).
+    CLASS-METHODS ape_run
+      IMPORTING iv_target  TYPE csequence
+                iv_package TYPE string
+                iv_batch   TYPE i
+      EXPORTING ev_rows  TYPE i
+                ev_ins   TYPE i
+                ev_upd   TYPE i
+                ev_del   TYPE i
+                ev_done  TYPE abap_bool
+                ev_error TYPE string.
+    "! Stop a graph, swallowing everything: cleanup never fails the cycle.
+    CLASS-METHODS ape_stop IMPORTING iv_uuid TYPE csequence.
+    "! Best-effort subscription erase for a finished FULL scan (FR-4): look the
+    "! id up by graph and run the eraser graph. Never sets the caller's error.
+    CLASS-METHODS ape_erase_for_graph IMPORTING iv_uuid TYPE csequence.
+    CLASS-METHODS ape_erase IMPORTING iv_subid TYPE csequence.
+    "! One APE DELTA cycle: GC stale graphs -> replay the spill tail -> resume
+    "! (or create) the named subscription -> poll until K consecutive empty
+    "! roundtrips post-data -> stop (the subscription persists) -> purge the
+    "! spill. Replication graphs never send lastBatch (honored if one arrives).
+    "! rs-rows counts staged + replayed rows; ins = upserted after-images,
+    "! del = keys-only deletes, upd = 0 (the engine does not split I/U).
+    CLASS-METHODS run_ape_delta IMPORTING is_state TYPE ty_state RETURNING VALUE(rs) TYPE ty_run.
+    "! The engine's own retention procedure (protocol §13): flip session-less
+    "! running graphs to stopped so they stop wedging subscriptions. Fail-closed
+    "! with a telling error: an unrun GC leaves the wedge a cycle would trip on.
+    CLASS-METHODS ape_gc RETURNING VALUE(rv_error) TYPE string.
+    "! Subscription id for (cds, subscriber_process) via the subscr.reader
+    "! admin graph (verified shape, erpl ape_subscriptions.cpp). '' = none:
+    "! the caller creates New. Only Replication-mode subscriptions resume (a
+    "! wrong-mode resume inherits server-side state, protocol §13).
+    CLASS-METHODS ape_find_subscription
+      IMPORTING iv_cds TYPE csequence
+                iv_sub TYPE csequence
+      RETURNING VALUE(rv_id) TYPE string.
+    "! Harvest a created graph's uuid: ev_graph_uuid when the engine fills it,
+    "! else the "Graph UUID is <32 hex>." message text (this release leaves the
+    "! export empty). '' = the create failed, read the messages instead.
+    CLASS-METHODS ape_harvest_uuid
+      IMPORTING it_msg TYPE dhape_t_graph_msg
+                iv_uuid TYPE char32
+      RETURNING VALUE(rv_uuid) TYPE char32.
     "! CDHDR change feed since a 14-char YYYYMMDDHHMMSS watermark: change numbers,
     "! object ids, and the new high-water (max udate+utime). cls = OBJECTCLAS.
     CLASS-METHODS cdhdr_feed
@@ -296,6 +370,125 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
                  |method { is_state-method }; only WATERMARK targets support one|.
       RETURN.
     ENDIF.
+    " APE static rules (BRD FR-1/FR-2, NFR-2). Defense in depth behind the CLI
+    " validator: the queue path reaches register() without passing through it.
+    " The FR-2 probes run here -- before any state is written -- so a target
+    " that can never run is refused at registration, not at the first cycle.
+    IF is_state-method = 'APE_FULL' OR is_state-method = 'APE_DELTA'.
+      IF is_state-subscriber_process IS INITIAL.
+        rv_error = |APE registration requires subscriber_process: the named | &&
+                   |SAP-side subscription the cycle resumes|.
+        RETURN.
+      ENDIF.
+      IF is_state-cadence CP 'micro:*'.
+        rv_error = |cadence { is_state-cadence } is refused for APE methods: | &&
+                   |graph preparation alone takes tens of seconds (NFR-2)|.
+        RETURN.
+      ENDIF.
+      " Gate 4 writes its WARN here; the INSERT below renders it. Declared up
+      " front because ABAP sees a DATA only below its declaration.
+      DATA lv_warn TYPE string.
+      " Gate 1: APE/DHAPE present on this system at all.
+      DATA lv_apev TYPE char30.
+      TRY.
+          CALL FUNCTION 'DHAPE_GRAPH_VERSION'
+            EXPORTING iv_version = ''
+            IMPORTING ev_version = lv_apev.
+        CATCH cx_root INTO DATA(lx_ape).
+          rv_error = |this system has no APE/DHAPE engine, so APE_FULL/APE_DELTA | &&
+                     |cannot run here: { lx_ape->get_text( ) }|.
+          RETURN.
+      ENDTRY.
+      " Gate 2: the source is a CDS view (definition service, OBJECTTYPE).
+      DATA lt_ape_prm TYPE dhbas_t_name_value_string.
+      DATA lv_ape_def TYPE string.
+      DATA lv_ape_http TYPE i.
+      DATA lv_ape_dstat TYPE string.
+      CALL FUNCTION 'DHAMB_SERVICE_DSET_DEFINITION'
+        EXPORTING iv_path        = |/CDS/{ is_state-source_from }|
+                  it_parameters  = lt_ape_prm
+        IMPORTING ev_result_json = lv_ape_def
+                  ev_http_status = lv_ape_http
+                  ev_status      = lv_ape_dstat.
+      DATA(lv_otype) = jstr( iv_json = lv_ape_def iv_key = 'OBJECTTYPE' ).
+      IF lv_ape_http <> 200 OR lv_otype <> 'CDS'.
+        rv_error = |{ is_state-source_from } is not a CDS view (OBJECTTYPE=| &&
+                   |{ lv_otype }); APE methods read CDS entities only|.
+        RETURN.
+      ENDIF.
+      " Gate 3: the extraction annotations (protocol §13: enabled for load,
+      " changeDataCapture.automatic additionally for replication).
+      TRY.
+          cl_dd_ddl_annotation_service=>get_direct_annoval_4_entity(
+            EXPORTING entityname = CONV ddstrucobjname( is_state-source_from )
+                      annoname   = 'ANALYTICS.DATAEXTRACTION.ENABLED'
+            IMPORTING values     = DATA(lt_ape_av) ).
+        CATCH cx_root INTO DATA(lx_ape_an).
+          rv_error = |cannot read annotations of { is_state-source_from }: | &&
+                     |{ lx_ape_an->get_text( ) }|.
+          RETURN.
+      ENDTRY.
+      READ TABLE lt_ape_av INDEX 1 INTO DATA(ls_ape_av).
+      DATA(lv_ape_en) = condense( CONV string( ls_ape_av ) ).
+      TRANSLATE lv_ape_en TO UPPER CASE.
+      IF sy-subrc <> 0 OR lv_ape_en <> 'TRUE'.
+        rv_error = |{ is_state-source_from } lacks | &&
+                   |@Analytics.dataExtraction.enabled: true; APE methods need it|.
+        RETURN.
+      ENDIF.
+      IF is_state-method = 'APE_DELTA'.
+        TRY.
+            cl_dd_ddl_annotation_service=>get_direct_annoval_4_entity(
+              EXPORTING entityname = CONV ddstrucobjname( is_state-source_from )
+                        annoname   = 'ANALYTICS.DATAEXTRACTION.DELTA.CHANGEDATACAPTURE.AUTOMATIC'
+              IMPORTING values     = DATA(lt_ape_ac) ).
+          CATCH cx_root INTO DATA(lx_ape_ac).
+            rv_error = |cannot read delta annotations of { is_state-source_from }: | &&
+                       |{ lx_ape_ac->get_text( ) }|.
+            RETURN.
+        ENDTRY.
+        READ TABLE lt_ape_ac INDEX 1 INTO DATA(ls_ape_ac).
+        DATA(lv_ape_ac) = condense( CONV string( ls_ape_ac ) ).
+        TRANSLATE lv_ape_ac TO UPPER CASE.
+        IF sy-subrc <> 0 OR lv_ape_ac <> 'TRUE'.
+          rv_error = |{ is_state-source_from } is not enabled for replication, | &&
+                     |only initial load is possible: APE_DELTA needs | &&
+                     |@Analytics.dataExtraction.delta.changeDataCapture.automatic|.
+          RETURN.
+        ENDIF.
+      ENDIF.
+      " Gate 4: released API under C1 (ARS catalog, BRD §6 AC-4). Not XCO --
+      " its STOB existence check fails before ARS is consulted -- and not
+      " CDS_PUBLISHED, which is empty even for SAP views. DDLDEPENDENCY maps
+      " the DDLS name to the entity; the catalog answers RELEASED or nothing.
+      " Only RELEASED passes; DEPRECATED is refused like unreleased (the
+      " override covers it) so no untested branch decides a registration.
+      DATA(lv_ape_entity) = CONV ddldependency-objectname( is_state-source_from ).
+      SELECT SINGLE objectname FROM ddldependency
+        WHERE ddlname = @is_state-source_from
+          AND objecttype = 'STOB' AND state = 'A'
+        INTO @lv_ape_entity.
+      DATA lv_ape_relstate TYPE string.
+      SELECT SINGLE releasestate FROM i_apisforclouddevelopment
+        WHERE releasedobjecttype = 'CDS_STOB'
+          AND releasedobjectname = @lv_ape_entity
+        INTO @lv_ape_relstate.
+      IF sy-subrc <> 0 OR lv_ape_relstate <> 'RELEASED'.
+        IF is_state-allow_unreleased = 'true'.
+          lv_warn = |WARN: { is_state-source_from } is not a C1-RELEASED API | &&
+                    |(state={ COND string( WHEN sy-subrc = 0 THEN lv_ape_relstate
+                                           ELSE 'unreleased' ) }); | &&
+                    |--allow-unreleased accepted, extraction runs unprotected|.
+        ELSE.
+          rv_error = |{ is_state-source_from } is not a C1-RELEASED API | &&
+                     |(state={ COND string( WHEN sy-subrc = 0 THEN lv_ape_relstate
+                                            ELSE 'unreleased' ) }); | &&
+                     |APE methods extract released APIs only -- re-register | &&
+                     |with --allow-unreleased to override (logged)|.
+          RETURN.
+        ENDIF.
+      ENDIF.
+    ENDIF.
     " `sync create` is CREATE-OR-UPDATE: re-running it on an existing target
     " updates it, and that is deliberate -- it is what makes registration
     " idempotent and scriptable.
@@ -329,13 +522,16 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
     DATA(lv_aer) = COND string( WHEN is_state-allow_empty_reload IS INITIAL THEN 'NULL'
                                 WHEN is_state-allow_empty_reload = 'true' THEN 'true'
                                 ELSE 'false' ).
+    " lv_warn (declared with the gates): empty unless gate 4 overrode, so a
+    " clean re-registration clears the warning with the override.
     DATA(lv_lt)  = COND string( WHEN is_state-load_type_default IS INITIAL THEN 'NULL'
                                 ELSE |'{ q( is_state-load_type_default ) }'| ).
     DATA(lv_sql) =
       |INSERT INTO _erpl_rev_delta_state | &&
       |(target,method,source_from,keys,chg_col,time_col,wm_kind,wm_value,| &&
       |safety_secs,safety_units,cadence,extra,log_enabled,load_type_default,| &&
-      |allow_empty_reload,status) VALUES (| &&
+      |allow_empty_reload,subscriber_process,chunk_size,wireformat,| &&
+      |allow_unreleased,last_warning,status) VALUES (| &&
       |'{ q( is_state-target ) }','{ q( is_state-method ) }','{ q( is_state-source_from ) }',| &&
       |'{ q( is_state-keys ) }','{ q( is_state-chg_col ) }',| &&
       |{ COND string( WHEN is_state-time_col IS INITIAL THEN 'NULL' ELSE |'{ q( is_state-time_col ) }'| ) },| &&
@@ -343,17 +539,33 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       |{ COND string( WHEN is_state-wm_value IS INITIAL THEN 'NULL' ELSE |'{ q( is_state-wm_value ) }'| ) },| &&
       |{ is_state-safety_secs },{ is_state-safety_units },'{ q( is_state-cadence ) }',| &&
       |{ COND string( WHEN is_state-extra IS INITIAL THEN 'NULL' ELSE |'{ q( is_state-extra ) }'| ) },| &&
-      |{ lv_log },{ lv_lt },{ lv_aer },'IDLE') | &&
+      |{ lv_log },{ lv_lt },{ lv_aer },| &&
+      |{ COND string( WHEN is_state-subscriber_process IS INITIAL THEN 'NULL' ELSE |'{ q( is_state-subscriber_process ) }'| ) },| &&
+      |{ is_state-chunk_size },| &&
+      |{ COND string( WHEN is_state-wireformat IS INITIAL THEN 'NULL' ELSE |'{ q( is_state-wireformat ) }'| ) },| &&
+      |{ COND string( WHEN is_state-allow_unreleased = 'true' THEN 'true' ELSE 'false' ) },| &&
+      |{ COND string( WHEN lv_warn IS INITIAL THEN 'NULL' ELSE |'{ q( lv_warn ) }'| ) },| &&
+      |'IDLE') | &&
       |ON CONFLICT (target) DO UPDATE SET method=excluded.method, source_from=excluded.source_from, | &&
       |keys=excluded.keys, chg_col=excluded.chg_col, time_col=excluded.time_col, | &&
       |wm_kind=excluded.wm_kind, | &&
       |safety_secs=excluded.safety_secs, safety_units=excluded.safety_units, | &&
       |cadence=excluded.cadence, extra=excluded.extra, | &&
+      |subscriber_process=coalesce(excluded.subscriber_process, | &&
+      |                            _erpl_rev_delta_state.subscriber_process), | &&
+      |chunk_size=excluded.chunk_size, | &&
+      |wireformat=coalesce(excluded.wireformat, | &&
+      |                     _erpl_rev_delta_state.wireformat), | &&
       |log_enabled=coalesce(excluded.log_enabled, _erpl_rev_delta_state.log_enabled), | &&
       |load_type_default=coalesce(excluded.load_type_default, | &&
       |                           _erpl_rev_delta_state.load_type_default), | &&
       |allow_empty_reload=coalesce(excluded.allow_empty_reload, | &&
       |                            _erpl_rev_delta_state.allow_empty_reload), | &&
+      " allow_unreleased is present-tense intent: SET, never coalesced, so an
+      " unstated re-registration re-enforces the gate. last_warning is
+      " register()'s answer and rewritten every call for the same reason.
+      |allow_unreleased=excluded.allow_unreleased, | &&
+      |last_warning=excluded.last_warning, | &&
       " one_shot_spent is the ENGINE's column and registration does not set it.
       " It is only CLEARED here, and only when this call actually states a load
       " type: saying 'L' again means "seed it again", while a registration that
@@ -452,6 +664,11 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       |CASE WHEN log_enabled THEN 'true' ELSE 'false' END AS log_enabled, | &&
       |coalesce(load_type_default,'D') AS load_type_default, | &&
       |CASE WHEN allow_empty_reload THEN 'true' ELSE 'false' END AS allow_empty_reload, | &&
+      |coalesce(subscriber_process,'') AS subscriber_process, | &&
+      |coalesce(chunk_size,0) AS chunk_size, | &&
+      |coalesce(wireformat,'') AS wireformat, | &&
+      |CASE WHEN allow_unreleased THEN 'true' ELSE 'false' END AS allow_unreleased, | &&
+      |coalesce(last_warning,'') AS last_warning, | &&
       |coalesce(status,'IDLE') AS status | &&
       |FROM _erpl_rev_delta_state WHERE target='{ q( iv_target ) }'| ).
     IF ls-error IS NOT INITIAL OR ls-row_count = 0. RETURN. ENDIF.
@@ -562,6 +779,8 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       WHEN 'INSERT_ONLY'. rs = run_insert_only( ls_state ).
       WHEN 'CHANGEDOC'.   rs = run_changedoc( ls_state ).
       WHEN 'SNAPSHOT'.    rs = run_snapshot( ls_state ).
+      WHEN 'APE_FULL'.    rs = run_ape_full( ls_state ).
+      WHEN 'APE_DELTA'.   rs = run_ape_delta( ls_state ).
       WHEN OTHERS.        rs-error = |unknown delta method { ls_state-method }|.
     ENDCASE.
     rs-target = iv_target.
@@ -963,6 +1182,455 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
     IF sy-subrc = 0. rv = CONV i( lv ). ENDIF.
   ENDMETHOD.
 
+  METHOD run_ape_full.
+    " Seed the target first (the same seed contract replicate() honours, so a
+    " later APE_DELTA registration on this target just works, HLD §4).
+    DATA(ld) = zcl_erpl_rev_util=>describe_table(
+      iv_tab = is_state-source_from iv_target = is_state-target ).
+    IF ld-error IS NOT INITIAL. rs-error = ld-error. RETURN. ENDIF.
+    DATA(lc) = zcl_erpl_rev_util=>query( ld-ddl ).
+    IF lc-error IS NOT INITIAL. rs-error = lc-error. RETURN. ENDIF.
+    " A unique-per-scan subscription: the engine refuses create when the name
+    " exists (protocol §11), so a crashed scan's leftover must not block the
+    " next one. The tail (timestamp) is what makes it unique, so a >30 name
+    " loses its head, never its tail.
+    DATA(lv_sub) = |{ is_state-subscriber_process }_{ sy-datum }{ sy-uzeit }|.
+    DATA(lv_l) = strlen( lv_sub ).
+    IF lv_l > 30.
+      DATA(lv_off) = lv_l - 30.
+      lv_sub = lv_sub+lv_off(30).
+    ENDIF.
+    " The graph JSON comes from the server (tested builder, HLD §4 reuse).
+    DATA(ls_g) = plan_json( iv_action = 'APE_GRAPH' iv_target = is_state-target
+                            iv_params = |\{"subscription_name":"{ lv_sub }"\}| ).
+    IF ls_g-error IS NOT INITIAL. rs-error = ls_g-error. RETURN. ENDIF.
+    " The action returns the graph JSON raw (wrapping it would defeat the
+    " flat extractors on both sides).
+    DATA(lv_graph) = ls_g-json.
+    IF lv_graph IS INITIAL.
+      rs-error = 'APE_GRAPH returned no graph and no reason'.
+      RETURN.
+    ENDIF.
+    " Create (v6 auto-starts; do NOT send R, protocol §11).
+    DATA lv_uuid TYPE char32.
+    DATA lt_cmsg TYPE dhape_t_graph_msg.
+    CALL FUNCTION 'DHAPE_GRAPH_MANAGER'
+      EXPORTING iv_mode = 'C' iv_appid = 'ERPL_REV' iv_graph = lv_graph
+      IMPORTING ev_graph_uuid = lv_uuid et_msg = lt_cmsg.
+    lv_uuid = ape_harvest_uuid( it_msg = lt_cmsg iv_uuid = lv_uuid ).
+    IF lv_uuid IS INITIAL.
+      READ TABLE lt_cmsg INTO DATA(ls_cm) INDEX 1.
+      rs-error = |graph create failed: { COND string( WHEN sy-subrc = 0 THEN ls_cm-text
+                                                      ELSE 'no uuid, no message' ) }|.
+      RETURN.
+    ENDIF.
+    " Poll: preparation is asynchronous (tens of seconds to minutes), so an
+    " empty roundtrip before first data means "still preparing", bounded by
+    " the preparation timeout. lastBatch on any envelope ends the scan.
+    DATA: lt_in TYPE dhape_t_graph_port, lt_nothing TYPE dhape_t_graph_msg,
+          lt_pmsg TYPE dhape_t_graph_msg, lt_eport TYPE dhape_t_graph_port.
+    DATA: lv_post TYPE i VALUE 0, lv_polls TYPE i VALUE 0,
+          lv_got TYPE abap_bool VALUE abap_false, lv_done TYPE abap_bool VALUE abap_false,
+          lv_fwd TYPE abap_bool VALUE abap_false.
+    DATA lv_rows TYPE i VALUE 0.
+    WHILE lv_done = abap_false.
+      lv_polls = lv_polls + 1.
+      " Per-poll reset, NOT a loop-local DATA: ABAP creates a loop-local data
+      " object once, so a VALUE initialisation inside the loop would keep the
+      " first posted poll's value forever (a stuck lv_fwd would poll fast but
+      " never time out -- the M4B restore taught us that on the delta side).
+      lv_fwd = abap_false.
+      CLEAR lt_in.
+      APPEND VALUE #( graph_uuid = lv_uuid port_number = 0 direction = 'O'
+                      port_status = 'R' ) TO lt_in.
+      CLEAR lt_eport. CLEAR lt_pmsg.
+      CALL FUNCTION 'DHAPE_GRAPH_ROUNDTRIP'
+        EXPORTING iv_graph_uuid = lv_uuid it_port = lt_in it_msg = lt_nothing
+        IMPORTING et_port = lt_eport et_msg = lt_pmsg.
+      " Engine errors (TYPE E/F/A, the erpl_ape rule) abort the scan.
+      LOOP AT lt_pmsg INTO DATA(ls_pm) WHERE ( type = 'E' OR type = 'F' OR type = 'A' ).
+        rs-error = |engine: { ls_pm-text }|.
+      ENDLOOP.
+      IF rs-error IS NOT INITIAL. EXIT. ENDIF.
+      " Every non-empty handover goes to the server -- including control
+      " envelopes, whose lastBatch is what finalises the scan.
+      LOOP AT lt_eport INTO DATA(ls_ep).
+        IF ls_ep-port_data IS INITIAL. CONTINUE. ENDIF.
+        lv_fwd = abap_true.
+        ape_run( EXPORTING iv_target = is_state-target iv_package = ls_ep-port_data
+                           iv_batch = lv_post
+                 IMPORTING ev_rows = DATA(lv_r) ev_ins = rs-ins ev_upd = rs-upd
+                           ev_del = rs-del ev_done = DATA(lv_d) ev_error = DATA(lv_e) ).
+        IF lv_e IS NOT INITIAL. rs-error = lv_e. EXIT. ENDIF.
+        IF lv_r > 0. lv_got = abap_true. ENDIF.
+        lv_rows = lv_rows + lv_r.
+        lv_post = lv_post + 1.
+        IF lv_d = abap_true. lv_done = abap_true. ENDIF.
+      ENDLOOP.
+      IF rs-error IS NOT INITIAL. EXIT. ENDIF.
+      IF lv_done = abap_true. EXIT. ENDIF.
+      IF lv_got = abap_false AND lv_polls >= 60.
+        rs-error = |APE preparation timeout: no data after { lv_polls } polls; | &&
+                   |check the CDC background jobs (S_DHCDC* authorisations)|.
+        EXIT.
+      ENDIF.
+      " Lease heartbeat: a healthy scan legitimately outlasts the 600 s
+      " reclaim TTL, and a second cycle staging into the same __apesnap would
+      " corrupt this one. One cheap UPDATE per poll holds the lease.
+      zcl_erpl_rev_util=>query(
+        |UPDATE _erpl_rev_delta_state SET lease_ts=now() | &&
+        |WHERE target='{ q( is_state-target ) }'| ).
+      " Adaptive pause: preparation waits the full 10 s, but a flowing stream
+      " polls fast (2 s). A fixed 10 s per poll would turn a 100k-row volume
+      " scan into an hour of sleeping (AC-1).
+      IF lv_fwd = abap_true.
+        WAIT UP TO 2 SECONDS.
+      ELSE.
+        WAIT UP TO 10 SECONDS.
+      ENDIF.
+    ENDWHILE.
+    " Cleanup is best-effort and never fails the cycle (HLD FR-4).
+    ape_stop( lv_uuid ).
+    IF rs-error IS NOT INITIAL. RETURN. ENDIF.
+    IF lv_done = abap_false.
+      " No merge ran (the server only merges on lastBatch), so the target is
+      " untouched: report the incomplete scan, do not invent counts.
+      rs-error = |scan ended without lastBatch ({ lv_post } packages staged, | &&
+                 |target untouched)|.
+      RETURN.
+    ENDIF.
+    ape_erase_for_graph( lv_uuid ).
+    rs-rows = lv_rows.
+    GET TIME STAMP FIELD DATA(lv_ts).
+    rs-wm = condense( |{ lv_ts }| ).
+  ENDMETHOD.
+
+  METHOD ape_harvest_uuid.
+    " This engine release reports the new uuid in the message text ("Graph
+    " UUID is <32 hex>.") and leaves ev_graph_uuid empty: harvest it there
+    " before calling the create failed. FIND REGEX, not PCRE: the latter
+    " fails on this kernel (measured).
+    rv_uuid = iv_uuid.
+    IF rv_uuid IS NOT INITIAL. RETURN. ENDIF.
+    LOOP AT it_msg INTO DATA(ls_cm).
+      FIND REGEX `Graph UUID is ([0-9A-Fa-f]{32})` IN ls_cm-text SUBMATCHES rv_uuid.
+      IF sy-subrc = 0. RETURN. ENDIF.
+    ENDLOOP.
+    CLEAR rv_uuid.
+  ENDMETHOD.
+
+  METHOD ape_gc.
+    TRY.
+        DATA(lo_db) = cl_dhape_engine_factory=>new( )->new_db( ).
+        DATA(lo_sm) = cl_dhape_engine_factory=>get_graph_session_manager( ).
+        LOOP AT lo_db->read_graph_ids_by_status( if_dhape_db_facade=>gc_status-running )
+             INTO DATA(lv_gu).
+          " Flips to stopped when nothing holds the graph: the documented
+          " recovery, not a guess at liveness (received: a functional call's
+          " return cannot be discarded).
+          DATA(lv_held) = lo_sm->is_session_active( lv_gu ).
+        ENDLOOP.
+      CATCH cx_root INTO DATA(lx).
+        rv_error = |stale-graph GC failed, the cycle would trip on the wedge: | &&
+                   |{ lx->get_text( ) }|.
+    ENDTRY.
+  ENDMETHOD.
+
+  METHOD ape_find_subscription.
+    " The reader admin graph returns {"subscriptions":[{subscriptionID,
+    " field1 (CDS), field2 (mode), description (name), ...}]} on its string
+    " outport. Chunks are concatenated whole before parsing, so a payload
+    " split across packages still parses.
+    DATA(lv_json) =
+      `{"Attributes":{"graphid":"erpl_rev_subs","protocol":"v6",` &&
+      `"graphkind":"user","multiplicity":"1"},` &&
+      `"Processes":{"reader":{"Component":"com.sap.abap.subscr.reader.v1",` &&
+      `"Metadata":{"Config":{"reader":"com.sap.abap.cds.reader"}}}},` &&
+      `"Connections":[],"Outports":{"0":{"Process":"reader","Port":"out",` &&
+      `"Metadata":{"portNumber":0,"type":"string"}}},"vTypes":{}}`.
+    DATA lv_uuid TYPE char32.
+    DATA lt_m TYPE dhape_t_graph_msg.
+    CALL FUNCTION 'DHAPE_GRAPH_MANAGER'
+      EXPORTING iv_mode = 'C' iv_appid = 'ERPL_REV' iv_graph = lv_json
+      IMPORTING ev_graph_uuid = lv_uuid et_msg = lt_m.
+    lv_uuid = ape_harvest_uuid( it_msg = lt_m iv_uuid = lv_uuid ).
+    IF lv_uuid IS INITIAL. RETURN. ENDIF.
+    TRY.
+        DATA: lt_in TYPE dhape_t_graph_port, lt_nothing TYPE dhape_t_graph_msg,
+              lt_pmsg TYPE dhape_t_graph_msg, lt_eport TYPE dhape_t_graph_port.
+        DATA lv_payload TYPE string.
+        DO 10 TIMES.
+          CLEAR lt_in.
+          APPEND VALUE #( graph_uuid = lv_uuid port_number = 0 direction = 'O'
+                          port_status = 'R' ) TO lt_in.
+          CLEAR lt_eport. CLEAR lt_pmsg.
+          CALL FUNCTION 'DHAPE_GRAPH_ROUNDTRIP'
+            EXPORTING iv_graph_uuid = lv_uuid it_port = lt_in it_msg = lt_nothing
+            IMPORTING et_port = lt_eport et_msg = lt_pmsg.
+          LOOP AT lt_eport INTO DATA(ls_ep).
+            lv_payload = lv_payload && ls_ep-port_data.
+          ENDLOOP.
+          WAIT UP TO 1 SECONDS.
+        ENDDO.
+        TYPES: BEGIN OF ty_sub,
+                 subscriptionid TYPE string,
+                 field1         TYPE string,
+                 field2         TYPE string,
+                 description    TYPE string,
+               END OF ty_sub,
+               BEGIN OF ty_list, subscriptions TYPE STANDARD TABLE OF ty_sub WITH EMPTY KEY,
+               END OF ty_list.
+        DATA ls_list TYPE ty_list.
+        /ui2/cl_json=>deserialize( EXPORTING json = lv_payload CHANGING data = ls_list ).
+        DATA(lv_want_sub) = iv_sub.
+        DATA(lv_want_cds) = iv_cds.
+        TRANSLATE lv_want_sub TO UPPER CASE.
+        TRANSLATE lv_want_cds TO UPPER CASE.
+        LOOP AT ls_list-subscriptions INTO DATA(ls_s).
+          DATA(lv_got_sub) = ls_s-description.
+          DATA(lv_got_cds) = ls_s-field1.
+          DATA(lv_got_mode) = ls_s-field2.
+          TRANSLATE lv_got_sub TO UPPER CASE.
+          TRANSLATE lv_got_cds TO UPPER CASE.
+          TRANSLATE lv_got_mode TO UPPER CASE.
+          IF lv_got_sub = lv_want_sub AND lv_got_cds = lv_want_cds AND
+             lv_got_mode = 'REPLICATION'.
+            rv_id = ls_s-subscriptionid.
+            EXIT.
+          ENDIF.
+        ENDLOOP.
+      CATCH cx_root ##NO_HANDLER.
+    ENDTRY.
+    ape_stop( lv_uuid ).
+  ENDMETHOD.
+
+  METHOD run_ape_delta.
+    " GC first: a crashed cycle's running graph wedges the subscription
+    " (FR-9/R-4), and only this procedure unwedges it.
+    DATA(lv_gc) = ape_gc( ).
+    IF lv_gc IS NOT INITIAL. rs-error = lv_gc. RETURN. ENDIF.
+    " The target must exist before anything reads it -- including the replay
+    " below (a never-cycled target has no table yet). Same seed contract as
+    " FULL; DuckDB-local, no SAP contact.
+    DATA(ld) = zcl_erpl_rev_util=>describe_table(
+      iv_tab = is_state-source_from iv_target = is_state-target ).
+    IF ld-error IS NOT INITIAL. rs-error = ld-error. RETURN. ENDIF.
+    DATA(lc) = zcl_erpl_rev_util=>query( ld-ddl ).
+    IF lc-error IS NOT INITIAL. rs-error = lc-error. RETURN. ENDIF.
+    " Replay the spill tail before touching SAP: a graph would advance the
+    " subscription past owed changes (FR-6). A clean state is a no-op.
+    DATA(ls_rec) = plan_json( iv_action = 'APE_RECOVER' iv_target = is_state-target ).
+    IF ls_rec-error IS NOT INITIAL. rs-error = ls_rec-error. RETURN. ENDIF.
+    DATA lv_rows TYPE i VALUE 0.
+    DATA(lv_r) = jstr( iv_json = ls_rec-json iv_key = 'rows' ).
+    DATA(lv_u) = jstr( iv_json = ls_rec-json iv_key = 'upserted' ).
+    DATA(lv_d) = jstr( iv_json = ls_rec-json iv_key = 'deleted' ).
+    IF lv_r CO ' 0123456789'. lv_rows = CONV i( lv_r ). ENDIF.
+    IF lv_u CO ' 0123456789'. rs-ins = CONV i( lv_u ). ENDIF.
+    IF lv_d CO ' 0123456789'. rs-del = CONV i( lv_d ). ENDIF.
+    " Resume the named subscription when it exists (no "already exists"
+    " failure), else create it. The name travels unstated: DELTA resumes an
+    " identity, FULL mints unique-per-scan names.
+    DATA(lv_subid) = ape_find_subscription( iv_cds = is_state-source_from
+                                            iv_sub = is_state-subscriber_process ).
+    DATA(ls_g) = plan_json( iv_action = 'APE_GRAPH' iv_target = is_state-target
+                            iv_params = |\{"subscription_name":"{ is_state-subscriber_process }",| &&
+                                        |\{"subscription_id":"{ lv_subid }"\}| ).
+    IF ls_g-error IS NOT INITIAL. rs-error = ls_g-error. RETURN. ENDIF.
+    DATA(lv_graph) = ls_g-json.
+    IF lv_graph IS INITIAL.
+      rs-error = 'APE_GRAPH returned no graph and no reason'.
+      RETURN.
+    ENDIF.
+    DATA lv_uuid TYPE char32.
+    DATA lt_cmsg TYPE dhape_t_graph_msg.
+    CALL FUNCTION 'DHAPE_GRAPH_MANAGER'
+      EXPORTING iv_mode = 'C' iv_appid = 'ERPL_REV' iv_graph = lv_graph
+      IMPORTING ev_graph_uuid = lv_uuid et_msg = lt_cmsg.
+    lv_uuid = ape_harvest_uuid( it_msg = lt_cmsg iv_uuid = lv_uuid ).
+    IF lv_uuid IS INITIAL.
+      READ TABLE lt_cmsg INTO DATA(ls_cm) INDEX 1.
+      rs-error = |graph create failed: { COND string( WHEN sy-subrc = 0 THEN ls_cm-text
+                                                      ELSE 'no uuid, no message' ) }|.
+      RETURN.
+    ENDIF.
+    " A replication stream never ends: K consecutive ROWLESS roundtrips mean
+    " "nothing more right now" (ADR-3) -- idle or drained, both end clean. An
+    " idle stream's Element lastBatch terminator is one such rowless poll, NOT
+    " an exit (exiting on it ends the cycle before lagging CDC changes arrive;
+    " the m4 carry proved it). Merges commit per package, so any exit below
+    " loses nothing; the subscription position is the resume point.
+    CONSTANTS: lc_empty_end TYPE i VALUE 3,
+               lc_poll_cap  TYPE i VALUE 360.
+    DATA: lt_in TYPE dhape_t_graph_port, lt_nothing TYPE dhape_t_graph_msg,
+          lt_pmsg TYPE dhape_t_graph_msg, lt_eport TYPE dhape_t_graph_port.
+    DATA: lv_post TYPE i VALUE 0, lv_polls TYPE i VALUE 0, lv_empty TYPE i VALUE 0,
+          lv_poll TYPE i VALUE 0.
+    WHILE abap_true = abap_true.
+      lv_polls = lv_polls + 1.
+      " Per-poll reset, NOT a loop-local DATA: ABAP creates a loop-local data
+      " object once, so a VALUE initialisation inside the loop would keep the
+      " first posted poll's row count forever -- lv_empty would pin at 0 and
+      " the K rowless exit below could never fire (the M4B restore looped 92
+      " rowless polls on exactly this).
+      lv_poll = 0.
+      CLEAR lt_in.
+      APPEND VALUE #( graph_uuid = lv_uuid port_number = 0 direction = 'O'
+                      port_status = 'R' ) TO lt_in.
+      CLEAR lt_eport. CLEAR lt_pmsg.
+      CALL FUNCTION 'DHAPE_GRAPH_ROUNDTRIP'
+        EXPORTING iv_graph_uuid = lv_uuid it_port = lt_in it_msg = lt_nothing
+        IMPORTING et_port = lt_eport et_msg = lt_pmsg.
+      LOOP AT lt_pmsg INTO DATA(ls_pm) WHERE ( type = 'E' OR type = 'F' OR type = 'A' ).
+        rs-error = |engine: { ls_pm-text }|.
+      ENDLOOP.
+      IF rs-error IS NOT INITIAL. EXIT. ENDIF.
+      " Rows, not packages: terminators and control envelopes forward zero
+      " rows and count as empty. ev_done is ignored (see above): it arrives
+      " on every idle poll.
+      LOOP AT lt_eport INTO DATA(ls_ep).
+        IF ls_ep-port_data IS INITIAL. CONTINUE. ENDIF.
+        ape_run( EXPORTING iv_target = is_state-target iv_package = ls_ep-port_data
+                           iv_batch = lv_post
+                 IMPORTING ev_rows = DATA(lv_pr) ev_ins = DATA(lv_pi) ev_del = DATA(lv_pd)
+                           ev_done = DATA(lv_dd) ev_error = DATA(lv_e) ).
+        IF lv_e IS NOT INITIAL. rs-error = lv_e. EXIT. ENDIF.
+        lv_poll = lv_poll + lv_pr.
+        lv_rows = lv_rows + lv_pr.
+        rs-ins = rs-ins + lv_pi.
+        rs-del = rs-del + lv_pd.
+        lv_post = lv_post + 1.
+      ENDLOOP.
+      IF rs-error IS NOT INITIAL. EXIT. ENDIF.
+      IF lv_poll > 0.
+        lv_empty = 0.
+      ELSE.
+        lv_empty = lv_empty + 1.
+      ENDIF.
+      IF lv_empty >= lc_empty_end.
+        EXIT.
+      ENDIF.
+      IF lv_polls >= lc_poll_cap.
+        " Runaway backstop: a constantly-written source streams forever.
+        " Exiting is lossless (per-package commits + subscription position),
+        " the next cycle resumes where this one stopped.
+        EXIT.
+      ENDIF.
+      zcl_erpl_rev_util=>query(
+        |UPDATE _erpl_rev_delta_state SET lease_ts=now() | &&
+        |WHERE target='{ q( is_state-target ) }'| ).
+      IF lv_empty = 0.
+        WAIT UP TO 2 SECONDS.
+      ELSE.
+        WAIT UP TO 10 SECONDS.
+      ENDIF.
+    ENDWHILE.
+    " Stop, but keep the subscription: position IS the subscription (HLD §4).
+    ape_stop( lv_uuid ).
+    IF rs-error IS NOT INITIAL. RETURN. ENDIF.
+    " Clean end: the spill is garbage (every spilled batch merged). Best
+    " effort -- a missed purge replays idempotently next cycle, it never loses.
+    " (Received into a dummy: a functional call's return cannot be discarded.)
+    DATA(ls_purge) = plan_json( iv_action = 'APE_PURGE' iv_target = is_state-target ).
+    rs-rows = lv_rows.
+    GET TIME STAMP FIELD DATA(lv_ts).
+    rs-wm = condense( |{ lv_ts }| ).
+  ENDMETHOD.
+
+  METHOD ape_run.
+    DATA: lv_rows TYPE string, lv_ins TYPE string, lv_upd TYPE string,
+          lv_del TYPE string, lv_done TYPE string.
+    DATA lv_msg TYPE c LENGTH 255.
+    CLEAR: ev_rows, ev_ins, ev_upd, ev_del, ev_error.
+    ev_done = abap_false.
+    CALL FUNCTION 'Z_DUCKDB_APE_RUN' DESTINATION c_dest
+      EXPORTING iv_target      = CONV string( iv_target )
+                iv_package     = iv_package
+                iv_batch_index = CONV string( iv_batch )
+      IMPORTING ev_rows  = lv_rows
+                ev_ins   = lv_ins
+                ev_upd   = lv_upd
+                ev_del   = lv_del
+                ev_done  = lv_done
+                ev_error = ev_error
+      EXCEPTIONS system_failure = 1 MESSAGE lv_msg
+                 communication_failure = 2 MESSAGE lv_msg
+                 OTHERS = 3.
+    IF sy-subrc <> 0.
+      ev_error = |RFC subrc={ sy-subrc } { lv_msg }|.
+      RETURN.
+    ENDIF.
+    IF ev_error IS NOT INITIAL. RETURN. ENDIF.
+    IF lv_rows CO ' 0123456789'. ev_rows = CONV i( lv_rows ). ENDIF.
+    IF lv_ins CO ' 0123456789'. ev_ins = CONV i( lv_ins ). ENDIF.
+    IF lv_upd CO ' 0123456789'. ev_upd = CONV i( lv_upd ). ENDIF.
+    IF lv_del CO ' 0123456789'. ev_del = CONV i( lv_del ). ENDIF.
+    ev_done = xsdbool( lv_done = 'X' ).
+  ENDMETHOD.
+
+  METHOD ape_stop.
+    " A throwing stop out of cleanup would fail a cycle whose data already
+    " merged -- and a retry would then re-run the whole scan.
+    TRY.
+        DATA lt_m TYPE dhape_t_graph_msg.
+        CALL FUNCTION 'DHAPE_GRAPH_MANAGER'
+          EXPORTING iv_mode = 'S' iv_appid = 'ERPL_REV' iv_graph_uuid = iv_uuid
+          IMPORTING et_msg = lt_m.
+      CATCH cx_root ##NO_HANDLER.
+    ENDTRY.
+  ENDMETHOD.
+
+  METHOD ape_erase_for_graph.
+    " The subscription id lives by the graph that created it; without it there
+    " is nothing to erase (a create that never ran, or an engine that names
+    " things differently -- both are best-effort exits, not errors).
+    TRY.
+        SELECT SINGLE subscription_id FROM dhape_subscr
+          WHERE graph_uuid = @iv_uuid INTO @DATA(lv_id).
+        IF sy-subrc <> 0 OR lv_id IS INITIAL. RETURN. ENDIF.
+        ape_erase( lv_id ).
+      CATCH cx_root ##NO_HANDLER.
+    ENDTRY.
+  ENDMETHOD.
+
+  METHOD ape_erase.
+    " The eraser graph shape is erpl's verified one (ape_subscriptions.cpp):
+    " every reader-family id key must be present, only cdsSubscrID is read.
+    DATA(lv_json) =
+      `{"Attributes":{"graphid":"erpl_rev_erase","protocol":"v6",` &&
+      `"graphkind":"user","multiplicity":"1"},` &&
+      `"Processes":{"eraser":{"Component":"com.sap.abap.subscr.eraser.v1",` &&
+      `"Metadata":{"Config":{"readerObj":"CDS Views","allSubscrID":"",` &&
+      `"tablesSubscrID":"","cdsSubscrID":"` && iv_subid &&
+      `","odpSubscrID":""}}}},` &&
+      `"Connections":[],"Outports":{"0":{"Process":"eraser","Port":"out",` &&
+      `"Metadata":{"portNumber":0,"type":"string"}}},"vTypes":{}}`.
+    TRY.
+        DATA lv_uuid TYPE char32.
+        DATA lt_m TYPE dhape_t_graph_msg.
+        CALL FUNCTION 'DHAPE_GRAPH_MANAGER'
+          EXPORTING iv_mode = 'C' iv_appid = 'ERPL_REV' iv_graph = lv_json
+          IMPORTING ev_graph_uuid = lv_uuid et_msg = lt_m.
+        IF lv_uuid IS INITIAL. RETURN. ENDIF.
+        DATA: lt_in TYPE dhape_t_graph_port, lt_nothing TYPE dhape_t_graph_msg,
+              lt_pmsg TYPE dhape_t_graph_msg, lt_eport TYPE dhape_t_graph_port.
+        DO 8 TIMES.
+          CLEAR lt_in.
+          APPEND VALUE #( graph_uuid = lv_uuid port_number = 0 direction = 'O'
+                          port_status = 'R' ) TO lt_in.
+          CLEAR lt_eport. CLEAR lt_pmsg.
+          CALL FUNCTION 'DHAPE_GRAPH_ROUNDTRIP'
+            EXPORTING iv_graph_uuid = lv_uuid it_port = lt_in it_msg = lt_nothing
+            IMPORTING et_port = lt_eport et_msg = lt_pmsg.
+          WAIT UP TO 1 SECONDS.
+        ENDDO.
+        CALL FUNCTION 'DHAPE_GRAPH_MANAGER'
+          EXPORTING iv_mode = 'S' iv_appid = 'ERPL_REV' iv_graph_uuid = lv_uuid
+          IMPORTING et_msg = lt_m.
+      CATCH cx_root ##NO_HANDLER.
+    ENDTRY.
+  ENDMETHOD.
+
   METHOD snapshot_merge.
     DATA: lv_ins TYPE string, lv_upd TYPE string, lv_del TYPE string.
     DATA lv_msg TYPE c LENGTH 255.
@@ -1016,6 +1684,53 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
     LOOP AT due( ) INTO DATA(lv_t).
       APPEND run( lv_t ) TO rt.
     ENDLOOP.
+  ENDMETHOD.
+
+  METHOD drop.
+    DATA(ls_state) = state( iv_target ).
+    IF ls_state-target IS INITIAL.
+      rv_msg = |no registration for { iv_target } (nothing to drop)|.
+      RETURN.
+    ENDIF.
+    " A cycle in flight owns the subscription this would erase: refuse rather
+    " than abort it (same fresh-lease predicate due() uses; a stale lease is
+    " an orphan and does not block).
+    DATA(ls_l) = zcl_erpl_rev_util=>query(
+      |SELECT status AS s, coalesce(epoch(now()) - epoch(lease_ts), 9.0e18) AS age | &&
+      |FROM _erpl_rev_delta_state WHERE target='{ q( iv_target ) }'| ).
+    TYPES: BEGIN OF ty_l, s TYPE string, age TYPE f, END OF ty_l.
+    DATA lt_l TYPE STANDARD TABLE OF ty_l WITH EMPTY KEY.
+    IF ls_l-error IS INITIAL AND ls_l-row_count > 0.
+      /ui2/cl_json=>deserialize( EXPORTING json = ls_l-rows CHANGING data = lt_l ).
+      READ TABLE lt_l INTO DATA(ls_ll) INDEX 1.
+      IF sy-subrc = 0 AND ls_ll-s = 'RUNNING' AND ls_ll-age < c_lease_ttl.
+        rv_msg = |ERROR: { iv_target } has a cycle in flight (fresh RUNNING lease); drop refused|.
+        RETURN.
+      ENDIF.
+    ENDIF.
+    " Erase the SAP-side subscription when the target has one (FR-9/BR-5).
+    " Best-effort like every other cleanup: ape_erase never raises.
+    DATA(lv_note) = |state dropped|.
+    IF ( ls_state-method = 'APE_DELTA' OR ls_state-method = 'APE_FULL' ) AND
+       ls_state-subscriber_process IS NOT INITIAL.
+      DATA(lv_subid) = ape_find_subscription( iv_cds = ls_state-source_from
+                                              iv_sub = ls_state-subscriber_process ).
+      IF lv_subid IS NOT INITIAL.
+        ape_erase( lv_subid ).
+        lv_note = |subscription { lv_subid } erased; state dropped|.
+      ELSE.
+        lv_note = |no live subscription; state dropped|.
+      ENDIF.
+    ENDIF.
+    zcl_erpl_rev_util=>query(
+      |DELETE FROM _erpl_rev_ape_spill WHERE target='{ q( iv_target ) }'| ).
+    DATA(ls_d) = zcl_erpl_rev_util=>query(
+      |DELETE FROM _erpl_rev_delta_state WHERE target='{ q( iv_target ) }'| ).
+    IF ls_d-error IS NOT INITIAL.
+      rv_msg = |ERROR: state delete failed for { iv_target }: { ls_d-error }|.
+      RETURN.
+    ENDIF.
+    rv_msg = |dropped { iv_target }: { lv_note }|.
   ENDMETHOD.
 
   METHOD schedule.

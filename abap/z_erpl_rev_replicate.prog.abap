@@ -299,7 +299,7 @@ AT SELECTION-SCREEN ON HELP-REQUEST FOR p_dmeth.
   PERFORM help USING 'Delta method'
     'How changes are detected. SNAPSHOT: reload + compare - the only method that catches physical DELETES (good default for small/medium tables).'
     ' WATERMARK: read rows where a change column exceeds the last high-water (needs a timestamp/sequence column).'
-    ' CHANGEDOC / INSERT_ONLY: driven by SAP change documents (CDHDR/CDPOS).'.
+    ' CHANGEDOC / INSERT_ONLY: driven by SAP change documents (CDHDR/CDPOS). APE_FULL / APE_DELTA (SAP DHAPE extraction for CDS views) are NOT registered here - use the CLI (sync create --method ...) or the APETEST classruns; see delta.md.'.
 AT SELECTION-SCREEN ON HELP-REQUEST FOR p_dwm.
   PERFORM help USING 'Watermark column'
     'For WATERMARK: the source column whose values only ever grow (a UTC timestamp or a sequence).'
