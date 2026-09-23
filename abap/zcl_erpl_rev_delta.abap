@@ -50,6 +50,18 @@ CLASS zcl_erpl_rev_delta DEFINITION PUBLIC FINAL CREATE PUBLIC.
              subscriber_process TYPE string,    " SAP-side subscription name
              chunk_size      TYPE i,             " graph package size, 0 = default
              wireformat      TYPE string,        " graph wire format
+             " BR-8 column subset (CSV of stream field names, empty = all).
+             " The seed shapes the target from it (keys the subset omits are
+             " auto-kept, describe_table convention); changing it on an
+             " existing target is refused at seed -- drop + re-register.
+             columns         TYPE string,
+             " DELTA crash position: the last merged spill batch (-1 = none).
+             " run_ape_delta seeds its package counter from spill_batch + 1
+             " AFTER the recover replay (which advances it), so indexes stay
+             " unique across cycles; the server refuses any batch at/below
+             " this position instead of silently losing it. ABAP i headroom
+             " is not a concern: each clean purge returns the position to -1.
+             spill_batch     TYPE i,
              " FR-2 release gate (ARS catalog, not XCO, not CDS_PUBLISHED).
              " allow_unreleased is INPUT, last_warning is register()'s answer:
              " never set last_warning by hand, it is rewritten on every call.
@@ -191,10 +203,12 @@ CLASS zcl_erpl_rev_delta DEFINITION PUBLIC FINAL CREATE PUBLIC.
     "! Drop a target (FR-9): erase the SAP-side subscription when the target
     "! has one, then delete the local state row and its spill (a spill without
     "! state is orphaned: RECOVER refuses unregistered targets). Refuses when a
-    "! cycle holds a fresh RUNNING lease. Idempotent: unknown targets report,
-    "! they do not fail. The DuckDB target table itself stays (data retention
-    "! is the operator's call, not the drop's). 'ERROR:' prefix on failure,
-    "! following schedule().
+    "! cycle holds a fresh RUNNING lease. The final delete carries that
+    "! predicate itself, so a cycle starting mid-drop loses atomically (drop
+    "! refused, row survives) instead of interleaving. Idempotent: unknown
+    "! targets report, they do not fail. The DuckDB target table itself stays
+    "! (data retention is the operator's call, not the drop's). 'ERROR:'
+    "! prefix on failure, following schedule().
     CLASS-METHODS drop
       IMPORTING iv_target    TYPE csequence
       RETURNING VALUE(rv_msg) TYPE string.
@@ -243,6 +257,33 @@ CLASS zcl_erpl_rev_delta DEFINITION PUBLIC FINAL CREATE PUBLIC.
       IMPORTING iv_cadence TYPE csequence
       RETURNING VALUE(rv)  TYPE i.
 
+    "! Pure poll-termination rule shared by both APE loops (W4/W5). PUBLIC
+    "! so headless probes (and operators) can exercise it without an engine.
+    "! Pre-data polls are preparation: iv_prep_max bounds them with an error
+    "! (FULL -- without lastBatch nothing merged, so clean would lie), while
+    "! iv_warn_at only RAISES ev_warn (DELTA on a new subscription -- a quiet
+    "! established stream must stay a fast clean exit, never an error, or
+    "! every idle cycle on a drained source would fail; AC-3). Post-data
+    "! rowless polls end the scan after iv_idle_max -- cleanly when iv_idle_ok
+    "! (DELTA K) or as an error (FULL stall). A RESUMED subscription
+    "! (iv_new_sub initial) ends pre-data quiet with the same K rule: its
+    "! position is
+    "! established, so quiet means drained, not preparing. A new subscription
+    "! never ends pre-data clean -- its first quiet past iv_warn_at warns
+    "! instead. Zero disables a bound.
+    CLASS-METHODS ape_poll_state
+      IMPORTING iv_got_data TYPE abap_bool
+                iv_empty    TYPE i
+                iv_polls    TYPE i
+                iv_prep_max TYPE i
+                iv_idle_max TYPE i
+                iv_idle_ok  TYPE abap_bool
+                iv_warn_at  TYPE i DEFAULT 0
+                iv_new_sub  TYPE abap_bool DEFAULT abap_false
+      EXPORTING ev_done    TYPE abap_bool
+                ev_timeout TYPE abap_bool
+                ev_warn    TYPE abap_bool.
+
   PRIVATE SECTION.
     CONSTANTS c_dest TYPE rfcdest VALUE 'ERPL_REV'.
 
@@ -282,10 +323,31 @@ CLASS zcl_erpl_rev_delta DEFINITION PUBLIC FINAL CREATE PUBLIC.
                 ev_error TYPE string.
     "! Stop a graph, swallowing everything: cleanup never fails the cycle.
     CLASS-METHODS ape_stop IMPORTING iv_uuid TYPE csequence.
+    "! Seed shape check (BR-8): when the registration pins a column subset,
+    "! an EXISTING target must already carry exactly the described field set
+    "! (subset + auto-kept keys). A mismatch means the column set changed
+    "! since the target was built -- refuse loudly (drop + re-register)
+    "! instead of merging into the wrong shape. Full-width targets (no
+    "! columns registered) are unchecked: sources evolve, and IF NOT EXISTS
+    "! keeps today's behavior there.
+    CLASS-METHODS ape_check_seed_shape
+      IMPORTING is_state TYPE ty_state
+                is_desc  TYPE zcl_erpl_rev_util=>ty_desc
+      RETURNING VALUE(rv_error) TYPE string.
     "! Best-effort subscription erase for a finished FULL scan (FR-4): look the
     "! id up by graph and run the eraser graph. Never sets the caller's error.
     CLASS-METHODS ape_erase_for_graph IMPORTING iv_uuid TYPE csequence.
-    CLASS-METHODS ape_erase IMPORTING iv_subid TYPE csequence.
+    "! Best-effort subscription erase by id (FR-9/BR-5): run the eraser graph
+    "! and WITNESS it. Returns true only when the engine raised no E/F/A
+    "! across create + drain AND (when iv_cds/iv_sub name the subscription) a
+    "! post re-lookup no longer finds it. Never raises: false means
+    "! "unverified", and the caller reports it as such instead of claiming an
+    "! erase it never saw.
+    CLASS-METHODS ape_erase
+      IMPORTING iv_subid TYPE csequence
+                iv_cds   TYPE csequence OPTIONAL
+                iv_sub   TYPE csequence OPTIONAL
+      RETURNING VALUE(rv_erased) TYPE abap_bool.
     "! One APE DELTA cycle: GC stale graphs -> replay the spill tail -> resume
     "! (or create) the named subscription -> poll until K consecutive empty
     "! roundtrips post-data -> stop (the subscription persists) -> purge the
@@ -489,6 +551,25 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
         ENDIF.
       ENDIF.
     ENDIF.
+    " Gate 5: the BR-8 column subset resolves against the source at plan
+    " time (AC-4). describe_table is the single authority: unknown names
+    " fail here, keys the subset omits are auto-kept (SLT convention), and
+    " the same field set shapes the seed target below. The DDL is built but
+    " never executed here -- registration writes intent, cycles build.
+    IF is_state-columns IS NOT INITIAL.
+      IF is_state-method <> 'APE_FULL' AND is_state-method <> 'APE_DELTA'.
+        rv_error = |columns is an APE-only knob ({ is_state-method } has no registered column set; | &&
+                   |use the read path's own column selection or switch to an APE method)|.
+        RETURN.
+      ENDIF.
+      DATA(ld_cols) = zcl_erpl_rev_util=>describe_table(
+        iv_tab = is_state-source_from iv_target = '__ape_col_probe__'
+        iv_columns = is_state-columns ).
+      IF ld_cols-error IS NOT INITIAL.
+        rv_error = |{ is_state-source_from }: { ld_cols-error }|.
+        RETURN.
+      ENDIF.
+    ENDIF.
     " `sync create` is CREATE-OR-UPDATE: re-running it on an existing target
     " updates it, and that is deliberate -- it is what makes registration
     " idempotent and scriptable.
@@ -530,7 +611,7 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       |INSERT INTO _erpl_rev_delta_state | &&
       |(target,method,source_from,keys,chg_col,time_col,wm_kind,wm_value,| &&
       |safety_secs,safety_units,cadence,extra,log_enabled,load_type_default,| &&
-      |allow_empty_reload,subscriber_process,chunk_size,wireformat,| &&
+      |allow_empty_reload,subscriber_process,chunk_size,wireformat,columns,| &&
       |allow_unreleased,last_warning,status) VALUES (| &&
       |'{ q( is_state-target ) }','{ q( is_state-method ) }','{ q( is_state-source_from ) }',| &&
       |'{ q( is_state-keys ) }','{ q( is_state-chg_col ) }',| &&
@@ -543,6 +624,7 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       |{ COND string( WHEN is_state-subscriber_process IS INITIAL THEN 'NULL' ELSE |'{ q( is_state-subscriber_process ) }'| ) },| &&
       |{ is_state-chunk_size },| &&
       |{ COND string( WHEN is_state-wireformat IS INITIAL THEN 'NULL' ELSE |'{ q( is_state-wireformat ) }'| ) },| &&
+      |{ COND string( WHEN is_state-columns IS INITIAL THEN 'NULL' ELSE |'{ q( is_state-columns ) }'| ) },| &&
       |{ COND string( WHEN is_state-allow_unreleased = 'true' THEN 'true' ELSE 'false' ) },| &&
       |{ COND string( WHEN lv_warn IS INITIAL THEN 'NULL' ELSE |'{ q( lv_warn ) }'| ) },| &&
       |'IDLE') | &&
@@ -556,6 +638,12 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       |chunk_size=excluded.chunk_size, | &&
       |wireformat=coalesce(excluded.wireformat, | &&
       |                     _erpl_rev_delta_state.wireformat), | &&
+      " columns coalesces like the other APE knobs: unstated keeps the
+      " stored subset (a re-registration for an unrelated reason must not
+      " widen the target), and a changed set is refused at seed -- drop +
+      " re-register to change it.
+      |columns=coalesce(excluded.columns, | &&
+      |                   _erpl_rev_delta_state.columns), | &&
       |log_enabled=coalesce(excluded.log_enabled, _erpl_rev_delta_state.log_enabled), | &&
       |load_type_default=coalesce(excluded.load_type_default, | &&
       |                           _erpl_rev_delta_state.load_type_default), | &&
@@ -667,6 +755,8 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       |coalesce(subscriber_process,'') AS subscriber_process, | &&
       |coalesce(chunk_size,0) AS chunk_size, | &&
       |coalesce(wireformat,'') AS wireformat, | &&
+      |coalesce(columns,'') AS columns, | &&
+      |coalesce(spill_batch,-1) AS spill_batch, | &&
       |CASE WHEN allow_unreleased THEN 'true' ELSE 'false' END AS allow_unreleased, | &&
       |coalesce(last_warning,'') AS last_warning, | &&
       |coalesce(status,'IDLE') AS status | &&
@@ -745,6 +835,15 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
     ENDIF.
     IF try_lease( iv_target ) = abap_false.
       rs-skipped = abap_true.
+      RETURN.
+    ENDIF.
+    " Fence against drop: the registration may have vanished between the
+    " read above and the lease take (drop deletes the row). Refuse here,
+    " loudly and at once, instead of failing mid-merge on a ghost. No
+    " release is needed: a missing row holds no lease.
+    DATA(ls_fresh) = state( iv_target ).
+    IF ls_fresh-target IS INITIAL.
+      rs-error = |registration for { iv_target } dropped after lease take; cycle refused|.
       RETURN.
     ENDIF.
     " Defensive only -- the server refuses this in BEGIN_CYCLE, before anything
@@ -1184,12 +1283,17 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
 
   METHOD run_ape_full.
     " Seed the target first (the same seed contract replicate() honours, so a
-    " later APE_DELTA registration on this target just works, HLD §4).
+    " later APE_DELTA registration on this target just works, HLD §4). A
+    " registered subset shapes the table (keys auto-kept); a changed set on
+    " an existing target is refused -- drop + re-register.
     DATA(ld) = zcl_erpl_rev_util=>describe_table(
-      iv_tab = is_state-source_from iv_target = is_state-target ).
+      iv_tab = is_state-source_from iv_target = is_state-target
+      iv_columns = is_state-columns ).
     IF ld-error IS NOT INITIAL. rs-error = ld-error. RETURN. ENDIF.
     DATA(lc) = zcl_erpl_rev_util=>query( ld-ddl ).
     IF lc-error IS NOT INITIAL. rs-error = lc-error. RETURN. ENDIF.
+    DATA(lv_shape) = ape_check_seed_shape( is_state = is_state is_desc = ld ).
+    IF lv_shape IS NOT INITIAL. rs-error = lv_shape. RETURN. ENDIF.
     " A unique-per-scan subscription: the engine refuses create when the name
     " exists (protocol §11), so a crashed scan's leftover must not block the
     " next one. The tail (timestamp) is what makes it unique, so a >30 name
@@ -1233,6 +1337,10 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
           lv_got TYPE abap_bool VALUE abap_false, lv_done TYPE abap_bool VALUE abap_false,
           lv_fwd TYPE abap_bool VALUE abap_false.
     DATA lv_rows TYPE i VALUE 0.
+    " Post-data stall tracking (W5): consecutive rowless polls after first
+    " data. Pre-declared (never loop-local DATA) for the same once-created
+    " reason as lv_fwd.
+    DATA: lv_stall TYPE i VALUE 0, lv_rows_before TYPE i VALUE 0.
     WHILE lv_done = abap_false.
       lv_polls = lv_polls + 1.
       " Per-poll reset, NOT a loop-local DATA: ABAP creates a loop-local data
@@ -1240,6 +1348,7 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       " first posted poll's value forever (a stuck lv_fwd would poll fast but
       " never time out -- the M4B restore taught us that on the delta side).
       lv_fwd = abap_false.
+      lv_rows_before = lv_rows.
       CLEAR lt_in.
       APPEND VALUE #( graph_uuid = lv_uuid port_number = 0 direction = 'O'
                       port_status = 'R' ) TO lt_in.
@@ -1269,9 +1378,31 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       ENDLOOP.
       IF rs-error IS NOT INITIAL. EXIT. ENDIF.
       IF lv_done = abap_true. EXIT. ENDIF.
-      IF lv_got = abap_false AND lv_polls >= 60.
-        rs-error = |APE preparation timeout: no data after { lv_polls } polls; | &&
-                   |check the CDC background jobs (S_DHCDC* authorisations)|.
+      " Stall accounting: rows this poll reset the counter, anything else
+      " after first data grows it. Control envelopes (forwarded, zero rows)
+      " count as stalled -- only row delivery proves the stream alive.
+      IF lv_got = abap_true AND lv_rows = lv_rows_before.
+        lv_stall = lv_stall + 1.
+      ELSE.
+        lv_stall = 0.
+      ENDIF.
+      " Termination is the shared rule: 60 pre-data polls bound preparation
+      " (unchanged message), and 360 rowless polls after first data end a
+      " stalled scan as an ERROR -- without lastBatch the server merged
+      " nothing, so a clean exit would lie. ape_stop still runs below, so
+      " the graph never leaks.
+      ape_poll_state(
+        EXPORTING iv_got_data = lv_got iv_empty = lv_stall iv_polls = lv_polls
+                  iv_prep_max = 60 iv_idle_max = 360 iv_idle_ok = abap_false
+        IMPORTING ev_timeout = DATA(lv_to) ).
+      IF lv_to = abap_true.
+        IF lv_got = abap_false.
+          rs-error = |APE preparation timeout: no data after { lv_polls } polls; | &&
+                     |check the CDC background jobs (S_DHCDC* authorisations)|.
+        ELSE.
+          rs-error = |APE stream stalled: no rows for { lv_stall } polls after first data; | &&
+                     |scan ended without lastBatch (target untouched: the server only merges on lastBatch)|.
+        ENDIF.
         EXIT.
       ENDIF.
       " Lease heartbeat: a healthy scan legitimately outlasts the 600 s
@@ -1411,12 +1542,16 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
     IF lv_gc IS NOT INITIAL. rs-error = lv_gc. RETURN. ENDIF.
     " The target must exist before anything reads it -- including the replay
     " below (a never-cycled target has no table yet). Same seed contract as
-    " FULL; DuckDB-local, no SAP contact.
+    " FULL (subset-shaped when columns are registered); DuckDB-local, no SAP
+    " contact. A changed set on an existing target is refused.
     DATA(ld) = zcl_erpl_rev_util=>describe_table(
-      iv_tab = is_state-source_from iv_target = is_state-target ).
+      iv_tab = is_state-source_from iv_target = is_state-target
+      iv_columns = is_state-columns ).
     IF ld-error IS NOT INITIAL. rs-error = ld-error. RETURN. ENDIF.
     DATA(lc) = zcl_erpl_rev_util=>query( ld-ddl ).
     IF lc-error IS NOT INITIAL. rs-error = lc-error. RETURN. ENDIF.
+    DATA(lv_shape) = ape_check_seed_shape( is_state = is_state is_desc = ld ).
+    IF lv_shape IS NOT INITIAL. rs-error = lv_shape. RETURN. ENDIF.
     " Replay the spill tail before touching SAP: a graph would advance the
     " subscription past owed changes (FR-6). A clean state is a no-op.
     DATA(ls_rec) = plan_json( iv_action = 'APE_RECOVER' iv_target = is_state-target ).
@@ -1433,6 +1568,9 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
     " identity, FULL mints unique-per-scan names.
     DATA(lv_subid) = ape_find_subscription( iv_cds = is_state-source_from
                                             iv_sub = is_state-subscriber_process ).
+    " A missing subscription means this cycle creates it: pre-data quiet is
+    " then preparation (warn-bound), not an established drained stream (K).
+    DATA(lv_created) = xsdbool( lv_subid IS INITIAL ).
     DATA(ls_g) = plan_json( iv_action = 'APE_GRAPH' iv_target = is_state-target
                             iv_params = |\{"subscription_name":"{ is_state-subscriber_process }",| &&
                                         |\{"subscription_id":"{ lv_subid }"\}| ).
@@ -1460,12 +1598,31 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
     " an exit (exiting on it ends the cycle before lagging CDC changes arrive;
     " the m4 carry proved it). Merges commit per package, so any exit below
     " loses nothing; the subscription position is the resume point.
-    CONSTANTS: lc_empty_end TYPE i VALUE 3,
-               lc_poll_cap  TYPE i VALUE 360.
+    " K = 3 rowless polls ends a drained stream and 36 pre-data polls bound
+    " preparation; both live in ape_poll_state now, this cap stays absolute.
+    CONSTANTS lc_poll_cap TYPE i VALUE 360.
     DATA: lt_in TYPE dhape_t_graph_port, lt_nothing TYPE dhape_t_graph_msg,
           lt_pmsg TYPE dhape_t_graph_msg, lt_eport TYPE dhape_t_graph_port.
-    DATA: lv_post TYPE i VALUE 0, lv_polls TYPE i VALUE 0, lv_empty TYPE i VALUE 0,
+    " Seed the package counter past the merged position: the recover above
+    " may have advanced spill_batch, so the entry snapshot is stale --
+    " re-read. A counter restarted at 0 would collide with surviving spill
+    " rows (a kill between spill and merge would then replay nothing), and
+    " the server refuses such batches loudly; counting past the position
+    " keeps every index unique within the generation. The clean-end purge
+    " returns the position to -1, so ordinary cycles still count 0, 1, ....
+    DATA(ls_fresh) = state( is_state-target ).
+    IF ls_fresh-target IS INITIAL.
+      rs-error = |APE DELTA { is_state-target }: state lost mid-cycle, cannot seed batch counter|.
+      ape_stop( lv_uuid ).
+      RETURN.
+    ENDIF.
+    DATA(lv_post) = ls_fresh-spill_batch + 1.
+    DATA: lv_polls TYPE i VALUE 0, lv_empty TYPE i VALUE 0,
           lv_poll TYPE i VALUE 0.
+    " Stream rows seen (never replay rows): flips pre-data preparation rules
+    " to post-data K rules. Per-poll reset does not apply -- once data has
+    " streamed, the cycle is post-data for good.
+    DATA lv_got TYPE abap_bool VALUE abap_false.
     WHILE abap_true = abap_true.
       lv_polls = lv_polls + 1.
       " Per-poll reset, NOT a loop-local DATA: ABAP creates a loop-local data
@@ -1504,10 +1661,33 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       IF rs-error IS NOT INITIAL. EXIT. ENDIF.
       IF lv_poll > 0.
         lv_empty = 0.
+        lv_got = abap_true.
       ELSE.
         lv_empty = lv_empty + 1.
       ENDIF.
-      IF lv_empty >= lc_empty_end.
+      " Termination is the shared rule (FR-5): K rowless polls end a drained
+      " stream, and pre-data empties never count toward K. A NEW subscription
+      " that stays quiet only raises a WARNING: a drained established stream
+      " must exit fast and clean -- erroring it would fail every idle cycle
+      " on a quiet source (AC-3). The warning names the CDC jobs and stays
+      " observable on the row; the exit stays clean and lossless (no handover
+      " means the subscription position never moved). lv_got is stream rows
+      " only: replay rows (lv_rows) must not flip a still-preparing graph to
+      " post-data rules.
+      ape_poll_state(
+        EXPORTING iv_got_data = lv_got iv_empty = lv_empty iv_polls = lv_polls
+                  iv_prep_max = 0 iv_idle_max = 3 iv_idle_ok = abap_true
+                  iv_warn_at = COND #( WHEN lv_created = abap_true THEN 36 ELSE 0 )
+                  iv_new_sub = lv_created
+        IMPORTING ev_done = DATA(lv_end) ev_warn = DATA(lv_prewarn) ).
+      IF lv_prewarn = abap_true.
+        zcl_erpl_rev_util=>query(
+          |UPDATE _erpl_rev_delta_state SET last_warning='no stream data after { lv_polls } polls | &&
+          |on a new subscription; check the CDC background jobs (S_DHCDC* authorisations)' | &&
+          |WHERE target='{ q( is_state-target ) }'| ).
+        EXIT.
+      ENDIF.
+      IF lv_end = abap_true.
         EXIT.
       ENDIF.
       IF lv_polls >= lc_poll_cap.
@@ -1580,6 +1760,60 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
     ENDTRY.
   ENDMETHOD.
 
+  METHOD ape_poll_state.
+    CLEAR: ev_done, ev_timeout, ev_warn.
+    IF iv_got_data = abap_true.
+      IF iv_empty >= iv_idle_max.
+        IF iv_idle_ok = abap_true.
+          ev_done = abap_true.
+        ELSE.
+          ev_timeout = abap_true.
+        ENDIF.
+      ENDIF.
+      RETURN.
+    ENDIF.
+    " Pre-data. The hard error bound is FULL-only; DELTA never errors here.
+    IF iv_prep_max > 0 AND iv_polls >= iv_prep_max.
+      ev_timeout = abap_true.
+      RETURN.
+    ENDIF.
+    IF iv_new_sub = abap_false AND iv_idle_ok = abap_true AND
+       iv_empty >= iv_idle_max.
+      " Resumed subscription, established position: quiet means drained, so
+      " the same K rule ends it fast. Without this a drained stream polls
+      " forever (nothing ever flips it post-data).
+      ev_done = abap_true.
+      RETURN.
+    ENDIF.
+    IF iv_new_sub = abap_true AND iv_warn_at > 0 AND iv_polls >= iv_warn_at.
+      ev_warn = abap_true.
+    ENDIF.
+  ENDMETHOD.
+
+  METHOD ape_check_seed_shape.
+    IF is_state-columns IS INITIAL. RETURN. ENDIF.
+    DATA(ls) = zcl_erpl_rev_util=>query(
+      |SELECT lower(column_name) AS c FROM duckdb_columns() | &&
+      |WHERE lower(table_name) = '{ q( to_lower( CONV string( is_state-target ) ) ) }'| ).
+    IF ls-error IS NOT INITIAL. rv_error = ls-error. RETURN. ENDIF.
+    IF ls-row_count = 0. RETURN. ENDIF.  " no table yet: the seed DDL builds it
+    TYPES: BEGIN OF ty_c, c TYPE string, END OF ty_c.
+    DATA lt_have TYPE STANDARD TABLE OF ty_c WITH EMPTY KEY.
+    /ui2/cl_json=>deserialize( EXPORTING json = ls-rows CHANGING data = lt_have ).
+    DATA lt_want TYPE SORTED TABLE OF string WITH UNIQUE KEY table_line.
+    LOOP AT is_desc-fields INTO DATA(ls_f).
+      INSERT to_lower( CONV string( ls_f-name ) ) INTO TABLE lt_want.
+    ENDLOOP.
+    DATA lt_got TYPE SORTED TABLE OF string WITH UNIQUE KEY table_line.
+    LOOP AT lt_have INTO DATA(ls_h).
+      INSERT ls_h-c INTO TABLE lt_got.
+    ENDLOOP.
+    IF lt_want <> lt_got.
+      rv_error = |target { is_state-target } carries a different column set than registered | &&
+                 |({ is_state-columns }); drop and re-register to change the column set|.
+    ENDIF.
+  ENDMETHOD.
+
   METHOD ape_erase_for_graph.
     " The subscription id lives by the graph that created it; without it there
     " is nothing to erase (a create that never ran, or an engine that names
@@ -1588,7 +1822,10 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
         SELECT SINGLE subscription_id FROM dhape_subscr
           WHERE graph_uuid = @iv_uuid INTO @DATA(lv_id).
         IF sy-subrc <> 0 OR lv_id IS INITIAL. RETURN. ENDIF.
-        ape_erase( lv_id ).
+        " Best-effort and reportless here (FR-4): the witness only matters
+        " where a message is produced (drop). Received into a dummy: a
+        " functional call's return cannot be discarded.
+        DATA(lv_erase_ok) = ape_erase( lv_id ).
       CATCH cx_root ##NO_HANDLER.
     ENDTRY.
   ENDMETHOD.
@@ -1605,13 +1842,22 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       `","odpSubscrID":""}}}},` &&
       `"Connections":[],"Outports":{"0":{"Process":"eraser","Port":"out",` &&
       `"Metadata":{"portNumber":0,"type":"string"}}},"vTypes":{}}`.
+    " Witness, not hope: every engine message on the eraser graph is
+    " scanned for E/F/A (the erpl_ape rule the poll loops live by), and when
+    " the caller names the subscription a post re-lookup must no longer find
+    " it. Anything else -- create failure, engine complaint, lookup residue,
+    " exception -- returns false ("unverified"), never raises.
+    rv_erased = abap_false.
     TRY.
         DATA lv_uuid TYPE char32.
         DATA lt_m TYPE dhape_t_graph_msg.
         CALL FUNCTION 'DHAPE_GRAPH_MANAGER'
           EXPORTING iv_mode = 'C' iv_appid = 'ERPL_REV' iv_graph = lv_json
           IMPORTING ev_graph_uuid = lv_uuid et_msg = lt_m.
-        IF lv_uuid IS INITIAL. RETURN. ENDIF.
+        LOOP AT lt_m INTO DATA(ls_cm) WHERE ( type = 'E' OR type = 'F' OR type = 'A' ).
+          EXIT.
+        ENDLOOP.
+        IF sy-subrc = 0 OR lv_uuid IS INITIAL. RETURN. ENDIF.
         DATA: lt_in TYPE dhape_t_graph_port, lt_nothing TYPE dhape_t_graph_msg,
               lt_pmsg TYPE dhape_t_graph_msg, lt_eport TYPE dhape_t_graph_port.
         DO 8 TIMES.
@@ -1622,11 +1868,25 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
           CALL FUNCTION 'DHAPE_GRAPH_ROUNDTRIP'
             EXPORTING iv_graph_uuid = lv_uuid it_port = lt_in it_msg = lt_nothing
             IMPORTING et_port = lt_eport et_msg = lt_pmsg.
+          LOOP AT lt_pmsg INTO DATA(ls_pm) WHERE ( type = 'E' OR type = 'F' OR type = 'A' ).
+            EXIT.
+          ENDLOOP.
+          IF sy-subrc = 0.
+            CALL FUNCTION 'DHAPE_GRAPH_MANAGER'
+              EXPORTING iv_mode = 'S' iv_appid = 'ERPL_REV' iv_graph_uuid = lv_uuid
+              IMPORTING et_msg = lt_m.
+            RETURN.
+          ENDIF.
           WAIT UP TO 1 SECONDS.
         ENDDO.
         CALL FUNCTION 'DHAPE_GRAPH_MANAGER'
           EXPORTING iv_mode = 'S' iv_appid = 'ERPL_REV' iv_graph_uuid = lv_uuid
           IMPORTING et_msg = lt_m.
+        rv_erased = abap_true.
+        IF iv_cds IS NOT INITIAL AND iv_sub IS NOT INITIAL.
+          rv_erased = xsdbool( ape_find_subscription( iv_cds = iv_cds
+                                                      iv_sub = iv_sub ) IS INITIAL ).
+        ENDIF.
       CATCH cx_root ##NO_HANDLER.
     ENDTRY.
   ENDMETHOD.
@@ -1716,18 +1976,40 @@ CLASS zcl_erpl_rev_delta IMPLEMENTATION.
       DATA(lv_subid) = ape_find_subscription( iv_cds = ls_state-source_from
                                               iv_sub = ls_state-subscriber_process ).
       IF lv_subid IS NOT INITIAL.
-        ape_erase( lv_subid ).
-        lv_note = |subscription { lv_subid } erased; state dropped|.
+        " Honest report, best-effort act: confirmed only when the engine
+        " raised nothing and the subscription is gone on re-lookup.
+        DATA(lv_ok) = ape_erase( iv_subid = lv_subid
+                                 iv_cds = ls_state-source_from
+                                 iv_sub = ls_state-subscriber_process ).
+        lv_note = COND string( WHEN lv_ok = abap_true
+                  THEN |subscription { lv_subid } erase confirmed; state dropped|
+                  ELSE |subscription { lv_subid } erase unverified; state dropped| ).
       ELSE.
         lv_note = |no live subscription; state dropped|.
       ENDIF.
     ENDIF.
+    " Fenced delete: the row vanishes only when no fresh RUNNING lease
+    " exists AT DELETE TIME. This single statement is the fence -- a cycle
+    " that takes the lease after the pre-check above cannot slip through:
+    " the predicate sees it. The re-read below tells "cycle won" from
+    " "drop won" without depending on affected-row counts.
     zcl_erpl_rev_util=>query(
       |DELETE FROM _erpl_rev_ape_spill WHERE target='{ q( iv_target ) }'| ).
     DATA(ls_d) = zcl_erpl_rev_util=>query(
-      |DELETE FROM _erpl_rev_delta_state WHERE target='{ q( iv_target ) }'| ).
+      |DELETE FROM _erpl_rev_delta_state WHERE target='{ q( iv_target ) }' | &&
+      |AND NOT (status = 'RUNNING' AND | &&
+      |lease_ts >= now() - INTERVAL '{ c_lease_ttl }' SECOND)| ).
     IF ls_d-error IS NOT INITIAL.
       rv_msg = |ERROR: state delete failed for { iv_target }: { ls_d-error }|.
+      RETURN.
+    ENDIF.
+    DATA(ls_left) = state( iv_target ).
+    IF ls_left-target IS NOT INITIAL.
+      IF ls_left-status = 'RUNNING'.
+        rv_msg = |ERROR: { iv_target } started a cycle during drop; drop refused|.
+      ELSE.
+        rv_msg = |ERROR: state delete failed for { iv_target }: row survives|.
+      ENDIF.
       RETURN.
     ENDIF.
     rv_msg = |dropped { iv_target }: { lv_note }|.

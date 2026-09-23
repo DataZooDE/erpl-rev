@@ -288,3 +288,15 @@ TEST_CASE("migrate: v10 adds the release-gate override and warning", "[schema][a
     CHECK(schema::CurrentVersion(con) == schema::LatestVersion());
     CHECK(schema::LatestVersion() >= 10);
 }
+
+TEST_CASE("migrate: v11 adds the APE column subset", "[schema][ape]") {
+    // BRD BR-8: the registered subset (CSV, NULL/"" = all columns) that the
+    // seed shapes subset targets from.
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection con(db);
+    schema::Migrate(con, "test");
+    CHECK(HasColumn(con, "_erpl_rev_delta_state", "columns"));
+    REQUIRE_NOTHROW(schema::Migrate(con, "test"));
+    CHECK(schema::CurrentVersion(con) == schema::LatestVersion());
+    CHECK(schema::LatestVersion() >= 11);
+}

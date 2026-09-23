@@ -265,6 +265,18 @@ ApeDeltaCounts ApeApplyDeltaPackage(DuckDbBridge &db, const std::string &target,
     EnsureTarget(db, target, "DELTA " + batch_id);
     const ApeEnvelope probe = ExtractEnvelope(package_json.c_str());
     if (!probe.has_data) return {};
+    // No silent restarts: a batch at/below the merged position means the
+    // cycle counter restarted at 0 while spill_batch survived from an older
+    // generation. Merging would strand a kill between spill and merge
+    // (RECOVER replays batch_index > position, i.e. nothing), so refuse
+    // loudly. Retries are unaffected: a failed batch never advances the
+    // position, so its re-send still counts past it.
+    const long long pos = SpillPosition(db, target, "DELTA " + batch_id);
+    if (batch_index <= pos)
+        throw ApeDecodeError("APE DELTA " + batch_id + ": stale batch index " +
+                             std::to_string(batch_index) + " at/below merged position " +
+                             std::to_string(pos) + " for '" + target +
+                             "'; the cycle must count past spill_batch, never restart at 0");
     // Structural validation before the side-effecting spill: a package that
     // can never merge (no indicator to classify by) is refused up front, so
     // it neither spills nor poisons the recover queue. Row-level failures
@@ -327,6 +339,13 @@ ApeDeltaCounts ApeRecover(DuckDbBridge &db, const std::string &target,
     db.Execute("DELETE FROM _erpl_rev_ape_spill WHERE target=" + SqlQ(target) +
                " AND batch_index <= " + std::to_string(top));
     return total;
+}
+
+void ApePurge(DuckDbBridge &db, const std::string &target) {
+    EnsureTarget(db, target, "PURGE");
+    db.Execute("DELETE FROM _erpl_rev_ape_spill WHERE target=" + SqlQ(target));
+    db.Execute("UPDATE _erpl_rev_delta_state SET spill_batch=-1 WHERE target=" +
+               SqlQ(target));
 }
 
 }  // namespace ape

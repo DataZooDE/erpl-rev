@@ -272,6 +272,7 @@ std::vector<RegisterField> RegisterFields(const SyncState &s) {
         num("chunk_size", s.chunk_size),
         str("wireformat", s.wireformat, "--wireformat"),
         str("allow_unreleased", s.allow_unreleased, "--allow-unreleased"),
+        str("columns", s.columns, "--columns"),
     };
 }
 

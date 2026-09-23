@@ -116,6 +116,7 @@ TEST_CASE("ape_register: the register fields carry the APE knobs", "[ape]") {
     st.chunk_size = 20000;
     st.wireformat = "W";
     st.allow_unreleased = "true";
+    st.columns = "RID,DESCR";
     const auto fs = erpl_rev::abapgen::RegisterFields(st);
     auto raw = [&](const std::string &name) {
         for (const auto &f : fs)
@@ -126,6 +127,7 @@ TEST_CASE("ape_register: the register fields carry the APE knobs", "[ape]") {
     CHECK(raw("chunk_size") == "20000");
     CHECK(raw("wireformat") == "W");
     CHECK(raw("allow_unreleased") == "true");
+    CHECK(raw("columns") == "RID,DESCR");
     // ...and the pre-existing fields still travel alongside.
     CHECK(raw("method") == "APE_DELTA");
     CHECK(raw("keys") == "MANDT,ID");
@@ -138,7 +140,10 @@ TEST_CASE("ape_register: the generated ABAP names the APE knobs", "[ape]") {
     st.source_from = "ZERPL_APE_D";
     st.keys = "MANDT,ID";
     st.subscriber_process = "ERPLREV01";
+    st.columns = "RID,DESCR";
     const auto src = erpl_rev::abapgen::RenderSyncRegister(st, "abcdef12");
     CHECK_THAT(src, ContainsSubstring("subscriber_process"));
     CHECK_THAT(src, ContainsSubstring("ERPLREV01"));
+    CHECK_THAT(src, ContainsSubstring("columns"));
+    CHECK_THAT(src, ContainsSubstring("RID,DESCR"));
 }

@@ -56,6 +56,7 @@ std::string UnknownFlag(const std::vector<std::string> &args, const std::string 
         {"--allow-empty-reload", false}, {"--no-allow-empty-reload", false},
         {"--subscriber-process", true}, {"--chunk-size", true},
         {"--wireformat", true}, {"--allow-unreleased", false},
+        {"--columns", true},
     };
     static const Spec kSyncSchedule[] = {
         {"--every", true}, {"--remove", false},
@@ -384,6 +385,7 @@ static int SyncCreate(Options &o, const std::string &target) {
     const std::string chunk = Field(o, "--chunk-size");
     if (!chunk.empty()) st.chunk_size = std::atoll(chunk.c_str());
     st.wireformat         = Field(o, "--wireformat");
+    st.columns            = Field(o, "--columns");
     // Present-tense opt-in (BRD §6 AC-4): stated on this call or the release
     // gate re-enforces. No --no- form: absence is the safe default.
     st.allow_unreleased   = HasFlag(o, "--allow-unreleased") ? "true" : "";
@@ -415,6 +417,7 @@ static int SyncCreate(Options &o, const std::string &target) {
         ar.cadence = st.cadence;
         ar.wireformat = st.wireformat;
         ar.chunk_size = st.chunk_size;
+        ar.columns = st.columns;
         const std::string err = ape::ValidateRegistration(ar);
         if (!err.empty()) {
             std::fprintf(stderr, "erpl-rev sync create: %s\n", err.c_str());

@@ -19,6 +19,8 @@ CLASS zcl_erpl_rev_apetest DEFINITION PUBLIC FINAL CREATE PUBLIC.
     METHODS m6_stale_graph.
     METHODS m7_volume_100k.
     METHODS m8_drop_command.
+    METHODS run_ac4 IMPORTING iv_out TYPE REF TO if_oo_adt_classrun_out.
+    METHODS m9_columns_gate.
   PRIVATE SECTION.
     DATA: mv_pass TYPE i, mv_fail TYPE i, mo TYPE REF TO if_oo_adt_classrun_out.
     METHODS ok IMPORTING cond TYPE abap_bool what TYPE string detail TYPE string DEFAULT ''.
@@ -101,6 +103,19 @@ CLASS zcl_erpl_rev_apetest IMPLEMENTATION.
         mo->write( |DUMP: { lv_t }| ).
     ENDTRY.
     mo->write( |APEDLTV RESULT pass={ mv_pass } fail={ mv_fail }| ).
+  ENDMETHOD.
+
+  METHOD run_ac4.
+    mo = iv_out.
+    TRY.
+        m1_register_gates( ).
+        m2_release_gate( ).
+        m9_columns_gate( ).
+      CATCH cx_root INTO DATA(lx).
+        mv_fail = mv_fail + 1.
+        mo->write( |DUMP: { lx->get_text( ) }| ).
+    ENDTRY.
+    mo->write( |APEDLTN RESULT pass={ mv_pass } fail={ mv_fail }| ).
   ENDMETHOD.
 
   METHOD m1_register_gates.
@@ -573,9 +588,11 @@ CLASS zcl_erpl_rev_apetest IMPLEMENTATION.
     zcl_erpl_rev_util=>query(
       |UPDATE _erpl_rev_delta_state SET status='IDLE' WHERE target='ape_t_drop1'| ).
 
-    " The drop: subscription erased, state row gone.
+    " The drop: subscription erase CONFIRMED (re-lookup finds nothing),
+    " state row gone. 'erased' alone is not enough: the pre-witness message
+    " claimed erasures the engine never confirmed (W2).
     DATA(lv_msg) = zcl_erpl_rev_delta=>drop( 'ape_t_drop1' ).
-    ok( cond = xsdbool( NOT lv_msg CS 'ERROR:' AND lv_msg CS 'erased' )
+    ok( cond = xsdbool( NOT lv_msg CS 'ERROR:' AND lv_msg CS 'erase confirmed' )
         what = 'M8 drop erases subscription' detail = lv_msg ).
     DATA(ls_gone) = zcl_erpl_rev_delta=>state( 'ape_t_drop1' ).
     ok( cond = xsdbool( ls_gone-target IS INITIAL )
@@ -598,12 +615,80 @@ CLASS zcl_erpl_rev_apetest IMPLEMENTATION.
     ok( cond = xsdbool( ls_run-error IS INITIAL AND ls_run-skipped IS INITIAL
                         AND lv_tgt = lv_src )
         what = 'M8 re-run converges' detail = |{ lv_tgt }/{ lv_src } { ls_run-error }| ).
+    " Final drop under a STALE running lease: an orphan is not a cycle, so
+    " the fenced delete proceeds (a fresh one refused above). Leaves no
+    " trace: no state row, erase witnessed.
+    zcl_erpl_rev_util=>query(
+      |UPDATE _erpl_rev_delta_state SET status='RUNNING', | &&
+      |lease_ts=now() - INTERVAL '3600' SECOND WHERE target='ape_t_drop1'| ).
     lv_msg = zcl_erpl_rev_delta=>drop( 'ape_t_drop1' ).
-    ok( cond = xsdbool( NOT lv_msg CS 'ERROR:' )
-        what = 'M8 final drop clean' detail = lv_msg ).
+    ok( cond = xsdbool( NOT lv_msg CS 'ERROR:' AND lv_msg CS 'erase confirmed' )
+        what = 'M8 stale lease does not block' detail = lv_msg ).
     ls_gone = zcl_erpl_rev_delta=>state( 'ape_t_drop1' ).
     ok( cond = xsdbool( ls_gone-target IS INITIAL )
         what = 'M8 no trace' detail = ls_gone-target ).
+  ENDMETHOD.
+
+  METHOD m9_columns_gate.
+    " BR-8/AC-4, durable home of the W6 proofs: unknown names fail at plan
+    " time; non-APE methods refuse the knob; the subset shapes the target
+    " and replicates; a changed set is refused; the drop leaves no trace.
+    " (Filter refusal has no ABAP channel -- has_filter is set only by the
+    " graph-spec builder -- so it stays a C++ unit proof in
+    " test_ape_register.)
+    DATA ls TYPE zcl_erpl_rev_delta=>ty_state.
+    ls-target = 'ape_t_negcol'.
+    ls-method = 'APE_DELTA'.
+    ls-source_from = 'ZERPL_APE_D'.
+    ls-keys = 'RID'.
+    ls-cadence = 'hourly'.
+    ls-subscriber_process = 'ERPLREVN'.
+    ls-allow_unreleased = 'true'.
+    ls-columns = 'RID,NOPE_COL'.
+    DATA(lv_e) = zcl_erpl_rev_delta=>register( ls ).
+    ok( cond = xsdbool( lv_e CS 'unknown column' )
+        what = 'M9 unknown column refused' detail = lv_e ).
+
+    ls-target = 'ape_t_negcol2'.
+    ls-method = 'SNAPSHOT'.
+    ls-columns = 'RID'.
+    lv_e = zcl_erpl_rev_delta=>register( ls ).
+    ok( cond = xsdbool( lv_e CS 'APE-only' )
+        what = 'M9 non-APE refuses columns' detail = lv_e ).
+    ls-method = 'APE_DELTA'.
+
+    " Subset E2E on its own target + subscriber (never touches milestones).
+    ls-target = 'ape_t_col1'.
+    ls-subscriber_process = 'ERPLREVCOL'.
+    ls-columns = 'RID,DESCR'.
+    lv_e = zcl_erpl_rev_delta=>register( ls ).
+    ok( cond = xsdbool( lv_e IS INITIAL )
+        what = 'M9 subset registers' detail = lv_e ).
+    DATA(ls_run) = zcl_erpl_rev_delta=>run( 'ape_t_col1' ).
+    SELECT COUNT(*) FROM zerpl_ape_d INTO @DATA(lv_src).
+    DATA(lv_tgt) = zcl_erpl_rev_delta=>scalar(
+      `SELECT count(*) AS c FROM ape_t_col1` ).
+    DATA(lv_ncol) = zcl_erpl_rev_delta=>scalar(
+      `SELECT count(*) AS c FROM duckdb_columns() WHERE lower(table_name) = 'ape_t_col1'` ).
+    ok( cond = xsdbool( ls_run-error IS INITIAL AND ls_run-skipped IS INITIAL
+                        AND lv_tgt = lv_src AND lv_ncol = 2 )
+        what = 'M9 subset replicates' detail = |{ lv_tgt }/{ lv_src } cols={ lv_ncol } { ls_run-error }| ).
+
+    " Changed set on the existing target: refused, drop + re-register.
+    ls-columns = 'RID,AMOUNT'.
+    lv_e = zcl_erpl_rev_delta=>register( ls ).
+    ok( cond = xsdbool( lv_e IS INITIAL )
+        what = 'M9 changed set re-registers' detail = lv_e ).
+    ls_run = zcl_erpl_rev_delta=>run( 'ape_t_col1' ).
+    ok( cond = xsdbool( ls_run-error CS 'drop and re-register' )
+        what = 'M9 drift refused' detail = ls_run-error ).
+
+    DATA(lv_msg) = zcl_erpl_rev_delta=>drop( 'ape_t_col1' ).
+    ok( cond = xsdbool( NOT lv_msg CS 'ERROR:' AND lv_msg CS 'erase confirmed' )
+        what = 'M9 drop clean' detail = lv_msg ).
+    DATA(ls_gone) = zcl_erpl_rev_delta=>state( 'ape_t_col1' ).
+    ok( cond = xsdbool( ls_gone-target IS INITIAL )
+        what = 'M9 no trace' detail = ls_gone-target ).
   ENDMETHOD.
 
 ENDCLASS.

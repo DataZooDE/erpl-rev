@@ -24,6 +24,11 @@ struct ApeRegistration {
     std::string wireformat;           // optional graph knob
     long long chunk_size = 0;         // 0 = engine default
     bool has_filter = false;          // ADR-1: v6 has no filter path -> refuse
+    std::string columns;              // BR-8 subset (CSV), "" = all columns.
+                                      // Names are validated live against the
+                                      // source (register + seed); keys the
+                                      // subset omits are auto-kept by the
+                                      // seed, following describe_table.
 };
 
 // Empty when valid, else the telling error for the operator.

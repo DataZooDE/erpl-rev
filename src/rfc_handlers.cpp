@@ -793,11 +793,11 @@ extern "C" RFC_RC SAP_API ZPlanImpl(RFC_CONNECTION_HANDLE,
                    ",\"deleted\":" + std::to_string(r.deleted) + "}";
         } else if (action == "APE_PURGE") {
             // End-of-cycle spill cleanup (best-effort): every spilled batch
-            // of a clean cycle merged, so the spill is garbage. A crash
+            // of a clean cycle merged, so the spill is garbage and the
+            // position returns to -1 for the next generation. A crash
             // before this leaves rows behind, and the next cycle's
             // APE_RECOVER replays them idempotently before purging again.
-            auto con = g_bridge->Connect();
-            Exec(con, "DELETE FROM _erpl_rev_ape_spill WHERE target=" + SqlLit(target));
+            ape::ApePurge(*g_bridge, target);
             plan = "{\"purged\":true}";
         } else if (action == "CDC_APPLY") {
             // The KEYS_IUD apply. It is an action rather than a parameter on

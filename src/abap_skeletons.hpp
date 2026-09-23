@@ -57,6 +57,10 @@ struct SyncState {
     // FR-2 release-gate override: "true" | "". No "false": absence IS false,
     // and a re-registration that does not restate it re-enforces the gate.
     std::string allow_unreleased;
+    // APE column subset (BR-8): CSV of stream field names, "" = all columns.
+    // Travels like every other knob (queue + generated ABAP); the server
+    // validates names against the source and seeds a subset-shaped target.
+    std::string columns;
 };
 
 // One field of the register call, in both the forms its two writers need:

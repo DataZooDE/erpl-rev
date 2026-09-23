@@ -267,6 +267,57 @@ TEST_CASE("ape_cycle: recover replays a spilled batch after a crash", "[ape]") {
     CHECK(c2.rows_applied == 0);
 }
 
+TEST_CASE("ape_cycle: a restarted batch counter is refused, never silently lost",
+          "[ape]") {
+    erpl_rev::DuckDbBridge db;
+    MakeTarget(db);
+    MakeDeltaState(db, "t");
+    // Prior cycle merged batch 0 (spilled + merged, position 0).
+    CHECK(ApeApplyDeltaPackage(db, "t", {"rid"},
+                               Pkg(kFields, "1,A,10.00,U\\n", false), 0)
+              .rows_applied == 1);
+    // A new cycle that restarts its counter at 0 re-sends index 0 with new
+    // content. Silently overwriting the spill and re-merging would strand a
+    // kill between spill and merge: RECOVER replays batch_index >
+    // spill_batch = 0, i.e. nothing. Refuse loudly instead.
+    try {
+        ApeApplyDeltaPackage(db, "t", {"rid"},
+                             Pkg(kFields, "9,nine,9.00,U\\n", false), 0);
+        FAIL("expected ApeDecodeError");
+    } catch (const ApeDecodeError &e) {
+        CHECK_THAT(e.what(), ContainsSubstring("batch"));
+    }
+    CHECK(Cell(db, "SELECT count(*) AS c FROM t WHERE rid='9'") == R"({"c":0})");
+}
+
+TEST_CASE("ape_cycle: purge starts a new spill generation", "[ape]") {
+    erpl_rev::DuckDbBridge db;
+    MakeTarget(db);
+    MakeDeltaState(db, "t");
+    CHECK(ApeApplyDeltaPackage(db, "t", {"rid"},
+                               Pkg(kFields, "1,A,10.00,U\\n", false), 0)
+              .rows_applied == 1);
+    CHECK(ApeApplyDeltaPackage(db, "t", {"rid"},
+                               Pkg(kFields, "2,B,20.00,U\\n", false), 1)
+              .rows_applied == 1);
+    // Clean cycle end: the spill is garbage AND the position returns to -1,
+    // so the next cycle counts 0, 1, ... again without colliding with the
+    // generation the purge just discarded.
+    ApePurge(db, "t");
+    CHECK(Spilled(db, "t") == 0);
+    CHECK(Cell(db, "SELECT spill_batch AS s FROM _erpl_rev_delta_state "
+                   "WHERE target='t'") == R"({"s":-1})");
+    // A kill between spill and merge of the new generation's batch 0 replays
+    // it: position -1 < 0. (Planted directly, like the recover test above.)
+    db.Execute("INSERT INTO _erpl_rev_ape_spill VALUES ('t', 0, 'x', now())");
+    db.Execute("UPDATE _erpl_rev_ape_spill SET payload='" +
+               Pkg(kFields, "9,nine,9.00,U\\n", false) +
+               "' WHERE target='t' AND batch_index=0");
+    auto c = ApeRecover(db, "t", {"rid"});
+    CHECK(c.rows_applied == 1);
+    CHECK(Cell(db, "SELECT count(*) AS c FROM t WHERE rid='9'") == R"({"c":1})");
+}
+
 TEST_CASE("ape_cycle: DELTA control envelopes spill nothing", "[ape]") {
     erpl_rev::DuckDbBridge db;
     MakeTarget(db);

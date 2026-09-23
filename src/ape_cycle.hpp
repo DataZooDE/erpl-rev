@@ -61,7 +61,9 @@ struct ApeDeltaCounts {
 // merge replays exactly the unmerged tail. Empty polls (control envelopes)
 // spill nothing and advance nothing. Throws ApeDecodeError on anything
 // refusal-shaped: unknown target, missing registration, no operation column,
-// row-width mismatch, a target column the package does not carry.
+// row-width mismatch, a target column the package does not carry, or a batch
+// index at/below the merged position (a restarted cycle counter, which would
+// otherwise strand a spill-then-crash package past recovery).
 ApeDeltaCounts ApeApplyDeltaPackage(DuckDbBridge &db, const std::string &target,
                                     const std::vector<std::string> &keys,
                                     const std::string &package_json,
@@ -73,6 +75,13 @@ ApeDeltaCounts ApeApplyDeltaPackage(DuckDbBridge &db, const std::string &target,
 // the position is a no-op.
 ApeDeltaCounts ApeRecover(DuckDbBridge &db, const std::string &target,
                           const std::vector<std::string> &keys);
+
+// Clean-cycle spill cleanup: discard the target's spill rows AND return
+// spill_batch to -1, starting a new spill generation. The next cycle counts
+// 0, 1, ... again without colliding with the discarded generation; a kill
+// between spill and merge of the new generation replays from -1. Only a
+// clean end (every spilled batch merged) may purge.
+void ApePurge(DuckDbBridge &db, const std::string &target);
 
 }  // namespace ape
 }  // namespace erpl_rev

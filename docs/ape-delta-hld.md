@@ -285,3 +285,58 @@ construction, protocol §9). Consequences:
   dialog session (HTTP dead, work process alive) keeps heartbeating until
   TIME_OUT; the 600 s lease TTL plus reclaim is what unblocks the next
   cycle.
+
+## 12. Codex-findings amendments (supersede §4–§6 where they differ)
+
+An independent read-only review returned 8 findings with the verdict "not
+safe as lossless". All eight are fixed below; the DoD suite gains APEDLTN
+(m1 + m2 + m9: the AC-4 negative matrix) and every suite re-runs green.
+
+- Spill generations (critical): `lv_post` restarted at 0 every DELTA cycle
+  while `spill_batch` persisted, so a kill between spill and merge replayed
+  nothing whenever the new index sat at/below the stale position. Each
+  cycle now seeds its counter from `spill_batch + 1` (re-read after
+  RECOVER, which advances it); a clean-end `APE_PURGE` returns the position
+  to -1, starting a new generation; the server refuses any batch at/below
+  the merged position loudly instead of merging it.
+- Witnessed erase: `ape_erase` returned void and ignored the engine. It now
+  returns a flag -- true only with no E/F/A across create + drain and (when
+  the caller names the subscription) a post re-lookup that finds nothing.
+  `drop` reports "erase confirmed" vs "erase unverified"; cleanup stays
+  best-effort and never raises.
+- Fenced drop: the final state delete carries the fresh-lease predicate
+  itself (single statement -- a cycle starting mid-drop loses atomically,
+  drop refused, row survives) with a re-read to tell "cycle won" from
+  "drop won"; `run()` re-validates the registration after taking the lease.
+  No `DROPPING` status: the predicate plus re-validation close the window
+  without new vocabulary.
+- DELTA preparation bound (FR-5): pre-data rowless polls no longer count
+  toward K, and K = 3 applies post-data only, tracked by stream rows
+  (replay rows must not flip a still-preparing graph to post-data rules).
+  A first attempt failed loudly after 36 pre-data polls -- but a drained
+  established stream is indistinguishable from slow preparation at poll
+  level, so that turned every quiet idle cycle into an error (AC-3). The
+  shipped rule: only a NEW subscription (created this cycle) warns after 36
+  quiet polls -- the warning names the CDC jobs and stays observable on
+  `last_warning`, the exit stays clean and lossless. Resumed subscriptions
+  keep the fast K = 3 clean exit. The absolute 360-poll backstop is
+  unchanged.
+- FULL stall cap: 360 rowless polls after first data end the scan as an
+  error (without `lastBatch` nothing merged, so clean would lie);
+  `ape_stop` still runs on every loop exit, so no graph leaks. The 60-poll
+  pre-data timeout and its message are unchanged.
+- Shared rule: both loops terminate through the public pure
+  `ape_poll_state` (headless-probed, no engine needed) instead of inline
+  counters. Classrun probes, not ABAP Unit: the repo has no testclasses
+  deploy/run plumbing, so the predicate is public and the classruns assert
+  it directly.
+- Columns subset (BR-8, full projection per decision): `columns` travels
+  registration (CLI `--columns` → `RegisterFields` → queue/generated ABAP
+  → `ty_state`, plus migration v11) and is validated at plan time against
+  the source (unknown names fail registration). The seed shapes
+  subset targets via `describe_table`'s `iv_columns`; merge/staging project
+  by name with no code change (they already map target columns by name).
+  Keys the subset omits are auto-kept (describe/SLT convention, not
+  refused). A changed set on an existing target is refused at seed (drop +
+  re-register); full-width targets stay unchecked. `columns` on non-APE
+  methods is refused rather than ignored.

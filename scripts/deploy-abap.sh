@@ -112,6 +112,7 @@ cls ZCL_ERPL_REV_APEDLTA    zcl_erpl_rev_apedlta.abap    "APE DELTA converge (m4
 cls ZCL_ERPL_REV_APEDLTB    zcl_erpl_rev_apedltb.abap    "APE DELTA carry+restore (m4b)"
 cls ZCL_ERPL_REV_APEDLTC    zcl_erpl_rev_apedltc.abap    "APE recover + stale graph (m5-m6) + drop (m8)"
 cls ZCL_ERPL_REV_APEDLTV    zcl_erpl_rev_apedltv.abap    "APE 100k volume (m7)"
+cls ZCL_ERPL_REV_APEDLTN    zcl_erpl_rev_apedltn.abap    "APE AC-4 negatives (m1+m2+m9)"
 
 echo "== reports (worker before the report -- the parallel branch SUBMITs it) =="
 prog Z_ERPL_REV_REPL_WORKER   z_erpl_rev_repl_worker.prog.abap   "parallel-replication worker"

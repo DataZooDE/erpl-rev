@@ -180,6 +180,12 @@ const std::vector<Migration> &Migrations() {
         "SELECT 1",
     }},
 
+    // v11 -- APE columns subset (BRD BR-8): CSV of stream field names,
+    // ""/NULL = all columns. The seed shapes subset targets from it.
+    {11, "ape: registered column subset", {
+        "SELECT 1",
+    }},
+
     };
     // clang-format on
     return kMigrations;
@@ -254,6 +260,8 @@ void ApplyColumnAdds(duckdb::Connection &con, int version) {
         const char *st = "_erpl_rev_delta_state";
         AddColumnIfMissing(con, st, "allow_unreleased", "BOOLEAN DEFAULT false");
         AddColumnIfMissing(con, st, "last_warning", "VARCHAR");
+    } else if (version == 11) {
+        AddColumnIfMissing(con, "_erpl_rev_delta_state", "columns", "VARCHAR");
     }
 }
 
