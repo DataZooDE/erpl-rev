@@ -32,8 +32,10 @@ erpl-rev doctor     # verifies the objects the server expects are present
 
 ## The control database migrates itself, and only forwards
 
-On first open the binary applies migrations **v2 through v8** to your existing
+On first open the binary applies migrations **v2 through v11** to your existing
 `.duckdb` file. It is in place and automatic; there is no export/import step.
+(v9 adds the APE subscription/spill state, v10 the release-gate override and
+warning, v11 the registered column subset.)
 
 - **A file is never downgraded.** An *older* binary opening a *newer* file refuses
   to open it and names both versions, rather than failing deep inside a query for a

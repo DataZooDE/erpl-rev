@@ -6,6 +6,13 @@ erpl `ape/docs/protocol.md`; this HLD cites its sections instead of copying them
 
 ## 1. Introduction and goals
 
+> How to read this document: §§2–§10 record the **original client-port
+> design** (C++ owns graph I/O over a new outbound RFC path). That plan was
+> **not built** — §11 inverted it (ABAP drives DHAPE in-session; C++ handles
+> packages/merge/recovery) and §12 reworked review findings. Where §§2–§10
+> differ from §11/§12 and the code, §11/§12 and the code are normative; the
+> earlier sections stay as decision history.
+
 erpl-rev gains two delta methods, `APE_FULL` (snapshot/seed) and `APE_DELTA`
 (incremental with real deletes), for CDS entities on APE-capable S/4 systems
 (BRD §2). Quality goals, in order:
@@ -63,15 +70,12 @@ parameters; any change to the five existing read paths.
 
 ## 4. Solution strategy
 
-- **Reuse `erpl_ape`'s client logic** (graph spec → JSON, session create/poll/stop,
-  CSV-package decode, subscription inventory/erase, spill). Recommended packaging:
-  consume the private `erpl-ape` repo as a library/submodule inside the erpl-rev
-  build (OQ-1 for the implementing session to confirm; fallback is a vendored
-  port, which must stay behaviour-identical and is the worse option).
-- **Server-driven cycles.** The ABAP scheduler keeps dispatching by method, but
-  for APE targets it calls one new server endpoint (e.g. `Z_DUCKDB_APE_RUN`, in
-  the style of `Z_DUCKDB_CDC_APPLY`): all graph I/O happens inside the C++
-  server on a pinned connection, satisfying C-3. ABAP never holds graph state.
+- **Reuse `erpl_ape`'s client logic** *(plan superseded by §11: only the
+  graph-shape/decode knowledge was reused; no client was ported — ABAP holds
+  graph state in-session, satisfying C-3 without a pinned server connection).*
+- **Server-driven cycles.** *(plan superseded by §11: ABAP drives; the server
+  exposes per-package `Z_DUCKDB_APE_RUN` plus `APE_RECOVER`/`APE_PURGE`
+  plan actions instead of owning the loop).*
 - **Position = subscription.** Unlike watermark methods there is no change-column
   window: the resume token is the named SAP-side subscription (`subscriber_process`
   per target). Cycle commit = merge commit + spill bookkeeping; nothing advances
@@ -88,9 +92,13 @@ Key design decisions (ADR shortlist):
 - ADR-2 *Spill-before-merge + replay.* The engine commits on handover
   (protocol §13); the spill is the only copy after a crash. Persist raw packages
   first, merge second.
-- ADR-3 *Termination asymmetry.* Initial load ends on `lastBatch`/port close;
-  replication ends after K consecutive empty roundtrips post-data (default 3),
-  with the preparation timeout applying only pre-first-data (protocol §13).
+- ADR-3 *Termination asymmetry.* Initial load ends on `lastBatch` (any exit
+  without it errors untouched; 60-poll pre-data error, 360-poll post-data
+  stall error). Replication ends after K consecutive empty roundtrips
+  post-data (default 3); pre-data quiet never counts toward K — a quiet new
+  subscription warns observably and exits clean, a quiet resumed one exits
+  clean after K (protocol §13; see §12 for why erroring quiet drains was
+  rejected).
 - ADR-4 *Release gate default-off.* Unreleased CDS refused unless an explicit,
   WARN-logged override is set (mirrors `erpl_ape_allow_unreleased`).
   Release state is read from the ARS catalog view `I_APISFORCLOUDDEVELOPMENT`
@@ -109,21 +117,22 @@ reader) are reused unchanged.
 
 | Block | Responsibility | Notes |
 |---|---|---|
-| `ApeClient` (new, C++) | Owns one pinned RFC client connection; `Create(spec)` → `Roundtrip` loop → `Stop` (noexcept); capability probe (`DHAPE_GRAPH_VERSION` + `DHAMB_SERVICE_SYSTEM`) | Wraps/reuses `ApeSession`, `ApeGraphSpec`, `ApeDecodedPackage` from `erpl_ape` |
-| `ApeCycle` (new, C++) | One cycle: GC stale graphs → create/resume subscription → poll → decode → spill → merge → stats; `recover` replay path that never touches SAP | Called from the new `Z_DUCKDB_APE_RUN` handler; single-threaded per target (graph session affinity) |
-| `ApeMerge` (new, thin) | Maps `/1DH/OPERATION`: `U`/blank → keyed upsert, `D` → delete by key; keeps the engine-computed `I`/`U`/`D` verdict for `_erpl_rev_log_<target>` | Reuses the existing MERGE path (`Z_DUCKDB_INGEST MODE=MERGE` semantics) |
-| State migration (new) | Extends `_erpl_rev_delta_state` with `subscriber_process`, `chunk_size`, `wireformat`, `last_batch_index`, `spill_batch`; method enum += `APE_FULL`, `APE_DELTA` | One idempotent migration per C-6; CLI/ABAP registration writes the new fields |
-| CLI + ABAP registration (extended) | `sync create --method APE_*` flags; `register()` params; cadence-floor refusal for `micro:*` on APE methods | Telling errors per BRD FR-2/AC-4 |
+| `ApeClient` (superseded by §11 — never built) | Was to own one pinned RFC client connection; graph I/O lives ABAP-side instead (`zcl_erpl_rev_delta`, DHAPE in-session) | No outbound RFC path exists |
+| `ApeCycle` (C++, as built) | Per package: decode → spill → keyed merge; `recover` replays every spilled batch above `spill_batch`, in order; `purge` starts a new spill generation | Called from `Z_DUCKDB_APE_RUN`; single-threaded per target |
+| `ApeMerge` (thin, as built) | Maps `/1DH/OPERATION`: `U`/blank → keyed upsert, `D` → delete by key; maps target columns by name (subset targets project naturally) | Reuses the existing MERGE path (`Z_DUCKDB_INGEST MODE=MERGE` semantics) |
+| State migration (built) | `_erpl_rev_delta_state` carries `subscriber_process`, `chunk_size`, `wireformat`, `last_batch_index`, `spill_batch`, `allow_unreleased`, `last_warning`, `columns` (v9–v11); method enum += `APE_FULL`, `APE_DELTA`; plus `_erpl_rev_ape_spill(target, batch_index, payload, spilled_ts)` | One idempotent migration per C-6; CLI/ABAP registration writes the new fields |
+| CLI + ABAP registration (extended) | `sync create --method APE_*` flags incl. `--columns`; `register()` params; cadence-floor refusal for `micro:*` on APE methods; unknown subset columns refused at plan time | Telling errors per BRD FR-2/AC-4 |
 | `cds_delta` (extended) | Recognise `@Analytics.dataExtraction.*` annotations; suggest/refuse `APE_DELTA` accordingly | Small, pure, unit-testable (existing style) |
 
 ## 6. Runtime view
 
-`APE_FULL` cycle:
+`APE_FULL` cycle (ABAP drives; no `ApeClient`):
 
 ```
-run(target) → lease → ApeClient::probe → Create(v6 graph, subscription New/unique)
-  → poll ROUNDTRIP (2 s) until lastBatch/port-close [prep timeout guards]
-  → per package: decode → spill? (no: full re-runs cheaply) → merge(upsert)
+run(target) → lease → seed (subset-aware) → Create(v6 graph, subscription New/unique)
+  → poll ROUNDTRIP (2 s flowing / 10 s idle) until lastBatch [60-poll pre-data
+    error; 360 rowless post-data polls error, target untouched]
+  → per package: stage → on lastBatch: reconcile staging onto target
   → Stop(graph) → erase subscription (best-effort) → stats → release
 ```
 
@@ -131,14 +140,17 @@ run(target) → lease → ApeClient::probe → Create(v6 graph, subscription New
 
 ```
 run(target) → lease → GC stale R-graphs (read_graph_ids_by_status+is_session_active)
-  → lookup subscription by (cds, subscriber_process); New or Existing
-  → Create → poll: empty pre-data ⇒ preparing (prep timeout); empty post-data ×K ⇒ done
+  → subset-aware seed + shape check → APE_RECOVER (replay all batches above
+    spill_batch; no SAP contact) → lookup subscription by (cds, subscriber_process)
+  → resume or create (counter seeded past spill_batch) → poll: post-data empty ×K ⇒ done;
+    pre-data quiet never counts (new quiet warns at 36, resumed quiet exits at K); 360 cap
   → per package: spill BEFORE merge → merge(U=upsert, D=delete-by-key)
-  → Stop(graph), keep subscription → stats → release
+  → Stop(graph), keep subscription → purge (new spill generation) → stats → release
 ```
 
-`recover` cycle: read latest spilled batch → decode → merge → discard batch. No
-SAP contact (a graph would advance the subscription past owed changes).
+`recover`: read every spilled batch above `spill_batch`, in order → decode →
+merge → advance position → discard replayed prefix. No SAP contact (a graph
+would advance the subscription past owed changes).
 
 Concurrency: one active cycle per target (existing lease); one graph per cycle
 (session affinity). No intra-cycle parallelism in v1 (chunkSize stays the
@@ -146,12 +158,10 @@ throughput knob; protocol §14: 100k×8 ≈ 40 s, wide tables are decode-bound).
 
 ## 7. Deployment view
 
-No new process. The server binary gains an outbound RFC client (same `nwrfcsdk`,
-new `RfcOpenConnection` client handle + stored `sap_rfc`-style credentials —
-secret plumbing to be designed in implementation, reusing ADT credential patterns
-where possible). Network: server → SAP gateway/message server must allow
-inbound RFC (this is the genuinely new operational requirement vs today's
-register-outbound + ADT-HTTP topology). SAP authorisations: RFC rights for
+No new process, and — per §11 — **no outbound RFC client**: the server never
+calls SAP, so no client handle, no stored SAP credentials, and no new
+server→gateway network path beyond today's register-outbound + ADT-HTTP
+topology. SAP authorisations (ABAP session side): RFC rights for
 `DHAPE_*`/`DHAMB_*` + `S_DHCDC*` for the CDC jobs + background-job capacity for
 preparation.
 
@@ -186,6 +196,9 @@ preparation.
 
 ## 10. Implementation plan (for the coding-agent session)
 
+*(Historical: the client-port plan as written before implementation. Built
+instead per §11/§12; the live DoD split is APETEST/APEDLTA/B/C/V/N.)*
+
 Phase 0 — gates: policy clearance (C-5); OQ-1 packaging decision; credential +
 network path for outbound RFC proven with `DHAPE_GRAPH_VERSION` from the server
 host. Do not proceed without all three.
@@ -208,7 +221,7 @@ values, mapping/validation); integration (recorded packages); E2E on A4H
 (`scripts/e2e.sh` style: seed → full → I/U/D → kill-cycle → stale-graph);
 negative matrix (AC-4). Definition of done = BRD §6 AC-1–AC-5 all green.
 
-## 11. Phase-2 implementation amendments (supersede §4–§6 where they differ)
+## 11. Phase-2 implementation amendments (supersede §§2–§10 where they differ)
 
 ABAP drives DHAPE; there is no C++ outbound RFC client. The shim exposes
 `RfcOpenConnection`/`RfcPing` but no invoke surface, and the SDK is gone by
@@ -249,13 +262,16 @@ construction, protocol §9). Consequences:
   has no table for the replay to read), and the replay must precede any SAP
   contact (a graph would advance the subscription past owed changes).
 - Drop (FR-9) is `sync drop <target>` → queued `sync_drop` verb → CLIDRV →
-  `zcl_erpl_rev_delta=>drop`: refuse on a fresh RUNNING lease, erase the
-  SAP-side subscription by id when the target has one (best-effort, like all
-  cleanup), then delete the state row plus its spill (an orphaned spill can
-  never replay: RECOVER refuses unregistered targets). Unknown targets report,
-  they do not fail. The DuckDB target table stays: retention is the operator's
-  call. Proven by m8 (refuse, erase-message witness, gone, idempotent,
-  re-register, converge, final drop).
+  `zcl_erpl_rev_delta=>drop`: refuse on a fresh RUNNING lease (a stale one
+  proceeds), erase the SAP-side subscription by id when the target has one,
+  then delete the state row plus its spill in one fenced statement (an
+  orphaned spill can never replay: RECOVER refuses unregistered targets).
+  The erase is witnessed: success needs no E/F/A engine message plus, when
+  the subscription is named, a re-lookup proving it gone — the message says
+  `erase confirmed` vs `erase unverified`. Unknown targets report, they do
+  not fail. The DuckDB target table stays: retention is the operator's call.
+  Proven by m8 (refuse, witness, stale-lease, gone, idempotent, re-register,
+  converge, final drop).
 - Two-row handovers: a 3-DML commit streams its FIRST TWO DMLs per cycle
   window (measured twice: carry `[I,U]`, restore `[D,U]`; two drained top-up
   cycles found no tails). The third DML's image never streams -- clipped, not
@@ -279,14 +295,17 @@ construction, protocol §9). Consequences:
 - Classrun budget: one m1-m6 classrun exceeds the dialog TIME_OUT
   (~10 min, HTTP 500, results lost). The DoD suite is split — APETEST
   (m1-m3), APEDLTA (m4a converge), APEDLTB (m4b surgery/carry/restore),
-  APEDLTC (m5 recover, m6 stale graph). A `run()` skipped on a held lease
+  APEDLTC (m5 recover, m6 stale graph, m8 drop), APEDLTV (m7 100k volume),
+  APEDLTN (AC-4 negatives m1+m2+m9). Client calls need `--timeout 600`:
+  past the 120 s default the caller reports HTTP 500 while the dialog
+  session keeps working unseen. A `run()` skipped on a held lease
   returns error-initial with `rs-skipped = X`: tests assert
   `skipped IS INITIAL`, turning vacuous passes into loud skips. An orphaned
   dialog session (HTTP dead, work process alive) keeps heartbeating until
   TIME_OUT; the 600 s lease TTL plus reclaim is what unblocks the next
   cycle.
 
-## 12. Codex-findings amendments (supersede §4–§6 where they differ)
+## 12. Codex-findings amendments (supersede §§2–§10 where they differ)
 
 An independent read-only review returned 8 findings with the verdict "not
 safe as lossless". All eight are fixed below; the DoD suite gains APEDLTN

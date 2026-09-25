@@ -3,10 +3,16 @@
 erpl-rev can keep a DuckDB target in sync with a SAP source **incrementally** —
 loading only what changed since the last cycle — on top of the existing full-load
 path. All merge logic and all delta state live in the C++/DuckDB server; the ABAP
-side stays a thin reader that selects changed rows with plain Open SQL. **No SAP
-interface restricted by the April-2026 API policy is used** (no ODP-RFC, no SAPI/BW
-Service API, no `RFC_READ_TABLE`) — every source read is Open SQL / CDS / native-SQL
-in a customer `Z` function module.
+side stays a thin reader that selects changed rows with plain Open SQL — except
+for the APE path (§"The sixth path" below), where ABAP itself drives SAP's
+DHAPE engine in-session and the server handles packages, staging, and merge.
+**No SAP interface restricted by the April-2026 API policy is used** (no ODP-RFC,
+no SAPI/BW Service API, no `RFC_READ_TABLE`) — every source read is Open SQL /
+CDS / native-SQL in a customer `Z` function module.
+
+In short: **choose a method** (table below), **register** it with `sync create`,
+**run once and verify** with `sync run` + `sync validate` — then automate via
+the SAP periodic job or the daemon.
 
 ## Architecture
 
@@ -25,7 +31,7 @@ Config **and** runtime state live in one DuckDB table, `_erpl_rev_delta_state`
 (created at server boot), read/written through the existing `Z_DUCKDB_QUERY` — there
 is **no new `Z` table in SAP**.
 
-## The five methods
+## The methods (all seven)
 
 | Method | Use when | How it reads | Apply |
 |--------|----------|--------------|-------|
@@ -34,23 +40,35 @@ is **no new `Z` table in SAP**.
 | **CHANGEDOC** | weak/absent change column (e.g. `MARA`, `MAKT`) | CDHDR `WHERE objectclas=… AND (udate>… OR (udate=… AND utime>…))` → business keys → **re-read** current rows from the source by key | keyed upsert |
 | **SNAPSHOT** | physical deletes, or bounded column-less tables | full reload into `<target>__snap` (the normal full-load path) | server anti-join: upsert all of staging **and DELETE target keys absent from it** |
 | **CDC** | physical deletes on a table too large to snapshot | database triggers on the source write a shadow log; the cycle drains it | delete-then-upsert per net operation — see [`cdc.md`](cdc.md) |
+| **APE_FULL** | one-off snapshot of a CDS view | SAP DHAPE engine, unique-per-scan subscription | staging → snapshot merge |
+| **APE_DELTA** | ongoing replication of a CDS view incl. deletes | SAP DHAPE engine, named resumed subscription | keyed merge (`U` upsert, `D` delete by key) |
 
-Rule of thumb: **timestamp present → WATERMARK; append-only huge → INSERT_ONLY;
+Rule of thumb: **CDS view with extraction enabled → APE_DELTA** (snapshot → APE_FULL);
+**timestamp present → WATERMARK; append-only huge → INSERT_ONLY;
 no/weak change column → CHANGEDOC for I/U + nightly SNAPSHOT for deletes; bounded &
-column-less → just SNAPSHOT.** Physical deletes are reflected **only** by SNAPSHOT
-(no change column can report a row that no longer exists) — or, for a table too large
-to snapshot, by the opt-in **trigger-CDC** tier (see [`cdc.md`](cdc.md)).
+column-less → just SNAPSHOT.** Physical deletes are reflected by SNAPSHOT, the
+trigger-CDC tier (see [`cdc.md`](cdc.md)), or APE_DELTA — a plain change column
+can never report a row that no longer exists.
 
-## The sixth path: APE_FULL / APE_DELTA (SAP DHAPE extraction)
+No separate initial-load step exists: APE cycles seed their own target first,
+SNAPSHOT reloads every cycle by definition, and the other methods start from
+their watermark/position on the first cycle.
+
+## APE path details: APE_FULL / APE_DELTA (SAP DHAPE extraction)
 
 For **CDS views** with `@Analytics.dataExtraction.enabled: true`, erpl-rev can
-extract through SAP's own DHAPE engine instead of Open SQL. Two methods, same
+extract through SAP's own DHAPE engine instead of Open SQL. Prerequisites
+before registering: an APE-capable S/4 (DHAPE engine present), the extraction
+annotations on the view (plus `...delta.changeDataCapture.automatic: true`
+for APE_DELTA), working CDC background jobs (`S_DHCDC*` authorisations), a
+C1-released view — or `--allow-unreleased` as a development/test escape hatch
+(WARN-logged on the row) — and a non-`micro:*` cadence. Two methods, same
 registry, same scheduler:
 
 | Method | Use when | How it reads | Apply |
 |--------|----------|--------------|-------|
-| **APE_FULL** | snapshot of a CDS view | unique-per-scan subscription, ends on `lastBatch` | staging → snapshot merge; subscription erased afterwards |
-| **APE_DELTA** | ongoing replication of a CDS view (`...delta.changeDataCapture.automatic: true` additionally required) | named subscription, resume-or-create; ends after 3 consecutive rowless polls | per-package spill → keyed merge (`U` upsert, `D` delete by key) |
+| **APE_FULL** | snapshot of a CDS view | unique-per-scan subscription, ends on `lastBatch`; errors when the stream stalls 360 polls after first data | staging → snapshot merge; subscription erased afterwards |
+| **APE_DELTA** | ongoing replication of a CDS view (`...delta.changeDataCapture.automatic: true` additionally required) | named subscription, resume-or-create; ends after 3 consecutive rowless polls once data has streamed (a quiet new subscription warns instead) | per-package spill → keyed merge (`U` upsert, `D` delete by key) |
 
 Register from the CLI (not from the Delta tab):
 
@@ -64,16 +82,24 @@ erpl-rev sync create ape_flights \
 
 `--subscriber-process` names the SAP-side subscription (unique-per-scan names are
 minted for `APE_FULL`, the name is resumed for `APE_DELTA`); `--chunk-size`
-sizes engine handovers (default 20000); `--allow-unreleased` accepts `$TMP`/unreleased
-views with a WARN logged on the row; `micro:*` cadences are refused. Re-running
-`sync create` on an existing target is create-or-update, as with the five methods.
+sizes engine handovers (default 20000); `micro:*` cadences are refused.
+Re-running `sync create` on an existing target is create-or-update, as with
+the other methods.
 
-Cycle order for `APE_DELTA` is lease → stale-graph GC → seed → spill replay
-(`APE_RECOVER`, no SAP contact) → poll → release. The seed-first snapshot means
-state converges even when a stream handover clips: measured on A4H, one cycle
-window carries a commit's first two DMLs, so a delete lands within 1–2 cycles
-while counts and keys stay exact. Every spilled package replays after a crash;
-a second replay is a no-op.
+Column subset (`--columns`): replicate only the named stream fields — the
+target will contain exactly those columns. Key columns you omit are added
+automatically. Unknown names fail at registration with a telling error. To
+change the selection later, drop the target and re-register; `--columns` on
+a non-APE method is refused rather than ignored.
+
+A cycle runs lease → cleanup → seed → spill replay (crashed packages apply
+automatically, a second replay changes nothing) → poll → release. The
+seed-first snapshot means state converges even when a stream handover clips:
+measured on A4H, one cycle window carries a commit's first two DMLs, so a
+delete lands within 1–2 cycles while counts and keys stay exact. If a cycle
+reports a stale batch error, the saved crash position and the incoming
+package counter disagree — do not retry blindly, check for a second
+server/database writing the same target.
 
 Retire a target with the explicit drop (FR-9):
 
@@ -82,16 +108,22 @@ erpl-rev sync drop ape_flights
 ```
 
 This erases the SAP-side subscription and deletes the state row plus its spill,
-and refuses while a cycle holds a fresh lease. Dropping an unknown target
-reports instead of failing. The DuckDB table itself is kept.
+and refuses while a cycle holds a fresh lease (a cycle starting mid-drop loses
+atomically: the drop is refused and the row survives). The drop reports `erase
+confirmed` only when SAP raised no error and the subscription is gone on
+re-lookup, otherwise `erase unverified` — cleanup stays best-effort either
+way, and the local registration is removed in both cases: after an
+`erase unverified`, check the subscription in SAP (`DHAPE_SUBSCR`) and erase
+it there if it survives. A stale (orphaned) lease does not block the drop.
+Dropping an unknown target reports instead of failing. The DuckDB table
+itself is kept.
 
 One operator note: amounts under `...Plus Currency` wire formats are
 **currency-shifted by design** — compare against APE semantics, not Open-SQL
 values (cell-for-cell parity excludes `AMOUNT`).
 
 Live proof on A4H is the `ZCL_ERPL_REV_APETEST` milestones, split across
-classruns for the dialog budget: A (converge), B (surgery + carry + restore),
-C (spill replay + stale graph + drop), V (100k rows, key-count == row-count).
+classruns — see [`testing.md`](testing.md#the-ape-path).
 
 ## Registering a target
 
@@ -109,7 +141,7 @@ only the fields you pass. The flags map one-to-one onto the registry:
 | flag | field | |
 |---|---|---|
 | *(positional)* | `target` | the DuckDB table to fill |
-| `--method` | `method` | `WATERMARK` \| `INSERT_ONLY` \| `CHANGEDOC` \| `SNAPSHOT` \| `CDC` |
+| `--method` | `method` | `WATERMARK` \| `INSERT_ONLY` \| `CHANGEDOC` \| `SNAPSHOT` \| `CDC` \| `APE_FULL` \| `APE_DELTA` (APE needs `--subscriber-process`; see "The sixth path" above) |
 | `--source` | `source_from` | the SAP table, CDS view or calc view |
 | `--keys` | `keys` | the key columns, comma-separated |
 | `--chg-col` | `chg_col` | the column a watermark advances on |
@@ -120,6 +152,11 @@ only the fields you pass. The flags map one-to-one onto the registry:
 | `--log` / `--no-log` | `log_enabled` | keep a per-target change log |
 | `--load-type-default` | `load_type_default` | `D`, `I`, `L` or `F` |
 | `--allow-empty-reload` | `allow_empty_reload` | permit an `F` that reads nothing |
+| `--subscriber-process` | `subscriber_process` | APE only: SAP-side subscription name |
+| `--chunk-size` | `chunk_size` | APE only: engine handover size (default 20000) |
+| `--wireformat` | `wireformat` | APE only: engine wire-format string |
+| `--allow-unreleased` | `allow_unreleased` | APE only: accept unreleased CDS (WARN-logged) |
+| `--columns` | `columns` | APE only: replicate this subset by name (empty = all) |
 
 Trigger-CDC targets need one more step after this — `erpl-rev cdc provision` — see
 [`cdc.md`](cdc.md).
@@ -191,8 +228,9 @@ erpl-rev sync ls                   # what is registered, and how far behind
 erpl-rev sync show sales           # one target in detail
 ```
 
-To have cycles run without being asked, use the daemon
-([`daemon.md`](daemon.md)) or the periodic job below.
+To have cycles run without being asked: run once manually to verify, then
+choose the SAP periodic job for cadences of a minute or more, or the daemon
+for sub-minute targets (APE targets use hourly or slower cadences).
 
 ### The same from ABAP
 

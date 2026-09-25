@@ -275,11 +275,11 @@ suite parity ZCL_ERPL_REV_PARITYTEST abap/zcl_erpl_rev_paritytest.abap PARITY 10
 suite cdc ZCL_ERPL_REV_CDCTEST abap/zcl_erpl_rev_cdctest.abap CDC 49 "" \
   "real HANA triggers capture physical deletes; a RAW column survives the log as bytes"
 
-# APE registration (Phase 1): FR-2 fail-fast gates plus the knob round-trip.
-# Cycle coverage (FULL/DELTA) extends this suite in Phases 2-3 under the same
-# marker; the min-pass count grows with it.
+# APE (DoD AC-1..AC-5): FR-2 fail-fast gates, release gate, FULL scan (m1-m3);
+# the DELTA/volume/negative milestones run under the APEDLTA/B/C/V/N split
+# drivers (same milestones as ZCL_ERPL_REV_APETEST run_dlta/dltb/dltc/dltv/ac4).
 suite ape ZCL_ERPL_REV_APETEST abap/zcl_erpl_rev_apetest.abap APE 14 "" \
-  "APE registration gates: fail-fast refusals and knob round-trip"
+  "APE gates + FULL: fail-fast refusals, release gate, knob round-trip, scan"
 
 
 suite partition ZCL_ERPL_REV_PARTEST abap/zcl_erpl_rev_partest.abap PARTITION 9 "" \

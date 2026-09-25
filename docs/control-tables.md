@@ -37,7 +37,8 @@ existing database with no version bump.
 | Table | One row per | Purpose |
 |---|---|---|
 | `_erpl_rev_schema_version` | migration | which binary applied what, and when |
-| `_erpl_rev_delta_state` | target | method, source, keys, watermark, safety window, cadence, load type, backoff and parking, logging, transform, validation policy, lease and `active_run_id` |
+| `_erpl_rev_delta_state` | target | method, source, keys, watermark, safety window, cadence, load type, backoff and parking, logging, transform, validation policy, lease and `active_run_id`, APE subscription settings (`subscriber_process`, `chunk_size`, `wireformat`), spill position (`spill_batch`), release override/warning (`allow_unreleased`, `last_warning`), registered column subset (`columns`) |
+| `_erpl_rev_ape_spill` | spilled package | crash-recovery spill for APE_DELTA: `(target, batch_index)` keyed payloads plus the merged position |
 | `_erpl_rev_run_stats` | run | status, counts, duration, watermarks, load type, validation status, lag |
 | `_erpl_rev_cdc` | trigger target | platform, mode, log and trigger table names, position, status, shadow depth, tuning |
 | `_erpl_rev_daemon` | server (one row) | instance, heartbeat, tick interval, worker budget, full-load share, stop flag, ticks |
@@ -134,7 +135,7 @@ dashboard reads.
 | `ts` | when the run was recorded (server clock — same source as the delta state) |
 | `target` / `source` | DuckDB target table / SAP source entity |
 | `run_type` | `FULL` \| `DELTA` |
-| `method` | `FULL` \| `WATERMARK` \| `SNAPSHOT` \| `CHANGEDOC` \| `INSERT_ONLY` \| `CDC` |
+| `method` | `FULL` \| `WATERMARK` \| `SNAPSHOT` \| `CHANGEDOC` \| `INSERT_ONLY` \| `CDC` \| `APE_FULL` \| `APE_DELTA` |
 | `status` | `SUCCESS` \| `ERROR` |
 | `duration_ms` | wall-clock of the run |
 | `rows_read` | rows pulled from SAP |

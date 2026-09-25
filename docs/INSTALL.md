@@ -3,6 +3,11 @@
 Two parts: (1) get the **ABAP objects** into the SAP system, (2) install the
 **external server** + wire up the gateway. Read `docs/security.md` alongside this.
 
+Which path are you on? **DEV/non-production with `S_DEVELOP`** → run `setup`
+below and you are done. **QA/production** → build the transport request once
+on a controlled DEV system (§1), then import it normally (STMS) and continue
+at §2.
+
 > **Try `erpl-rev setup` first.** If you installed via `uvx erpl-rev`, most of this
 > document is automated:
 >
@@ -30,6 +35,9 @@ Two parts: (1) get the **ABAP objects** into the SAP system, (2) install the
 
 ## 0. Prerequisites
 - SAP NetWeaver AS ABAP **7.40 SP05+** (tested on A4H / ABAP 7.5x).
+- ADT access to the system (host/port/user/client in `erpl-rev doctor`'s reach),
+  a user with `S_DEVELOP` for `setup` (or a Basis owner for the transport path),
+  and gateway details for the registration step (§2).
 - A host for the external server (Linux) with network access to the SAP **gateway**
   (`sapgw<nr>`, default port 33<nr>).
   **A released bundle needs nothing else** — since `v2026.08.30` the RFC protocol is
@@ -41,10 +49,11 @@ Two parts: (1) get the **ABAP objects** into the SAP system, (2) install the
 
 ## 1. Import the ABAP transport (the package `ZERPL_CORE`)
 
-> **There is no prebuilt transport to download**, and there cannot be: a transport
+> Build the request once on a DEV system you control — the binary does it for
+> you (§1.0) — then release it and import it downstream in the normal way.
+> There is no prebuilt transport to download, and there cannot be: a transport
 > carries the originating system's object directory, so a generic one is not
-> something we can publish. You build it on a system you control — which the binary
-> can do for you.
+> something we can publish.
 
 ### 1.0 Producing the request on your own DEV system
 
@@ -114,14 +123,18 @@ Use **`ARCHIVFILE_CLIENT_TO_SERVER`** (SE37) to upload both files to the server'
 the standard path for importing a transport onto a system you have no shell access
 to, and the one other SAP add-ons document.)
 
-## 2. Post-import setup (run once)
-1. Run classrun **`ZCL_ERPL_REV_SETUP`**: creates the type-T **`ERPL_REV`**
-   destination in **registration mode** (`method='R'`), pointing at your gateway.
-   Then run **`ZCL_ERPL_REV_MKFM`**, which creates the nine `Z_DUCKDB_*` function
-   modules in function group `ZERPL_REV` (create the group in SE80 first).
+## 2. Post-import setup (run once; Basis + ABAP developer together)
+1. Run classrun **`ZCL_ERPL_REV_SETUP`** (SE24 or ADT "Run as console"):
+   creates the type-T **`ERPL_REV`** destination in **registration mode**
+   (`method='R'`), pointing at your gateway — success is a saved destination
+   with registration mode set. Then run **`ZCL_ERPL_REV_MKFM`**, which creates
+   the nine `Z_DUCKDB_*` function modules in function group `ZERPL_REV`
+   (create the group in SE80 first) — success is nine active modules.
    For the `reginfo` line filled in for your host, run `erpl-rev setup
    --print-runbook`, or compose it from security.md §2.
-2. Add the **`reginfo`** allow-list line (security.md §2) and reload the ACL in SMGW.
+2. Add the **`reginfo`** allow-list line (security.md §2) and reload the ACL
+   in SMGW (transaction SMGW → Goto → ACL → reload) — success is the gateway
+   accepting the program ID (no `REGISTRATION denied` in `dev_rd`/SMGW log).
 3. Create the **RFC user** + assign role **`ZERPL_REV_RFC`** (security.md §4).
 
 ## 3. Install + start the external server
@@ -134,9 +147,11 @@ export ERPL_REV_PROGRAM_ID=ERPL_REV ERPL_REV_DB_PATH=/var/lib/erpl/erpl.duckdb
 ```
 Production: run it as a **systemd service** — see `deploy/erpl-rev.service`.
 
-## 4. Smoke test
-- `ZCL_ERPL_REV_DIAG` (ping) → `PONG from erpl-rev`.
-- Run `Z_ERPL_REV_REPLICATE` on a small table → DuckDB target; verify row parity.
+## 4. Smoke test (in this order — stop at the first failure)
+1. Server process running on its host; gateway shows the `ERPL_REV` program
+   ID registered (SMGW → Logged on Clients).
+2. `ZCL_ERPL_REV_DIAG` (ping) → `PONG from erpl-rev`.
+3. Run `Z_ERPL_REV_REPLICATE` on a small table → DuckDB target; verify row parity.
 
 ## 5. Upgrade
 Import the next transport (cumulative). Objects are `Z*` and non-modifying, so an

@@ -2,7 +2,9 @@
 
 `Z_ERPL_REV_DAEMON` is one background job that ticks every few seconds, asks the
 server what is due, and runs it. It is what turns erpl-rev from "replicate on a
-schedule" into second-scale replication, and it needs no new SAP interface: the
+schedule" into second-scale replication for the eligible Open-SQL/CDC methods
+(APE targets register `hourly` or slower cadences and run on the same ticks
+when due), and it needs no new SAP interface: the
 tick is an ordinary RFC call to a function module that was already there.
 
 Latency is one tick plus one cycle. Nothing is pushed, nothing long-polls, and
@@ -13,6 +15,10 @@ Measured on the test system, at a two-second tick under a generated workload of
 p95 3.34 s**, source commit to applied.
 
 ## Operating it
+
+Prerequisites: the server is reachable and at least one target is registered.
+Healthy looks like this — one running instance, a heartbeat seconds (not
+minutes) old, and a tick count that grows between two `status` calls:
 
 ```bash
 erpl-rev daemon start --tick 2 --workers 4
@@ -34,10 +40,9 @@ Two daemons would run every target against each other. The per-target lease
 stops double *cycles*; the singleton row in `_erpl_rev_daemon` stops double
 *daemons*, and a second start reports the running instance and exits.
 
-The instance id is a UUID. It was host/user/timestamp at one-second resolution,
-which meant two daemons launched in the same second — a scheduler retrying a
-failed submit, two jobs released together, an operator starting twice from two
-sessions — built the *same* id and both believed they had won.
+The instance id is a UUID, so two concurrent starts cannot share an identity
+(an earlier host/user/timestamp scheme collided when two daemons launched in
+the same second).
 
 A daemon that dies without releasing the row is detected by its heartbeat going
 stale, at which point the next start takes over. The heartbeat is written
@@ -47,17 +52,18 @@ look like a dead daemon.
 ## What runs on a tick
 
 The server decides, in one pure function that the batch tick and the daemon both
-go through. Per tick it picks the targets that are due, subject to:
+go through. Per tick it picks the targets that are due, subject to (operator
+settings first, internals after):
 
-| Rule | Effect |
-|---|---|
-| Cadence | `micro:<sec>`, `hourly`, `nightly`; `manual` is never due on its own |
-| Backoff | after a failure the interval doubles, capped, so a broken target stops hammering SAP |
-| Parking | after enough consecutive failures a target is parked until `sync unpark` |
-| Worker budget | `max_workers` cycles per tick, most overdue first, ties broken by name |
-| Full-load share | a mass load cannot take every slot and starve the micro-cadence targets |
-| Trigger reservation | one slot is held for the trigger tier when it has work — its shadow rows only accumulate |
-| `BLOCKED` | a target whose registration cannot run is skipped entirely |
+| Rule | Effect | Operator setting |
+|---|---|---|
+| Cadence | `micro:<sec>`, `hourly`, `nightly`; `manual` is never due on its own | `--cadence` at registration |
+| Worker budget | `max_workers` cycles per tick, most overdue first, ties broken by name | `--workers` at `daemon start`; symptom of too few is latency climbing on quiet targets |
+| Full-load share | a mass load cannot take every slot and starve the micro-cadence targets | automatic; symptom of pressure is slow micro targets during a mass load |
+| Trigger reservation | one slot is held for the trigger tier when it has work — its shadow rows only accumulate | automatic |
+| Backoff | after a failure the interval doubles, capped, so a broken target stops hammering SAP | automatic; `fail_count`/`last_error` show it |
+| Parking | after enough consecutive failures a target is parked until `sync unpark` | `sync unpark` to release |
+| `BLOCKED` | a target whose registration cannot run is skipped entirely | fix the registration and re-register |
 
 A cycle the planner marks too large to run inline is submitted as its own
 background job, so it cannot hold the tick thread and stall the heartbeat.
@@ -70,7 +76,7 @@ background job, so it cannot hold the tick thread and stall the heartbeat.
 | One target never runs | its `status`: `BLOCKED` means the registration cannot run; `parked_until` means backoff |
 | A target retries constantly | `fail_count` and `last_error` on `_erpl_rev_delta_state` |
 | Latency climbing | `erpl_rev_run_stats` for cycle duration, and whether one target dominates the budget |
-| Two daemons suspected | `instance_id` on `_erpl_rev_daemon`; only one row exists, and only one id can hold it |
+| Two daemons suspected | `daemon status` first (one running instance?), then `instance_id` on `_erpl_rev_daemon`; only one row exists, and only one id can hold it |
 
 A target is `BLOCKED` when its registration is impossible — for example a load
 type its replication method does not implement. Re-registering it clears the

@@ -8,7 +8,7 @@ For contributors. Nothing here is needed to *run* erpl-rev — the operator's ru
 `make e2e` skips two lanes, and they are the two that matter most:
 
 ```bash
-make e2e         # 13 suites against a live ABAP system, minutes
+make e2e         # 14 suites against a live ABAP system, minutes
 make e2e-full    # …plus the daemon running for real: soak, daemon, stress
 make e2e-perf    # the measured numbers behind docs/perf-results.md
 ```
@@ -63,6 +63,21 @@ Every cycle (and every full load) is recorded in `_erpl_rev_run_stats` for a
 replication dashboard — see [`control-tables.md`](control-tables.md#what-each-run-records).
 
 See the design study (HLD + ADRs) for the rationale behind each decision.
+
+### The APE path
+
+- **Server engine** — Catch2 (`test/test_ape_cycle.cpp`, `test/test_ape_register.cpp`,
+  `test/test_control_schema.cpp`, run by `make test`): spill/merge/recover/purge
+  generations, registration refusals, column-subset plumbing, migrations.
+- **E2E on A4H** — `ZCL_ERPL_REV_APETEST` plus the split drivers
+  `ZCL_ERPL_REV_APEDLTA/B/C/V/N` (run by `make e2e`): gates + FULL (m1–m3),
+  DELTA converge (m4a), surgery/carry/restore (m4b), recover + stale graph +
+  drop (m5/m6/m8), 100k volume (m7), AC-4 negatives + subset E2E
+  (m1+m2+m9). Each prints `APE* RESULT pass=N fail=0`. The split exists for
+  the dialog budget: one m1–m6 classrun exceeds TIME_OUT (~10 min, HTTP 500,
+  results lost). Long classruns also need a client read timeout above the
+  default (`--timeout 600`): past it the caller reports HTTP 500 while the
+  dialog session keeps working unseen.
 
 ### The trigger tier
 

@@ -7,6 +7,10 @@ and do not contact SAP at all.
 
 ## Registering a target
 
+Before you begin: the server must be installed and reachable ([INSTALL.md](INSTALL.md)),
+and you need a source you can read. Register, run once, verify rows match —
+then automate.
+
 ```bash
 erpl-rev sync create sales \
     --method WATERMARK --source VBAK --keys MANDT,VBELN \
@@ -24,9 +28,19 @@ status, the failure count and the run history belong to the engine, and
 registration cannot overwrite them. See [control-tables.md](control-tables.md)
 for which column is which.
 
+For the APE methods (`APE_FULL`/`APE_DELTA` over CDS views) add
+`--subscriber-process <NAME>` plus `--chunk-size`, `--wireformat`,
+`--allow-unreleased`, and `--columns` as needed — see
+[`delta.md`](delta.md#ape-path-details-apefull--apedelta-sap-dhape-extraction).
+Retire an APE target with `erpl-rev sync drop <target>`; the reply says
+`erase confirmed` only when SAP erasure is verified, otherwise
+`erase unverified` (local registration is removed either way).
+
 ## Seeding and repairing
 
-There are four load types — `D` delta, `I` adopt a position, `L` initial load then
+The ordinary first cycle is a `D` delta (or an initial load where the method
+needs one); reach for the others only to repair. There are four load types —
+`D` delta, `I` adopt a position, `L` initial load then
 delta, `F` repair — and `F`, `I` and `L` are **one-shot**: set as a target's default
 they run once and the target reverts to delta. What each does to the watermark, which
 is the part that catches people out, is in
@@ -55,7 +69,9 @@ erpl-rev sync validate sales --full
 
 `validate` compares canonical text per column, not row counts: a replica that is
 the right size and the wrong content passes every count check there is. A
-differing row count is itself a mismatch.
+differing row count is itself a mismatch. The default comparison samples
+(`--sample-rows`); reach for `--full` (cell-by-cell over the whole table)
+only when counts match but content is suspect.
 
 ## Publishing
 
@@ -109,11 +125,19 @@ discarding every change captured since.
 
 ## Watching it
 
+A healthy target: the daemon is ticking (or the periodic job runs), status is
+`IDLE`, the last run succeeded with no warning/error, and validation passes.
+Check that first; the graph below is for throughput questions, not health.
+
 ```bash
 erpl-rev top                      # the monitor: worst target first, refreshed every 2s
 erpl-rev top --once               # one frame, for a script, a ticket or a log
 erpl-rev top --once --graph --refreshes 3   # …with the throughput graph
 ```
+
+**`LAG` is not freshness.** It is the time since that target last applied
+something — on an idle target it grows, correctly. For how far behind the data
+actually is, compare `_commit_ts` with `_applied_at` in the change log.
 
 Keys: `q` quit, `r` refresh, **`g` throughput graph**, `n` run the selected target now,
 `u` unpark it, `↑`/`↓` select.
@@ -177,10 +201,6 @@ than always on.
 final frame. That is what makes the graph testable: a rate needs two samples, so a loop
 of separate `--once` runs can never draw a band and would pass over a broken binary.
 
-**`LAG` is not freshness.** It is the time since that target last applied something. On
-an idle target it grows, correctly — nothing has changed. For how far behind the data
-actually is, compare `_commit_ts` with `_applied_at` in the change log.
-
 ## Before a release
 
 The release gate and the full test lanes are in [`testing.md`](testing.md).
@@ -196,6 +216,12 @@ The release gate and the full test lanes are in [`testing.md`](testing.md).
 | Subscriber sees nothing | the target has no change log | register with `--log`; the log starts at the next cycle |
 | `cdc status` INCONSISTENT | a trigger is missing or invalid | `cdc repair --target T` — the position survives |
 | Validation FAILED | the replica diverged | the run names the first mismatching row; repair with `--load-type F` |
+| APE quiet new subscription warns | preparation is slow, CDC jobs lag, or the source is empty | `last_warning` on the row; check `S_DHCDC*` jobs, re-run converges when data arrives |
+| APE FULL preparation timeout | no stream data after 60 polls | check CDC background jobs and authorisations |
+| APE FULL stream stalled | no rows for 360 polls after first data, target untouched | the scan never got `lastBatch`; investigate the engine side, re-run |
+| APE stale batch index | a cycle counter restarted below the merged position | do not retry blindly — check for a second server/DB writing the same target |
+| APE subset drift | registered `--columns` changed since the target was built | `sync drop` + re-register with the intended set |
+| `erase unverified` after drop | SAP erasure could not be confirmed | local registration is removed; verify the subscription in SAP (`DHAPE_SUBSCR`) and erase it there if it survives |
 | Daemon not ticking | see [daemon.md](daemon.md) | |
 
 Everything above is visible in `erpl_rev_run_stats` and

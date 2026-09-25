@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Draft for implementation by a separate coding-agent session |
+| Status | Implemented; DoD green on A4H (AC-1–AC-5), plus Codex-findings rework (see HLD §12) |
 | Companion | [`ape-delta-hld.md`](ape-delta-hld.md) (arc42, normative for design) |
 | Sources of truth | erpl `ape/docs/protocol.md` §§11–14; erpl-rev [`delta.md`](delta.md), [`cdc.md`](cdc.md), [`control-tables.md`](control-tables.md) |
 
@@ -23,9 +23,12 @@ SAP's **ABAP Pipeline Engine (APE)** already solves exactly this: its CDS reader
 (`com.sap.abap.cds.reader.v2`, protocol v6) streams initial loads **and**
 replication with a per-row change indicator (`/1DH/OPERATION`: `U` after-image,
 `D` keys-only delete). The erpl project has a working client (`erpl_ape`:
-`ape/docs/protocol.md`, verified live against the A4H trial, APE 2.7.0). erpl-rev
-cannot use it today: erpl-rev is an RFC **server** (ABAP calls in), while APE must
-be driven as an RFC **client** (calls out to `DHAPE_*`/`DHAMB_*`).
+`ape/docs/protocol.md`, verified live against the A4H trial, APE 2.7.0). The
+shipped design does **not** port it: erpl-rev stays an RFC **server** (ABAP
+calls in) and ABAP itself drives DHAPE inside its own session
+(`DHAPE_GRAPH_MANAGER` / `DHAPE_GRAPH_ROUNDTRIP`); the C++ server receives
+packages and performs staging/merge/recovery (see HLD §11–§12 for the
+inversion of the original client-port plan).
 
 ## 2. Objective
 
@@ -46,10 +49,10 @@ emulation:
   and from ABAP (`zcl_erpl_rev_delta=>register`), same registry
   (`_erpl_rev_delta_state`) and same per-target lease/cadence/run-stats machinery
   as the five existing methods.
-- BR-2: Drive the APE graph lifecycle server-side (create → poll `ROUNDTRIP` →
-  stop) over a **new outbound RFC client path** in the C++ server, reusing the
-  `erpl_ape` graph/session/decode logic (see HLD §4 for the reuse-vs-port
-  decision).
+- BR-2: Drive the APE graph lifecycle ABAP-side (create → poll `ROUNDTRIP` →
+  stop inside the existing session; **no** outbound RFC client path — this
+  inverts the original port plan, see HLD §11). The C++ server handles
+  package decode, spill, staging/merge, and recovery.
 - BR-3: Merge semantics: `U` → keyed upsert, `D` → delete by key, blank operation
   (initial load) → upsert. The engine's `I`/`U`/`D` verdict stays server-computed,
   consistent with [`control-tables.md`](control-tables.md).
@@ -85,15 +88,15 @@ emulation:
 
 | ID | Requirement |
 |---|---|
-| FR-1 | `sync create --method APE_FULL\|APE_DELTA --source <CDS> --keys <k> --subscriber-process <NAME> [--chunk-size N] [--wireformat W]` registers a target; same create-or-update semantics as existing methods. |
+| FR-1 | `sync create --method APE_FULL\|APE_DELTA --source <CDS> --keys <k> --subscriber-process <NAME> [--chunk-size N] [--wireformat W] [--columns C,...] [--allow-unreleased]` registers a target; same create-or-update semantics as existing methods. |
 | FR-2 | Registration probes the source and fails fast with a telling error when: the system has no APE/DHAPE (`DHAPE_GRAPH_VERSION`), the entity is not a CDS view (`DHAMB_SERVICE_DSET_DEFINITION` `OBJECTTYPE`), the entity lacks the `dataExtraction` annotation (DDIC annotation service; `APE_DELTA` additionally needs `changeDataCapture.automatic`), or it is unreleased and the override is off. Release state comes from the ARS catalog (`I_APISFORCLOUDDEVELOPMENT`, `CDS_STOB`/`RELEASED`) — never XCO (its STOB existence check fails before ARS) and never `CDS_PUBLISHED` (empty even for SAP views). The override (`--allow-unreleased`) is present-tense: a re-registration that does not restate it re-enforces the gate; each use is WARN-logged on the target row (`last_warning`, observable via `state()`). |
 | FR-3 | A cycle for an APE target runs on the existing scheduler (`run`, `run_due`, `Z_ERPL_REV_DELTA`, daemon): lease → extract → keyed merge → commit position → release. No new scheduler. |
-| FR-4 | `APE_FULL` terminates on `message.lastBatch` / port close; the scan owns its subscription and erases it afterwards (best-effort, never throwing out of cleanup). |
-| FR-5 | `APE_DELTA` resumes the named subscription when it exists (no "already exists" failure) and creates it otherwise; it ends after N consecutive empty roundtrips post-data (replication graphs never send `lastBatch`), bounded by the preparation timeout before first data. |
-| FR-6 | Every delta package is persisted **before** its rows are merged, so a crash between handover and commit loses nothing; a `recover`-style replay re-applies the latest spilled batch without touching SAP. |
+| FR-4 | `APE_FULL` terminates on `message.lastBatch`; any exit without it is an error and leaves the target untouched (the server merges only on `lastBatch`). Pre-data polls are bounded by a 60-poll preparation error; 360 rowless polls after first data end a stalled scan as an error. The scan owns its subscription and erases it afterwards (best-effort, never throwing out of cleanup). |
+| FR-5 | `APE_DELTA` resumes the named subscription when it exists (no "already exists" failure) and creates it otherwise; post-data it ends after 3 consecutive empty roundtrips (replication graphs never send `lastBatch`). Pre-data quiet never counts toward K: a quiet newly created subscription warns observably (`last_warning`) and exits clean, a quiet resumed one exits clean after 3 polls; a 360-poll backstop (absolute for DELTA, consecutive-rowless for FULL) bounds every scan. |
+| FR-6 | Every delta package is persisted **before** its rows are merged, so a crash between handover and commit loses nothing; a `recover`-style replay re-applies every spilled batch above the merged position, in order, without touching SAP. Batch counters continue past the position across cycles (a clean purge starts a new generation); a restarted counter is refused loudly. |
 | FR-7 | Row mapping is by package-field **name** (case-insensitive fallback), not position; a row whose cell count disagrees with the declared field count is refused with package/row identity, never silently shifted. |
 | FR-8 | Currency-shifted `CURR` amounts under `...Plus Currency` wire formats are documented and surfaced consistently (they differ from `RFC_READ_TABLE` values by design — protocol §12); the parity/diff harness must compare against APE semantics, not Open-SQL semantics, for APE targets. |
-| FR-9 | An explicit drop command removes the SAP-side subscription (`subscr.eraser.v1` path) and the local state row; crashed-cycle recovery (stale `R`unning graphs blocking later cycles) follows the documented `read_graph_ids_by_status` + `is_session_active` procedure. |
+| FR-9 | An explicit drop command removes the SAP-side subscription (`subscr.eraser.v1` path) and the local state row; crashed-cycle recovery (stale `R`unning graphs blocking later cycles) follows the documented `read_graph_ids_by_status` + `is_session_active` procedure. The drop reports `erase confirmed` only when SAP raised no error and a re-lookup proves the subscription gone, otherwise `erase unverified` (cleanup stays best-effort); it refuses a fresh cycle lease, lets a stale one through, and fences the final state-row delete against a cycle starting mid-drop. |
 
 ## 5. Non-functional requirements
 
