@@ -12,6 +12,9 @@
 
 #include "cli_common.hpp"
 #include "table_render.hpp"
+#include "tui_model.hpp"
+
+#include <ftxui/dom/elements.hpp>
 
 namespace erpl_rev::cmd {
 
@@ -74,6 +77,17 @@ int RunRetain(Options o);   // prune a target's change log
 int RunCdc(Options o);      // status | repair
 int RunMass(Options o);     // run --split
 int RunTop(Options o);      // the replication monitor
+
+// The monitor's one frame as an element tree, factored out of RunTop so a
+// script can assert on exactly what `--once` prints: rendering through
+// Screen::Create(Dimension::Fit) like the real path, not a second formatter
+// that could drift from the first. `throughput_box` is the graph pane
+// builder (unused when `graph_on` is false); `term_cols` is the live width,
+// ignored when `once` fixes the frame at 80.
+ftxui::Element RenderTopDocument(const tui::Snapshot &snap, int selected,
+                                 const std::string &action_note, bool graph_on,
+                                 const std::function<ftxui::Element(int)> &throughput_box,
+                                 bool once, int term_cols);
 
 // `abap export <dir>` -- write the embedded ABAP sources out as files, for any
 // delivery route that is not `setup` pushing them over ADT.

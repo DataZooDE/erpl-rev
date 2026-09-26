@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <chrono>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <string>
@@ -86,6 +87,158 @@ std::string OpCell(const char *glyph, const std::string &num, size_t w) {
 }
 
 }  // namespace
+
+using namespace ftxui;
+
+Element RenderTopDocument(const tui::Snapshot &snap, int selected,
+                          const std::string &action_note, bool graph_on,
+                          const std::function<Element(int)> &throughput_box,
+                          bool once, int term_cols) {
+    const auto &th = tui::DefaultTheme();
+    const auto &s = snap.summary;
+    // The header answers "is anything wrong" before the eye reaches the
+    // table. The daemon is here because "nothing is replicating" is usually
+    // the daemon, not the targets.
+    auto daemon_ok = s.daemon_status == "RUNNING";
+    // The summary above the table, in the shape of btop's title values: the
+    // answer to "is anything wrong" arrives before the eye reaches the first
+    // row. Two short lines, and NOT the window title: as a title the header
+    // was sized to the table width, so FTXUI squeezed the middle counts out
+    // entirely and clipped the tail -- `daemon STOPPED` printed as
+    // `daemon STOPP`. As one standalone line it fared no better: the
+    // `--once` frame is eighty columns, the line is longer, and the same
+    // squeeze ate it. Each line below fits the frame on its own.
+    Elements counts{
+        text(" targets ") | bold | color(C(th.title)),
+        text(std::to_string(s.targets)) | color(C(th.main_fg)),
+        text("  healthy " + std::to_string(s.healthy)) | color(C(th.ok)),
+    };
+    if (s.blocked) counts.push_back(text("  blocked " + std::to_string(s.blocked)) |
+                                    color(C(th.bad)) | bold);
+    if (s.parked) counts.push_back(text("  parked " + std::to_string(s.parked)) |
+                                   color(C(th.parked_c)));
+    if (s.failing) counts.push_back(text("  failing " + std::to_string(s.failing)) |
+                                    color(C(th.warn)));
+    if (s.never_run) counts.push_back(text("  never run " + std::to_string(s.never_run)) |
+                                      color(C(th.inactive_fg)));
+    // No filler() here: separated explicitly, which also survives a narrow
+    // terminal -- otherwise the right-hand items butt against the left-hand
+    // ones ("healthy 2worst lag 0s").
+    counts.push_back(text("  ·  ") | color(C(th.div_line)));
+    // The lag gradient: calm to warm as it grows. An hour is the ceiling
+    // for the ramp -- past that it is simply red, and the number says how
+    // much worse.
+    const double lag_t = s.worst_lag < 0 ? 0.0 : std::min(1.0, s.worst_lag / 3600.0);
+    counts.push_back(text("worst lag " + tui::FormatLag(s.worst_lag)) |
+                     color(C(th.lag.At(lag_t))));
+    Elements daemon_line{
+        text(" daemon " + s.daemon_status +
+             (s.daemon_age >= 0 ? " (" + tui::FormatLag(s.daemon_age) + " ago)" : "") +
+             " ") |
+        color(daemon_ok ? C(th.ok) : C(th.bad)) | bold,
+    };
+
+    // 77 columns of fixed fields plus two of border; whatever is left is
+    // the note's. Computed from the frame the table is actually rendered
+    // into, so the fixed columns keep their widths at any terminal size.
+    const int note_budget = std::max(0, (once ? 80 : term_cols) - 79);
+
+    Elements body;
+    // ROWS is gone and LAST CYCLE stands in its place. ROWS was
+    // rows_applied -- the SUM of the three numbers now printed beside it --
+    // and a sum cannot tell a target that loaded a million rows from one
+    // that deleted them, which is the most consequential distinction an
+    // operator can draw from this screen. METHOD and FAILS gave up four
+    // more columns between them: "CDC" and "DELTA" fit in eight, and a
+    // fail count needing five digits has stopped being a number anyone
+    // reads. The whole row now fits 80 columns, which is what a scripted
+    // `top --once` renders into and the narrowest place it has to be legible.
+    body.push_back(hbox({text(Pad("TARGET", 20)), text(Pad("METHOD", 8)),
+                         text(Pad("CADENCE", 9)), text(Pad("STATUS", 9)),
+                         text(Pad("LAG", 8)), text(Pad("FAILS", 6)),
+                         text(Pad("LAST CYCLE", 18)), text("NOTE")}) |
+                   bold | color(C(th.hi_fg)));
+    for (size_t i = 0; i < snap.rows.size(); ++i) {
+        const auto &r = snap.rows[i];
+        // The reason, where there is one: a status with no reason is a
+        // status nobody can act on.
+        // Truncated to what is actually LEFT, not to a fixed maximum. The
+        // note is the only column with no width, and FTXUI squeezes an
+        // over-long row proportionally rather than clipping its last
+        // element -- so one long error message compressed every fixed
+        // column beside it and the row stopped lining up with its own
+        // header. Whatever does not fit is in the footer, at full width.
+        std::string note = Note(r);
+        if (static_cast<int>(note.size()) > note_budget)
+            note = note_budget > 1 ? note.substr(0, note_budget - 1) + "…" : std::string();
+        // The exact split the last cycle reported, in the target's own
+        // band colour so the rule learned from the graph -- glyph is the
+        // operation, colour is the replication -- holds here too. Dimmed
+        // at zero, so a target that only ever inserts does not read as
+        // one that is also deleting.
+        const Color band =
+            C(th.band[tui::ColorSlotFor(r.target, tui::Theme::kBands)]);
+        const long long by_op[tui::kOps] = {r.last_ins, r.last_upd, r.last_del};
+        Elements ops;
+        for (int o = 0; o < tui::kOps; ++o) {
+            const auto op = static_cast<tui::Op>(o);
+            ops.push_back(text(OpCell(tui::OpGlyph(op),
+                                      tui::FormatCount(static_cast<double>(by_op[o])), 6)) |
+                          color(by_op[o] > 0 ? band : C(th.inactive_fg)));
+        }
+        auto line = hbox({text(Pad(r.target, 20)), text(Pad(r.method, 8)),
+                          text(Pad(r.cadence, 9)), text(Pad(r.status, 9)),
+                          text(Pad(tui::FormatLag(r.lag_seconds), 8)),
+                          text(Pad(std::to_string(r.fail_count), 6)),
+                          // LAST CYCLE last, because its three fields are
+                          // padded and NOTE therefore starts clear of it.
+                          // Ending on an unpadded column ran "FAILS" into
+                          // "NOTE" in the header.
+                          hbox(std::move(ops)), text(note)}) |
+                    color(RowColour(r));
+        if (static_cast<int>(i) == selected) line = line | inverted;
+        body.push_back(line);
+    }
+    if (snap.rows.empty())
+        body.push_back(text("  no registered targets") | color(C(th.inactive_fg)));
+
+    Elements foot{text(" q quit   r refresh   g graph   n run now   u unpark   ↑/↓ select ") |
+                  color(C(th.inactive_fg))};
+    // The selected row's reason, at full width. The table column is
+    // whatever fits; this is the whole of it, and on an eighty-column frame
+    // it is the only place the text appears at all.
+    if (selected >= 0 && selected < static_cast<int>(snap.rows.size())) {
+        const auto full = Note(snap.rows[selected]);
+        if (!full.empty())
+            foot.push_back(text("  " + snap.rows[selected].target + ": " + full) |
+                           color(C(th.warn)));
+    }
+    if (!action_note.empty()) foot.push_back(text("  " + action_note) | color(C(th.hi_fg)));
+    if (!snap.error.empty())
+        foot.push_back(text("  " + snap.error) | color(C(th.bad)) | bold);
+
+    Elements panes;
+    // The terminal's real width when there is one; a fixed width for
+    // `--once`, whose output is sized to fit the document rather than a
+    // screen.
+    //
+    // Eighty, and not a column more. FTXUI's Fit clamps the whole frame to
+    // the terminal anyway, so a wider box is not wider output -- it is the
+    // same output with its right-hand end cut off, and what sits at that
+    // end is the legend. Set to 104 to stop the target table being clipped,
+    // it clipped the graph's operation key instead, and the e2e assertion
+    // that greps for it is the only reason that was noticed. The table now
+    // fits eighty on its own.
+    if (graph_on) panes.push_back(throughput_box(once ? 80 : term_cols));
+    panes.push_back(hbox(counts));
+    panes.push_back(hbox(daemon_line));
+    panes.push_back(window(text(" targets ") | bold | color(C(th.title)),
+                           vbox(body) | flex, ROUNDED) |
+                    color(C(th.box_targets)) | flex);
+    panes.push_back(hbox(foot));
+    return vbox(panes);
+}
+
 
 int RunTop(Options o) {
     const auto cfg = cli::ReadConfig();
@@ -379,141 +532,8 @@ int RunTop(Options o) {
 
     auto render = [&] {
         std::lock_guard<std::mutex> g(snap_mx);
-        const auto &th = tui::DefaultTheme();
-        const auto &s = snap.summary;
-        // The header answers "is anything wrong" before the eye reaches the
-        // table. The daemon is here because "nothing is replicating" is usually
-        // the daemon, not the targets.
-        auto daemon_ok = s.daemon_status == "RUNNING";
-        // The counts live in the box's own border, as btop puts a value in the
-        // title: the answer to "is anything wrong" arrives before the eye
-        // reaches the first row.
-        Elements head{
-            text(" targets ") | bold | color(C(th.title)),
-            text(std::to_string(s.targets)) | color(C(th.main_fg)),
-            text("  healthy " + std::to_string(s.healthy)) | color(C(th.ok)),
-        };
-        if (s.blocked) head.push_back(text("  blocked " + std::to_string(s.blocked)) |
-                                      color(C(th.bad)) | bold);
-        if (s.parked) head.push_back(text("  parked " + std::to_string(s.parked)) |
-                                     color(C(th.parked_c)));
-        if (s.failing) head.push_back(text("  failing " + std::to_string(s.failing)) |
-                                      color(C(th.warn)));
-        if (s.never_run) head.push_back(text("  never run " + std::to_string(s.never_run)) |
-                                        color(C(th.inactive_fg)));
-        // No filler() here. A window's title is sized to its content, so a
-        // filler has nothing to expand into and the right-hand items simply
-        // butt against the left-hand ones -- "healthy 2worst lag 0s". Separated
-        // explicitly instead, which also survives a narrow terminal.
-        head.push_back(text("  ·  ") | color(C(th.div_line)));
-        // The lag gradient: calm to warm as it grows. An hour is the ceiling
-        // for the ramp -- past that it is simply red, and the number says how
-        // much worse.
-        const double lag_t = s.worst_lag < 0 ? 0.0 : std::min(1.0, s.worst_lag / 3600.0);
-        head.push_back(text("worst lag " + tui::FormatLag(s.worst_lag)) |
-                       color(C(th.lag.At(lag_t))));
-        head.push_back(text("  ·  ") | color(C(th.div_line)));
-        head.push_back(text("daemon " + s.daemon_status +
-                            (s.daemon_age >= 0 ? " (" + tui::FormatLag(s.daemon_age) + " ago)"
-                                               : "") + " ") |
-                       color(daemon_ok ? C(th.ok) : C(th.bad)) | bold);
-
-        // 77 columns of fixed fields plus two of border; whatever is left is
-        // the note's. Computed from the frame the table is actually rendered
-        // into, so the fixed columns keep their widths at any terminal size.
-        const int note_budget = std::max(0, (once ? 80 : term_cols.load()) - 79);
-
-        Elements body;
-        // ROWS is gone and LAST CYCLE stands in its place. ROWS was
-        // rows_applied -- the SUM of the three numbers now printed beside it --
-        // and a sum cannot tell a target that loaded a million rows from one
-        // that deleted them, which is the most consequential distinction an
-        // operator can draw from this screen. METHOD and FAILS gave up four
-        // more columns between them: "CDC" and "DELTA" fit in eight, and a
-        // fail count needing five digits has stopped being a number anyone
-        // reads. The whole row now fits 80 columns, which is what a scripted
-        // `top --once` renders into and the narrowest place it has to be legible.
-        body.push_back(hbox({text(Pad("TARGET", 20)), text(Pad("METHOD", 8)),
-                             text(Pad("CADENCE", 9)), text(Pad("STATUS", 9)),
-                             text(Pad("LAG", 8)), text(Pad("FAILS", 6)),
-                             text(Pad("LAST CYCLE", 18)), text("NOTE")}) |
-                       bold | color(C(th.hi_fg)));
-        for (size_t i = 0; i < snap.rows.size(); ++i) {
-            const auto &r = snap.rows[i];
-            // The reason, where there is one: a status with no reason is a
-            // status nobody can act on.
-            // Truncated to what is actually LEFT, not to a fixed maximum. The
-            // note is the only column with no width, and FTXUI squeezes an
-            // over-long row proportionally rather than clipping its last
-            // element -- so one long error message compressed every fixed
-            // column beside it and the row stopped lining up with its own
-            // header. Whatever does not fit is in the footer, at full width.
-            std::string note = Note(r);
-            if (static_cast<int>(note.size()) > note_budget)
-                note = note_budget > 1 ? note.substr(0, note_budget - 1) + "…" : std::string();
-            // The exact split the last cycle reported, in the target's own
-            // band colour so the rule learned from the graph -- glyph is the
-            // operation, colour is the replication -- holds here too. Dimmed
-            // at zero, so a target that only ever inserts does not read as
-            // one that is also deleting.
-            const Color band =
-                C(th.band[tui::ColorSlotFor(r.target, tui::Theme::kBands)]);
-            const long long by_op[tui::kOps] = {r.last_ins, r.last_upd, r.last_del};
-            Elements ops;
-            for (int o = 0; o < tui::kOps; ++o) {
-                const auto op = static_cast<tui::Op>(o);
-                ops.push_back(text(OpCell(tui::OpGlyph(op),
-                                          tui::FormatCount(static_cast<double>(by_op[o])), 6)) |
-                              color(by_op[o] > 0 ? band : C(th.inactive_fg)));
-            }
-            auto line = hbox({text(Pad(r.target, 20)), text(Pad(r.method, 8)),
-                              text(Pad(r.cadence, 9)), text(Pad(r.status, 9)),
-                              text(Pad(tui::FormatLag(r.lag_seconds), 8)),
-                              text(Pad(std::to_string(r.fail_count), 6)),
-                              // LAST CYCLE last, because its three fields are
-                              // padded and NOTE therefore starts clear of it.
-                              // Ending on an unpadded column ran "FAILS" into
-                              // "NOTE" in the header.
-                              hbox(std::move(ops)), text(note)}) |
-                        color(RowColour(r));
-            if (static_cast<int>(i) == selected) line = line | inverted;
-            body.push_back(line);
-        }
-        if (snap.rows.empty())
-            body.push_back(text("  no registered targets") | color(C(th.inactive_fg)));
-
-        Elements foot{text(" q quit   r refresh   g graph   n run now   u unpark   ↑/↓ select ") |
-                      color(C(th.inactive_fg))};
-        // The selected row's reason, at full width. The table column is
-        // whatever fits; this is the whole of it, and on an eighty-column frame
-        // it is the only place the text appears at all.
-        if (selected >= 0 && selected < static_cast<int>(snap.rows.size())) {
-            const auto full = Note(snap.rows[selected]);
-            if (!full.empty())
-                foot.push_back(text("  " + snap.rows[selected].target + ": " + full) |
-                               color(C(th.warn)));
-        }
-        if (!action_note.empty()) foot.push_back(text("  " + action_note) | color(C(th.hi_fg)));
-        if (!snap.error.empty())
-            foot.push_back(text("  " + snap.error) | color(C(th.bad)) | bold);
-
-        Elements panes;
-        // The terminal's real width when there is one; a fixed width for
-        // `--once`, whose output is sized to fit the document rather than a
-        // screen.
-        //
-        // Eighty, and not a column more. FTXUI's Fit clamps the whole frame to
-        // the terminal anyway, so a wider box is not wider output -- it is the
-        // same output with its right-hand end cut off, and what sits at that
-        // end is the legend. Set to 104 to stop the target table being clipped,
-        // it clipped the graph's operation key instead, and the e2e assertion
-        // that greps for it is the only reason that was noticed. The table now
-        // fits eighty on its own.
-        if (graph_on) panes.push_back(throughput_box(once ? 80 : term_cols.load()));
-        panes.push_back(window(hbox(head), vbox(body) | flex, ROUNDED) |
-                        color(C(th.box_targets)) | flex);
-        panes.push_back(hbox(foot));
-        return vbox(panes);
+        return RenderTopDocument(snap, selected, action_note, graph_on,
+                                 throughput_box, once, term_cols.load());
     };
 
     // Actions go through the ordinary queue, exactly as the CLI verbs do. A
