@@ -310,6 +310,26 @@ DuckDbBridge::DuckDbBridge(const std::string &path, const std::string &init_sql)
         // NULL for a target that is not on the trigger tier, so a watermark
         // target reads as "no trigger registry", not as "trigger broken".
         "c.cdc_status_raw AS cdc_status, c.cdc_error_raw AS cdc_error, "
+        // The per-target lease, so a cycle that died holding one is visible.
+        // A RUNNING row whose lease aged past max_cycle_secs belongs to a dead
+        // cycle: the planner reclaims it, but until then the target reads as
+        // mid-run with a recent last_run_ts and zero failures.
+        "CASE WHEN lease_ts IS NULL THEN NULL "
+        "     ELSE CAST(epoch(now()) - epoch(lease_ts) AS BIGINT) END AS lease_age_s, "
+        "(coalesce(status,'') = 'RUNNING' AND lease_ts IS NOT NULL "
+        " AND lease_ts < now() - (coalesce(max_cycle_secs,3600) * INTERVAL '1 second')) "
+        "AS is_stale_lease, "
+        // The APE crash copy still waiting for APE_RECOVER: spill rows past
+        // the merged position. At/below it is recovered history, not pending
+        // work, so the comparison is strict.
+        "(SELECT count(*) FROM _erpl_rev_ape_spill s WHERE s.target = "
+        "_erpl_rev_delta_state.target "
+        " AND s.batch_index > coalesce(_erpl_rev_delta_state.spill_batch,-1)) "
+        "AS ape_spill_pending, "
+        // Where a quiet subscription or a release-override use leaves its
+        // observable trace. Both exit clean, so this stays advisory: exposed
+        // here, but never part of is_healthy.
+        "last_warning, "
         // A trigger target whose registry is not ACTIVE or SEEDED is NOT
         // healthy, whatever delta_state remembers of the last good cycle: the
         // planner will not schedule it, so it has stopped replicating. This is
@@ -319,7 +339,13 @@ DuckDbBridge::DuckDbBridge(const std::string &path, const std::string &init_sql)
         " AND coalesce(status,'') <> 'BLOCKED' "
         " AND (c.cdc_status_raw IS NULL "
         "      OR c.cdc_status_raw IN ('ACTIVE','SEEDED')) "
-        " AND (parked_until IS NULL OR parked_until <= now())) AS is_healthy "
+        " AND (parked_until IS NULL OR parked_until <= now())"
+        " AND NOT (coalesce(status,'') = 'RUNNING' AND lease_ts IS NOT NULL "
+        "         AND lease_ts < now() - (coalesce(max_cycle_secs,3600) * INTERVAL '1 second')) "
+        " AND (SELECT count(*) FROM _erpl_rev_ape_spill s WHERE s.target = "
+        "_erpl_rev_delta_state.target "
+        "     AND s.batch_index > coalesce(_erpl_rev_delta_state.spill_batch,-1)) = 0) "
+        "AS is_healthy "
         "FROM _erpl_rev_delta_state "
         // LEFT JOIN, and the subquery renames its key: a target registered but
         // never run must still appear, with zeros rather than vanishing.
@@ -354,6 +380,10 @@ DuckDbBridge::DuckDbBridge(const std::string &path, const std::string &init_sql)
         "(SELECT count(*) FROM erpl_rev_targets WHERE fail_count > 0) AS failing, "
         "(SELECT max(lag_seconds) FROM erpl_rev_targets) AS worst_lag_seconds, "
         "(SELECT count(*) FROM erpl_rev_targets WHERE lag_seconds IS NULL) AS never_run, "
+        "(SELECT count(*) FROM erpl_rev_targets WHERE is_stale_lease) AS stale_leases, "
+        "(SELECT coalesce(sum(ape_spill_pending),0) FROM erpl_rev_targets) AS ape_spill_pending, "
+        "(SELECT count(*) FROM erpl_rev_targets WHERE last_warning IS NOT NULL "
+        " AND last_warning <> '') AS warned, "
         "(SELECT coalesce(status,'STOPPED') FROM _erpl_rev_daemon WHERE id=1) AS daemon_status, "
         "(SELECT CASE WHEN heartbeat_ts IS NULL THEN NULL "
         "             ELSE CAST(epoch(now()) - epoch(heartbeat_ts) AS BIGINT) END "

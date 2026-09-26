@@ -161,6 +161,88 @@ TEST_CASE("stats: a provisioned trigger target that is running is healthy", "[st
           R"({"is_healthy":true})");
 }
 
+TEST_CASE("stats: a stale lease is visible and not healthy", "[stats]") {
+    // A RUNNING row whose lease aged past max_cycle_secs belongs to a cycle
+    // that died. The planner reclaims it, but until then nothing in any
+    // operator surface says so: last_run_ts still reads recent, fail_count is
+    // still 0, and the target counts as healthy.
+    DuckDbBridge db;
+    SeedHealthy(db, "stuck");
+    db.Execute("UPDATE _erpl_rev_delta_state SET status='RUNNING', active_run_id=42, "
+               "lease_ts = now() - INTERVAL '2 hours', max_cycle_secs=3600 "
+               "WHERE target='stuck'");
+
+    CHECK(One(db, "SELECT is_stale_lease FROM erpl_rev_targets WHERE target='stuck'") ==
+          R"({"is_stale_lease":true})");
+    CHECK(One(db, "SELECT is_healthy FROM erpl_rev_targets WHERE target='stuck'") ==
+          R"({"is_healthy":false})");
+    const auto age = One(db, "SELECT lease_age_s BETWEEN 7000 AND 8000 AS stale_old "
+                             "FROM erpl_rev_targets WHERE target='stuck'");
+    CHECK(age.find("\"stale_old\":true") != std::string::npos);
+    CHECK(One(db, "SELECT stale_leases FROM erpl_rev_health").find("\"stale_leases\":1") !=
+          std::string::npos);
+
+    // ...while a cycle that is actually running stays healthy.
+    SeedHealthy(db, "live");
+    db.Execute("UPDATE _erpl_rev_delta_state SET status='RUNNING', active_run_id=43, "
+               "lease_ts = now() - INTERVAL '10 seconds', max_cycle_secs=3600 "
+               "WHERE target='live'");
+    CHECK(One(db, "SELECT is_stale_lease FROM erpl_rev_targets WHERE target='live'") ==
+          R"({"is_stale_lease":false})");
+    CHECK(One(db, "SELECT is_healthy FROM erpl_rev_targets WHERE target='live'") ==
+          R"({"is_healthy":true})");
+}
+
+TEST_CASE("stats: unrecovered APE spill is visible and not healthy", "[stats]") {
+    // Spill rows past spill_batch are a crash copy waiting for APE_RECOVER:
+    // handed-over packages the merge never acknowledged. Until recovery runs
+    // the target is behind, and no surface says so.
+    DuckDbBridge db;
+    SeedHealthy(db, "ape1");
+    db.Execute("UPDATE _erpl_rev_delta_state SET method='APE_DELTA', spill_batch=7 "
+               "WHERE target='ape1'");
+    db.Execute("INSERT INTO _erpl_rev_ape_spill (target, batch_index, payload) "
+               "VALUES ('ape1', 8, '{}')");
+
+    CHECK(One(db, "SELECT ape_spill_pending FROM erpl_rev_targets WHERE target='ape1'") ==
+          R"({"ape_spill_pending":1})");
+    CHECK(One(db, "SELECT is_healthy FROM erpl_rev_targets WHERE target='ape1'") ==
+          R"({"is_healthy":false})");
+    CHECK(One(db, "SELECT ape_spill_pending FROM erpl_rev_health")
+              .find("\"ape_spill_pending\":1") != std::string::npos);
+
+    // Spill rows at/below the merged position are already recovered history,
+    // not pending work.
+    SeedHealthy(db, "ape2");
+    db.Execute("UPDATE _erpl_rev_delta_state SET method='APE_DELTA', spill_batch=8 "
+               "WHERE target='ape2'");
+    db.Execute("INSERT INTO _erpl_rev_ape_spill (target, batch_index, payload) "
+               "VALUES ('ape2', 8, '{}')");
+    CHECK(One(db, "SELECT ape_spill_pending FROM erpl_rev_targets WHERE target='ape2'") ==
+          R"({"ape_spill_pending":0})");
+    CHECK(One(db, "SELECT is_healthy FROM erpl_rev_targets WHERE target='ape2'") ==
+          R"({"is_healthy":true})");
+}
+
+TEST_CASE("stats: an APE warning travels with the target", "[stats]") {
+    // last_warning is where a quiet newly created subscription and the
+    // release-override use leave their observable trace. Both exit clean, so
+    // the target stays healthy -- but the reason must travel with it, or the
+    // warning warns nobody.
+    DuckDbBridge db;
+    SeedHealthy(db, "apew");
+    db.Execute("UPDATE _erpl_rev_delta_state SET method='APE_DELTA', "
+               "last_warning='quiet newly created subscription; no data yet' "
+               "WHERE target='apew'");
+
+    CHECK(One(db, "SELECT last_warning FROM erpl_rev_targets WHERE target='apew'").find(
+              "quiet newly created subscription") != std::string::npos);
+    CHECK(One(db, "SELECT is_healthy FROM erpl_rev_targets WHERE target='apew'") ==
+          R"({"is_healthy":true})");
+    CHECK(One(db, "SELECT warned FROM erpl_rev_health").find("\"warned\":1") !=
+          std::string::npos);
+}
+
 TEST_CASE("stats: a watermark target is not judged by a trigger registry it has none of",
           "[stats]") {
     // The join is a LEFT one and the columns come back NULL. A target that was
