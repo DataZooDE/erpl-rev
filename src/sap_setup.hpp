@@ -122,6 +122,12 @@ struct Plan {
     bool create_function_group = false;
     bool run_mkfm = false;
     bool run_setup_class = false;
+    // Re-render and redeploy just ZCL_ERPL_REV_SETUP before running it. The
+    // program id and gateway service are baked into that class at deploy
+    // time, so a system deployed under other values would otherwise re-run
+    // the stale class, which re-asserts the old values and fails the check
+    // against the requested ones.
+    bool refresh_setup_class = false;
     std::string target_package;        // resolved "$TMP" or ZERPL_CORE
     bool needs_transport = false;      // the package is transportable
     std::string transport;             // the request to record on; empty for $TMP

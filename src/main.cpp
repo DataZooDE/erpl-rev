@@ -229,6 +229,19 @@ void PrintHelp() {
         "  DATAZOO_DISABLE_TELEMETRY  disable telemetry across all DataZoo tools\n"
         "  ERPL_REV_TELEMETRY_SAMPLE_RATE  sample rfc_call events, 0<r<=1 (default 1)\n"
         "  DATAZOO_NO_BANNER      suppress the startup feedback banner (truthy)\n\n"
+        "Commands (`sync` takes -h/--help for its own subcommands):\n"
+        "  setup                  Deploy the ABAP objects and check the system.\n"
+        "  doctor                 Diagnose connection and gateway problems.\n"
+        "  sql \"SELECT ...\"       Query DuckDB (the replica) directly.\n"
+        "  sync <sub>              Register and run sync targets (try `sync --help`).\n"
+        "  replicate              One-shot replication without a registered target.\n"
+        "  daemon                 Background scheduler status and control.\n"
+        "  top                    Live monitor of targets and lag.\n"
+        "  cdc                    Trigger-based change data capture.\n"
+        "  mass                   Run many targets with shared portions.\n"
+        "  retain                 Retention: prune old replica history.\n"
+        "  sub                    APE subscriptions.\n"
+        "  abap                   Generated ABAP helpers.\n\n"
         "Bugs, feedback and stars: https://github.com/DataZooDE/erpl-rev\n",
         stderr);
 }
@@ -256,8 +269,8 @@ Cli ParseArgs(int argc, char **argv) {
         else if (v == "abap")   { c.verb = Verb::Abap;   first = 2; }
         else {
             std::fprintf(stderr, "erpl-rev: unknown command '%s'\n"
-                                 "Commands: serve (default), setup, doctor, sql, sync, replicate, abap. "
-                                 "Try --help.\n",
+                                 "Commands: serve (default), setup, doctor, sql, sync, replicate, "
+                                 "daemon, top, cdc, mass, retain, sub, abap. Try --help.\n",
                          v.c_str());
             c.bad_args = true;
             return c;
@@ -335,7 +348,12 @@ Cli ParseArgs(int argc, char **argv) {
             c.init_file = take_value();
             c.init_file_set = true;
         } else if (key == "-h" || key == "--help") {
-            c.help = true;
+            // After a command verb, help asks about the verb
+            // (`sync create --help`), not the server: hand it to the command,
+            // which knows its own subcommands. Anywhere else it is the
+            // top-level help above.
+            if (c.verb == Verb::Sync) c.cmd.args.push_back(key);
+            else c.help = true;
         } else if (key == "--smoke") {
             c.smoke = true;
         } else if (key == "--no-telemetry") {
@@ -701,6 +719,7 @@ int main(int argc, char **argv) {
                 // line above, and `erpl-rev sql` against a server started with no
                 // arguments would have nothing to authenticate with.
                 cli::ServerState st;
+                st.started_at = log::Timestamp(true);
                 st.db_path = db_path;
                 st.quack_listen = quack_listen;
                 st.quack_token = quack_token.empty() ? TokenFromDetails(details)

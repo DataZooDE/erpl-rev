@@ -334,14 +334,24 @@ TempClassrun::TempClassrun(const adt::Conn &conn, const std::string &kind_letter
     : conn_(conn), name_("ZCL_ERPL_REV_CLI_" + kind_letter + nonce), keep_(keep) {}
 
 std::string TempClassrun::DeleteHint() const {
+    // A non-interactive run without SAP_USER must not render `--user  `:
+    // name the variable to export, using the SAP_USER convention the README
+    // documents for every other verb.
+    const std::string user = conn_.user.empty() ? "$SAP_USER" : conn_.user;
     return "uvx erpl-adt --host " + conn_.host + " --port " + conn_.port +
-           " --user " + conn_.user + " --client " + conn_.client +
+           " --user " + user + " --client " + conn_.client +
            " object delete /sap/bc/adt/oo/classes/" + Lower(name_);
 }
 
 std::string TempClassrun::Deploy(const std::string &source) {
     auto r = adt::CreateObject(conn_, "CLAS/OC", name_, "$TMP",
                                "erpl-rev CLI (temporary)");
+    // Only SAP contact can leave a half-created object behind: when the
+    // helper itself could not start, nothing exists in SAP, warning about
+    // cleanup is noise on top of the real failure, and everything downstream
+    // (write, activate, run) needs the same helper -- so fail fast with the
+    // true cause instead of a downstream "did not activate".
+    if (r.spawn_failed) return "erpl-adt could not be started";
     created_ = true;   // set even on failure: a half-created object still needs removing
 
     std::error_code ec;

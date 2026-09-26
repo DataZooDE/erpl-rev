@@ -80,5 +80,9 @@ class Logger {
 // Shorthand accessor used at call sites: log::get().Info("rfc", ...).
 inline Logger &get() { return Logger::Instance(); }
 
+// "2026-05-31 12:00:00.123" for console; ISO-8601 UTC ("...T...Z") for state
+// files and JSON.
+std::string Timestamp(bool iso_utc);
+
 }  // namespace log
 }  // namespace erpl_rev

@@ -4,6 +4,7 @@
 #include <vector>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 
 #ifdef _WIN32
 #define ERPL_POPEN  _popen
@@ -67,6 +68,21 @@ std::string Join(const std::vector<std::string> &argv, bool &ok) {
 
 Result RunCapture(const std::vector<std::string> &argv) {
     Result r;
+    // An explicit path that does not exist is a missing tool, on every
+    // platform. Without this the verdict depends on the shell: POSIX sh exits
+    // 127 ("command not found", detected below) but Windows cmd.exe exits 1
+    // with "cannot find the path specified", which looks exactly like a tool
+    // that ran and failed. Bare names ("erpl-adt", "uvx") still go through
+    // PATH lookup in the shell.
+    if (!argv.empty() && argv[0].find_first_of("/\\") != std::string::npos) {
+        std::error_code ec;
+        if (!std::filesystem::exists(argv[0], ec) || ec) {
+            r.spawn_failed = true;
+            r.output = "erpl-rev: '" + argv[0] +
+                       "' does not exist: missing tool or bad --adt-path";
+            return r;
+        }
+    }
     // 2>&1: erpl-adt writes diagnostics to stderr, and a caller trying to work
     // out why a step failed needs them interleaved with the rest.
     bool quotable = false;
@@ -147,16 +163,42 @@ std::string ToolHint() {
 
 bool ToolAvailable() { return !ToolVersion().empty(); }
 
-std::string ToolVersion() {
-    auto argv = Launcher();
+std::string ToolVersion() { return ProbeTool().version; }
+
+ToolProbe ProbeTool(std::vector<std::string> argv) {
+    if (argv.empty()) argv = Launcher();
+    bool quotable = false;
+    const std::string what = Join(argv, quotable);
     argv.push_back("--version");
     auto r = RunCapture(argv);
-    if (!r.ok()) return "";
+    ToolProbe p;
+    if (!r.ok()) {
+        if (r.spawn_failed) {
+            p.diagnostic = "the erpl-adt launcher could not be started (" + what +
+                           "): missing tool or bad --adt-path";
+        } else {
+            // The launcher ran but --version failed: a broken uv cache or a
+            // failed download looks exactly like this. Surface what it said.
+            auto nl = r.output.find('\n');
+            std::string first =
+                nl == std::string::npos ? r.output : r.output.substr(0, nl);
+            while (!first.empty() && (first.back() == '\r' || first.back() == ' ' ||
+                                      first.back() == '\t'))
+                first.pop_back();
+            p.ran = true;
+            p.diagnostic = "`" + what + " --version` failed (exit " +
+                           std::to_string(r.exit_code) + ")" +
+                           (first.empty() ? " with no output" : ": " + first);
+        }
+        return p;
+    }
+    p.ran = true;
     // Trim to the first line; the version banner may be followed by other output.
     auto nl = r.output.find('\n');
-    std::string v = nl == std::string::npos ? r.output : r.output.substr(0, nl);
-    while (!v.empty() && (v.back() == '\r' || v.back() == ' ')) v.pop_back();
-    return v;
+    p.version = nl == std::string::npos ? r.output : r.output.substr(0, nl);
+    while (!p.version.empty() && (p.version.back() == '\r' || p.version.back() == ' '))
+        p.version.pop_back();
+    return p;
 }
 
 Result Run(const Conn &c, const std::vector<std::string> &args) {

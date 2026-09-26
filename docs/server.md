@@ -31,7 +31,7 @@ loopback** (`quack:localhost`, port 9494). The CLI uses it to read the live data
 It generates a random auth token at boot and writes the connection details to:
 
 ```
-$XDG_RUNTIME_DIR/erpl-rev/server.json      # falls back to a temp dir
+$XDG_RUNTIME_DIR/erpl-rev/server.json      # else $XDG_STATE_HOME, else ~/.local/state
 ```
 
 `erpl-rev sql` and `sync ls|show` find it there themselves. You only need the token
@@ -67,6 +67,13 @@ INFO [server] registration state from="starting" to="running"
 
 `broken` means the gateway refused it, almost always a `reginfo` that does not name
 this host and program ID.
+
+One server per destination: the `ERPL_REV` RFC destination in `RFCDES` names a
+single program ID, so two servers (different `--program-id`) cannot share it --
+the second registration has nowhere to receive calls. Run one server per SAP
+system, or point each system at its own destination. Re-running `setup
+--program-id <id>` re-renders and redeploys the setup class so the destination
+follows the id.
 
 If this host has no route to the gateway at all, there is a tunnel —
 [`tunnel.md`](tunnel.md), which opens by telling you that you probably do not need it.

@@ -8,6 +8,8 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include "abap_codegen.hpp"
+#include "abap_skeletons.hpp"
+#include "adt.hpp"
 
 using namespace erpl_rev::abapgen;
 using Catch::Matchers::ContainsSubstring;
@@ -247,4 +249,21 @@ TEST_CASE("multi-line SQL becomes one concatenated string template", "[abapgen]"
 TEST_CASE("multi-line SQL still escapes template metacharacters per line", "[abapgen]") {
     const auto lines = MultilineTemplate("SELECT '{a}'\nFROM t", "", "sql");
     CHECK_THAT(lines[0], ContainsSubstring("\\{a\\}"));
+}
+
+TEST_CASE("TempClassrun hint names the missing user instead of leaving it blank",
+          "[abap][cleanup]") {
+    // A non-interactive run without SAP_USER produced a deletion command with
+    // `--user  ` (blank): copy-pasteable nowhere. The hint must name what to
+    // fill in, using the same SAP_USER convention the README documents.
+    erpl_rev::adt::Conn noninteractive;
+    noninteractive.host = "localhost";
+    noninteractive.user = "";
+    erpl_rev::abapgen::TempClassrun cls(noninteractive, "C", "abc123", false);
+    CHECK_THAT(cls.DeleteHint(), ContainsSubstring("--user $SAP_USER"));
+
+    erpl_rev::adt::Conn normal;
+    normal.user = "DEVELOPER";
+    erpl_rev::abapgen::TempClassrun ok(normal, "C", "abc123", false);
+    CHECK_THAT(ok.DeleteHint(), ContainsSubstring("--user DEVELOPER"));
 }

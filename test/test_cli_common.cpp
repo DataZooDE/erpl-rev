@@ -24,6 +24,9 @@
 #endif
 
 #include "cli_common.hpp"
+#include "commands.hpp"
+#include "duckdb_bridge.hpp"
+#include "temp_path.hpp"
 
 using namespace erpl_rev::cli;
 using Catch::Matchers::ContainsSubstring;
@@ -228,4 +231,114 @@ TEST_CASE("connection flags are consumed, unknown ones are not", "[cli]") {
     // No password flag exists by design: an argument is visible in the process
     // list to every user on the machine.
     CHECK_FALSE(ParseConnOption("--sap-password", take, o));
+}
+
+TEST_CASE("sync create only accepts known delta methods", "[cli]") {
+    // A typo persisted at registration fails two steps later at run with
+    // "unknown delta method" -- or never, in dry-run. The gate belongs at
+    // the API boundary, before SAP contact or a confirmation prompt.
+    CHECK(erpl_rev::cmd::IsSyncMethod("SNAPSHOT"));
+    CHECK(erpl_rev::cmd::IsSyncMethod("WATERMARK"));
+    CHECK(erpl_rev::cmd::IsSyncMethod("INSERT_ONLY"));
+    CHECK(erpl_rev::cmd::IsSyncMethod("CHANGEDOC"));
+    CHECK(erpl_rev::cmd::IsSyncMethod("APE_FULL"));
+    CHECK(erpl_rev::cmd::IsSyncMethod("APE_DELTA"));
+    CHECK(erpl_rev::cmd::IsSyncMethod("snapshot"));   // case-insensitive
+    CHECK_FALSE(erpl_rev::cmd::IsSyncMethod("BANANA"));
+    // CDC has its own `erpl-rev cdc` verb; as a sync method it registers and
+    // then fails at run, which is exactly the deferred failure above.
+    CHECK_FALSE(erpl_rev::cmd::IsSyncMethod("CDC"));
+    CHECK_FALSE(erpl_rev::cmd::IsSyncMethod(""));
+}
+
+TEST_CASE("sync verbs honor dry-run without writing", "[cli]") {
+    // --dry-run must describe without writing: no queue row, no SAP contact,
+    // no prompts. Each verb below used to fall straight into RunViaDriver,
+    // which inserts a command row before doing anything else.
+    const std::string db = erpl_rev_test::TmpDbPath("dryrun");
+    auto opts = [&](const char *flag = nullptr) {
+        erpl_rev::cmd::Options o;
+        o.dry_run = true;
+        o.assume_yes = true;
+        o.non_interactive = true;
+        o.db_path = db;
+        if (flag) o.args.push_back(flag);
+        return o;
+    };
+    {
+        auto o = opts("--rows");
+        o.args.push_back("5");
+        CHECK(erpl_rev::cmd::SyncPreview(o, "t") == 0);
+    }
+    {
+        auto o = opts();
+        CHECK(erpl_rev::cmd::SyncValidate(o, "t") == 0);
+    }
+    {
+        // set-wm takes its value from --wm-value, like the real CLI.
+        erpl_rev::cmd::Options o = opts("--wm-value");
+        o.args.push_back("20240101");
+        CHECK(erpl_rev::cmd::SyncSetWm(o, "t") == 0);
+    }
+    {
+        auto o = opts();
+        CHECK(erpl_rev::cmd::SyncUnpark(o, "t") == 0);
+    }
+    {
+        auto o = opts();
+        CHECK(erpl_rev::cmd::SyncDrop(o, "t") == 0);
+    }
+    // And nothing was queued anywhere: opening the file fresh migrates it, so
+    // any row found here could only have come from the calls above.
+    erpl_rev::DuckDbBridge probe(db);
+    CHECK(probe.Query("SELECT count(*) AS c FROM _erpl_rev_cli_cmd").rows[0] ==
+          R"({"c":0})");
+}
+
+TEST_CASE("driver classrun errors surface instead of bare PENDING", "[cli]") {
+    // When the RFC leg fails before the driver claims the queued command, the
+    // DuckDB row stays PENDING and says nothing. The classrun console output
+    // usually says everything (agreed format: ERPL-DRV ...;status=..;error=..),
+    // so RunViaDriver prefers it over the row status.
+    CHECK(erpl_rev::cmd::DriverErrorFromOutput(
+              "ERPL-DRV id=;verb=sync_run;status=ERROR;result=;"
+              "error=RFC subrc=2 Error when opening an RFC connection (CPIC-CALL: "
+              "'ThSAPOCMINIT', communication rc: CM_ALLOCATE_FAILURE_RETRY (cmRc=2)).") ==
+          "RFC subrc=2 Error when opening an RFC connection (CPIC-CALL: "
+          "'ThSAPOCMINIT', communication rc: CM_ALLOCATE_FAILURE_RETRY (cmRc=2)).");
+    CHECK(erpl_rev::cmd::DriverErrorFromOutput("ERPL-DRV id=3;status=DONE;") == "");
+    CHECK(erpl_rev::cmd::DriverErrorFromOutput("some unrelated console noise") == "");
+    CHECK(erpl_rev::cmd::DriverErrorFromOutput("") == "");
+}
+
+TEST_CASE("read-only sync verbs need no SAP connection", "[cli]") {
+    // `sync ls` on an interactive terminal prompted for SAP user and password
+    // before reading local DuckDB state it never uses for SAP. The dispatcher
+    // skips credential resolution for the read-only verbs; this pins that
+    // decision table.
+    CHECK_FALSE(erpl_rev::cmd::SyncNeedsSapConn("ls"));
+    CHECK_FALSE(erpl_rev::cmd::SyncNeedsSapConn("show"));
+    CHECK(erpl_rev::cmd::SyncNeedsSapConn("create"));
+    CHECK(erpl_rev::cmd::SyncNeedsSapConn("run"));
+    CHECK(erpl_rev::cmd::SyncNeedsSapConn("preview"));
+    CHECK(erpl_rev::cmd::SyncNeedsSapConn("validate"));
+    CHECK(erpl_rev::cmd::SyncNeedsSapConn(""));
+}
+
+TEST_CASE("sync help answers about the verb", "[cli]") {
+    // `sync create --help` used to print the generic server help: -h/--help
+    // was claimed by the top-level parser wherever it appeared. The create
+    // text must name the flags and the six methods; anything else (including
+    // no sub, or a typo'd one) gets the verb overview -- asking for help must
+    // never fail.
+    using Catch::Matchers::ContainsSubstring;
+    const std::string create = erpl_rev::cmd::SyncHelpText("create");
+    CHECK_THAT(create, ContainsSubstring("--method"));
+    CHECK_THAT(create, ContainsSubstring("SNAPSHOT"));
+    CHECK_THAT(create, ContainsSubstring("APE_DELTA"));
+    CHECK_THAT(create, ContainsSubstring("--dry-run"));
+    const std::string overview = erpl_rev::cmd::SyncHelpText("");
+    CHECK_THAT(overview, ContainsSubstring("ls"));
+    CHECK_THAT(overview, ContainsSubstring("drop"));
+    CHECK(erpl_rev::cmd::SyncHelpText("frobnicate") == overview);
 }

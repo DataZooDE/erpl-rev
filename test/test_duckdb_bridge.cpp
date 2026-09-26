@@ -1111,6 +1111,26 @@ TEST_CASE("SnapshotMerge: empty staging deletes all; fresh target inserts all",
     REQUIRE(db.Query("SELECT count(*) AS c FROM es").rows[0] == R"({"c":2})");
 }
 
+TEST_CASE("bridge: opening a fresh file leaves no WAL behind", "[bridge][wal]") {
+    // An un-checkpointed migration WAL bricked the file on the next open:
+    // DuckDB's replay of ALTER TABLE ... ADD COLUMN ... DEFAULT crashed with
+    // "Calling DatabaseManager::GetDefaultDatabase with no default database
+    // set", and the server exited 1. Any unclean shutdown (kill -9, OOM)
+    // between first boot and the next checkpoint hit it, because migrations
+    // are exactly the DDL whose replay crashes.
+    using erpl_rev_test::TmpDbPath;
+    const std::string path = TmpDbPath("wal");
+    DuckDbBridge db(path);
+    db.Query("SELECT count(*) AS c FROM _erpl_rev_schema_version");
+    // While the bridge is still open: the migration DDL must already be
+    // checkpointed, so an unclean shutdown from here on replays nothing.
+    // (A clean close checkpoints on its own, so checking after the close
+    // would pass with or without the fix and prove nothing.) Gone entirely
+    // or truncated empty -- either way there is nothing left to replay.
+    CHECK((!std::filesystem::exists(path + ".wal") ||
+           std::filesystem::file_size(path + ".wal") == 0));
+}
+
 TEST_CASE("SnapshotMerge: all-key table (no non-key columns to update)",
           "[bridge][snapshot][edge]") {
     DuckDbBridge db;

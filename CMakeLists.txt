@@ -372,6 +372,7 @@ if(TRUE)  # tests always build; DuckDB is in-tree
     test/test_tui_model.cpp
     test/test_tui_graph.cpp
     test/test_top_render.cpp
+    test/test_adt.cpp
     test/test_cdc_status.cpp
     test/test_portion.cpp
     test/test_cds_delta.cpp

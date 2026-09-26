@@ -32,6 +32,70 @@ std::string BuildParams(const std::vector<std::pair<std::string, std::string>> &
     return j + "}";
 }
 
+bool SyncNeedsSapConn(const std::string &sub) {
+    return sub != "ls" && sub != "show";
+}
+
+std::string SyncHelpText(const std::string &sub) {
+    if (sub == "create") {
+        return
+            "erpl-rev sync create <target> --method M --source S --keys K [flags]\n"
+            "  Register a sync target. Methods: SNAPSHOT, WATERMARK, INSERT_ONLY,\n"
+            "  CHANGEDOC, APE_FULL, APE_DELTA (CDC has its own `erpl-rev cdc` verb).\n"
+            "  --source S             SAP table, CDS entity (APE) or query.\n"
+            "  --keys K               Comma-separated key columns.\n"
+            "  --chg-col C            CHANGEDOC change-pointer column.\n"
+            "  --wm-kind DATE|TIMESTAMP  WATERMARK column kind.\n"
+            "  --wm-value V           WATERMARK start position.\n"
+            "  --cadence <spec>       e.g. hourly (default), minutely.\n"
+            "  --columns a,b          Load only these columns (client-side projection).\n"
+            "  --time-col C           INSERT_ONLY commit-timestamp column.\n"
+            "  --safety-secs N / --safety-units U\n"
+            "  --load-type-default T  Fallback load type for the first cycle.\n"
+            "  --subscriber-process P APE subscriber process.\n"
+            "  --chunk-size N         Rows per package.\n"
+            "  --wireformat F         Transfer format.\n"
+            "  --extra K=V            Extra driver parameter (repeatable).\n"
+            "  --log / --no-log       Per-cycle logging.\n"
+            "  --allow-empty-reload / --no-allow-empty-reload\n"
+            "  --allow-unreleased     Skip the release gate (audited).\n"
+            "  Server flags: --dry-run (describe only), -y/--yes,\n"
+            "  --non-interactive, --db, --quack-url, --quack-token.\n";
+    }
+    return
+        "erpl-rev sync <sub> [flags]   (`sync <sub> --help` prints the flags)\n"
+        "  ls                     List registered targets with lag and health.\n"
+        "  show <target>          One target in detail.\n"
+        "  create                 Register a target (see `sync create --help`).\n"
+        "  run <target>           Replicate now.\n"
+        "  preview <target>       Sample rows without writing.\n"
+        "  validate <target>      Cell-by-cell parity check.\n"
+        "  set-wm <target>        Move the watermark.\n"
+        "  schedule               Periodic runs.\n"
+        "  unpark <target>        Release a parked target.\n"
+        "  drop <target>          Erase subscription and state (keeps the table).\n";
+}
+
+bool IsSyncMethod(const std::string &method) {
+    static const char *kMethods[] = {"SNAPSHOT", "WATERMARK", "INSERT_ONLY",
+                                     "CHANGEDOC", "APE_FULL", "APE_DELTA"};
+    std::string upper = method;
+    for (auto &c : upper)
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    for (const char *k : kMethods)
+        if (upper == k) return true;
+    return false;
+}
+
+std::string DriverErrorFromOutput(const std::string &output) {
+    const std::string key = "error=";
+    const size_t at = output.find(key);
+    if (at == std::string::npos) return {};
+    std::string err = output.substr(at + key.size());
+    while (!err.empty() && (err.back() == '\n' || err.back() == '\r')) err.pop_back();
+    return err;
+}
+
 std::string UnknownFlag(const std::vector<std::string> &args, const std::string &sub) {
     // name, takes_value. A value-taking flag's value is the next word, and a
     // value may itself look like a flag (`--where=--x`), so it is skipped
@@ -291,7 +355,14 @@ int RunViaDriver(Options &o, const std::string &verb, const std::string &params)
         return 1;
     }
     if (status != "DONE") {
-        std::fprintf(stderr, "erpl-rev: %s\n", error.empty() ? status.c_str() : error.c_str());
+        // The row is the driver's verdict -- except when the driver never
+        // ran: a PENDING row after a successful classrun means the RFC leg
+        // failed before the driver could claim the command, and printing the
+        // row status then reports "PENDING" with zero diagnosis.
+        std::string msg = error;
+        if (msg.empty()) msg = DriverErrorFromOutput(r.output);
+        if (msg.empty()) msg = status;
+        std::fprintf(stderr, "erpl-rev: %s\n", msg.c_str());
         return 1;
     }
     std::printf("%s\n", result.c_str());
@@ -404,6 +475,19 @@ static int SyncCreate(Options &o, const std::string &target) {
         return 2;
     }
 
+    // Before any consent prompt or SAP contact: a typo should cost an error,
+    // not a password prompt and a persisted row that fails two steps later at
+    // run. CDC is refused here on purpose -- it has its own `erpl-rev cdc`
+    // verb and is not a runnable sync method.
+    if (!IsSyncMethod(st.method)) {
+        std::fprintf(stderr,
+                     "erpl-rev sync create: unknown method '%s'.\n"
+                     "  Valid methods: SNAPSHOT, WATERMARK, INSERT_ONLY, CHANGEDOC, "
+                     "APE_FULL, APE_DELTA.\n",
+                     st.method.c_str());
+        return 2;
+    }
+
     // Static APE rules fire here, before any consent prompt or SAP contact: a
     // typo should cost an error, not a password prompt and a prepared graph.
     // sync create has no filter channel, so has_filter stays false; the
@@ -444,7 +528,10 @@ static int SyncCreate(Options &o, const std::string &target) {
     const std::string src = abapgen::RenderSyncRegister(st, nonce);
     if (o.print_abap) { std::fputs(src.c_str(), stdout); return 0; }
     if (o.dry_run) {
-        std::printf("Would register sync job '%s' (%s over %s).\n",
+        // Configuration syntax only: whether the SAP source exists is proven
+        // at the first cycle, not here, and nothing is written.
+        std::printf("Would register sync job '%s' (%s over %s).\n"
+                    "  Configuration syntax only; the SAP source is not checked.\n",
                     st.target.c_str(), st.method.c_str(), st.source_from.c_str());
         return 0;
     }
@@ -591,14 +678,24 @@ int RunSync(Options o) {
     const std::string sub = o.args.empty() ? "" : o.args.front();
     const std::string arg = o.args.size() > 1 && o.args[1].rfind("--", 0) != 0
                                 ? o.args[1] : std::string();
+    // -h/--help after the verb asks about the verb, not the server: answer
+    // here, before flag validation can refuse the very flag being asked about.
+    for (const auto &a : o.args)
+        if (a == "--help" || a == "-h") {
+            std::printf("%s", SyncHelpText(sub).c_str());
+            return 0;
+        }
+
     // Before anything that prompts or contacts SAP: a typo'd flag should cost
     // the user an error message, not a password prompt and a wrong job.
     if (const int rc = RefuseUnknownFlags(o, "sync " + sub)) return rc;
 
     const auto cfg = cli::ReadConfig();
     // --queue-only never contacts SAP, so it must not prompt for a password to
-    // write a row into a local database.
-    cli::ResolveConn(o, cfg, !o.queue_only && !o.non_interactive && cli::IsTty());
+    // write a row into a local database. Neither do the read-only verbs, for
+    // the same reason: ls/show inspect local DuckDB state only.
+    if (SyncNeedsSapConn(sub))
+        cli::ResolveConn(o, cfg, !o.queue_only && !o.non_interactive && cli::IsTty());
 
     try {
         if (sub == "ls")            return SyncList(o);
@@ -633,6 +730,10 @@ int SyncSetWm(Options &o, const std::string &target) {
                              "there.\n");
         return 2;
     }
+    if (o.dry_run) {
+        std::printf("Would set the watermark of '%s' to %s.\n", target.c_str(), wm.c_str());
+        return 0;
+    }
     if (const int rc = ConsentGate(o, "Set the watermark of '" + target + "' to " + wm)) return rc;
     return RunViaDriver(o, "set_wm", BuildParams({{"target", target}, {"wm_value", wm}}));
 }
@@ -641,6 +742,11 @@ int SyncPreview(Options &o, const std::string &target) {
     if (target.empty()) {
         std::fprintf(stderr, "erpl-rev sync preview <target> [--rows N]\n");
         return 2;
+    }
+    if (o.dry_run) {
+        std::printf("Would preview %s rows of '%s'.\n", Field(o, "--rows", "20").c_str(),
+                    target.c_str());
+        return 0;
     }
     return RunViaDriver(o, "preview",
                         BuildParams({{"target", target}, {"rows", Field(o, "--rows", "20")}}));
@@ -654,6 +760,12 @@ int SyncValidate(Options &o, const std::string &target) {
                              "check there is.\n");
         return 2;
     }
+    if (o.dry_run) {
+        std::printf("Would validate parity for '%s' (%s, %s rows).\n", target.c_str(),
+                    HasFlag(o, "--full") ? "full" : "sample",
+                    Field(o, "--sample-rows", "1000").c_str());
+        return 0;
+    }
     return RunViaDriver(o, "validate", BuildParams({
         {"target", target},
         {"mode", HasFlag(o, "--full") ? "full" : "sample"},
@@ -666,6 +778,10 @@ int SyncUnpark(Options &o, const std::string &target) {
                              "  Releases a parked target and clears its backoff.\n");
         return 2;
     }
+    if (o.dry_run) {
+        std::printf("Would release parked target '%s' and clear its backoff.\n", target.c_str());
+        return 0;
+    }
     return RunViaDriver(o, "unpark", BuildParams({{"target", target}}));
 }
 
@@ -676,6 +792,12 @@ int SyncDrop(Options &o, const std::string &target) {
                              "  state row (FR-9). Refuses a target with a cycle in flight.\n"
                              "  The DuckDB target table itself is kept.\n");
         return 2;
+    }
+    if (o.dry_run) {
+        std::printf("Would erase the subscription and state row of '%s' "
+                    "(the DuckDB target table itself is kept).\n",
+                    target.c_str());
+        return 0;
     }
     return RunViaDriver(o, "sync_drop", BuildParams({{"target", target}}));
 }

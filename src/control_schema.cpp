@@ -283,8 +283,10 @@ void Migrate(duckdb::Connection &con, const std::string &binary_version) {
          "applied_ts TIMESTAMPTZ DEFAULT now(), binary_version VARCHAR)",
          "create version table");
 
+    bool migrated = false;
     for (const auto &m : Migrations()) {
         if (m.version <= have) continue;
+        migrated = true;
 
         // Deliberately NOT wrapped in an explicit transaction. DuckDB refuses to
         // commit two ALTER TABLEs against the same table in one transaction
@@ -314,6 +316,16 @@ void Migrate(duckdb::Connection &con, const std::string &binary_version) {
                  std::to_string(m.version) + ", " + lit(m.name) + ", " + lit(binary_version) + ")",
              "record version");
     }
+
+    // Checkpoint the migration DDL out of the WAL before serving anything.
+    // DuckDB replays an un-checkpointed WAL on the next open, and replaying
+    // ALTER TABLE ... ADD COLUMN ... DEFAULT crashes with
+    // "Calling DatabaseManager::GetDefaultDatabase with no default database
+    // set" -- so any unclean shutdown (kill -9, OOM) between first boot and
+    // the next checkpoint bricked the file with exit 1. Only when something
+    // actually migrated: a checkpoint on every open would tax the hot path
+    // for no reason.
+    if (migrated) Exec(con, "CHECKPOINT", "checkpoint after migration");
 }
 
 }  // namespace schema
