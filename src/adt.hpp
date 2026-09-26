@@ -56,6 +56,21 @@ bool ToolAvailable();
 // The erpl-adt version string, or empty if unavailable.
 std::string ToolVersion();
 
+// What `uvx erpl-adt --version` (or the --adt-path override) reported.
+// Separates "the launcher could not start" (missing tool, bad override)
+// from "it ran and failed" (broken uv cache, failed download, execution
+// error) -- which need different remedies -- instead of blaming a missing
+// uv for all of them.
+struct ToolProbe {
+    bool ran = false;        // the launcher started
+    std::string version;     // first --version line; empty unless it worked
+    std::string diagnostic;  // why not, trimmed, when version is empty
+};
+// Probe the given launcher argv (default: the resolved Launcher()). Taking
+// the argv as a parameter keeps this testable without touching the cached
+// global launcher resolution.
+ToolProbe ProbeTool(std::vector<std::string> argv = {});
+
 // erpl-adt invocations. Each returns the raw result so callers can inspect the
 // output -- a classrun that hits an ABAP short dump comes back as HTTP 500 with
 // the dump text in the body, so the status alone is not enough to report on.

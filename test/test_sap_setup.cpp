@@ -408,3 +408,21 @@ TEST_CASE("under a tunnel the handout refuses to guess HOST=", "[setup]") {
     // ACCESS/CANCEL still name the real gateway, not the forward's local end.
     CHECK_THAT(h, ContainsSubstring("ACCESS=sap.example.com"));
 }
+
+TEST_CASE("an explicit --program-id re-renders the setup class on a healthy system",
+          "[setup]") {
+    // The program id is baked into ZCL_ERPL_REV_SETUP at deploy time. On a
+    // healthy system whose objects were deployed under another id, setup
+    // would otherwise re-run the stale class, which re-asserts the old id
+    // and fails the destination check against the requested one.
+    Diagnosis d = HealthyDiagnosis();
+    Options o = DefaultOptions();
+    o.program_id = "UXAGY";
+    o.program_set = true;
+    const Plan p = MakePlan(d, o);
+
+    CHECK(p.refresh_setup_class);
+    CHECK(p.run_setup_class);       // the fresh class, not the stale one
+    CHECK_FALSE(p.deploy_objects);  // the sources are fine; only the id is stale
+    CHECK_FALSE(p.nothing_to_do);
+}

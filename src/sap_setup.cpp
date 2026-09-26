@@ -207,15 +207,23 @@ Diagnosis Diagnose(const Options &o) {
                             std::move(remedy), st});
     };
 
-    // 1. Can we drive ADT at all?
-    const std::string ver = adt::ToolVersion();
-    d.have_uvx = !ver.empty();
-    if (d.have_uvx)
-        add("local.adt", "erpl-adt available", Status::Ok, ver);
-    else
-        add("local.adt", "erpl-adt available", Status::Fail, "uvx erpl-adt did not run",
+    // 1. Can we drive ADT at all? A missing launcher and a launcher that
+    // fails (broken uv cache, failed download) need different remedies, so
+    // they get different findings instead of one "uvx did not run".
+    const adt::ToolProbe probe = adt::ProbeTool();
+    d.have_uvx = !probe.version.empty();
+    if (d.have_uvx) {
+        add("local.adt", "erpl-adt available", Status::Ok, probe.version);
+    } else if (!probe.ran) {
+        add("local.adt", "erpl-adt available", Status::Fail, probe.diagnostic,
             "Install uv (https://docs.astral.sh/uv/) so setup can deploy the ABAP objects.\n"
             "        Without it, run `erpl-rev setup --print-runbook` and do the steps by hand.");
+    } else {
+        add("local.adt", "erpl-adt available", Status::Fail, probe.diagnostic,
+            "The launcher ran but `erpl-adt --version` failed: a broken uv cache or a\n"
+            "        failed download looks exactly like this. Try `uv cache clean`, check the\n"
+            "        network, or point at a fixed binary with --adt-path.");
+    }
 
     adt::Conn conn{o.host, o.port, o.client, o.user, o.password, false, 600};
 
@@ -396,6 +404,15 @@ Plan MakePlan(const Diagnosis &d, const Options &o) {
         // system that reaped $TMP or never had the setup class run.
         p.create_function_group = true;
         p.run_mkfm = true;
+        p.run_setup_class = true;
+    } else if ((o.program_set || o.gwserv_set) && !p.deploy_objects) {
+        // Objects are there and the round trip works, but the operator
+        // explicitly asked for a program id or gateway service: the deployed
+        // setup class still carries the old baked-in values. Re-render and
+        // redeploy just that class, then run the fresh one. A full deploy
+        // would regenerate everything anyway, so this only fires when it does
+        // not; re-running with unchanged values rewrites identical source.
+        p.refresh_setup_class = true;
         p.run_setup_class = true;
     }
 
@@ -887,6 +904,9 @@ int RunSetup(Options o) {
         if (p.create_function_group)
             std::cout << "  · create function group ZERPL_REV in " << p.target_package
                       << on_request << "\n";
+        if (p.refresh_setup_class)
+            std::cout << "  · re-render ZCL_ERPL_REV_SETUP for program id " << o.program_id
+                      << " and redeploy it (the deployed copy still carries the old id)\n";
         if (p.run_setup_class)
             std::cout << "  · run ZCL_ERPL_REV_SETUP  (destination " << o.program_id
                       << ", gateway " << GwService(o.gwserv) << ", registration mode)\n";
@@ -977,6 +997,25 @@ int RunSetup(Options o) {
         adt::CreateObject(conn, "FUGR/F", "ZERPL_REV", p.target_package,
                           "erpl-rev RFC function group", p.transport);
         std::cout << "  ok   function group ZERPL_REV\n";
+    }
+    if (p.refresh_setup_class) {
+        // The deployed copy bakes in the old program id / gateway service;
+        // re-render from the template with the requested values and overwrite
+        // it, exactly like the full deploy does for every object.
+        for (const auto &a : abap::ProductionAssets()) {
+            if (a.name != "ZCL_ERPL_REV_SETUP") continue;
+            const auto file = Materialise(a, o, tmp);
+            adt::CreateObject(conn, std::string(a.adt_type), std::string(a.name),
+                              p.target_package, std::string(a.description), p.transport);
+            auto w = adt::WriteSource(conn, std::string(a.name), file.string(),
+                                      std::string(a.src_type), p.transport);
+            const bool ok = adt::ActivationSucceeded(w);
+            std::cout << (ok ? "  ok   " : "  FAIL ") << a.name << " (re-rendered)\n";
+            if (!ok) {
+                failures++;
+                std::cout << "        " << w.output.substr(0, 200) << "\n";
+            }
+        }
     }
     if (p.run_setup_class) {
         auto r = adt::RunClass(conn, "ZCL_ERPL_REV_SETUP");

@@ -2,8 +2,8 @@
 
 The day-to-day runbook. Anything here that makes SAP *do* something goes through the
 SAP command queue, so it needs no `S_DEVELOP` and no generated ABAP, and it is
-recorded. The read-only ones — `sync ls`, `sync show`, `top` — read DuckDB directly
-and do not contact SAP at all.
+recorded. The read-only ones — `sync ls`, `sync show`, `top` — read DuckDB directly,
+do not contact SAP at all, and never prompt for SAP credentials.
 
 ## Registering a target
 
@@ -27,6 +27,12 @@ Registration writes **intent**; it never writes engine state. The watermark, the
 status, the failure count and the run history belong to the engine, and
 registration cannot overwrite them. See [control-tables.md](control-tables.md)
 for which column is which.
+
+Registration checks configuration syntax only -- the method enum, required
+flags, APE subscription shape. Whether the SAP source exists (a typo'd table
+or CDS name) is proven at the first cycle: it registers, then the first run
+fails with an SAP error naming the source. `--dry-run` reports the same
+syntax-only verdict without writing anything.
 
 For the APE methods (`APE_FULL`/`APE_DELTA` over CDS views) add
 `--subscriber-process <NAME>` plus `--chunk-size`, `--wireformat`,

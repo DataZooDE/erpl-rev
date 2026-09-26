@@ -68,27 +68,6 @@ bool ParseLevel(const char *s, Level &out) {
     return false;
 }
 
-// "2026-05-31 12:00:00.123" for console; ISO-8601 UTC for JSON.
-std::string Timestamp(bool iso_utc) {
-    auto now = std::chrono::system_clock::now();
-    auto t = std::chrono::system_clock::to_time_t(now);
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
-
-    std::tm tm{};
-    char buf[32];
-    if (iso_utc) {
-        gmtime_r(&t, &tm);
-        std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm);
-    } else {
-        localtime_r(&t, &tm);
-        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
-    }
-    char out[40];
-    std::snprintf(out, sizeof(out), "%s.%03lld%s", buf, (long long)ms.count(),
-                  iso_utc ? "Z" : "");
-    return out;
-}
-
 // Escape a string for embedding in a JSON string literal.
 void AppendJsonEscaped(std::string &dst, const std::string &s) {
     for (char c : s) {
@@ -111,6 +90,27 @@ void AppendJsonEscaped(std::string &dst, const std::string &s) {
 }
 
 }  // namespace
+
+// "2026-05-31 12:00:00.123" for console; ISO-8601 UTC for JSON and state files.
+std::string Timestamp(bool iso_utc) {
+    auto now = std::chrono::system_clock::now();
+    auto t = std::chrono::system_clock::to_time_t(now);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+
+    std::tm tm{};
+    char buf[32];
+    if (iso_utc) {
+        gmtime_r(&t, &tm);
+        std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm);
+    } else {
+        localtime_r(&t, &tm);
+        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+    }
+    char out[40];
+    std::snprintf(out, sizeof(out), "%s.%03lld%s", buf, (long long)ms.count(),
+                  iso_utc ? "Z" : "");
+    return out;
+}
 
 Logger &Logger::Instance() {
     static Logger instance;

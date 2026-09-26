@@ -39,7 +39,7 @@ is **no new `Z` table in SAP**.
 | **INSERT_ONLY** | append-only, driven by change documents (e.g. `CDPOS`) | CDHDR feed → `CHANGENR` list → `CDPOS WHERE CHANGENR IN (…)` (2-step, portable across ECC cluster / S4 transparent) | keyed upsert (DDIC key dedups re-delivered rows) |
 | **CHANGEDOC** | weak/absent change column (e.g. `MARA`, `MAKT`) | CDHDR `WHERE objectclas=… AND (udate>… OR (udate=… AND utime>…))` → business keys → **re-read** current rows from the source by key | keyed upsert |
 | **SNAPSHOT** | physical deletes, or bounded column-less tables | full reload into `<target>__snap` (the normal full-load path) | server anti-join: upsert all of staging **and DELETE target keys absent from it** |
-| **CDC** | physical deletes on a table too large to snapshot | database triggers on the source write a shadow log; the cycle drains it | delete-then-upsert per net operation — see [`cdc.md`](cdc.md) |
+| **CDC** | physical deletes on a table too large to snapshot | database triggers on the source write a shadow log; the cycle drains it | delete-then-upsert per net operation — reached via `erpl-rev cdc`, **not** `--method CDC`: `sync create` refuses it at registration, see [`cdc.md`](cdc.md) |
 | **APE_FULL** | one-off snapshot of a CDS view | SAP DHAPE engine, unique-per-scan subscription | staging → snapshot merge |
 | **APE_DELTA** | ongoing replication of a CDS view incl. deletes | SAP DHAPE engine, named resumed subscription | keyed merge (`U` upsert, `D` delete by key) |
 

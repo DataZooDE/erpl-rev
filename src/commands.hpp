@@ -63,6 +63,37 @@ std::string BuildParams(const std::vector<std::pair<std::string, std::string>> &
 // does know them. Exposed for tests.
 std::string UnknownFlag(const std::vector<std::string> &args, const std::string &sub);
 
+// Whether `sync create --method` names a runnable delta method, matched
+// case-insensitively. CDC is deliberately absent: the trigger tier has its own
+// `erpl-rev cdc` verb. Exposed for tests.
+bool IsSyncMethod(const std::string &method);
+
+// The `error=` value from a driver classrun console line
+// (`ERPL-DRV ...;status=..;error=..`), or "" when the output carries none.
+// RunViaDriver prefers it over a bare row status: when the RFC leg fails
+// before the driver claims the queued command, the row stays PENDING and
+// says nothing, while the console output says everything. Exposed for tests.
+std::string DriverErrorFromOutput(const std::string &output);
+
+// Single-verb entry points, exposed for tests so dry-run and validation can
+// be asserted without a server: with --dry-run they must return 0 having
+// written nothing and contacted nothing.
+int SyncSetWm(Options &o, const std::string &target);
+int SyncPreview(Options &o, const std::string &target);
+int SyncValidate(Options &o, const std::string &target);
+int SyncUnpark(Options &o, const std::string &target);
+int SyncDrop(Options &o, const std::string &target);
+
+// Whether `sync <sub>` can touch SAP. The read-only verbs inspect local
+// DuckDB state only and must not trigger credential resolution (which prompts
+// on an interactive terminal). Exposed for tests.
+bool SyncNeedsSapConn(const std::string &sub);
+
+// The `sync --help` / `sync <sub> --help` text. Returned, not printed, so
+// tests can assert on the exact words operators read. Unknown subs get the
+// overview rather than an error: asking for help must never fail.
+std::string SyncHelpText(const std::string &sub);
+
 int RunSql(Options o);
 int RunSync(Options o);
 

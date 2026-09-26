@@ -427,6 +427,19 @@ DuckDbBridge::DuckDbBridge(const std::string &path, const std::string &init_sql)
         if (e->HasError())
             throw std::runtime_error("DuckDB init SQL failed: " + e->GetError());
     }
+
+    // Checkpoint everything boot wrote (migrations, views, macros) out of the
+    // WAL before serving anything. Migrate() already checkpoints its own DDL,
+    // but the views and macros recreated below it are catalog writes too, and
+    // any un-checkpointed boot DDL replays on the next open -- where
+    // ALTER ... ADD COLUMN ... DEFAULT crashes outright (see Migrate). File
+    // databases only: an in-memory engine has no WAL, and most test bridges
+    // are in-memory.
+    if (!path.empty()) {
+        auto ck = con.Query("CHECKPOINT");
+        if (ck->HasError())
+            throw std::runtime_error("DuckDB checkpoint after boot failed: " + ck->GetError());
+    }
 }
 
 DuckDbBridge::~DuckDbBridge() = default;
