@@ -108,8 +108,8 @@ existing database without a migration:
 | view | answers |
 |---|---|
 | `erpl_rev_run_stats` | what each run did — derived counts, rates and durations |
-| `erpl_rev_targets` | per target: method, cadence, status, lag, last cycle's inserts/updates/deletes, health, and the trigger registry's own state |
-| `erpl_rev_health` | one row: how many targets, how many healthy, worst lag, daemon heartbeat |
+| `erpl_rev_targets` | per target: method, cadence, status, lag, last cycle's inserts/updates/deletes, health, the trigger registry's own state, lease state (`lease_age_s`, `is_stale_lease`), pending APE spill (`ape_spill_pending`), and the last advisory (`last_warning`) |
+| `erpl_rev_health` | one row: how many targets, how many healthy, worst lag, daemon heartbeat, stale leases, pending APE spill, warned targets |
 
 `erpl_rev_targets` and `erpl_rev_health` are what `erpl-rev top`, `sync ls`, the
 Prometheus endpoint and the ABAP ALV report all read — so four surfaces cannot

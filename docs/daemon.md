@@ -75,6 +75,7 @@ background job, so it cannot hold the tick thread and stall the heartbeat.
 | No cycles at all | `daemon status` — is it ticking, and is `stop` set? |
 | One target never runs | its `status`: `BLOCKED` means the registration cannot run; `parked_until` means backoff |
 | A target retries constantly | `fail_count` and `last_error` on `_erpl_rev_delta_state` |
+| A target stuck in `RUNNING` | `erpl_rev_targets`: `is_stale_lease` / `lease_age_s` — a lease older than `max_cycle_secs` belongs to a dead cycle; the planner reclaims it on the next tick. Pending APE crash copies show as `ape_spill_pending`, advisories as `last_warning` |
 | Latency climbing | `erpl_rev_run_stats` for cycle duration, and whether one target dominates the budget |
 | Two daemons suspected | `daemon status` first (one running instance?), then `instance_id` on `_erpl_rev_daemon`; only one row exists, and only one id can hold it |
 
