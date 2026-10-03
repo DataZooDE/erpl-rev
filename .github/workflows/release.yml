@@ -21,6 +21,7 @@ env:
 jobs:
   posix:
     name: bundle ${{ matrix.asset }}
+    timeout-minutes: 110
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -137,6 +138,7 @@ jobs:
 
   windows:
     name: bundle erpl-rev-windows-amd64
+    timeout-minutes: 110
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -249,6 +251,7 @@ jobs:
   pypi-wheels:
     name: Build Python wheels
     needs: [posix, windows]
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -327,6 +330,7 @@ jobs:
     name: Publish to PyPI
     needs: pypi-wheels
     if: startsWith(github.ref, 'refs/tags/v')
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -344,6 +348,7 @@ jobs:
     name: Publish release
     needs: [posix, windows]
     if: startsWith(github.ref, 'refs/tags/v')
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -394,6 +399,7 @@ jobs:
     # separate build/stage path). Release-only, gated to v* tags like the release job.
     needs: [posix]
     if: startsWith(github.ref, 'refs/tags/v')
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     permissions:
       contents: read
