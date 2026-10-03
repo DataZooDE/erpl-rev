@@ -31,6 +31,7 @@ permissions:
 jobs:
   resolve:
     name: Resolve release tag
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.t.outputs.tag }}
@@ -68,6 +69,7 @@ jobs:
     name: smoke ${{ matrix.bin }}
     needs: resolve
     if: needs.resolve.outputs.tag != ''
+    timeout-minutes: 15
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

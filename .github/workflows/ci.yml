@@ -15,9 +15,14 @@ permissions:
 env:
   DUCKDB_VERSION: "1.5.5"
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   build-and-test:
     name: Build server + run tests (Linux)
+    timeout-minutes: 90
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -88,6 +93,7 @@ jobs:
     # -- so a break here is a break in the artifact, not in a configuration
     # nobody ships.
     name: Build server + run tests (macOS)
+    timeout-minutes: 50
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -135,6 +141,7 @@ jobs:
     # used to slip to the release. Build the same x64-windows-static config
     # (server + tests) AND run the suite here on every push/PR.
     name: Build server + run tests (Windows)
+    timeout-minutes: 110
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
