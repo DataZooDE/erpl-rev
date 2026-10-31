@@ -37,7 +37,7 @@ jobs:
           # below) -- but NOT yet against a live SAP system. See erpl-rev#75.
           - { os: ubuntu-latest, sub: linux, plat: linux, triplet: x64-linux,
               asset: erpl-rev-linux-amd64 }
-          - { os: macos-14, sub: osx, plat: osx, triplet: arm64-osx,
+          - { os: macos-15, sub: osx, plat: osx, triplet: arm64-osx,
               asset: erpl-rev-macos-arm64 }
     steps:
       - uses: actions/checkout@v4

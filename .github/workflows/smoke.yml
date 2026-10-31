@@ -74,7 +74,7 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-latest,  archive: erpl-rev-linux-amd64.tar.gz,  bin: erpl-rev-linux-amd64 }
-          - { os: macos-14,       archive: erpl-rev-macos-arm64.tar.gz,  bin: erpl-rev-macos-arm64 }
+          - { os: macos-15,       archive: erpl-rev-macos-arm64.tar.gz,  bin: erpl-rev-macos-arm64 }
           - { os: windows-latest, archive: erpl-rev-windows-amd64.zip,   bin: erpl-rev-windows-amd64.exe }
     steps:
       - name: Smoke-test the published bundle (posix)
